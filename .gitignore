@@ -1,0 +1,10 @@
+.zig-cache/
+zig-cache/
+zig-out/
+zide
+zide.exe
+*.pdb
+*.obj
+*.o
+*.tmp
+

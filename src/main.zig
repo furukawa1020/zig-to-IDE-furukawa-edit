@@ -72,11 +72,13 @@ test {
     _ = @import("tasks/console.zig");
     _ = @import("terminal/ansi.zig");
     _ = @import("terminal/input.zig");
+    _ = @import("terminal/renderer.zig");
     _ = @import("terminal/screen.zig");
     _ = @import("ui/layout.zig");
     _ = @import("ui/command_palette.zig");
     _ = @import("ui/render.zig");
     _ = @import("ui/theme.zig");
+    _ = @import("ui/tui.zig");
     _ = @import("ui/view.zig");
     _ = @import("workspace/file_tree.zig");
     _ = @import("workspace/session.zig");

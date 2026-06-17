@@ -37,6 +37,7 @@ pub const platform = struct {
 pub const terminal_layer = struct {
     pub const ansi = @import("terminal/ansi.zig");
     pub const input = @import("terminal/input.zig");
+    pub const renderer = @import("terminal/renderer.zig");
     pub const screen = @import("terminal/screen.zig");
 };
 
@@ -45,6 +46,7 @@ pub const ui = struct {
     pub const layout = @import("ui/layout.zig");
     pub const render = @import("ui/render.zig");
     pub const theme = @import("ui/theme.zig");
+    pub const tui = @import("ui/tui.zig");
     pub const view = @import("ui/view.zig");
 };
 

@@ -5,6 +5,7 @@ pub const architecture = @import("architecture.zig");
 pub const app = @import("core/app.zig");
 pub const command = @import("core/command.zig");
 pub const demo = @import("core/demo.zig");
+pub const dispatcher = @import("core/dispatcher.zig");
 pub const event = @import("core/event.zig");
 pub const event_loop = @import("core/event_loop.zig");
 pub const runtime = @import("core/runtime.zig");
@@ -18,6 +19,7 @@ pub const workspace = @import("workspace/workspace.zig");
 pub const core = struct {
     pub const app = @import("core/app.zig");
     pub const command = @import("core/command.zig");
+    pub const dispatcher = @import("core/dispatcher.zig");
     pub const event = @import("core/event.zig");
     pub const event_loop = @import("core/event_loop.zig");
     pub const runtime = @import("core/runtime.zig");
@@ -37,6 +39,7 @@ pub const terminal_layer = struct {
 };
 
 pub const ui = struct {
+    pub const command_palette = @import("ui/command_palette.zig");
     pub const layout = @import("ui/layout.zig");
     pub const render = @import("ui/render.zig");
     pub const theme = @import("ui/theme.zig");
@@ -47,6 +50,7 @@ pub const editor = struct {
     pub const buffer = @import("editor/buffer.zig");
     pub const cursor = @import("editor/cursor.zig");
     pub const document = @import("editor/document.zig");
+    pub const navigation = @import("editor/navigation.zig");
     pub const save = @import("editor/save.zig");
     pub const selection = @import("editor/selection.zig");
     pub const store = @import("editor/store.zig");
@@ -70,6 +74,7 @@ pub const language = struct {
 };
 
 pub const diagnostics = struct {
+    pub const collection = @import("diagnostics/collection.zig");
     pub const model = @import("diagnostics/model.zig");
     pub const zig_output = @import("diagnostics/zig_output.zig");
 };
@@ -81,10 +86,12 @@ pub const build_layer = struct {
 };
 
 pub const tasks = struct {
+    pub const console = @import("tasks/console.zig");
     pub const task = @import("tasks/task.zig");
 };
 
 pub const search = struct {
+    pub const file_finder = @import("search/file_finder.zig");
     pub const fuzzy = @import("search/fuzzy.zig");
     pub const literal = @import("search/literal.zig");
     pub const workspace_search = @import("search/workspace_search.zig");

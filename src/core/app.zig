@@ -1,7 +1,10 @@
 const std = @import("std");
+const command_palette = @import("../ui/command_palette.zig");
+const diagnostics = @import("../diagnostics/collection.zig");
 const store = @import("../editor/store.zig");
 const render = @import("../ui/render.zig");
 const runtime = @import("runtime.zig");
+const console = @import("../tasks/console.zig");
 const workspace = @import("../workspace/workspace.zig");
 
 pub const Mode = enum {
@@ -16,6 +19,9 @@ pub const App = struct {
     mode: Mode,
     workspace: workspace.Workspace,
     documents: store.DocumentStore,
+    palette: command_palette.CommandPalette,
+    diagnostics: diagnostics.Collection,
+    process_console: console.ProcessConsole,
 
     pub fn init(allocator: std.mem.Allocator, root_path: []const u8) !App {
         const open_kind = detectOpenKind(root_path);
@@ -30,6 +36,9 @@ pub const App = struct {
             .mode = .normal,
             .workspace = try workspace.Workspace.open(allocator, workspace_path),
             .documents = store.DocumentStore.init(allocator),
+            .palette = command_palette.CommandPalette.init(allocator),
+            .diagnostics = diagnostics.Collection.init(allocator),
+            .process_console = console.ProcessConsole.init(allocator),
         };
         errdefer self.deinit();
 
@@ -41,6 +50,9 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        self.process_console.deinit();
+        self.diagnostics.deinit();
+        self.palette.deinit();
         self.documents.deinit();
         self.workspace.deinit();
     }

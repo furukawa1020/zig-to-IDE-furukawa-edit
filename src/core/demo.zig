@@ -1,9 +1,12 @@
 const std = @import("std");
 const architecture = @import("../architecture.zig");
 const app_mod = @import("app.zig");
+const build_output = @import("../build/output.zig");
 const cli = @import("../cli.zig");
 const command = @import("command.zig");
 const dispatcher = @import("dispatcher.zig");
+const event = @import("event.zig");
+const input_handler = @import("input_handler.zig");
 const buffer = @import("../editor/buffer.zig");
 const document_store = @import("../editor/store.zig");
 const modes = @import("../language/modes.zig");
@@ -21,6 +24,8 @@ pub fn run(allocator: std.mem.Allocator, kind: cli.DemoName, stdout: anytype) !v
         .editor => try editorDemo(allocator, stdout),
         .palette => try paletteDemo(allocator, stdout),
         .dispatch => try dispatchDemo(allocator, stdout),
+        .diagnostics => try diagnosticsDemo(allocator, stdout),
+        .input => try inputDemo(allocator, stdout),
         .buffer => try bufferDemo(allocator, stdout),
         .zig_tokens => try zigTokens(stdout),
     }
@@ -44,6 +49,8 @@ fn overview(stdout: anytype) !void {
         \\  zide demo editor
         \\  zide demo palette
         \\  zide demo dispatch
+        \\  zide demo diagnostics
+        \\  zide demo input
         \\  zide demo buffer
         \\  zide demo zig-tokens
         \\
@@ -62,6 +69,56 @@ fn architectureDemo(stdout: anytype) !void {
             }
             try stdout.writeAll("\n");
         }
+    }
+}
+
+fn inputDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
+    var app = try app_mod.App.init(allocator, ".");
+    defer app.deinit();
+    _ = try app.documents.createScratch("input-demo.zig", "");
+
+    _ = try input_handler.handle(&app, charEvent('i'));
+    _ = try input_handler.handle(&app, charEvent('z'));
+    _ = try input_handler.handle(&app, charEvent('i'));
+    _ = try input_handler.handle(&app, charEvent('d'));
+    _ = try input_handler.handle(&app, charEvent('e'));
+    _ = try input_handler.handle(&app, .{ .key = .{ .code = .escape } });
+
+    const doc = app.documents.active() orelse return error.NoActiveDocument;
+    try stdout.writeAll("input demo\n----------\n");
+    try stdout.print("mode   : {s}\n", .{@tagName(app.mode)});
+    try stdout.print("cursor : {d}\n", .{doc.cursor.position.byte_offset});
+    try stdout.print("text   : {s}\n", .{doc.text.bytes});
+}
+
+fn charEvent(char: u21) event.Event {
+    return .{ .key = .{ .code = .{ .char = char } } };
+}
+
+fn diagnosticsDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
+    var app = try app_mod.App.init(allocator, ".");
+    defer app.deinit();
+
+    try build_output.appendOutput(
+        &app.process_console,
+        &app.diagnostics,
+        .stderr,
+        "src/main.zig:12:9: error: expected expression\nsrc/root.zig:3:1: warning: unused variable\n",
+    );
+
+    try stdout.writeAll("diagnostics demo\n----------------\n");
+    try stdout.print("console lines : {d}\n", .{app.process_console.lines.items.len});
+    try stdout.print("errors        : {d}\n", .{app.diagnostics.countBySeverity(.error)});
+    try stdout.print("warnings      : {d}\n\n", .{app.diagnostics.countBySeverity(.warning)});
+
+    for (app.diagnostics.items.items) |item| {
+        try stdout.print("{s}:{d}:{d}: {s}: {s}\n", .{
+            item.path,
+            item.range.start.line + 1,
+            item.range.start.column + 1,
+            @tagName(item.severity),
+            item.message,
+        });
     }
 }
 

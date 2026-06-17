@@ -27,6 +27,7 @@ test {
     _ = @import("core/dispatcher.zig");
     _ = @import("core/event.zig");
     _ = @import("core/event_loop.zig");
+    _ = @import("core/input_handler.zig");
     _ = @import("core/runtime.zig");
     _ = @import("core/types.zig");
     _ = @import("build/steps.zig");

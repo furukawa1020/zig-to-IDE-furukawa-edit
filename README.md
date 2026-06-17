@@ -66,6 +66,7 @@ zig build run -- demo diagnostics
 zig build run -- demo input
 zig build run -- demo loop
 zig build run -- demo screen
+zig build run -- demo security
 zig build run -- demo buffer
 zig build run -- demo zig-tokens
 zig build test
@@ -90,6 +91,31 @@ untrustedなら自動実行しない。
 Zig以外も開ける。
 でもZigを特別扱いする。
 これは汎用エディタではなく、Zigを書くためのIDEです。
+
+## Security Workbench
+
+ZigのIDEなら、Zigの危険も見えなきゃだめです。
+
+`zide` は知らないworkspaceを最初から信頼しません。
+`build.zig` は設定ファイルではなくコードとして扱います。
+`zig test` は静的チェックではなく実行です。
+build outputはterminalではなく攻撃者入力です。
+
+だから、これも作ります。
+
+- workspace trust bar
+- build consent preview
+- output sanitizer
+- Zig security scanner
+- FFI boundary lens
+- secret flow warning
+- safety profile warning
+- allocator cockpit
+
+「安全です」と雑に言わない。
+どこで安全網が効いていて、どこで外れていて、どこから外部世界に触っているかを見せる。
+
+Zigを書く行為そのものを安全にするIDEにする。
 
 ## 合言葉
 

@@ -4,6 +4,7 @@ const build_commands = @import("../build/commands.zig");
 const command = @import("command.zig");
 const navigation = @import("../editor/navigation.zig");
 const process = @import("../platform/process.zig");
+const zig_scanner = @import("../security/zig_scanner.zig");
 
 pub const Result = union(enum) {
     completed: []const u8,
@@ -95,6 +96,27 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         defer app.allocator.free(path);
         _ = try app.documents.openFile(path);
         return .{ .completed = "opened file" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "security.scan_current")) {
+        const doc = app.documents.active() orelse return .no_active_document;
+        const path = doc.path orelse "(scratch)";
+        var scan = try zig_scanner.scanSource(app.allocator, doc.text.bytes, .{ .path = path });
+        defer scan.deinit();
+
+        app.security_findings.clear();
+        for (scan.items.items) |item| {
+            try app.security_findings.append(
+                item.category,
+                item.risk,
+                item.path,
+                item.line,
+                item.column,
+                item.message,
+                item.evidence,
+            );
+        }
+        return .{ .completed = "security scan complete" };
     }
 
     if (std.mem.eql(u8, definition.id, "zig.build")) {

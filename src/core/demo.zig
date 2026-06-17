@@ -1,6 +1,7 @@
 const std = @import("std");
 const architecture = @import("../architecture.zig");
 const app_mod = @import("app.zig");
+const build_commands = @import("../build/commands.zig");
 const build_output = @import("../build/output.zig");
 const cli = @import("../cli.zig");
 const command = @import("command.zig");
@@ -13,6 +14,9 @@ const buffer = @import("../editor/buffer.zig");
 const document_store = @import("../editor/store.zig");
 const modes = @import("../language/modes.zig");
 const literal = @import("../search/literal.zig");
+const build_consent = @import("../security/build_consent.zig");
+const sanitizer = @import("../security/output_sanitizer.zig");
+const zig_security = @import("../security/zig_scanner.zig");
 const terminal_renderer = @import("../terminal/renderer.zig");
 const tokenizer = @import("../language/zig_tokenizer.zig");
 const palette_mod = @import("../ui/command_palette.zig");
@@ -32,6 +36,7 @@ pub fn run(allocator: std.mem.Allocator, kind: cli.DemoName, stdout: anytype) !v
         .input => try inputDemo(allocator, stdout),
         .loop => try loopDemo(allocator, stdout),
         .screen => try screenDemo(allocator, stdout),
+        .security => try securityDemo(allocator, stdout),
         .buffer => try bufferDemo(allocator, stdout),
         .zig_tokens => try zigTokens(stdout),
     }
@@ -59,6 +64,7 @@ fn overview(stdout: anytype) !void {
         \\  zide demo input
         \\  zide demo loop
         \\  zide demo screen
+        \\  zide demo security
         \\  zide demo buffer
         \\  zide demo zig-tokens
         \\
@@ -77,6 +83,62 @@ fn architectureDemo(stdout: anytype) !void {
             }
             try stdout.writeAll("\n");
         }
+    }
+}
+
+fn securityDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
+    const source =
+        \\extern fn c_read(buf: [*]u8, len: usize) c_int;
+        \\
+        \\pub fn main() void {
+        \\    const token = @embedFile("../.env");
+        \\    @setRuntimeSafety(false);
+        \\    const p = @ptrCast(raw);
+        \\    const x = parse() catch unreachable;
+        \\    _ = token;
+        \\    _ = p;
+        \\    _ = x;
+        \\}
+        \\
+    ;
+
+    var collection = try zig_security.scanSource(allocator, source, .{ .path = "demo.zig" });
+    defer collection.deinit();
+
+    var sanitized = try sanitizer.sanitizeAlloc(allocator, "build ok\x1b[2J hidden? \x1b]52;c;AAAA\x07done\n");
+    defer sanitized.deinit(allocator);
+    var consent = try build_consent.makePreview(
+        allocator,
+        build_commands.makeZigCommand(.{}, .test_step, &.{}),
+        .untrusted,
+    );
+    defer consent.deinit();
+
+    try stdout.writeAll("security workbench demo\n-----------------------\n");
+    try stdout.writeAll("workspace: UNTRUSTED | build: BLOCKED | output: SANITIZED\n\n");
+    try stdout.print("build consent command: {s}\n", .{consent.command});
+    try stdout.print("build consent cwd    : {s}\n", .{consent.cwd});
+    try stdout.print("trust state          : {s}\n", .{@tagName(consent.trust_state)});
+    for (consent.warnings) |warning| {
+        try stdout.print("warning              : {s}\n", .{warning});
+    }
+    try stdout.writeAll("\n");
+    try stdout.print("findings: {d} total, {d} high+\n", .{
+        collection.items.items.len,
+        collection.countRiskAtLeast(.high),
+    });
+    try stdout.print("output sanitizer: stripped {d} control sequence(s)\n\n", .{sanitized.stats.total()});
+
+    for (collection.items.items) |item| {
+        try stdout.print("{s:<14} {s:<15} {s}:{d}:{d} {s}\n", .{
+            @tagName(item.risk),
+            @tagName(item.category),
+            item.path,
+            item.line + 1,
+            item.column + 1,
+            item.message,
+        });
+        try stdout.print("  {s}\n", .{item.evidence});
     }
 }
 
@@ -101,11 +163,16 @@ fn screenDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
     _ = try app.documents.createScratch("screen-demo.zig",
         \\const std = @import("std");
         \\
+        \\extern fn c_read(buf: [*]u8, len: usize) c_int;
+        \\
         \\pub fn main() void {
+        \\    const token = @embedFile("../.env");
+        \\    @setRuntimeSafety(false);
         \\    std.debug.print("screen\n", .{});
         \\}
         \\
     );
+    _ = try dispatcher.dispatch(&app, .{ .id = "security.scan_current" });
     try app.palette.open();
     try app.palette.setQuery("zig");
 

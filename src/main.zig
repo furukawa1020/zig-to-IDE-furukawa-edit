@@ -67,9 +67,12 @@ test {
     _ = @import("search/fuzzy.zig");
     _ = @import("search/literal.zig");
     _ = @import("search/workspace_search.zig");
+    _ = @import("security/findings.zig");
+    _ = @import("security/build_consent.zig");
     _ = @import("security/permissions.zig");
     _ = @import("security/output_sanitizer.zig");
     _ = @import("security/trust.zig");
+    _ = @import("security/zig_scanner.zig");
     _ = @import("tasks/task.zig");
     _ = @import("tasks/console.zig");
     _ = @import("terminal/ansi.zig");

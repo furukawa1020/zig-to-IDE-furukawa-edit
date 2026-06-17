@@ -10,7 +10,7 @@ pub fn renderHelp(stdout: anytype) !void {
         \\Usage:
         \\  zide [workspace]
         \\  zide commands
-        \\  zide demo [overview|architecture|languages|commands|editor|palette|dispatch|diagnostics|input|loop|screen|buffer|zig-tokens]
+        \\  zide demo [overview|architecture|languages|commands|editor|palette|dispatch|diagnostics|input|loop|screen|security|buffer|zig-tokens]
         \\  zide --version
         \\
         \\The current slice has a virtual screen, input decoding, command dispatch,
@@ -44,6 +44,7 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
         instance.diagnostics.countBySeverity(.error),
         instance.diagnostics.countBySeverity(.warning),
     });
+    try stdout.print("security  : {d} high+ finding(s)\n", .{instance.security_findings.countRiskAtLeast(.high)});
     try stdout.print("process   : {s}\n\n", .{if (instance.process_console.running) "running" else "idle"});
 
     try stdout.writeAll("file tree preview\n-----------------\n");

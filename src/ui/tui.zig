@@ -110,6 +110,20 @@ fn renderBottomPanel(screen: *screen_mod.Screen, app: *const app_mod.App, rect: 
         row += 1;
     }
 
+    for (app.security_findings.items.items) |item| {
+        if (row >= rect.height) break;
+        var line_buf: [512]u8 = undefined;
+        const text = std.fmt.bufPrint(&line_buf, "SEC {s} {s}:{d}:{d}: {s}", .{
+            @tagName(item.risk),
+            item.path,
+            item.line + 1,
+            item.column + 1,
+            item.message,
+        }) catch item.message;
+        screen.writeTextClipped(rect.x, rect.y + row, rect.width, text, .{ .fg = if (isHighRisk(item.risk)) 1 else 3, .bg = 0 });
+        row += 1;
+    }
+
     for (app.process_console.lines.items) |line| {
         if (row >= rect.height) break;
         screen.writeTextClipped(rect.x, rect.y + row, rect.width, line.text, .{ .fg = if (line.stream == .stderr) 1 else 7, .bg = 0 });
@@ -126,10 +140,12 @@ fn renderStatus(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layou
         break :blk if (document.dirty) "dirty" else "clean";
     } else "no-doc";
     var status_buf: [256]u8 = undefined;
-    const status = std.fmt.bufPrint(&status_buf, " {s} | {s} | diag:{d} | build:{s} | {s}", .{
+    const status = std.fmt.bufPrint(&status_buf, " {s} | trust:{s} | {s} | diag:{d} | sec:{d} | build:{s} | {s}", .{
         @tagName(app.mode),
+        @tagName(app.runtime.trust_state),
         dirty,
         app.diagnostics.items.items.len,
+        app.security_findings.countRiskAtLeast(.high),
         if (app.process_console.running) "running" else "idle",
         app.workspace.root_path,
     }) catch " zide";
@@ -167,6 +183,10 @@ fn activeConst(app: *const app_mod.App) ?*const @import("../editor/document.zig"
     const index = app.documents.active_index orelse return null;
     if (index >= app.documents.documents.items.len) return null;
     return &app.documents.documents.items[index];
+}
+
+fn isHighRisk(risk: @import("../security/findings.zig").Risk) bool {
+    return risk == .high or risk == .critical;
 }
 
 fn safeWidth(width: u16, used: u16) u16 {

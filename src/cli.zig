@@ -12,6 +12,7 @@ pub const DemoName = enum {
     input,
     loop,
     screen,
+    security,
     buffer,
     zig_tokens,
 };
@@ -66,6 +67,7 @@ fn parseDemoName(raw: []const u8) ?DemoName {
     if (std.mem.eql(u8, raw, "input")) return .input;
     if (std.mem.eql(u8, raw, "loop")) return .loop;
     if (std.mem.eql(u8, raw, "screen")) return .screen;
+    if (std.mem.eql(u8, raw, "security")) return .security;
     if (std.mem.eql(u8, raw, "buffer")) return .buffer;
     if (std.mem.eql(u8, raw, "zig-tokens")) return .zig_tokens;
     if (std.mem.eql(u8, raw, "zig_tokens")) return .zig_tokens;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const command_palette = @import("../ui/command_palette.zig");
 const diagnostics = @import("../diagnostics/collection.zig");
+const security_findings = @import("../security/findings.zig");
 const store = @import("../editor/store.zig");
 const render = @import("../ui/render.zig");
 const runtime = @import("runtime.zig");
@@ -21,6 +22,7 @@ pub const App = struct {
     documents: store.DocumentStore,
     palette: command_palette.CommandPalette,
     diagnostics: diagnostics.Collection,
+    security_findings: security_findings.Collection,
     process_console: console.ProcessConsole,
 
     pub fn init(allocator: std.mem.Allocator, root_path: []const u8) !App {
@@ -38,6 +40,7 @@ pub const App = struct {
             .documents = store.DocumentStore.init(allocator),
             .palette = command_palette.CommandPalette.init(allocator),
             .diagnostics = diagnostics.Collection.init(allocator),
+            .security_findings = security_findings.Collection.init(allocator),
             .process_console = console.ProcessConsole.init(allocator),
         };
         errdefer self.deinit();
@@ -51,6 +54,7 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.process_console.deinit();
+        self.security_findings.deinit();
         self.diagnostics.deinit();
         self.palette.deinit();
         self.documents.deinit();

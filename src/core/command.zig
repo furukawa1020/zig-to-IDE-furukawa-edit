@@ -71,6 +71,7 @@ const definitions = [_]Definition{
     .{ .id = "symbol.find_references", .title = "Find References", .description = "Find references for the selected symbol.", .default_key = "shift-f12", .scope = .zig, .capability = .safe },
     .{ .id = "symbol.rename", .title = "Rename Symbol", .description = "Rename a symbol with preview and undo.", .default_key = "f2", .scope = .zig, .capability = .workspace_write },
     .{ .id = "diagnostics.next", .title = "Next Diagnostic", .description = "Jump to the next diagnostic.", .default_key = "f8", .scope = .workspace, .capability = .safe },
+    .{ .id = "security.scan_current", .title = "Scan Current File", .description = "Scan the current Zig file for security boundaries.", .default_key = "ctrl-alt-s", .scope = .zig, .capability = .safe },
     .{ .id = "debug.start", .title = "Start Debugging", .description = "Launch the configured debug session.", .default_key = "f5", .scope = .task, .capability = .external_command },
     .{ .id = "git.status", .title = "Git Status", .description = "Refresh visible git status.", .default_key = "", .scope = .workspace, .capability = .external_command },
     .{ .id = "demo.run", .title = "Run Demo", .description = "Run an internal zide demo.", .default_key = "", .scope = .demo, .capability = .safe },

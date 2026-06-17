@@ -9,15 +9,15 @@ pub const Match = struct {
 pub const CommandPalette = struct {
     allocator: std.mem.Allocator,
     visible: bool = false,
-    query: std.ArrayList(u8),
-    matches: std.ArrayList(Match),
+    query: std.array_list.Managed(u8),
+    matches: std.array_list.Managed(Match),
     selected_index: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) CommandPalette {
         return .{
             .allocator = allocator,
-            .query = std.ArrayList(u8).init(allocator),
-            .matches = std.ArrayList(Match).init(allocator),
+            .query = std.array_list.Managed(u8).init(allocator),
+            .matches = std.array_list.Managed(Match).init(allocator),
         };
     }
 

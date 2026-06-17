@@ -33,7 +33,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, source: []const u8) !ParseResul
     errdefer {
         if (owned_theme_name) |name| allocator.free(name);
     }
-    var diagnostics = std.ArrayList(ParseDiagnostic).init(allocator);
+    var diagnostics = std.array_list.Managed(ParseDiagnostic).init(allocator);
     errdefer diagnostics.deinit();
 
     var section: Section = .root;

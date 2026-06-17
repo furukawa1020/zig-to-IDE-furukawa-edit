@@ -4,7 +4,7 @@ const command_palette = @import("../ui/command_palette.zig");
 const diagnostics = @import("../diagnostics/collection.zig");
 const security_findings = @import("../security/findings.zig");
 const store = @import("../editor/store.zig");
-const render = @import("../ui/render.zig");
+const render_view = @import("../ui/render.zig");
 const runtime = @import("runtime.zig");
 const console = @import("../tasks/console.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
@@ -72,7 +72,7 @@ pub const App = struct {
     }
 
     pub fn render(self: *const App, stdout: anytype) !void {
-        try render.renderWorkspace(stdout, self);
+        try render_view.renderWorkspace(stdout, self);
     }
 
     pub fn clearPendingBuildConsent(self: *App) void {
@@ -102,7 +102,7 @@ const OpenKind = enum {
 };
 
 fn detectOpenKind(path: []const u8) OpenKind {
-    const stat = std.fs.cwd().statFile(path) catch return .unknown;
+    const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch return .unknown;
     return switch (stat.kind) {
         .file => .file,
         .directory => .directory,

@@ -74,7 +74,5 @@ fn isInteresting(path: []const u8) bool {
 }
 
 fn readFile(allocator: std.mem.Allocator, absolute: []const u8, max_bytes: usize) ![]u8 {
-    var file = try std.fs.openFileAbsolute(absolute, .{});
-    defer file.close();
-    return file.readToEndAlloc(allocator, max_bytes);
+    return std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, absolute, allocator, .limited(max_bytes));
 }

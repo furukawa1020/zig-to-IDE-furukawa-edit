@@ -25,7 +25,7 @@ pub fn makePreview(allocator: std.mem.Allocator, spec: process.SpawnSpec, state:
     const cwd = try allocator.dupe(u8, spec.command.cwd orelse ".");
     errdefer allocator.free(cwd);
 
-    var warnings = std.ArrayList([]const u8).init(allocator);
+    var warnings = std.array_list.Managed([]const u8).init(allocator);
     errdefer warnings.deinit();
 
     switch (state) {

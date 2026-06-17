@@ -3,13 +3,13 @@ const event = @import("event.zig");
 
 pub const EventLoop = struct {
     allocator: std.mem.Allocator,
-    queue: std.ArrayList(event.Event),
+    queue: std.array_list.Managed(event.Event),
     running: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) EventLoop {
         return .{
             .allocator = allocator,
-            .queue = std.ArrayList(event.Event).init(allocator),
+            .queue = std.array_list.Managed(event.Event).init(allocator),
         };
     }
 

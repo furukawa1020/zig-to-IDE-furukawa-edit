@@ -9,7 +9,7 @@ pub const ParseResult = struct {
 };
 
 pub fn parseTopLevel(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
-    var nodes = std.ArrayList(ast.Node).init(allocator);
+    var nodes = std.array_list.Managed(ast.Node).init(allocator);
     errdefer nodes.deinit();
 
     try nodes.append(.{

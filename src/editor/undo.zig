@@ -33,14 +33,14 @@ pub const Transaction = struct {
 
 pub const UndoStack = struct {
     allocator: std.mem.Allocator,
-    undo_items: std.ArrayList(Transaction),
-    redo_items: std.ArrayList(Transaction),
+    undo_items: std.array_list.Managed(Transaction),
+    redo_items: std.array_list.Managed(Transaction),
 
     pub fn init(allocator: std.mem.Allocator) UndoStack {
         return .{
             .allocator = allocator,
-            .undo_items = std.ArrayList(Transaction).init(allocator),
-            .redo_items = std.ArrayList(Transaction).init(allocator),
+            .undo_items = std.array_list.Managed(Transaction).init(allocator),
+            .redo_items = std.array_list.Managed(Transaction).init(allocator),
         };
     }
 

@@ -107,7 +107,7 @@ fn renderBottomPanel(screen: *screen_mod.Screen, app: *const app_mod.App, rect: 
             @tagName(item.severity),
             item.message,
         }) catch item.message;
-        screen.writeTextClipped(rect.x, rect.y + row, rect.width, text, .{ .fg = if (item.severity == .error) 1 else 3, .bg = 0 });
+        screen.writeTextClipped(rect.x, rect.y + row, rect.width, text, .{ .fg = if (item.severity == .err) 1 else 3, .bg = 0 });
         row += 1;
     }
 

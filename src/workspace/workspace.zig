@@ -23,15 +23,21 @@ pub const ScanOptions = struct {
 pub const Workspace = struct {
     allocator: std.mem.Allocator,
     root_path: []u8,
-    entries: std.ArrayList(FileEntry),
+    entries: std.array_list.Managed(FileEntry),
     scan_options: ScanOptions = .{},
 
     pub fn open(allocator: std.mem.Allocator, root_path: []const u8) !Workspace {
-        const resolved = std.fs.cwd().realpathAlloc(allocator, root_path) catch try allocator.dupe(u8, root_path);
+        const resolved = resolved_path: {
+            const resolved_raw = std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, root_path, allocator) catch {
+                break :resolved_path try allocator.dupe(u8, root_path);
+            };
+            defer allocator.free(resolved_raw);
+            break :resolved_path try allocator.dupe(u8, resolved_raw);
+        };
         var self = Workspace{
             .allocator = allocator,
             .root_path = resolved,
-            .entries = std.ArrayList(FileEntry).init(allocator),
+            .entries = std.array_list.Managed(FileEntry).init(allocator),
         };
         try self.scanTopLevel();
         return self;
@@ -65,13 +71,13 @@ pub const Workspace = struct {
         const absolute = try self.absolutePath(relative);
         defer self.allocator.free(absolute);
 
-        var dir = std.fs.openDirAbsolute(absolute, .{ .iterate = true }) catch {
+        var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, absolute, .{ .iterate = true }) catch {
             return;
         };
-        defer dir.close();
+        defer dir.close(std.Options.debug_io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(std.Options.debug_io)) |entry| {
             if (self.entries.items.len >= self.scan_options.max_entries) break;
             if (shouldSkip(entry.name, self.scan_options)) continue;
 

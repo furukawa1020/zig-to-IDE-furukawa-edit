@@ -10,7 +10,7 @@ pub const Newline = enum {
 pub const TextBuffer = struct {
     allocator: std.mem.Allocator,
     bytes: []u8,
-    line_starts: std.ArrayList(usize),
+    line_starts: std.array_list.Managed(usize),
     newline: Newline,
     valid_utf8: bool,
 
@@ -22,7 +22,7 @@ pub const TextBuffer = struct {
         var self = TextBuffer{
             .allocator = allocator,
             .bytes = try allocator.dupe(u8, input),
-            .line_starts = std.ArrayList(usize).init(allocator),
+            .line_starts = std.array_list.Managed(usize).init(allocator),
             .newline = .none,
             .valid_utf8 = false,
         };
@@ -81,8 +81,8 @@ pub const TextBuffer = struct {
 
     pub fn lineColumnToOffset(self: *const TextBuffer, line: usize, column: usize) !usize {
         const start = self.lineStart(line) orelse return error.LineOutOfBounds;
-        const slice = self.lineSlice(line);
-        return start + @min(column, slice.len);
+        const line_text = self.lineSlice(line);
+        return start + @min(column, line_text.len);
     }
 
     pub fn slice(self: *const TextBuffer, start: usize, end: usize) ![]const u8 {

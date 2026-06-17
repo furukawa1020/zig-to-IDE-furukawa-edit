@@ -42,7 +42,7 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
     try stdout.print("documents : {d}\n", .{instance.documents.documents.items.len});
     try stdout.print("palette   : {s}\n", .{if (instance.palette.visible) "open" else "closed"});
     try stdout.print("diagnostic: {d} error(s), {d} warning(s)\n", .{
-        instance.diagnostics.countBySeverity(.error),
+        instance.diagnostics.countBySeverity(.err),
         instance.diagnostics.countBySeverity(.warning),
     });
     const security = posture.summarize(&instance.security_findings, instance.runtime.trust_state);

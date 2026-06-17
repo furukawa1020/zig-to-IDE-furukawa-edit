@@ -23,7 +23,7 @@ pub const Result = struct {
 };
 
 pub fn search(allocator: std.mem.Allocator, ws: *const workspace.Workspace, query: []const u8, options: Options) ![]Result {
-    var results = std.ArrayList(Result).init(allocator);
+    var results = std.array_list.Managed(Result).init(allocator);
     errdefer {
         for (results.items) |*item| item.deinit(allocator);
         results.deinit();
@@ -60,9 +60,7 @@ pub fn search(allocator: std.mem.Allocator, ws: *const workspace.Workspace, quer
 }
 
 fn readFile(allocator: std.mem.Allocator, absolute: []const u8, max_bytes: usize) ![]u8 {
-    var file = try std.fs.openFileAbsolute(absolute, .{});
-    defer file.close();
-    return file.readToEndAlloc(allocator, max_bytes);
+    return std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, absolute, allocator, .limited(max_bytes));
 }
 
 fn looksBinary(bytes: []const u8) bool {
@@ -103,4 +101,3 @@ fn previewForLine(allocator: std.mem.Allocator, bytes: []const u8, offset: usize
 
     return allocator.dupe(u8, bytes[start..end]);
 }
-

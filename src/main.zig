@@ -1,19 +1,19 @@
 const std = @import("std");
 const zide = @import("zide.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    const allocator = gpa.allocator();
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     const options = zide.cli.parse(args);
-    var stdout = std.io.getStdOut().writer();
-    var stderr = std.io.getStdErr().writer();
+    var stdout_buffer: [4096]u8 = undefined;
+    var stderr_buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stderr = std.Io.File.stderr().writer(init.io, &stderr_buffer);
 
-    try zide.run(allocator, options, stdout, stderr);
+    try zide.run(allocator, options, &stdout.interface, &stderr.interface);
+    try stdout.interface.flush();
+    try stderr.interface.flush();
 }
 
 test {

@@ -27,9 +27,8 @@ pub fn saveBytes(allocator: std.mem.Allocator, destination: []const u8, bytes: [
 
     {
         var file = try createFile(temporary_path);
-        defer file.close();
-        try file.writeAll(bytes);
-        try file.sync();
+        defer file.close(std.Options.debug_io);
+        try writeFileBytes(file, bytes);
     }
 
     try renameFile(temporary_path, destination);
@@ -37,9 +36,8 @@ pub fn saveBytes(allocator: std.mem.Allocator, destination: []const u8, bytes: [
 
 fn writeDirect(path: []const u8, bytes: []const u8) !void {
     var file = try createFile(path);
-    defer file.close();
-    try file.writeAll(bytes);
-    try file.sync();
+    defer file.close(std.Options.debug_io);
+    try writeFileBytes(file, bytes);
 }
 
 fn createBackup(allocator: std.mem.Allocator, destination: []const u8) !void {
@@ -54,29 +52,28 @@ fn createBackup(allocator: std.mem.Allocator, destination: []const u8) !void {
     try writeDirect(backup_path, bytes);
 }
 
-fn createFile(path: []const u8) !std.fs.File {
+fn createFile(path: []const u8) !std.Io.File {
     if (std.fs.path.isAbsolute(path)) {
-        return std.fs.createFileAbsolute(path, .{ .truncate = true });
+        return std.Io.Dir.createFileAbsolute(std.Options.debug_io, path, .{ .truncate = true });
     }
-    return std.fs.cwd().createFile(path, .{ .truncate = true });
+    return std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{ .truncate = true });
 }
 
 fn renameFile(source: []const u8, destination: []const u8) !void {
     if (std.fs.path.isAbsolute(source) or std.fs.path.isAbsolute(destination)) {
-        return std.fs.renameAbsolute(source, destination);
+        return std.Io.Dir.renameAbsolute(source, destination, std.Options.debug_io);
     }
-    return std.fs.cwd().rename(source, destination);
-}
-
-fn openFile(path: []const u8) !std.fs.File {
-    if (std.fs.path.isAbsolute(path)) {
-        return std.fs.openFileAbsolute(path, .{});
-    }
-    return std.fs.cwd().openFile(path, .{});
+    return std.Io.Dir.rename(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, std.Options.debug_io);
 }
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var file = try openFile(path);
-    defer file.close();
-    return file.readToEndAlloc(allocator, 128 * 1024 * 1024);
+    return std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, allocator, .limited(128 * 1024 * 1024));
+}
+
+fn writeFileBytes(file: std.Io.File, bytes: []const u8) !void {
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(std.Options.debug_io, &buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+    try file.sync(std.Options.debug_io);
 }

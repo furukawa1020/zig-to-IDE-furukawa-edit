@@ -24,7 +24,7 @@ pub fn drain(app: *app_mod.App, loop: *event_loop.EventLoop) !StepResult {
                 switch (outcome) {
                     .ignored => {},
                     .redraw => result.redraw_requested = true,
-                    .command_result => |_| result.redraw_requested = true,
+                    .command_result => result.redraw_requested = true,
                 }
             },
         }
@@ -52,4 +52,3 @@ test "loop runner drains key input" {
     try @import("std").testing.expect(result.redraw_requested);
     try @import("std").testing.expect(app.palette.visible);
 }
-

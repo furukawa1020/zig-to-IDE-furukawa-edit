@@ -12,7 +12,7 @@ pub fn scanBuildZig(allocator: std.mem.Allocator, source: []const u8, options: S
     var line_iter = std.mem.splitScalar(u8, source, '\n');
     var line_number: usize = 0;
     while (line_iter.next()) |raw_line| : (line_number += 1) {
-        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const line = std.mem.trim(u8, raw_line, "\r");
         try scanLine(&collection, options.path, line, line_number);
     }
 

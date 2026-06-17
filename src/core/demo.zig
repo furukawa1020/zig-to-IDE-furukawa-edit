@@ -289,7 +289,7 @@ fn diagnosticsDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
 
     try stdout.writeAll("diagnostics demo\n----------------\n");
     try stdout.print("console lines : {d}\n", .{app.process_console.lines.items.len});
-    try stdout.print("errors        : {d}\n", .{app.diagnostics.countBySeverity(.error)});
+    try stdout.print("errors        : {d}\n", .{app.diagnostics.countBySeverity(.err)});
     try stdout.print("warnings      : {d}\n\n", .{app.diagnostics.countBySeverity(.warning)});
 
     for (app.diagnostics.items.items) |item| {

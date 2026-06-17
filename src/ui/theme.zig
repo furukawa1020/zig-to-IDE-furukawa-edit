@@ -14,8 +14,7 @@ pub const Theme = struct {
     foreground: Color = .white,
     background: Color = .black,
     accent: Color = .cyan,
-    error: Color = .red,
+    error_color: Color = .red,
     warning: Color = .yellow,
     success: Color = .green,
 };
-

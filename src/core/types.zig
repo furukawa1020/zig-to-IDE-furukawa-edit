@@ -24,6 +24,5 @@ pub const Range = struct {
 pub const Severity = enum {
     info,
     warning,
-    error,
+    err,
 };
-

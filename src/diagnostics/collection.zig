@@ -4,12 +4,12 @@ const types = @import("../core/types.zig");
 
 pub const Collection = struct {
     allocator: std.mem.Allocator,
-    items: std.ArrayList(model.Diagnostic),
+    items: std.array_list.Managed(model.Diagnostic),
 
     pub fn init(allocator: std.mem.Allocator) Collection {
         return .{
             .allocator = allocator,
-            .items = std.ArrayList(model.Diagnostic).init(allocator),
+            .items = std.array_list.Managed(model.Diagnostic).init(allocator),
         };
     }
 
@@ -74,11 +74,11 @@ test "collection counts severity" {
     const position = types.Position.start();
     try collection.append(.{
         .source = .internal,
-        .severity = .error,
+        .severity = .err,
         .path = "main.zig",
         .range = types.Range.empty(position),
         .message = "boom",
     });
 
-    try std.testing.expectEqual(@as(usize, 1), collection.countBySeverity(.error));
+    try std.testing.expectEqual(@as(usize, 1), collection.countBySeverity(.err));
 }

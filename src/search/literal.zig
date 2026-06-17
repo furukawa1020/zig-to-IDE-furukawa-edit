@@ -11,7 +11,7 @@ pub const Match = struct {
 };
 
 pub fn findAll(allocator: std.mem.Allocator, haystack: []const u8, needle: []const u8, options: Options) ![]Match {
-    var matches = std.ArrayList(Match).init(allocator);
+    var matches = std.array_list.Managed(Match).init(allocator);
     errdefer matches.deinit();
 
     if (needle.len == 0) return matches.toOwnedSlice();

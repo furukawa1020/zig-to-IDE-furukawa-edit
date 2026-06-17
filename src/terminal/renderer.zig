@@ -94,10 +94,9 @@ test "plain renderer emits screen rows" {
     defer screen.deinit();
     screen.writeText(0, 0, "zide", .{});
 
-    var output = std.ArrayList(u8).init(std.testing.allocator);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try renderPlain(output.writer(), &screen);
+    try renderPlain(&output.writer, &screen);
 
-    try std.testing.expect(std.mem.startsWith(u8, output.items, "zide\n"));
+    try std.testing.expect(std.mem.startsWith(u8, output.written(), "zide\n"));
 }
-

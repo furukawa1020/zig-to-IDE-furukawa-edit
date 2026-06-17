@@ -18,7 +18,7 @@ pub const Line = struct {
 
 pub const ProcessConsole = struct {
     allocator: std.mem.Allocator,
-    lines: std.ArrayList(Line),
+    lines: std.array_list.Managed(Line),
     running: bool = false,
     exit_code: ?i32 = null,
     max_lines: usize = 2000,
@@ -27,7 +27,7 @@ pub const ProcessConsole = struct {
     pub fn init(allocator: std.mem.Allocator) ProcessConsole {
         return .{
             .allocator = allocator,
-            .lines = std.ArrayList(Line).init(allocator),
+            .lines = std.array_list.Managed(Line).init(allocator),
         };
     }
 
@@ -58,7 +58,7 @@ pub const ProcessConsole = struct {
         var iter = std.mem.splitScalar(u8, sanitized.text, '\n');
         while (iter.next()) |line| {
             if (line.len == 0) continue;
-            try self.appendLine(stream, std.mem.trimRight(u8, line, "\r"));
+            try self.appendLine(stream, std.mem.trim(u8, line, "\r"));
         }
     }
 

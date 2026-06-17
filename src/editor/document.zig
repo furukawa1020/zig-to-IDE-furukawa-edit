@@ -3,7 +3,7 @@ const buffer = @import("buffer.zig");
 const cursor = @import("cursor.zig");
 const modes = @import("../language/modes.zig");
 const types = @import("../core/types.zig");
-const undo = @import("undo.zig");
+const undo_mod = @import("undo.zig");
 
 pub const Document = struct {
     allocator: std.mem.Allocator,
@@ -11,7 +11,7 @@ pub const Document = struct {
     language: modes.LanguageMode,
     text: buffer.TextBuffer,
     cursor: cursor.Cursor = .{},
-    undo_stack: undo.UndoStack,
+    undo_stack: undo_mod.UndoStack,
     dirty: bool = false,
 
     pub fn fromBytes(allocator: std.mem.Allocator, path: ?[]const u8, bytes: []const u8) !Document {
@@ -20,7 +20,7 @@ pub const Document = struct {
             .path = if (path) |p| try allocator.dupe(u8, p) else null,
             .language = if (path) |p| modes.detect(p) else .unknown,
             .text = try buffer.TextBuffer.initFromBytes(allocator, bytes),
-            .undo_stack = undo.UndoStack.init(allocator),
+            .undo_stack = undo_mod.UndoStack.init(allocator),
         };
     }
 

@@ -10,9 +10,9 @@ pub const PreviewResult = enum {
 pub fn previewLatest(queue: *const execution_queue.Queue, process_console: *console.ProcessConsole) !PreviewResult {
     const ticket = queue.latest() orelse return .empty_queue;
 
-    var text = std.ArrayList(u8).init(process_console.allocator);
+    var text: std.Io.Writer.Allocating = .init(process_console.allocator);
     defer text.deinit();
-    const writer = text.writer();
+    const writer = &text.writer;
 
     try writer.writeAll("launch plan\n");
     try writer.print("source: {s}\n", .{ticket.source_command_id});
@@ -23,7 +23,7 @@ pub fn previewLatest(queue: *const execution_queue.Queue, process_console: *cons
     try writer.print("network: {s}\n", .{@tagName(ticket.network_policy)});
     try writer.print("output_sanitized: {}\n", .{ticket.output_sanitized});
 
-    try process_console.appendBytes(.stdout, text.items);
+    try process_console.appendBytes(.stdout, text.written());
     return .rendered;
 }
 

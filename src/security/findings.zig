@@ -39,12 +39,12 @@ pub const Finding = struct {
 
 pub const Collection = struct {
     allocator: std.mem.Allocator,
-    items: std.ArrayList(Finding),
+    items: std.array_list.Managed(Finding),
 
     pub fn init(allocator: std.mem.Allocator) Collection {
         return .{
             .allocator = allocator,
-            .items = std.ArrayList(Finding).init(allocator),
+            .items = std.array_list.Managed(Finding).init(allocator),
         };
     }
 

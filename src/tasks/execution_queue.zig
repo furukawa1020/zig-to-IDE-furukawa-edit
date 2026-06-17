@@ -14,7 +14,7 @@ pub const Ticket = struct {
     source_command_id: []u8,
     display_command: []u8,
     executable: []u8,
-    args: std.ArrayList([]u8),
+    args: std.array_list.Managed([]u8),
     cwd: []u8,
     stdout: process.StreamMode,
     stderr: process.StreamMode,
@@ -40,7 +40,7 @@ pub const Ticket = struct {
         const owned_cwd = try allocator.dupe(u8, spec.command.cwd orelse consent.cwd);
         errdefer allocator.free(owned_cwd);
 
-        var owned_args = std.ArrayList([]u8).init(allocator);
+        var owned_args = std.array_list.Managed([]u8).init(allocator);
         errdefer {
             for (owned_args.items) |arg| allocator.free(arg);
             owned_args.deinit();
@@ -83,12 +83,12 @@ pub const Ticket = struct {
 
 pub const Queue = struct {
     allocator: std.mem.Allocator,
-    tickets: std.ArrayList(Ticket),
+    tickets: std.array_list.Managed(Ticket),
 
     pub fn init(allocator: std.mem.Allocator) Queue {
         return .{
             .allocator = allocator,
-            .tickets = std.ArrayList(Ticket).init(allocator),
+            .tickets = std.array_list.Managed(Ticket).init(allocator),
         };
     }
 

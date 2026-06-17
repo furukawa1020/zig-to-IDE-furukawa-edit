@@ -21,7 +21,7 @@ pub const Result = struct {
 };
 
 pub fn sanitizeAlloc(allocator: std.mem.Allocator, input: []const u8) !Result {
-    var output = std.ArrayList(u8).init(allocator);
+    var output = std.array_list.Managed(u8).init(allocator);
     errdefer output.deinit();
 
     var stats = Stats{};

@@ -10,7 +10,7 @@ pub const Match = struct {
 };
 
 pub fn find(allocator: std.mem.Allocator, ws: *const workspace.Workspace, query: []const u8, max_results: usize) ![]Match {
-    var matches = std.ArrayList(Match).init(allocator);
+    var matches = std.array_list.Managed(Match).init(allocator);
     errdefer matches.deinit();
 
     for (ws.entries.items) |entry| {

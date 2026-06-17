@@ -4,13 +4,13 @@ const save = @import("save.zig");
 
 pub const DocumentStore = struct {
     allocator: std.mem.Allocator,
-    documents: std.ArrayList(document.Document),
+    documents: std.array_list.Managed(document.Document),
     active_index: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator) DocumentStore {
         return .{
             .allocator = allocator,
-            .documents = std.ArrayList(document.Document).init(allocator),
+            .documents = std.array_list.Managed(document.Document).init(allocator),
         };
     }
 
@@ -52,12 +52,7 @@ pub const DocumentStore = struct {
 };
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var file = if (std.fs.path.isAbsolute(path))
-        try std.fs.openFileAbsolute(path, .{})
-    else
-        try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    return file.readToEndAlloc(allocator, max_bytes);
+    return std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, allocator, .limited(max_bytes));
 }
 
 test "document store creates scratch document" {

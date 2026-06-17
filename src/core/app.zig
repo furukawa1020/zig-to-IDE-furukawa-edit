@@ -1,5 +1,6 @@
 const std = @import("std");
 const render = @import("../ui/render.zig");
+const runtime = @import("runtime.zig");
 const workspace = @import("../workspace/workspace.zig");
 
 pub const Mode = enum {
@@ -10,12 +11,14 @@ pub const Mode = enum {
 
 pub const App = struct {
     allocator: std.mem.Allocator,
+    runtime: runtime.Runtime,
     mode: Mode,
     workspace: workspace.Workspace,
 
     pub fn init(allocator: std.mem.Allocator, root_path: []const u8) !App {
         return .{
             .allocator = allocator,
+            .runtime = runtime.Runtime.init(allocator),
             .mode = .normal,
             .workspace = try workspace.Workspace.open(allocator, root_path),
         };
@@ -29,4 +32,3 @@ pub const App = struct {
         try render.renderWorkspace(stdout, self);
     }
 };
-

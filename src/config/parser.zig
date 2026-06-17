@@ -10,8 +10,10 @@ pub const ParseResult = struct {
     allocator: std.mem.Allocator,
     config: model.Config,
     diagnostics: []const ParseDiagnostic = &.{},
+    owned_theme_name: ?[]u8 = null,
 
     pub fn deinit(self: *ParseResult) void {
+        if (self.owned_theme_name) |name| self.allocator.free(name);
         self.allocator.free(self.diagnostics);
         self.* = undefined;
     }
@@ -27,6 +29,10 @@ const Section = enum {
 
 pub fn parseConfig(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
     var config = model.Config{};
+    var owned_theme_name: ?[]u8 = null;
+    errdefer {
+        if (owned_theme_name) |name| allocator.free(name);
+    }
     var diagnostics = std.ArrayList(ParseDiagnostic).init(allocator);
     errdefer diagnostics.deinit();
 
@@ -61,7 +67,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, source: []const u8) !ParseResul
 
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = trimValue(line[eq + 1 ..]);
-        applyValue(&config, section, key, value) catch {
+        applyValue(allocator, &config, &owned_theme_name, section, key, value) catch {
             try diagnostics.append(.{ .message = "invalid config value", .offset = offset });
         };
     }
@@ -70,6 +76,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, source: []const u8) !ParseResul
         .allocator = allocator,
         .config = config,
         .diagnostics = try diagnostics.toOwnedSlice(),
+        .owned_theme_name = owned_theme_name,
     };
 }
 
@@ -95,7 +102,14 @@ fn trimValue(raw: []const u8) []const u8 {
     return value;
 }
 
-fn applyValue(config: *model.Config, section: Section, key: []const u8, value: []const u8) !void {
+fn applyValue(
+    allocator: std.mem.Allocator,
+    config: *model.Config,
+    owned_theme_name: *?[]u8,
+    section: Section,
+    key: []const u8,
+    value: []const u8,
+) !void {
     switch (section) {
         .editor => {
             if (std.mem.eql(u8, key, "tab_width")) {
@@ -110,7 +124,10 @@ fn applyValue(config: *model.Config, section: Section, key: []const u8, value: [
         },
         .theme => {
             if (std.mem.eql(u8, key, "name")) {
-                config.theme.name = value;
+                if (owned_theme_name.*) |old| allocator.free(old);
+                const name = try allocator.dupe(u8, value);
+                owned_theme_name.* = name;
+                config.theme.name = name;
             } else {
                 return error.UnknownField;
             }

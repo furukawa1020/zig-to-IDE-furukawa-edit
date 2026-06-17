@@ -3,7 +3,9 @@ const architecture = @import("../architecture.zig");
 const cli = @import("../cli.zig");
 const command = @import("command.zig");
 const buffer = @import("../editor/buffer.zig");
+const document_store = @import("../editor/store.zig");
 const modes = @import("../language/modes.zig");
+const literal = @import("../search/literal.zig");
 const tokenizer = @import("../language/zig_tokenizer.zig");
 const render = @import("../ui/render.zig");
 
@@ -13,6 +15,7 @@ pub fn run(allocator: std.mem.Allocator, kind: cli.DemoName, stdout: anytype) !v
         .architecture => try architectureDemo(stdout),
         .languages => try languages(stdout),
         .commands => try render.renderCommands(stdout),
+        .editor => try editorDemo(allocator, stdout),
         .buffer => try bufferDemo(allocator, stdout),
         .zig_tokens => try zigTokens(stdout),
     }
@@ -33,6 +36,7 @@ fn overview(stdout: anytype) !void {
         \\  zide demo architecture
         \\  zide demo languages
         \\  zide demo commands
+        \\  zide demo editor
         \\  zide demo buffer
         \\  zide demo zig-tokens
         \\
@@ -51,6 +55,39 @@ fn architectureDemo(stdout: anytype) !void {
             }
             try stdout.writeAll("\n");
         }
+    }
+}
+
+fn editorDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
+    var store = document_store.DocumentStore.init(allocator);
+    defer store.deinit();
+
+    _ = try store.createScratch("demo.zig",
+        \\const std = @import("std");
+        \\
+        \\pub fn main() void {
+        \\    std.debug.print("demo\n", .{});
+        \\}
+        \\
+    );
+
+    const doc = store.active() orelse return error.NoActiveDocument;
+    try doc.insert(0, "//! zide editor demo\n");
+    _ = try doc.undo();
+    _ = try doc.redo();
+
+    const matches = try literal.findAll(allocator, doc.text.bytes, "std", .{});
+    defer allocator.free(matches);
+
+    try stdout.writeAll("editor demo\n-----------\n");
+    try stdout.print("path      : {s}\n", .{doc.path orelse "(scratch)"});
+    try stdout.print("dirty     : {}\n", .{doc.dirty});
+    try stdout.print("lines     : {d}\n", .{doc.text.lineCount()});
+    try stdout.print("matches   : {d} occurrence(s) of 'std'\n\n", .{matches.len});
+
+    var line: usize = 0;
+    while (line < doc.text.lineCount()) : (line += 1) {
+        try stdout.print("{d:>3} | {s}\n", .{ line + 1, doc.text.lineSlice(line) });
     }
 }
 

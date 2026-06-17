@@ -32,6 +32,7 @@ test {
     _ = @import("core/types.zig");
     _ = @import("build/steps.zig");
     _ = @import("build/commands.zig");
+    _ = @import("build/output.zig");
     _ = @import("build/toolchain.zig");
     _ = @import("config/keymap.zig");
     _ = @import("config/model.zig");

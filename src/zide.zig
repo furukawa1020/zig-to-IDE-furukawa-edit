@@ -83,6 +83,7 @@ pub const diagnostics = struct {
 
 pub const build_layer = struct {
     pub const commands = @import("build/commands.zig");
+    pub const output = @import("build/output.zig");
     pub const steps = @import("build/steps.zig");
     pub const toolchain = @import("build/toolchain.zig");
 };

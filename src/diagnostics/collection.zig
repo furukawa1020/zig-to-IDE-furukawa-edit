@@ -25,12 +25,17 @@ pub const Collection = struct {
     }
 
     pub fn append(self: *Collection, diagnostic: model.Diagnostic) !void {
+        const path = try self.allocator.dupe(u8, diagnostic.path);
+        errdefer self.allocator.free(path);
+        const message = try self.allocator.dupe(u8, diagnostic.message);
+        errdefer self.allocator.free(message);
+
         try self.items.append(.{
             .source = diagnostic.source,
             .severity = diagnostic.severity,
-            .path = try self.allocator.dupe(u8, diagnostic.path),
+            .path = path,
             .range = diagnostic.range,
-            .message = try self.allocator.dupe(u8, diagnostic.message),
+            .message = message,
         });
     }
 

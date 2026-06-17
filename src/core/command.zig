@@ -39,6 +39,13 @@ const definitions = [_]Definition{
     .{ .id = "task.run", .title = "Run Task", .description = "Run a configured project task.", .default_key = "ctrl-r", .scope = .task, .capability = .external_command },
     .{ .id = "view.toggle_file_tree", .title = "Toggle File Tree", .description = "Show or hide the file tree.", .default_key = "ctrl-e", .scope = .view, .capability = .safe },
     .{ .id = "view.toggle_diagnostics", .title = "Toggle Diagnostics", .description = "Show or hide diagnostics.", .default_key = "ctrl-d", .scope = .view, .capability = .safe },
+    .{ .id = "view.command_palette", .title = "Command Palette", .description = "Open the command palette.", .default_key = "ctrl-shift-p", .scope = .view, .capability = .safe },
+    .{ .id = "symbol.goto_definition", .title = "Go To Definition", .description = "Jump to the selected symbol definition.", .default_key = "f12", .scope = .zig, .capability = .safe },
+    .{ .id = "symbol.find_references", .title = "Find References", .description = "Find references for the selected symbol.", .default_key = "shift-f12", .scope = .zig, .capability = .safe },
+    .{ .id = "symbol.rename", .title = "Rename Symbol", .description = "Rename a symbol with preview and undo.", .default_key = "f2", .scope = .zig, .capability = .workspace_write },
+    .{ .id = "diagnostics.next", .title = "Next Diagnostic", .description = "Jump to the next diagnostic.", .default_key = "f8", .scope = .workspace, .capability = .safe },
+    .{ .id = "debug.start", .title = "Start Debugging", .description = "Launch the configured debug session.", .default_key = "f5", .scope = .task, .capability = .external_command },
+    .{ .id = "git.status", .title = "Git Status", .description = "Refresh visible git status.", .default_key = "", .scope = .workspace, .capability = .external_command },
     .{ .id = "demo.run", .title = "Run Demo", .description = "Run an internal zide demo.", .default_key = "", .scope = .demo, .capability = .safe },
 };
 
@@ -87,7 +94,7 @@ fn isBoundary(c: u8) bool {
 }
 
 test "find command by id" {
-    const definition = findById("zig.build") orelse return error.TestExpectedEqual;
+    const definition = findById("zig.build") orelse return error.ExpectedCommand;
     try std.testing.expectEqual(Scope.zig, definition.scope);
 }
 
@@ -96,4 +103,3 @@ test "fuzzy score prefers consecutive matches" {
     const distant = fuzzyScore("zb", "workspace.zig.build").?;
     try std.testing.expect(compact >= distant);
 }
-

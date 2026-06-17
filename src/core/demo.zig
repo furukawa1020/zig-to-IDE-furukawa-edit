@@ -1,4 +1,5 @@
 const std = @import("std");
+const architecture = @import("../architecture.zig");
 const cli = @import("../cli.zig");
 const command = @import("command.zig");
 const buffer = @import("../editor/buffer.zig");
@@ -9,6 +10,7 @@ const render = @import("../ui/render.zig");
 pub fn run(allocator: std.mem.Allocator, kind: cli.DemoName, stdout: anytype) !void {
     switch (kind) {
         .overview => try overview(stdout),
+        .architecture => try architectureDemo(stdout),
         .languages => try languages(stdout),
         .commands => try render.renderCommands(stdout),
         .buffer => try bufferDemo(allocator, stdout),
@@ -28,12 +30,28 @@ fn overview(stdout: anytype) !void {
         \\  demo runner        : internal demos without external libraries
         \\
         \\Try:
+        \\  zide demo architecture
         \\  zide demo languages
         \\  zide demo commands
         \\  zide demo buffer
         \\  zide demo zig-tokens
         \\
     );
+}
+
+fn architectureDemo(stdout: anytype) !void {
+    try stdout.writeAll("architecture layers\n-------------------\n");
+    for (architecture.layers()) |layer| {
+        try stdout.print("{s:<14} {s}\n", .{ architecture.layerName(layer.id), layer.owns });
+        if (layer.may_call.len > 0) {
+            try stdout.writeAll("  may call: ");
+            for (layer.may_call, 0..) |callee, index| {
+                if (index > 0) try stdout.writeAll(", ");
+                try stdout.writeAll(architecture.layerName(callee));
+            }
+            try stdout.writeAll("\n");
+        }
+    }
 }
 
 fn languages(stdout: anytype) !void {
@@ -87,4 +105,3 @@ fn zigTokens(stdout: anytype) !void {
 test "all commands are visible to demos" {
     try std.testing.expect(command.all().len > 0);
 }
-

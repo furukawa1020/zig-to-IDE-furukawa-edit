@@ -10,7 +10,7 @@ pub fn renderHelp(stdout: anytype) !void {
         \\Usage:
         \\  zide [workspace]
         \\  zide commands
-        \\  zide demo [overview|languages|commands|buffer|zig-tokens]
+        \\  zide demo [overview|architecture|languages|commands|buffer|zig-tokens]
         \\  zide --version
         \\
         \\The current slice renders a TUI-style overview and internal demos.
@@ -33,6 +33,7 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
     try stdout.writeAll("\x1b[1mzide\x1b[0m\n");
     try stdout.writeAll("----\n");
     try stdout.print("mode      : {s}\n", .{@tagName(instance.mode)});
+    try stdout.print("trust     : {s}\n", .{@tagName(instance.runtime.trust_state)});
     try stdout.print("workspace : {s}\n", .{ws.root_path});
     try stdout.print("entries   : {d}\n", .{ws.entries.items.len});
     try stdout.print("zig files : {d}\n\n", .{ws.countZigFamily()});
@@ -65,4 +66,3 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
         \\
     );
 }
-

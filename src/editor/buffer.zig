@@ -102,11 +102,11 @@ pub const TextBuffer = struct {
     }
 
     fn noteNewline(self: *TextBuffer, found: Newline) void {
-        self.newline = switch (self.newline) {
-            .none => found,
-            found => found,
-            else => .mixed,
-        };
+        if (self.newline == .none) {
+            self.newline = found;
+        } else if (self.newline != found) {
+            self.newline = .mixed;
+        }
     }
 };
 
@@ -129,4 +129,3 @@ test "invalid utf8 is retained without panic" {
     try std.testing.expect(!buf.valid_utf8);
     try std.testing.expectEqual(@as(usize, 2), buf.lineCount());
 }
-

@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const DemoName = enum {
     overview,
+    architecture,
     languages,
     commands,
     buffer,
@@ -47,6 +48,8 @@ pub fn parse(args: []const []const u8) Options {
 
 fn parseDemoName(raw: []const u8) ?DemoName {
     if (std.mem.eql(u8, raw, "overview")) return .overview;
+    if (std.mem.eql(u8, raw, "architecture")) return .architecture;
+    if (std.mem.eql(u8, raw, "arch")) return .architecture;
     if (std.mem.eql(u8, raw, "languages")) return .languages;
     if (std.mem.eql(u8, raw, "commands")) return .commands;
     if (std.mem.eql(u8, raw, "buffer")) return .buffer;
@@ -57,11 +60,16 @@ fn parseDemoName(raw: []const u8) ?DemoName {
 
 test "parse defaults to current workspace" {
     const options = parse(&.{ "zide" });
-    try std.testing.expectEqualStrings(".", options.action.open);
+    switch (options.action) {
+        .open => |path| try std.testing.expectEqualStrings(".", path),
+        else => return error.ExpectedOpenAction,
+    }
 }
 
 test "parse demo names" {
     const options = parse(&.{ "zide", "demo", "buffer" });
-    try std.testing.expect(options.action.demo == .buffer);
+    switch (options.action) {
+        .demo => |name| try std.testing.expect(name == .buffer),
+        else => return error.ExpectedDemoAction,
+    }
 }
-

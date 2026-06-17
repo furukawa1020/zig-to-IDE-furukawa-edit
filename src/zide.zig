@@ -1,14 +1,117 @@
 const std = @import("std");
 
 pub const cli = @import("cli.zig");
+pub const architecture = @import("architecture.zig");
 pub const app = @import("core/app.zig");
 pub const command = @import("core/command.zig");
 pub const demo = @import("core/demo.zig");
+pub const event = @import("core/event.zig");
+pub const event_loop = @import("core/event_loop.zig");
+pub const runtime = @import("core/runtime.zig");
+pub const types = @import("core/types.zig");
 pub const buffer = @import("editor/buffer.zig");
 pub const modes = @import("language/modes.zig");
 pub const zig_tokenizer = @import("language/zig_tokenizer.zig");
 pub const render = @import("ui/render.zig");
 pub const workspace = @import("workspace/workspace.zig");
+
+pub const core = struct {
+    pub const app = @import("core/app.zig");
+    pub const command = @import("core/command.zig");
+    pub const event = @import("core/event.zig");
+    pub const event_loop = @import("core/event_loop.zig");
+    pub const runtime = @import("core/runtime.zig");
+    pub const types = @import("core/types.zig");
+};
+
+pub const platform = struct {
+    pub const fs = @import("platform/fs.zig");
+    pub const process = @import("platform/process.zig");
+    pub const terminal = @import("platform/terminal.zig");
+};
+
+pub const terminal_layer = struct {
+    pub const ansi = @import("terminal/ansi.zig");
+    pub const input = @import("terminal/input.zig");
+    pub const screen = @import("terminal/screen.zig");
+};
+
+pub const ui = struct {
+    pub const layout = @import("ui/layout.zig");
+    pub const render = @import("ui/render.zig");
+    pub const theme = @import("ui/theme.zig");
+    pub const view = @import("ui/view.zig");
+};
+
+pub const editor = struct {
+    pub const buffer = @import("editor/buffer.zig");
+    pub const cursor = @import("editor/cursor.zig");
+    pub const document = @import("editor/document.zig");
+    pub const save = @import("editor/save.zig");
+    pub const selection = @import("editor/selection.zig");
+    pub const undo = @import("editor/undo.zig");
+};
+
+pub const workspace_layer = struct {
+    pub const file_tree = @import("workspace/file_tree.zig");
+    pub const session = @import("workspace/session.zig");
+    pub const watcher = @import("workspace/watcher.zig");
+    pub const workspace = @import("workspace/workspace.zig");
+};
+
+pub const language = struct {
+    pub const modes = @import("language/modes.zig");
+    pub const semantic = @import("language/semantic.zig");
+    pub const symbols = @import("language/symbols.zig");
+    pub const zig_ast = @import("language/zig_ast.zig");
+    pub const zig_parser = @import("language/zig_parser.zig");
+    pub const zig_tokenizer = @import("language/zig_tokenizer.zig");
+};
+
+pub const diagnostics = struct {
+    pub const model = @import("diagnostics/model.zig");
+};
+
+pub const build_layer = struct {
+    pub const steps = @import("build/steps.zig");
+    pub const toolchain = @import("build/toolchain.zig");
+};
+
+pub const tasks = struct {
+    pub const task = @import("tasks/task.zig");
+};
+
+pub const search = struct {
+    pub const fuzzy = @import("search/fuzzy.zig");
+};
+
+pub const config = struct {
+    pub const keymap = @import("config/keymap.zig");
+    pub const model = @import("config/model.zig");
+    pub const parser = @import("config/parser.zig");
+};
+
+pub const persistence = struct {
+    pub const journal = @import("persistence/journal.zig");
+    pub const paths = @import("persistence/paths.zig");
+};
+
+pub const debug_layer = struct {
+    pub const session = @import("debug/session.zig");
+};
+
+pub const git = struct {
+    pub const status = @import("git/status.zig");
+};
+
+pub const security = struct {
+    pub const permissions = @import("security/permissions.zig");
+    pub const trust = @import("security/trust.zig");
+};
+
+pub const observability = struct {
+    pub const log = @import("observability/log.zig");
+};
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -31,4 +134,3 @@ pub fn run(
         .help => try render.renderHelp(stdout),
     }
 }
-

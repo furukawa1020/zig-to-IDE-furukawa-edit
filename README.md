@@ -60,6 +60,8 @@ zig build run -- demo architecture
 zig build run -- demo languages
 zig build run -- demo commands
 zig build run -- demo editor
+zig build run -- demo palette
+zig build run -- demo dispatch
 zig build run -- demo buffer
 zig build run -- demo zig-tokens
 zig build test

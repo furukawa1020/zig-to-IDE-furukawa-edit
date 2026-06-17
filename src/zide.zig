@@ -49,6 +49,7 @@ pub const editor = struct {
     pub const document = @import("editor/document.zig");
     pub const save = @import("editor/save.zig");
     pub const selection = @import("editor/selection.zig");
+    pub const store = @import("editor/store.zig");
     pub const undo = @import("editor/undo.zig");
 };
 
@@ -70,9 +71,11 @@ pub const language = struct {
 
 pub const diagnostics = struct {
     pub const model = @import("diagnostics/model.zig");
+    pub const zig_output = @import("diagnostics/zig_output.zig");
 };
 
 pub const build_layer = struct {
+    pub const commands = @import("build/commands.zig");
     pub const steps = @import("build/steps.zig");
     pub const toolchain = @import("build/toolchain.zig");
 };
@@ -83,6 +86,8 @@ pub const tasks = struct {
 
 pub const search = struct {
     pub const fuzzy = @import("search/fuzzy.zig");
+    pub const literal = @import("search/literal.zig");
+    pub const workspace_search = @import("search/workspace_search.zig");
 };
 
 pub const config = struct {

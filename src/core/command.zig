@@ -48,7 +48,13 @@ pub const Definition = struct {
 const definitions = [_]Definition{
     .{ .id = "file.open", .title = "Open File", .description = "Open a file in the workspace.", .default_key = "ctrl-o", .scope = .file, .capability = .safe },
     .{ .id = "file.save", .title = "Save File", .description = "Save the current buffer with atomic write.", .default_key = "ctrl-s", .scope = .file, .capability = .workspace_write },
+    .{ .id = "editor.enter_insert", .title = "Enter Insert Mode", .description = "Switch to insert mode.", .default_key = "i", .scope = .editor, .capability = .safe },
+    .{ .id = "editor.exit_insert", .title = "Exit Insert Mode", .description = "Switch back to normal mode.", .default_key = "escape", .scope = .editor, .capability = .safe },
     .{ .id = "editor.insert", .title = "Insert Text", .description = "Insert UTF-8 bytes into the current buffer.", .default_key = "", .scope = .editor, .capability = .safe },
+    .{ .id = "editor.move_left", .title = "Move Left", .description = "Move the cursor one character left.", .default_key = "left", .scope = .editor, .capability = .safe },
+    .{ .id = "editor.move_right", .title = "Move Right", .description = "Move the cursor one character right.", .default_key = "right", .scope = .editor, .capability = .safe },
+    .{ .id = "editor.move_up", .title = "Move Up", .description = "Move the cursor one line up.", .default_key = "up", .scope = .editor, .capability = .safe },
+    .{ .id = "editor.move_down", .title = "Move Down", .description = "Move the cursor one line down.", .default_key = "down", .scope = .editor, .capability = .safe },
     .{ .id = "editor.undo", .title = "Undo", .description = "Undo the last editing transaction.", .default_key = "ctrl-z", .scope = .editor, .capability = .safe },
     .{ .id = "editor.redo", .title = "Redo", .description = "Redo the last undone editing transaction.", .default_key = "ctrl-y", .scope = .editor, .capability = .safe },
     .{ .id = "workspace.search", .title = "Search Workspace", .description = "Search text across workspace files.", .default_key = "ctrl-f", .scope = .workspace, .capability = .safe },

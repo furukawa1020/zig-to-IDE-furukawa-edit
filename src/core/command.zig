@@ -16,6 +16,26 @@ pub const Capability = enum {
     external_command,
 };
 
+pub const Request = struct {
+    id: []const u8,
+    argument: ?[]const u8 = null,
+    source: Source = .command_palette,
+};
+
+pub const Source = enum {
+    keybinding,
+    command_palette,
+    startup,
+    task,
+    demo,
+};
+
+pub const Check = union(enum) {
+    allowed: Definition,
+    unknown_command,
+    blocked: []const u8,
+};
+
 pub const Definition = struct {
     id: []const u8,
     title: []const u8,

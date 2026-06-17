@@ -33,6 +33,7 @@ pub const Source = enum {
 pub const Check = union(enum) {
     allowed: Definition,
     unknown_command,
+    confirmation_required: []const u8,
     blocked: []const u8,
 };
 

@@ -10,7 +10,7 @@ pub fn renderHelp(stdout: anytype) !void {
         \\Usage:
         \\  zide [workspace]
         \\  zide commands
-        \\  zide demo [overview|architecture|languages|commands|buffer|zig-tokens]
+        \\  zide demo [overview|architecture|languages|commands|editor|buffer|zig-tokens]
         \\  zide --version
         \\
         \\The current slice renders a TUI-style overview and internal demos.
@@ -37,6 +37,7 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
     try stdout.print("workspace : {s}\n", .{ws.root_path});
     try stdout.print("entries   : {d}\n", .{ws.entries.items.len});
     try stdout.print("zig files : {d}\n\n", .{ws.countZigFamily()});
+    try stdout.print("documents : {d}\n\n", .{instance.documents.documents.items.len});
 
     try stdout.writeAll("file tree preview\n-----------------\n");
     if (ws.entries.items.len == 0) {
@@ -49,7 +50,7 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
                 .directory => "dir ",
                 .other => "misc",
             };
-            try stdout.print("{s}  {s:<12} {s}\n", .{ kind, modes.label(entry.language), entry.name });
+            try stdout.print("{s}  {s:<12} {s}\n", .{ kind, modes.label(entry.language), entry.path });
         }
         if (ws.entries.items.len > limit) {
             try stdout.print("... {d} more\n", .{ws.entries.items.len - limit});

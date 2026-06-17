@@ -6,6 +6,8 @@ pub const DemoName = enum {
     languages,
     commands,
     editor,
+    palette,
+    dispatch,
     buffer,
     zig_tokens,
 };
@@ -54,6 +56,8 @@ fn parseDemoName(raw: []const u8) ?DemoName {
     if (std.mem.eql(u8, raw, "languages")) return .languages;
     if (std.mem.eql(u8, raw, "commands")) return .commands;
     if (std.mem.eql(u8, raw, "editor")) return .editor;
+    if (std.mem.eql(u8, raw, "palette")) return .palette;
+    if (std.mem.eql(u8, raw, "dispatch")) return .dispatch;
     if (std.mem.eql(u8, raw, "buffer")) return .buffer;
     if (std.mem.eql(u8, raw, "zig-tokens")) return .zig_tokens;
     if (std.mem.eql(u8, raw, "zig_tokens")) return .zig_tokens;

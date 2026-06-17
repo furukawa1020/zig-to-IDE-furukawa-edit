@@ -11,8 +11,8 @@ TUIで作る。
 `zide` は、Zigを書くための自己完結型TUI IDEです。
 でも「Zigファイルしか触れません」みたいな窮屈な道具にはしません。
 READMEも設定もスクリプトもデモも、開発中に必要なものはちゃんと開ける。
-ただし、魂はZigに置く。
-高度な解析、補完、jump、rename、build/test/debug連携はZigに全力で寄せます。
+ただし、魂はZigに置く。zigによるzigのためのzigide
+高度な解析、補完、jump、rename、build/test/debug連携はZigに全力やる
 
 ## 何を作るのか
 

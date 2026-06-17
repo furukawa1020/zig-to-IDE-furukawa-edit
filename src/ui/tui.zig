@@ -2,6 +2,7 @@ const std = @import("std");
 const app_mod = @import("../core/app.zig");
 const layout = @import("layout.zig");
 const modes = @import("../language/modes.zig");
+const posture = @import("../security/posture.zig");
 const screen_mod = @import("../terminal/screen.zig");
 
 const Style = screen_mod.Style;
@@ -93,7 +94,7 @@ fn renderEditor(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layou
 fn renderBottomPanel(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layout.Rect) void {
     if (rect.width == 0 or rect.height == 0) return;
     screen.fillRect(rect.x, rect.y, rect.width, rect.height, ' ', .{ .fg = 7, .bg = 0 });
-    screen.writeTextClipped(rect.x, rect.y, rect.width, " DIAGNOSTICS / OUTPUT", .{ .fg = 5, .bg = 0, .bold = true });
+    screen.writeTextClipped(rect.x, rect.y, rect.width, " DIAGNOSTICS / SECURITY / OUTPUT", .{ .fg = 5, .bg = 0, .bold = true });
 
     var row: u16 = 1;
     for (app.diagnostics.items.items) |item| {
@@ -124,6 +125,20 @@ fn renderBottomPanel(screen: *screen_mod.Screen, app: *const app_mod.App, rect: 
         row += 1;
     }
 
+    if (app.pending_build_consent) |preview| {
+        if (row < rect.height) {
+            var line_buf: [512]u8 = undefined;
+            const text = std.fmt.bufPrint(&line_buf, "CONSENT {s} cwd={s} fs={s} net={s}", .{
+                preview.command,
+                preview.cwd,
+                @tagName(preview.consent.fs_policy),
+                @tagName(preview.consent.network_policy),
+            }) catch "CONSENT pending";
+            screen.writeTextClipped(rect.x, rect.y + row, rect.width, text, .{ .fg = 6, .bg = 0, .bold = true });
+            row += 1;
+        }
+    }
+
     if (app.process_console.sanitized_stats.total() > 0 and row < rect.height) {
         var line_buf: [160]u8 = undefined;
         const text = std.fmt.bufPrint(&line_buf, "OUTPUT SANITIZER stripped {d} terminal control sequence(s)", .{
@@ -148,13 +163,15 @@ fn renderStatus(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layou
     const dirty = if (doc) |document| blk: {
         break :blk if (document.dirty) "dirty" else "clean";
     } else "no-doc";
+    const security = posture.summarize(&app.security_findings, app.runtime.trust_state);
     var status_buf: [256]u8 = undefined;
-    const status = std.fmt.bufPrint(&status_buf, " {s} | trust:{s} | {s} | diag:{d} | sec:{d} | build:{s} | {s}", .{
+    const status = std.fmt.bufPrint(&status_buf, " {s} | trust:{s} | posture:{s} | {s} | diag:{d} | sec:{d} | build:{s} | {s}", .{
         @tagName(app.mode),
         @tagName(app.runtime.trust_state),
+        security.label,
         dirty,
         app.diagnostics.items.items.len,
-        app.security_findings.countRiskAtLeast(.high),
+        security.high,
         if (app.process_console.running) "running" else "idle",
         app.workspace.root_path,
     }) catch " zide";

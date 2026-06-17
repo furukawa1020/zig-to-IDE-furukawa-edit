@@ -2,6 +2,7 @@ const std = @import("std");
 const command = @import("../core/command.zig");
 const app = @import("../core/app.zig");
 const modes = @import("../language/modes.zig");
+const posture = @import("../security/posture.zig");
 
 pub fn renderHelp(stdout: anytype) !void {
     try stdout.writeAll(
@@ -44,9 +45,28 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
         instance.diagnostics.countBySeverity(.error),
         instance.diagnostics.countBySeverity(.warning),
     });
-    try stdout.print("security  : {d} high+ finding(s)\n", .{instance.security_findings.countRiskAtLeast(.high)});
+    const security = posture.summarize(&instance.security_findings, instance.runtime.trust_state);
+    try stdout.print("security  : {s} ({d} finding(s), {d} high+, {d} critical)\n", .{
+        security.label,
+        security.total,
+        security.high,
+        security.critical,
+    });
+    try stdout.print("recommend : {s}\n", .{@tagName(security.recommended_trust)});
     try stdout.print("sanitized : {d} terminal control sequence(s)\n", .{instance.process_console.sanitized_stats.total()});
     try stdout.print("process   : {s}\n\n", .{if (instance.process_console.running) "running" else "idle"});
+
+    if (instance.pending_build_consent) |preview| {
+        try stdout.writeAll("pending build consent\n---------------------\n");
+        try stdout.print("command   : {s}\n", .{preview.command});
+        try stdout.print("cwd       : {s}\n", .{preview.cwd});
+        try stdout.print("trust     : {s}\n", .{@tagName(preview.trust_state)});
+        try stdout.print("env/fs/net: {s} / {s} / {s}\n\n", .{
+            @tagName(preview.consent.env_policy),
+            @tagName(preview.consent.fs_policy),
+            @tagName(preview.consent.network_policy),
+        });
+    }
 
     try stdout.writeAll("file tree preview\n-----------------\n");
     if (ws.entries.items.len == 0) {

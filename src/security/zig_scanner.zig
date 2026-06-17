@@ -25,6 +25,17 @@ fn scanLine(collection: *findings.Collection, path: []const u8, line: []const u8
     try detect(collection, path, line, line_number, "@ptrFromInt", .ffi_boundary, .critical, "integer-to-pointer conversion can create invalid pointers");
     try detect(collection, path, line, line_number, "@intFromPtr", .ffi_boundary, .medium, "pointer value is being exposed as an integer");
     try detect(collection, path, line, line_number, "@setRuntimeSafety(false)", .safety_profile, .high, "runtime safety checks disabled in this scope");
+    try detect(collection, path, line, line_number, "@cImport", .ffi_boundary, .high, "C import expands the trusted computing boundary");
+    try detect(collection, path, line, line_number, "[*c]", .ffi_boundary, .high, "C pointer type requires explicit null and lifetime checks");
+    try detect(collection, path, line, line_number, "anyopaque", .ffi_boundary, .medium, "opaque pointer boundary needs a typed wrapper");
+    try detect(collection, path, line, line_number, "@memcpy", .allocator_policy, .medium, "raw memory copy requires length and aliasing proof");
+    try detect(collection, path, line, line_number, "@memset", .allocator_policy, .medium, "raw memory initialization requires lifetime proof");
+    try detect(collection, path, line, line_number, "std.heap.c_allocator", .allocator_policy, .high, "C allocator crosses Zig allocator policy");
+    try detect(collection, path, line, line_number, "std.heap.raw_c_allocator", .allocator_policy, .high, "raw C allocator bypasses Zig allocator safety expectations");
+    try detect(collection, path, line, line_number, "std.heap.page_allocator", .allocator_policy, .medium, "page allocator should be justified for long-lived allocations");
+    try detect(collection, path, line, line_number, "ArenaAllocator", .allocator_policy, .low, "arena lifetime should be bounded to a visible scope");
+    try detect(collection, path, line, line_number, "GeneralPurposeAllocator", .allocator_policy, .info, "general purpose allocator boundary detected");
+    try detect(collection, path, line, line_number, "ReleaseFast", .safety_profile, .high, "ReleaseFast removes runtime safety checks unless explicitly overridden");
 
     if (std.mem.indexOf(u8, line, "catch unreachable")) |column| {
         try collection.append(.safety_profile, .medium, path, line_number, column, "catch unreachable turns recoverable failure into a safety boundary", line);
@@ -109,3 +120,15 @@ test "scanner detects Zig-specific security boundaries" {
     try std.testing.expect(collection.countRiskAtLeast(.high) >= 3);
 }
 
+test "scanner detects allocator and C import boundaries" {
+    var collection = try scanSource(std.testing.allocator,
+        \\const c = @cImport({});
+        \\const allocator = std.heap.c_allocator;
+        \\const view: [*c]u8 = null;
+        \\const mode = .ReleaseFast;
+        \\
+    , .{ .path = "src/ffi.zig" });
+    defer collection.deinit();
+
+    try std.testing.expect(collection.countRiskAtLeast(.high) >= 4);
+}

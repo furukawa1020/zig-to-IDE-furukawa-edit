@@ -87,6 +87,18 @@ pub const Collection = struct {
         });
     }
 
+    pub fn appendFinding(self: *Collection, finding: Finding) !void {
+        try self.append(
+            finding.category,
+            finding.risk,
+            finding.path,
+            finding.line,
+            finding.column,
+            finding.message,
+            finding.evidence,
+        );
+    }
+
     pub fn countRiskAtLeast(self: *const Collection, minimum: Risk) usize {
         var count: usize = 0;
         for (self.items.items) |item| {
@@ -105,4 +117,3 @@ fn riskRank(risk: Risk) u8 {
         .critical => 4,
     };
 }
-

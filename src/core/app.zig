@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_consent = @import("../security/build_consent.zig");
 const command_palette = @import("../ui/command_palette.zig");
 const diagnostics = @import("../diagnostics/collection.zig");
 const security_findings = @import("../security/findings.zig");
@@ -24,6 +25,7 @@ pub const App = struct {
     diagnostics: diagnostics.Collection,
     security_findings: security_findings.Collection,
     process_console: console.ProcessConsole,
+    pending_build_consent: ?build_consent.Preview,
 
     pub fn init(allocator: std.mem.Allocator, root_path: []const u8) !App {
         const open_kind = detectOpenKind(root_path);
@@ -42,6 +44,7 @@ pub const App = struct {
             .diagnostics = diagnostics.Collection.init(allocator),
             .security_findings = security_findings.Collection.init(allocator),
             .process_console = console.ProcessConsole.init(allocator),
+            .pending_build_consent = null,
         };
         errdefer self.deinit();
 
@@ -53,6 +56,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        self.clearPendingBuildConsent();
         self.process_console.deinit();
         self.security_findings.deinit();
         self.diagnostics.deinit();
@@ -63,6 +67,18 @@ pub const App = struct {
 
     pub fn render(self: *const App, stdout: anytype) !void {
         try render.renderWorkspace(stdout, self);
+    }
+
+    pub fn clearPendingBuildConsent(self: *App) void {
+        if (self.pending_build_consent) |*preview| {
+            preview.deinit();
+        }
+        self.pending_build_consent = null;
+    }
+
+    pub fn setPendingBuildConsent(self: *App, preview: build_consent.Preview) void {
+        self.clearPendingBuildConsent();
+        self.pending_build_consent = preview;
     }
 };
 

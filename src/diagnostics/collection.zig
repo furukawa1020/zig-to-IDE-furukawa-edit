@@ -14,16 +14,24 @@ pub const Collection = struct {
     }
 
     pub fn deinit(self: *Collection) void {
+        self.freeItems();
         self.items.deinit();
         self.* = undefined;
     }
 
     pub fn clear(self: *Collection) void {
+        self.freeItems();
         self.items.clearRetainingCapacity();
     }
 
     pub fn append(self: *Collection, diagnostic: model.Diagnostic) !void {
-        try self.items.append(diagnostic);
+        try self.items.append(.{
+            .source = diagnostic.source,
+            .severity = diagnostic.severity,
+            .path = try self.allocator.dupe(u8, diagnostic.path),
+            .range = diagnostic.range,
+            .message = try self.allocator.dupe(u8, diagnostic.message),
+        });
     }
 
     pub fn countBySeverity(self: *const Collection, severity: types.Severity) usize {
@@ -45,6 +53,13 @@ pub const Collection = struct {
         }
         return best;
     }
+
+    fn freeItems(self: *Collection) void {
+        for (self.items.items) |item| {
+            self.allocator.free(item.path);
+            self.allocator.free(item.message);
+        }
+    }
 };
 
 test "collection counts severity" {
@@ -62,4 +77,3 @@ test "collection counts severity" {
 
     try std.testing.expectEqual(@as(usize, 1), collection.countBySeverity(.error));
 }
-

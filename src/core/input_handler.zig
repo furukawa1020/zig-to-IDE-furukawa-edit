@@ -1,4 +1,5 @@
 const app_mod = @import("app.zig");
+const build_output = @import("../build/output.zig");
 const command = @import("command.zig");
 const dispatcher = @import("dispatcher.zig");
 const event = @import("event.zig");
@@ -22,6 +23,15 @@ pub fn handle(app: *app_mod.App, input: event.Event) !Outcome {
         .command_requested => |id| {
             return .{ .command_result = try dispatcher.dispatch(app, .{ .id = id }) };
         },
+        .process_output => |output| {
+            try build_output.appendOutput(
+                &app.process_console,
+                &app.diagnostics,
+                if (output.stream == .stdout) .stdout else .stderr,
+                output.bytes,
+            );
+            return .redraw;
+        },
         else => return .ignored,
     }
 }
@@ -31,12 +41,41 @@ fn handleKey(app: *app_mod.App, key: event.KeyEvent) !Outcome {
         return handlePaletteKey(app, key);
     }
 
+    if (app.mode == .insert) {
+        return handleInsertKey(app, key);
+    }
+
     switch (key.code) {
+        .arrow_left => return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.move_left", .source = .keybinding }) },
+        .arrow_right => return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.move_right", .source = .keybinding }) },
+        .arrow_up => return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.move_up", .source = .keybinding }) },
+        .arrow_down => return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.move_down", .source = .keybinding }) },
         .char => |char| {
             if (key.modifiers.ctrl and (char == 'p' or char == 'P')) {
                 return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "view.command_palette", .source = .keybinding }) };
             }
+            if (char == 'i') {
+                return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.enter_insert", .source = .keybinding }) };
+            }
             return .ignored;
+        },
+        else => return .ignored,
+    }
+}
+
+fn handleInsertKey(app: *app_mod.App, key: event.KeyEvent) !Outcome {
+    switch (key.code) {
+        .escape => return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.exit_insert", .source = .keybinding }) },
+        .enter => return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.insert", .argument = "\n", .source = .keybinding }) },
+        .tab => return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.insert", .argument = "\t", .source = .keybinding }) },
+        .char => |char| {
+            var bytes: [4]u8 = undefined;
+            const len = encodeUtf8(char, &bytes) catch return .ignored;
+            return .{ .command_result = try dispatcher.dispatch(app, .{
+                .id = "editor.insert",
+                .argument = bytes[0..len],
+                .source = .keybinding,
+            }) };
         },
         else => return .ignored,
     }
@@ -117,4 +156,3 @@ test "ctrl-p opens command palette through input handler" {
     try @import("std").testing.expect(@import("std").meta.activeTag(outcome) == .command_result);
     try @import("std").testing.expect(app.palette.visible);
 }
-

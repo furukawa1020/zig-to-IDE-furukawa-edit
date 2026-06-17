@@ -1,4 +1,5 @@
 const diagnostics = @import("../diagnostics/collection.zig");
+const sanitizer = @import("../security/output_sanitizer.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
 const console = @import("../tasks/console.zig");
 
@@ -15,7 +16,9 @@ pub fn appendOutput(
     while (i <= bytes.len) : (i += 1) {
         if (i == bytes.len or bytes[i] == '\n') {
             const raw_line = bytes[start..i];
-            const line = trimRight(raw_line);
+            var sanitized = try sanitizer.sanitizeAlloc(process_console.allocator, trimRight(raw_line));
+            defer sanitized.deinit(process_console.allocator);
+            const line = sanitized.text;
             if (zig_output.parseLine(line)) |parsed| {
                 try diagnostic_collection.append(zig_output.toDiagnostic(parsed));
             }
@@ -40,4 +43,3 @@ test "build output extracts diagnostics" {
     try @import("std").testing.expectEqual(@as(usize, 1), process_console.lines.items.len);
     try @import("std").testing.expectEqual(@as(usize, 1), diagnostic_collection.items.items.len);
 }
-

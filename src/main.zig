@@ -68,6 +68,7 @@ test {
     _ = @import("search/literal.zig");
     _ = @import("search/workspace_search.zig");
     _ = @import("security/permissions.zig");
+    _ = @import("security/output_sanitizer.zig");
     _ = @import("security/trust.zig");
     _ = @import("tasks/task.zig");
     _ = @import("tasks/console.zig");

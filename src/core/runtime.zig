@@ -32,10 +32,11 @@ pub const Runtime = struct {
             else => .manual,
         };
         const policy = trust.Policy{ .state = self.trust_state };
-        if (!policy.canRun(definition.capability, reason)) {
-            return .{ .blocked = "workspace is untrusted; external command requires manual confirmation" };
+        switch (policy.decide(definition.capability, reason)) {
+            .allow => return .{ .allowed = definition },
+            .confirm => |message| return .{ .confirmation_required = message },
+            .block => |message| return .{ .blocked = message },
         }
-        return .{ .allowed = definition };
     }
 };
 

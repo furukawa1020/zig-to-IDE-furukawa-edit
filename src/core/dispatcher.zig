@@ -19,6 +19,7 @@ pub fn dispatch(app: *app_mod.App, request: command.Request) !Result {
     switch (check) {
         .unknown_command => return .unknown_command,
         .blocked => |message| return .{ .blocked = message },
+        .confirmation_required => |message| return .{ .blocked = message },
         .allowed => |definition| return dispatchAllowed(app, definition, request),
     }
 }

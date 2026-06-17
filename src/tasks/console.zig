@@ -1,4 +1,5 @@
 const std = @import("std");
+const sanitizer = @import("../security/output_sanitizer.zig");
 
 pub const Stream = enum {
     stdout,
@@ -21,6 +22,7 @@ pub const ProcessConsole = struct {
     running: bool = false,
     exit_code: ?i32 = null,
     max_lines: usize = 2000,
+    sanitized_stats: sanitizer.Stats = .{},
 
     pub fn init(allocator: std.mem.Allocator) ProcessConsole {
         return .{
@@ -47,7 +49,13 @@ pub const ProcessConsole = struct {
     }
 
     pub fn appendBytes(self: *ProcessConsole, stream: Stream, bytes: []const u8) !void {
-        var iter = std.mem.splitScalar(u8, bytes, '\n');
+        var sanitized = try sanitizer.sanitizeAlloc(self.allocator, bytes);
+        defer sanitized.deinit(self.allocator);
+        self.sanitized_stats.stripped_csi += sanitized.stats.stripped_csi;
+        self.sanitized_stats.stripped_osc += sanitized.stats.stripped_osc;
+        self.sanitized_stats.stripped_control += sanitized.stats.stripped_control;
+
+        var iter = std.mem.splitScalar(u8, sanitized.text, '\n');
         while (iter.next()) |line| {
             if (line.len == 0) continue;
             try self.appendLine(stream, std.mem.trimRight(u8, line, "\r"));
@@ -57,6 +65,7 @@ pub const ProcessConsole = struct {
     pub fn clear(self: *ProcessConsole) void {
         for (self.lines.items) |*line| line.deinit(self.allocator);
         self.lines.clearRetainingCapacity();
+        self.sanitized_stats = .{};
     }
 
     fn appendLine(self: *ProcessConsole, stream: Stream, text: []const u8) !void {
@@ -80,3 +89,11 @@ test "console stores output lines" {
     try std.testing.expectEqualStrings("two", console.lines.items[1].text);
 }
 
+test "console sanitizes terminal controls" {
+    var console = ProcessConsole.init(std.testing.allocator);
+    defer console.deinit();
+
+    try console.appendBytes(.stderr, "bad\x1b[2Jstill visible\n");
+    try std.testing.expectEqualStrings("badstill visible", console.lines.items[0].text);
+    try std.testing.expectEqual(@as(usize, 1), console.sanitized_stats.stripped_csi);
+}

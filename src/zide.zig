@@ -125,6 +125,7 @@ pub const git = struct {
 };
 
 pub const security = struct {
+    pub const output_sanitizer = @import("security/output_sanitizer.zig");
     pub const permissions = @import("security/permissions.zig");
     pub const trust = @import("security/trust.zig");
 };

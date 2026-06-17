@@ -7,6 +7,7 @@ const store = @import("../editor/store.zig");
 const render = @import("../ui/render.zig");
 const runtime = @import("runtime.zig");
 const console = @import("../tasks/console.zig");
+const execution_queue = @import("../tasks/execution_queue.zig");
 const workspace = @import("../workspace/workspace.zig");
 
 pub const Mode = enum {
@@ -26,6 +27,8 @@ pub const App = struct {
     security_findings: security_findings.Collection,
     process_console: console.ProcessConsole,
     pending_build_consent: ?build_consent.Preview,
+    pending_build_source_id: ?[]u8,
+    execution_queue: execution_queue.Queue,
 
     pub fn init(allocator: std.mem.Allocator, root_path: []const u8) !App {
         const open_kind = detectOpenKind(root_path);
@@ -45,6 +48,8 @@ pub const App = struct {
             .security_findings = security_findings.Collection.init(allocator),
             .process_console = console.ProcessConsole.init(allocator),
             .pending_build_consent = null,
+            .pending_build_source_id = null,
+            .execution_queue = execution_queue.Queue.init(allocator),
         };
         errdefer self.deinit();
 
@@ -57,6 +62,7 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.clearPendingBuildConsent();
+        self.execution_queue.deinit();
         self.process_console.deinit();
         self.security_findings.deinit();
         self.diagnostics.deinit();
@@ -73,12 +79,19 @@ pub const App = struct {
         if (self.pending_build_consent) |*preview| {
             preview.deinit();
         }
+        if (self.pending_build_source_id) |source_id| {
+            self.allocator.free(source_id);
+        }
         self.pending_build_consent = null;
+        self.pending_build_source_id = null;
     }
 
-    pub fn setPendingBuildConsent(self: *App, preview: build_consent.Preview) void {
+    pub fn setPendingBuildConsent(self: *App, source_command_id: []const u8, preview: build_consent.Preview) !void {
+        const owned_source_id = try self.allocator.dupe(u8, source_command_id);
+        errdefer self.allocator.free(owned_source_id);
         self.clearPendingBuildConsent();
         self.pending_build_consent = preview;
+        self.pending_build_source_id = owned_source_id;
     }
 };
 

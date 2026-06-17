@@ -5,6 +5,8 @@ const build_consent = @import("../security/build_consent.zig");
 const command = @import("command.zig");
 const navigation = @import("../editor/navigation.zig");
 const process = @import("../platform/process.zig");
+const executor = @import("../tasks/executor.zig");
+const permissions = @import("../security/permissions.zig");
 const posture = @import("../security/posture.zig");
 const security_findings = @import("../security/findings.zig");
 const workspace_audit = @import("../security/workspace_audit.zig");
@@ -126,6 +128,7 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
                 item.evidence,
             );
         }
+        applyPostureGuard(app);
         return .{ .completed = "security scan complete" };
     }
 
@@ -137,6 +140,7 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         for (audit.items.items) |item| {
             try app.security_findings.appendFinding(item);
         }
+        applyPostureGuard(app);
         return .{ .completed = "workspace security audit complete" };
     }
 
@@ -178,6 +182,32 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "build consent dismissed" };
     }
 
+    if (std.mem.eql(u8, definition.id, "security.approve_consent")) {
+        const source_id = app.pending_build_source_id orelse return .{ .blocked = "no pending build consent to approve" };
+        const preview = app.pending_build_consent orelse return .{ .blocked = "no pending build consent to approve" };
+        switch (app.runtime.checkCommand(.{ .id = source_id, .source = .command_palette })) {
+            .unknown_command => return .unknown_command,
+            .blocked => |message| return .{ .blocked = message },
+            .allowed, .confirmation_required => {},
+        }
+
+        const spec = externalCommandPreviewById(app, source_id) orelse return .{ .blocked = "pending consent is not an executable command" };
+        const cwd = spec.command.cwd orelse app.workspace.root_path;
+        if (!permissions.allowsWorkspacePath(preview.consent.fs_policy, app.workspace.root_path, cwd)) {
+            return .{ .blocked = "approved command cwd is outside the permitted workspace boundary" };
+        }
+        try app.execution_queue.enqueueSpec(source_id, spec, preview.consent);
+        app.clearPendingBuildConsent();
+        return .{ .completed = "approved command queued" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "task.preview_next")) {
+        return switch (try executor.previewLatest(&app.execution_queue, &app.process_console)) {
+            .rendered => .{ .completed = "launch plan rendered" },
+            .empty_queue => .{ .blocked = "no approved command in execution queue" },
+        };
+    }
+
     if (std.mem.eql(u8, definition.id, "zig.build")) {
         app.clearPendingBuildConsent();
         return .{ .external_command = zigCommand(app, .build) };
@@ -203,16 +233,16 @@ fn zigCommand(app: *app_mod.App, invocation: build_commands.BuildInvocation) pro
 }
 
 fn rememberConsentPreview(app: *app_mod.App, request: command.Request) !void {
-    const spec = externalCommandPreview(app, request) orelse return;
+    const spec = externalCommandPreviewById(app, request.id) orelse return;
     var preview = try build_consent.makePreview(app.allocator, spec, app.runtime.trust_state);
     errdefer preview.deinit();
-    app.setPendingBuildConsent(preview);
+    try app.setPendingBuildConsent(request.id, preview);
 }
 
-fn externalCommandPreview(app: *app_mod.App, request: command.Request) ?process.SpawnSpec {
-    if (std.mem.eql(u8, request.id, "zig.build")) return zigCommand(app, .build);
-    if (std.mem.eql(u8, request.id, "zig.test")) return zigCommand(app, .test_step);
-    if (std.mem.eql(u8, request.id, "zig.fmt")) return zigCommand(app, .fmt);
+fn externalCommandPreviewById(app: *app_mod.App, id: []const u8) ?process.SpawnSpec {
+    if (std.mem.eql(u8, id, "zig.build")) return zigCommand(app, .build);
+    if (std.mem.eql(u8, id, "zig.test")) return zigCommand(app, .test_step);
+    if (std.mem.eql(u8, id, "zig.fmt")) return zigCommand(app, .fmt);
     return null;
 }
 
@@ -221,6 +251,20 @@ fn hasWorkspaceAudit(collection: *const security_findings.Collection) bool {
         if (item.category == .workspace_trust) return true;
     }
     return false;
+}
+
+fn applyPostureGuard(app: *app_mod.App) void {
+    const summary = posture.summarize(&app.security_findings, app.runtime.trust_state);
+    if (summary.critical > 0) {
+        app.runtime.trust_state = .locked_down;
+        return;
+    }
+    if (summary.high > 0) {
+        app.runtime.trust_state = switch (app.runtime.trust_state) {
+            .trusted, .hardened => .paranoid,
+            else => app.runtime.trust_state,
+        };
+    }
 }
 
 fn workspacePath(app: *app_mod.App, path: []const u8) ![]u8 {
@@ -248,4 +292,30 @@ test "blocked build command creates consent preview" {
     try std.testing.expect(app.pending_build_consent != null);
     const preview = app.pending_build_consent.?;
     try std.testing.expect(std.mem.indexOf(u8, preview.command, "zig build") != null);
+}
+
+test "hardened consent approval queues command" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+    app.runtime.trust_state = .hardened;
+
+    const blocked = try dispatch(&app, .{ .id = "zig.test" });
+    try std.testing.expect(std.meta.activeTag(blocked) == .blocked);
+    try std.testing.expect(app.pending_build_consent != null);
+
+    const approved = try dispatch(&app, .{ .id = "security.approve_consent" });
+    try std.testing.expect(std.meta.activeTag(approved) == .completed);
+    try std.testing.expectEqual(@as(usize, 1), app.execution_queue.queuedCount());
+    try std.testing.expect(app.pending_build_consent == null);
+}
+
+test "critical security scan locks workspace down" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+    app.runtime.trust_state = .trusted;
+    _ = try app.documents.createScratch("critical.zig", "const p = @ptrFromInt(0xdeadbeef);\n");
+
+    const result = try dispatch(&app, .{ .id = "security.scan_current" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expectEqual(@import("../security/trust.zig").TrustState.locked_down, app.runtime.trust_state);
 }

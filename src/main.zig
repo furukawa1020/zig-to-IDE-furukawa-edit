@@ -79,6 +79,8 @@ test {
     _ = @import("security/zig_scanner.zig");
     _ = @import("tasks/task.zig");
     _ = @import("tasks/console.zig");
+    _ = @import("tasks/execution_queue.zig");
+    _ = @import("tasks/executor.zig");
     _ = @import("terminal/ansi.zig");
     _ = @import("terminal/input.zig");
     _ = @import("terminal/renderer.zig");

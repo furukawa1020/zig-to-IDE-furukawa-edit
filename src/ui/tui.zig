@@ -139,6 +139,20 @@ fn renderBottomPanel(screen: *screen_mod.Screen, app: *const app_mod.App, rect: 
         }
     }
 
+    if (app.execution_queue.latest()) |ticket| {
+        if (row < rect.height) {
+            var line_buf: [512]u8 = undefined;
+            const text = std.fmt.bufPrint(&line_buf, "QUEUED {s} cwd={s} fs={s} net={s}", .{
+                ticket.display_command,
+                ticket.cwd,
+                @tagName(ticket.fs_policy),
+                @tagName(ticket.network_policy),
+            }) catch "QUEUED command";
+            screen.writeTextClipped(rect.x, rect.y + row, rect.width, text, .{ .fg = 2, .bg = 0, .bold = true });
+            row += 1;
+        }
+    }
+
     if (app.process_console.sanitized_stats.total() > 0 and row < rect.height) {
         var line_buf: [160]u8 = undefined;
         const text = std.fmt.bufPrint(&line_buf, "OUTPUT SANITIZER stripped {d} terminal control sequence(s)", .{
@@ -165,13 +179,14 @@ fn renderStatus(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layou
     } else "no-doc";
     const security = posture.summarize(&app.security_findings, app.runtime.trust_state);
     var status_buf: [256]u8 = undefined;
-    const status = std.fmt.bufPrint(&status_buf, " {s} | trust:{s} | posture:{s} | {s} | diag:{d} | sec:{d} | build:{s} | {s}", .{
+    const status = std.fmt.bufPrint(&status_buf, " {s} | trust:{s} | posture:{s} | {s} | diag:{d} | sec:{d} | queue:{d} | build:{s} | {s}", .{
         @tagName(app.mode),
         @tagName(app.runtime.trust_state),
         security.label,
         dirty,
         app.diagnostics.items.items.len,
         security.high,
+        app.execution_queue.queuedCount(),
         if (app.process_console.running) "running" else "idle",
         app.workspace.root_path,
     }) catch " zide";

@@ -150,6 +150,12 @@ fn securityDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
         .untrusted,
     );
     defer consent.deinit();
+    var approval_app = try app_mod.App.init(allocator, ".");
+    defer approval_app.deinit();
+    approval_app.runtime.trust_state = .hardened;
+    _ = try dispatcher.dispatch(&approval_app, .{ .id = "zig.test" });
+    _ = try dispatcher.dispatch(&approval_app, .{ .id = "security.approve_consent" });
+    _ = try dispatcher.dispatch(&approval_app, .{ .id = "task.preview_next" });
 
     try stdout.writeAll("security workbench demo\n-----------------------\n");
     try stdout.writeAll("workspace: UNTRUSTED | build: BLOCKED | output: SANITIZED\n\n");
@@ -159,6 +165,15 @@ fn securityDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
     for (consent.warnings) |warning| {
         try stdout.print("warning              : {s}\n", .{warning});
     }
+    try stdout.print("approved queue       : {d} command(s)\n", .{approval_app.execution_queue.queuedCount()});
+    if (approval_app.execution_queue.latest()) |ticket| {
+        try stdout.print("queued command       : {s}\n", .{ticket.display_command});
+        try stdout.print("queued policy        : fs={s} net={s}\n", .{
+            @tagName(ticket.fs_policy),
+            @tagName(ticket.network_policy),
+        });
+    }
+    try stdout.print("launch plan lines    : {d}\n", .{approval_app.process_console.lines.items.len});
     try stdout.writeAll("\n");
     try stdout.print("findings: {d} total, {d} high+\n", .{
         collection.items.items.len,

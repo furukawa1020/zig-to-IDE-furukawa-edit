@@ -29,12 +29,14 @@ test {
     _ = @import("core/runtime.zig");
     _ = @import("core/types.zig");
     _ = @import("build/steps.zig");
+    _ = @import("build/commands.zig");
     _ = @import("build/toolchain.zig");
     _ = @import("config/keymap.zig");
     _ = @import("config/model.zig");
     _ = @import("config/parser.zig");
     _ = @import("debug/session.zig");
     _ = @import("diagnostics/model.zig");
+    _ = @import("diagnostics/zig_output.zig");
     _ = @import("editor/buffer.zig");
     _ = @import("editor/cursor.zig");
     _ = @import("editor/document.zig");
@@ -55,6 +57,8 @@ test {
     _ = @import("platform/process.zig");
     _ = @import("platform/terminal.zig");
     _ = @import("search/fuzzy.zig");
+    _ = @import("search/literal.zig");
+    _ = @import("search/workspace_search.zig");
     _ = @import("security/permissions.zig");
     _ = @import("security/trust.zig");
     _ = @import("tasks/task.zig");

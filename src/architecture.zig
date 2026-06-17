@@ -32,6 +32,7 @@ const ui_calls = [_]LayerId{ .core, .editor, .workspace, .diagnostics };
 const editor_calls = [_]LayerId{ .persistence };
 const workspace_calls = [_]LayerId{ .platform, .persistence, .security, .observability };
 const language_calls = [_]LayerId{ .editor, .workspace };
+const search_calls = [_]LayerId{ .workspace, .platform };
 const build_calls = [_]LayerId{ .platform, .diagnostics, .security, .observability };
 const tasks_calls = [_]LayerId{ .platform, .security, .observability };
 const persistence_calls = [_]LayerId{ .platform, .security };
@@ -49,7 +50,7 @@ const specs = [_]LayerSpec{
     .{ .id = .workspace, .owns = "roots, file tree, watcher, sessions", .may_call = workspace_calls[0..] },
     .{ .id = .language, .owns = "Zig tokenizer/parser/AST/symbol/semantic plus file modes", .may_call = language_calls[0..] },
     .{ .id = .diagnostics, .owns = "diagnostic model and source mapping", .may_call = no_layers[0..] },
-    .{ .id = .search, .owns = "literal, pattern, workspace, fuzzy search", .may_call = no_layers[0..] },
+    .{ .id = .search, .owns = "literal, pattern, workspace, fuzzy search", .may_call = search_calls[0..] },
     .{ .id = .config, .owns = "config model, parser, keymap, theme settings", .may_call = config_calls[0..] },
     .{ .id = .build, .owns = "Zig toolchain, build/test/fmt/run integration", .may_call = build_calls[0..] },
     .{ .id = .tasks, .owns = "user task runner and process console", .may_call = tasks_calls[0..] },
@@ -88,4 +89,3 @@ pub fn layerName(id: LayerId) []const u8 {
 test "architecture lists all major layers" {
     try std.testing.expect(layers().len >= 16);
 }
-

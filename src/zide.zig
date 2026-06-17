@@ -9,6 +9,7 @@ pub const dispatcher = @import("core/dispatcher.zig");
 pub const event = @import("core/event.zig");
 pub const event_loop = @import("core/event_loop.zig");
 pub const input_handler = @import("core/input_handler.zig");
+pub const loop_runner = @import("core/loop_runner.zig");
 pub const runtime = @import("core/runtime.zig");
 pub const types = @import("core/types.zig");
 pub const buffer = @import("editor/buffer.zig");
@@ -24,6 +25,7 @@ pub const core = struct {
     pub const event = @import("core/event.zig");
     pub const event_loop = @import("core/event_loop.zig");
     pub const input_handler = @import("core/input_handler.zig");
+    pub const loop_runner = @import("core/loop_runner.zig");
     pub const runtime = @import("core/runtime.zig");
     pub const types = @import("core/types.zig");
 };
@@ -38,6 +40,7 @@ pub const terminal_layer = struct {
     pub const ansi = @import("terminal/ansi.zig");
     pub const input = @import("terminal/input.zig");
     pub const renderer = @import("terminal/renderer.zig");
+    pub const session = @import("terminal/session.zig");
     pub const screen = @import("terminal/screen.zig");
 };
 

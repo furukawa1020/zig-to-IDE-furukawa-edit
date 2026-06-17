@@ -10,11 +10,12 @@ pub fn renderHelp(stdout: anytype) !void {
         \\Usage:
         \\  zide [workspace]
         \\  zide commands
-        \\  zide demo [overview|architecture|languages|commands|editor|palette|dispatch|diagnostics|input|buffer|zig-tokens]
+        \\  zide demo [overview|architecture|languages|commands|editor|palette|dispatch|diagnostics|input|loop|screen|buffer|zig-tokens]
         \\  zide --version
         \\
-        \\The current slice renders a TUI-style overview and internal demos.
-        \\Raw terminal mode, panels, process streaming, and editing UI come next.
+        \\The current slice has a virtual screen, input decoding, command dispatch,
+        \\document editing, diagnostics parsing, and internal demos.
+        \\OS raw mode and live process spawning are the next big wires.
         \\
     );
 }

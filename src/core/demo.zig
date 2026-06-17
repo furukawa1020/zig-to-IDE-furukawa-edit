@@ -6,14 +6,18 @@ const cli = @import("../cli.zig");
 const command = @import("command.zig");
 const dispatcher = @import("dispatcher.zig");
 const event = @import("event.zig");
+const event_loop = @import("event_loop.zig");
 const input_handler = @import("input_handler.zig");
+const loop_runner = @import("loop_runner.zig");
 const buffer = @import("../editor/buffer.zig");
 const document_store = @import("../editor/store.zig");
 const modes = @import("../language/modes.zig");
 const literal = @import("../search/literal.zig");
+const terminal_renderer = @import("../terminal/renderer.zig");
 const tokenizer = @import("../language/zig_tokenizer.zig");
 const palette_mod = @import("../ui/command_palette.zig");
 const render = @import("../ui/render.zig");
+const tui = @import("../ui/tui.zig");
 
 pub fn run(allocator: std.mem.Allocator, kind: cli.DemoName, stdout: anytype) !void {
     switch (kind) {
@@ -26,6 +30,8 @@ pub fn run(allocator: std.mem.Allocator, kind: cli.DemoName, stdout: anytype) !v
         .dispatch => try dispatchDemo(allocator, stdout),
         .diagnostics => try diagnosticsDemo(allocator, stdout),
         .input => try inputDemo(allocator, stdout),
+        .loop => try loopDemo(allocator, stdout),
+        .screen => try screenDemo(allocator, stdout),
         .buffer => try bufferDemo(allocator, stdout),
         .zig_tokens => try zigTokens(stdout),
     }
@@ -51,6 +57,8 @@ fn overview(stdout: anytype) !void {
         \\  zide demo dispatch
         \\  zide demo diagnostics
         \\  zide demo input
+        \\  zide demo loop
+        \\  zide demo screen
         \\  zide demo buffer
         \\  zide demo zig-tokens
         \\
@@ -70,6 +78,41 @@ fn architectureDemo(stdout: anytype) !void {
             try stdout.writeAll("\n");
         }
     }
+}
+
+fn loopDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
+    var app = try app_mod.App.init(allocator, ".");
+    defer app.deinit();
+    var loop = event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+
+    try loop_runner.pushInputBytes(&loop, &.{0x10});
+    const result = try loop_runner.drain(&app, &loop);
+
+    try stdout.writeAll("event loop demo\n---------------\n");
+    try stdout.print("handled : {d}\n", .{result.handled});
+    try stdout.print("redraw  : {}\n", .{result.redraw_requested});
+    try stdout.print("palette : {s}\n", .{if (app.palette.visible) "open" else "closed"});
+}
+
+fn screenDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
+    var app = try app_mod.App.init(allocator, ".");
+    defer app.deinit();
+    _ = try app.documents.createScratch("screen-demo.zig",
+        \\const std = @import("std");
+        \\
+        \\pub fn main() void {
+        \\    std.debug.print("screen\n", .{});
+        \\}
+        \\
+    );
+    try app.palette.open();
+    try app.palette.setQuery("zig");
+
+    var screen = try tui.renderApp(allocator, &app, 80, 22);
+    defer screen.deinit();
+
+    try terminal_renderer.renderPlain(stdout, &screen);
 }
 
 fn inputDemo(allocator: std.mem.Allocator, stdout: anytype) !void {

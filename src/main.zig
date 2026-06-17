@@ -28,6 +28,7 @@ test {
     _ = @import("core/event.zig");
     _ = @import("core/event_loop.zig");
     _ = @import("core/input_handler.zig");
+    _ = @import("core/loop_runner.zig");
     _ = @import("core/runtime.zig");
     _ = @import("core/types.zig");
     _ = @import("build/steps.zig");
@@ -73,6 +74,7 @@ test {
     _ = @import("terminal/ansi.zig");
     _ = @import("terminal/input.zig");
     _ = @import("terminal/renderer.zig");
+    _ = @import("terminal/session.zig");
     _ = @import("terminal/screen.zig");
     _ = @import("ui/layout.zig");
     _ = @import("ui/command_palette.zig");

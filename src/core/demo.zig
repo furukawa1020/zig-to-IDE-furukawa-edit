@@ -1,12 +1,15 @@
 const std = @import("std");
 const architecture = @import("../architecture.zig");
+const app_mod = @import("app.zig");
 const cli = @import("../cli.zig");
 const command = @import("command.zig");
+const dispatcher = @import("dispatcher.zig");
 const buffer = @import("../editor/buffer.zig");
 const document_store = @import("../editor/store.zig");
 const modes = @import("../language/modes.zig");
 const literal = @import("../search/literal.zig");
 const tokenizer = @import("../language/zig_tokenizer.zig");
+const palette_mod = @import("../ui/command_palette.zig");
 const render = @import("../ui/render.zig");
 
 pub fn run(allocator: std.mem.Allocator, kind: cli.DemoName, stdout: anytype) !void {
@@ -16,6 +19,8 @@ pub fn run(allocator: std.mem.Allocator, kind: cli.DemoName, stdout: anytype) !v
         .languages => try languages(stdout),
         .commands => try render.renderCommands(stdout),
         .editor => try editorDemo(allocator, stdout),
+        .palette => try paletteDemo(allocator, stdout),
+        .dispatch => try dispatchDemo(allocator, stdout),
         .buffer => try bufferDemo(allocator, stdout),
         .zig_tokens => try zigTokens(stdout),
     }
@@ -37,6 +42,8 @@ fn overview(stdout: anytype) !void {
         \\  zide demo languages
         \\  zide demo commands
         \\  zide demo editor
+        \\  zide demo palette
+        \\  zide demo dispatch
         \\  zide demo buffer
         \\  zide demo zig-tokens
         \\
@@ -56,6 +63,35 @@ fn architectureDemo(stdout: anytype) !void {
             try stdout.writeAll("\n");
         }
     }
+}
+
+fn paletteDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
+    var palette = palette_mod.CommandPalette.init(allocator);
+    defer palette.deinit();
+
+    try palette.open();
+    try palette.setQuery("zig");
+
+    try stdout.writeAll("command palette demo\n--------------------\n");
+    try stdout.print("query   : {s}\n", .{palette.query.items});
+    try stdout.print("matches : {d}\n\n", .{palette.matches.items.len});
+
+    const limit = @min(palette.matches.items.len, 8);
+    for (palette.matches.items[0..limit]) |match| {
+        try stdout.print("{d:>3}  {s:<24} {s}\n", .{ match.score, match.definition.id, match.definition.title });
+    }
+}
+
+fn dispatchDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
+    var app = try app_mod.App.init(allocator, ".");
+    defer app.deinit();
+
+    const result = try dispatcher.dispatch(&app, .{ .id = "view.command_palette" });
+
+    try stdout.writeAll("dispatch demo\n-------------\n");
+    try stdout.print("result  : {s}\n", .{@tagName(std.meta.activeTag(result))});
+    try stdout.print("mode    : {s}\n", .{@tagName(app.mode)});
+    try stdout.print("palette : {s}\n", .{if (app.palette.visible) "open" else "closed"});
 }
 
 fn editorDemo(allocator: std.mem.Allocator, stdout: anytype) !void {

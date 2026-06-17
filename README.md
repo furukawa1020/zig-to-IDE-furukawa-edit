@@ -48,6 +48,8 @@ Zigを書く人間の手元に置く、Zigっぽい作業台を作る。
 
 設計の地図は [docs/architecture.md](docs/architecture.md) にあります。
 ここは飾りではなく、実装が迷子にならないための背骨です。
+セキュリティの地図は [docs/security.md](docs/security.md) にあります。
+ここは「怖いから注意」ではなく、ZIDEの振る舞いを決めるルールです。
 
 ## 動かす
 

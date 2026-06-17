@@ -9,7 +9,7 @@ pub const Preview = struct {
     cwd: []u8,
     trust_state: trust.TrustState,
     consent: permissions.Consent,
-    warnings: []const []const u8,
+    warnings: [][]const u8,
 
     pub fn deinit(self: *Preview) void {
         self.allocator.free(self.command);
@@ -63,4 +63,3 @@ test "consent preview names command and trust state" {
     try std.testing.expect(std.mem.indexOf(u8, preview.command, "zig build test") != null);
     try std.testing.expect(preview.warnings.len > 0);
 }
-

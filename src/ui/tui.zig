@@ -124,6 +124,15 @@ fn renderBottomPanel(screen: *screen_mod.Screen, app: *const app_mod.App, rect: 
         row += 1;
     }
 
+    if (app.process_console.sanitized_stats.total() > 0 and row < rect.height) {
+        var line_buf: [160]u8 = undefined;
+        const text = std.fmt.bufPrint(&line_buf, "OUTPUT SANITIZER stripped {d} terminal control sequence(s)", .{
+            app.process_console.sanitized_stats.total(),
+        }) catch "OUTPUT SANITIZER active";
+        screen.writeTextClipped(rect.x, rect.y + row, rect.width, text, .{ .fg = 3, .bg = 0 });
+        row += 1;
+    }
+
     for (app.process_console.lines.items) |line| {
         if (row >= rect.height) break;
         screen.writeTextClipped(rect.x, rect.y + row, rect.width, line.text, .{ .fg = if (line.stream == .stderr) 1 else 7, .bg = 0 });

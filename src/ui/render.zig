@@ -45,6 +45,7 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
         instance.diagnostics.countBySeverity(.warning),
     });
     try stdout.print("security  : {d} high+ finding(s)\n", .{instance.security_findings.countRiskAtLeast(.high)});
+    try stdout.print("sanitized : {d} terminal control sequence(s)\n", .{instance.process_console.sanitized_stats.total()});
     try stdout.print("process   : {s}\n\n", .{if (instance.process_console.running) "running" else "idle"});
 
     try stdout.writeAll("file tree preview\n-----------------\n");

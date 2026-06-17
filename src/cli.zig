@@ -29,7 +29,7 @@ pub const Options = struct {
     action: Action,
 };
 
-pub fn parse(args: []const []const u8) Options {
+pub fn parse(args: anytype) Options {
     if (args.len <= 1) {
         return .{ .action = .{ .open = "." } };
     }

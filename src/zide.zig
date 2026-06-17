@@ -8,6 +8,7 @@ pub const demo = @import("core/demo.zig");
 pub const dispatcher = @import("core/dispatcher.zig");
 pub const event = @import("core/event.zig");
 pub const event_loop = @import("core/event_loop.zig");
+pub const input_handler = @import("core/input_handler.zig");
 pub const runtime = @import("core/runtime.zig");
 pub const types = @import("core/types.zig");
 pub const buffer = @import("editor/buffer.zig");
@@ -22,6 +23,7 @@ pub const core = struct {
     pub const dispatcher = @import("core/dispatcher.zig");
     pub const event = @import("core/event.zig");
     pub const event_loop = @import("core/event_loop.zig");
+    pub const input_handler = @import("core/input_handler.zig");
     pub const runtime = @import("core/runtime.zig");
     pub const types = @import("core/types.zig");
 };

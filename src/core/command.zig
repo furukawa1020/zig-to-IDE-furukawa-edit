@@ -65,6 +65,7 @@ const definitions = [_]Definition{
     .{ .id = "zig.fmt", .title = "Zig Format", .description = "Format the current Zig file using zig fmt.", .default_key = "ctrl-alt-f", .scope = .zig, .capability = .external_command },
     .{ .id = "task.run", .title = "Run Task", .description = "Run a configured project task.", .default_key = "ctrl-r", .scope = .task, .capability = .external_command },
     .{ .id = "task.preview_next", .title = "Preview Next Command", .description = "Render the latest approved launch plan without spawning it.", .default_key = "", .scope = .task, .capability = .safe },
+    .{ .id = "task.run_next", .title = "Run Approved Command", .description = "Run the next explicitly approved command and capture sanitized output.", .default_key = "", .scope = .task, .capability = .safe },
     .{ .id = "view.toggle_file_tree", .title = "Toggle File Tree", .description = "Show or hide the file tree.", .default_key = "ctrl-e", .scope = .view, .capability = .safe },
     .{ .id = "view.toggle_diagnostics", .title = "Toggle Diagnostics", .description = "Show or hide diagnostics.", .default_key = "ctrl-d", .scope = .view, .capability = .safe },
     .{ .id = "view.command_palette", .title = "Command Palette", .description = "Open the command palette.", .default_key = "ctrl-shift-p", .scope = .view, .capability = .safe },

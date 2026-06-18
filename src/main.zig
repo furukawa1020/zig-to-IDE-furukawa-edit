@@ -11,7 +11,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     var stderr = std.Io.File.stderr().writer(init.io, &stderr_buffer);
 
-    try zide.run(allocator, options, &stdout.interface, &stderr.interface);
+    try zide.runWithProcess(allocator, options, init.io, init.minimal.environ, &stdout.interface, &stderr.interface);
     try stdout.interface.flush();
     try stderr.interface.flush();
 }

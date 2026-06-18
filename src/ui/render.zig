@@ -15,8 +15,8 @@ pub fn renderHelp(stdout: anytype) !void {
         \\  zide --version
         \\
         \\The current slice has a virtual screen, input decoding, command dispatch,
-        \\document editing, diagnostics parsing, and internal demos.
-        \\OS raw mode and live process spawning are the next big wires.
+        \\document editing, diagnostics parsing, approved command execution,
+        \\output sanitization, and internal demos.
         \\
     );
 }

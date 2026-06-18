@@ -149,9 +149,20 @@ pub fn run(
     stdout: anytype,
     stderr: anytype,
 ) !void {
+    try runWithProcess(allocator, options, std.Options.debug_io, std.process.Environ.empty, stdout, stderr);
+}
+
+pub fn runWithProcess(
+    allocator: std.mem.Allocator,
+    options: cli.Options,
+    io: std.Io,
+    environ: std.process.Environ,
+    stdout: anytype,
+    stderr: anytype,
+) !void {
     switch (options.action) {
         .open => |path| {
-            var instance = app.App.init(allocator, path) catch |err| {
+            var instance = app.App.initWithProcess(allocator, path, io, environ) catch |err| {
                 try stderr.print("zide: workspace open failed for '{s}': {s}\n", .{ path, @errorName(err) });
                 return err;
             };

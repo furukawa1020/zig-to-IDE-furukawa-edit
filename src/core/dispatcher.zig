@@ -208,6 +208,22 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         };
     }
 
+    if (std.mem.eql(u8, definition.id, "task.run_next")) {
+        return switch (try executor.runNext(&app.execution_queue, &app.process_console, .{
+            .workspace_root = app.workspace.root_path,
+            .io = app.io,
+            .environ = app.environ,
+        })) {
+            .ran => |exit_code| if (exit_code == 0)
+                .{ .completed = "approved command finished" }
+            else
+                .{ .completed = "approved command finished with non-zero exit" },
+            .empty_queue => .{ .blocked = "no approved command in execution queue" },
+            .blocked => |message| .{ .blocked = message },
+            .failed => |message| .{ .blocked = message },
+        };
+    }
+
     if (std.mem.eql(u8, definition.id, "zig.build")) {
         app.clearPendingBuildConsent();
         return .{ .external_command = zigCommand(app, .build) };

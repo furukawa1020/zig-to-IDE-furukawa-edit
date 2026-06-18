@@ -18,6 +18,8 @@ pub const Mode = enum {
 
 pub const App = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
     runtime: runtime.Runtime,
     mode: Mode,
     workspace: workspace.Workspace,
@@ -31,6 +33,15 @@ pub const App = struct {
     execution_queue: execution_queue.Queue,
 
     pub fn init(allocator: std.mem.Allocator, root_path: []const u8) !App {
+        return initWithProcess(allocator, root_path, std.Options.debug_io, std.process.Environ.empty);
+    }
+
+    pub fn initWithProcess(
+        allocator: std.mem.Allocator,
+        root_path: []const u8,
+        io: std.Io,
+        environ: std.process.Environ,
+    ) !App {
         const open_kind = detectOpenKind(root_path);
         const workspace_path = if (open_kind == .file)
             std.fs.path.dirname(root_path) orelse "."
@@ -39,6 +50,8 @@ pub const App = struct {
 
         var self = App{
             .allocator = allocator,
+            .io = io,
+            .environ = environ,
             .runtime = runtime.Runtime.init(allocator),
             .mode = .normal,
             .workspace = try workspace.Workspace.open(allocator, workspace_path),

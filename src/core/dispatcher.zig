@@ -224,6 +224,13 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         };
     }
 
+    if (std.mem.eql(u8, definition.id, "task.history")) {
+        return switch (try executor.renderHistory(&app.execution_queue, &app.process_console)) {
+            .rendered => .{ .completed = "task history rendered" },
+            .empty_history => .{ .blocked = "no approved command history" },
+        };
+    }
+
     if (std.mem.eql(u8, definition.id, "zig.build")) {
         app.clearPendingBuildConsent();
         return .{ .external_command = zigCommand(app, .build) };
@@ -323,6 +330,33 @@ test "hardened consent approval queues command" {
     try std.testing.expect(std.meta.activeTag(approved) == .completed);
     try std.testing.expectEqual(@as(usize, 1), app.execution_queue.queuedCount());
     try std.testing.expect(app.pending_build_consent == null);
+}
+
+test "task history command renders recorded command results" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+
+    try app.execution_queue.enqueueSpec("zig.build", .{
+        .command = .{
+            .executable = "zig",
+            .args = &.{"build"},
+            .cwd = ".",
+        },
+    }, .{
+        .command = "zig build",
+        .cwd = ".",
+        .env_policy = .allowlist,
+        .fs_policy = .workspace_only,
+        .network_policy = .deny,
+        .output_sanitized = true,
+    });
+    var ticket = app.execution_queue.takeNextQueued() orelse return error.ExpectedTicket;
+    defer ticket.deinit();
+    try app.execution_queue.recordHistory(&ticket, .finished, 0, 2, 0);
+
+    const result = try dispatch(&app, .{ .id = "task.history" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expect(app.process_console.lines.items.len > 0);
 }
 
 test "critical security scan locks workspace down" {

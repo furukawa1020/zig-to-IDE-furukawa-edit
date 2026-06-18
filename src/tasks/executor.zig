@@ -8,6 +8,11 @@ pub const PreviewResult = enum {
     empty_queue,
 };
 
+pub const HistoryResult = enum {
+    rendered,
+    empty_history,
+};
+
 pub const RunOptions = struct {
     workspace_root: []const u8,
     io: std.Io = std.Options.debug_io,
@@ -43,6 +48,36 @@ pub fn previewLatest(queue: *const execution_queue.Queue, process_console: *cons
     return .rendered;
 }
 
+pub fn renderHistory(queue: *const execution_queue.Queue, process_console: *console.ProcessConsole) !HistoryResult {
+    if (queue.history.items.len == 0) return .empty_history;
+
+    var text: std.Io.Writer.Allocating = .init(process_console.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("task history\n");
+    for (queue.history.items, 0..) |entry, index| {
+        try writer.print("{d}: {s} {s}", .{
+            index + 1,
+            @tagName(entry.state),
+            entry.display_command,
+        });
+        if (entry.exit_code) |code| {
+            try writer.print(" exit={d}", .{code});
+        } else {
+            try writer.writeAll(" exit=none");
+        }
+        try writer.print(" lines={d} sanitized={d} cwd={s}\n", .{
+            entry.output_lines,
+            entry.sanitized_controls,
+            entry.cwd,
+        });
+    }
+
+    try process_console.appendBytes(.stdout, text.written());
+    return .rendered;
+}
+
 pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessConsole, options: RunOptions) !RunResult {
     var ticket = queue.takeNextQueued() orelse return .empty_queue;
     defer ticket.deinit();
@@ -52,6 +87,7 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
         const message = "approved command cwd is outside the permitted workspace boundary";
         try appendFormatted(process_console, .stderr, "blocked: {s}\n", .{message});
         process_console.finish(-1);
+        try queue.recordHistory(&ticket, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
         return .{ .blocked = message };
     }
 
@@ -59,6 +95,7 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
         const message = "approved command looks networked but network policy is deny";
         try appendFormatted(process_console, .stderr, "blocked: {s}\n", .{message});
         process_console.finish(-1);
+        try queue.recordHistory(&ticket, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
         return .{ .blocked = message };
     }
 
@@ -83,6 +120,7 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
     }) catch |err| {
         try appendFormatted(process_console, .stderr, "spawn failed: {s}\n", .{@errorName(err)});
         process_console.finish(-1);
+        try queue.recordHistory(&ticket, .failed, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
         return .{ .failed = @errorName(err) };
     };
     defer process_console.allocator.free(result.stdout);
@@ -93,6 +131,7 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
     const exit_code = termExitCode(result.term);
     process_console.finish(exit_code);
     try appendFormatted(process_console, .stdout, "exit: {d}\n", .{exit_code});
+    try queue.recordHistory(&ticket, .finished, exit_code, process_console.lines.items.len, process_console.sanitized_stats.total());
 
     return .{ .ran = exit_code };
 }
@@ -202,6 +241,34 @@ test "executor renders latest queued launch plan" {
     try std.testing.expect(process_console.lines.items.len > 0);
 }
 
+test "executor renders task history" {
+    var queue = execution_queue.Queue.init(std.testing.allocator);
+    defer queue.deinit();
+    var process_console = console.ProcessConsole.init(std.testing.allocator);
+    defer process_console.deinit();
+
+    try queue.enqueueSpec("zig.build", .{
+        .command = .{
+            .executable = "zig",
+            .args = &.{"build"},
+            .cwd = ".",
+        },
+    }, .{
+        .command = "zig build",
+        .cwd = ".",
+        .env_policy = .allowlist,
+        .fs_policy = .workspace_only,
+        .network_policy = .deny,
+        .output_sanitized = true,
+    });
+    var ticket = queue.takeNextQueued() orelse return error.ExpectedTicket;
+    defer ticket.deinit();
+    try queue.recordHistory(&ticket, .finished, 0, 2, 0);
+
+    try std.testing.expectEqual(HistoryResult.rendered, try renderHistory(&queue, &process_console));
+    try std.testing.expect(process_console.lines.items.len > 0);
+}
+
 test "runner blocks approved command cwd traversal before spawn" {
     var queue = execution_queue.Queue.init(std.testing.allocator);
     defer queue.deinit();
@@ -226,6 +293,8 @@ test "runner blocks approved command cwd traversal before spawn" {
     const result = try runNext(&queue, &process_console, .{ .workspace_root = "." });
     try std.testing.expect(std.meta.activeTag(result) == .blocked);
     try std.testing.expectEqual(@as(usize, 0), queue.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), queue.history.items.len);
+    try std.testing.expectEqual(execution_queue.State.blocked, queue.latestHistory().?.state);
     try std.testing.expect(process_console.lines.items.len > 0);
 }
 
@@ -253,4 +322,5 @@ test "runner blocks obvious network command when network is denied" {
     const result = try runNext(&queue, &process_console, .{ .workspace_root = "." });
     try std.testing.expect(std.meta.activeTag(result) == .blocked);
     try std.testing.expect(process_console.exit_code.? == -1);
+    try std.testing.expectEqual(execution_queue.State.blocked, queue.latestHistory().?.state);
 }

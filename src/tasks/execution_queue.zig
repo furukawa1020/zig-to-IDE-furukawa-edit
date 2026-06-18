@@ -7,6 +7,8 @@ pub const State = enum {
     running,
     finished,
     cancelled,
+    blocked,
+    failed,
 };
 
 pub const Ticket = struct {
@@ -81,19 +83,76 @@ pub const Ticket = struct {
     }
 };
 
+pub const HistoryEntry = struct {
+    allocator: std.mem.Allocator,
+    source_command_id: []u8,
+    display_command: []u8,
+    cwd: []u8,
+    env_policy: permissions.EnvPolicy,
+    fs_policy: permissions.FileSystemPolicy,
+    network_policy: permissions.NetworkPolicy,
+    output_sanitized: bool,
+    state: State,
+    exit_code: ?i32,
+    output_lines: usize,
+    sanitized_controls: usize,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        ticket: *const Ticket,
+        state: State,
+        exit_code: ?i32,
+        output_lines: usize,
+        sanitized_controls: usize,
+    ) !HistoryEntry {
+        const owned_source = try allocator.dupe(u8, ticket.source_command_id);
+        errdefer allocator.free(owned_source);
+        const owned_display = try allocator.dupe(u8, ticket.display_command);
+        errdefer allocator.free(owned_display);
+        const owned_cwd = try allocator.dupe(u8, ticket.cwd);
+        errdefer allocator.free(owned_cwd);
+
+        return .{
+            .allocator = allocator,
+            .source_command_id = owned_source,
+            .display_command = owned_display,
+            .cwd = owned_cwd,
+            .env_policy = ticket.env_policy,
+            .fs_policy = ticket.fs_policy,
+            .network_policy = ticket.network_policy,
+            .output_sanitized = ticket.output_sanitized,
+            .state = state,
+            .exit_code = exit_code,
+            .output_lines = output_lines,
+            .sanitized_controls = sanitized_controls,
+        };
+    }
+
+    pub fn deinit(self: *HistoryEntry) void {
+        self.allocator.free(self.source_command_id);
+        self.allocator.free(self.display_command);
+        self.allocator.free(self.cwd);
+        self.* = undefined;
+    }
+};
+
 pub const Queue = struct {
     allocator: std.mem.Allocator,
     tickets: std.array_list.Managed(Ticket),
+    history: std.array_list.Managed(HistoryEntry),
+    max_history: usize = 64,
 
     pub fn init(allocator: std.mem.Allocator) Queue {
         return .{
             .allocator = allocator,
             .tickets = std.array_list.Managed(Ticket).init(allocator),
+            .history = std.array_list.Managed(HistoryEntry).init(allocator),
         };
     }
 
     pub fn deinit(self: *Queue) void {
         self.clear();
+        self.history.deinit();
         self.tickets.deinit();
         self.* = undefined;
     }
@@ -101,6 +160,8 @@ pub const Queue = struct {
     pub fn clear(self: *Queue) void {
         for (self.tickets.items) |*ticket| ticket.deinit();
         self.tickets.clearRetainingCapacity();
+        for (self.history.items) |*entry| entry.deinit();
+        self.history.clearRetainingCapacity();
     }
 
     pub fn enqueue(self: *Queue, ticket: Ticket) !void {
@@ -132,6 +193,39 @@ pub const Queue = struct {
     pub fn latest(self: *const Queue) ?*const Ticket {
         if (self.tickets.items.len == 0) return null;
         return &self.tickets.items[self.tickets.items.len - 1];
+    }
+
+    pub fn latestHistory(self: *const Queue) ?*const HistoryEntry {
+        if (self.history.items.len == 0) return null;
+        return &self.history.items[self.history.items.len - 1];
+    }
+
+    pub fn recordHistory(
+        self: *Queue,
+        ticket: *const Ticket,
+        state: State,
+        exit_code: ?i32,
+        output_lines: usize,
+        sanitized_controls: usize,
+    ) !void {
+        if (self.history.items.len >= self.max_history) {
+            var first = self.history.orderedRemove(0);
+            first.deinit();
+        }
+
+        const entry = try HistoryEntry.init(
+            self.allocator,
+            ticket,
+            state,
+            exit_code,
+            output_lines,
+            sanitized_controls,
+        );
+        errdefer {
+            var owned = entry;
+            owned.deinit();
+        }
+        try self.history.append(entry);
     }
 
     pub fn takeNextQueued(self: *Queue) ?Ticket {
@@ -191,4 +285,34 @@ test "execution queue hands ownership to runner" {
 
     try std.testing.expectEqual(@as(usize, 0), queue.queuedCount());
     try std.testing.expectEqualStrings("zig", ticket.executable);
+}
+
+test "execution queue records bounded run history" {
+    var queue = Queue.init(std.testing.allocator);
+    defer queue.deinit();
+    queue.max_history = 1;
+
+    try queue.enqueueSpec("zig.build", .{
+        .command = .{
+            .executable = "zig",
+            .args = &.{ "build" },
+            .cwd = ".",
+        },
+    }, .{
+        .command = "zig build",
+        .cwd = ".",
+        .env_policy = .allowlist,
+        .fs_policy = .workspace_only,
+        .network_policy = .deny,
+        .output_sanitized = true,
+    });
+
+    var first = queue.takeNextQueued() orelse return error.ExpectedTicket;
+    defer first.deinit();
+    try queue.recordHistory(&first, .finished, 0, 3, 1);
+    try queue.recordHistory(&first, .failed, -1, 4, 2);
+
+    try std.testing.expectEqual(@as(usize, 1), queue.history.items.len);
+    try std.testing.expectEqual(State.failed, queue.latestHistory().?.state);
+    try std.testing.expectEqual(@as(usize, 2), queue.latestHistory().?.sanitized_controls);
 }

@@ -55,6 +55,7 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
     try stdout.print("recommend : {s}\n", .{@tagName(security.recommended_trust)});
     try stdout.print("sanitized : {d} terminal control sequence(s)\n", .{instance.process_console.sanitized_stats.total()});
     try stdout.print("queue     : {d} approved command(s)\n", .{instance.execution_queue.queuedCount()});
+    try stdout.print("history   : {d} completed command(s)\n", .{instance.execution_queue.history.items.len});
     try stdout.print("process   : {s}\n\n", .{if (instance.process_console.running) "running" else "idle"});
 
     if (instance.pending_build_consent) |preview| {
@@ -79,6 +80,20 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
             @tagName(ticket.fs_policy),
             @tagName(ticket.network_policy),
         });
+    }
+
+    if (instance.execution_queue.latestHistory()) |entry| {
+        try stdout.writeAll("latest command result\n---------------------\n");
+        try stdout.print("source    : {s}\n", .{entry.source_command_id});
+        try stdout.print("command   : {s}\n", .{entry.display_command});
+        try stdout.print("state     : {s}\n", .{@tagName(entry.state)});
+        if (entry.exit_code) |code| {
+            try stdout.print("exit      : {d}\n", .{code});
+        } else {
+            try stdout.writeAll("exit      : none\n");
+        }
+        try stdout.print("lines     : {d}\n", .{entry.output_lines});
+        try stdout.print("sanitized : {d}\n\n", .{entry.sanitized_controls});
     }
 
     try stdout.writeAll("file tree preview\n-----------------\n");

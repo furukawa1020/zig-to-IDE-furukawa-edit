@@ -153,6 +153,29 @@ fn renderBottomPanel(screen: *screen_mod.Screen, app: *const app_mod.App, rect: 
         }
     }
 
+    if (app.execution_queue.latestHistory()) |entry| {
+        if (row < rect.height) {
+            var line_buf: [512]u8 = undefined;
+            const text = if (entry.exit_code) |code|
+                std.fmt.bufPrint(&line_buf, "LAST {s} exit={d} lines={d} sanitized={d} {s}", .{
+                    @tagName(entry.state),
+                    code,
+                    entry.output_lines,
+                    entry.sanitized_controls,
+                    entry.display_command,
+                }) catch "LAST command result"
+            else
+                std.fmt.bufPrint(&line_buf, "LAST {s} exit=none lines={d} sanitized={d} {s}", .{
+                    @tagName(entry.state),
+                    entry.output_lines,
+                    entry.sanitized_controls,
+                    entry.display_command,
+                }) catch "LAST command result";
+            screen.writeTextClipped(rect.x, rect.y + row, rect.width, text, .{ .fg = if (entry.state == .finished) 2 else 3, .bg = 0, .bold = true });
+            row += 1;
+        }
+    }
+
     if (app.process_console.sanitized_stats.total() > 0 and row < rect.height) {
         var line_buf: [160]u8 = undefined;
         const text = std.fmt.bufPrint(&line_buf, "OUTPUT SANITIZER stripped {d} terminal control sequence(s)", .{
@@ -179,7 +202,7 @@ fn renderStatus(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layou
     } else "no-doc";
     const security = posture.summarize(&app.security_findings, app.runtime.trust_state);
     var status_buf: [256]u8 = undefined;
-    const status = std.fmt.bufPrint(&status_buf, " {s} | trust:{s} | posture:{s} | {s} | diag:{d} | sec:{d} | queue:{d} | build:{s} | {s}", .{
+    const status = std.fmt.bufPrint(&status_buf, " {s} | trust:{s} | posture:{s} | {s} | diag:{d} | sec:{d} | queue:{d} | hist:{d} | build:{s} | {s}", .{
         @tagName(app.mode),
         @tagName(app.runtime.trust_state),
         security.label,
@@ -187,6 +210,7 @@ fn renderStatus(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layou
         app.diagnostics.items.items.len,
         security.high,
         app.execution_queue.queuedCount(),
+        app.execution_queue.history.items.len,
         if (app.process_console.running) "running" else "idle",
         app.workspace.root_path,
     }) catch " zide";

@@ -40,20 +40,25 @@ fn renderFrame(screen: *screen_mod.Screen, app: *const app_mod.App, root: layout
 fn renderFileTree(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layout.Rect) void {
     if (rect.width == 0 or rect.height == 0) return;
     screen.fillRect(rect.x, rect.y, rect.width, rect.height, ' ', .{ .fg = 7, .bg = 0 });
-    screen.writeTextClipped(rect.x, rect.y, rect.width, " FILES", .{ .fg = 6, .bg = 0, .bold = true });
+    const title = if (app.focus == .files) " FILES *" else " FILES";
+    screen.writeTextClipped(rect.x, rect.y, rect.width, title, .{ .fg = 6, .bg = 0, .bold = true });
 
     var row: u16 = 1;
-    for (app.workspace.entries.items) |entry| {
+    const visible_rows = if (rect.height > 1) rect.height - 1 else 0;
+    const start_index = fileTreeStartIndex(app.file_cursor, visible_rows, app.workspace.entries.items.len);
+    for (app.workspace.entries.items[start_index..], start_index..) |entry, index| {
         if (row >= rect.height) break;
         const prefix = switch (entry.kind) {
             .file => "  ",
             .directory => "+ ",
             .other => "? ",
         };
-        const style = if (modes.isZigFamily(entry.language))
-            Style{ .fg = 2, .bg = 0 }
+        const selected = index == app.file_cursor;
+        const base_fg: u8 = if (modes.isZigFamily(entry.language)) 2 else 7;
+        const style = if (selected)
+            Style{ .fg = 0, .bg = 6, .bold = true }
         else
-            Style{ .fg = 7, .bg = 0 };
+            Style{ .fg = base_fg, .bg = 0 };
         screen.writeTextClipped(rect.x, rect.y + row, rect.width, prefix, style);
         const prefix_width = @as(u16, @intCast(prefix.len));
         const name_x = rect.x + prefix_width;
@@ -61,6 +66,13 @@ fn renderFileTree(screen: *screen_mod.Screen, app: *const app_mod.App, rect: lay
         screen.writeTextClipped(name_x, rect.y + row, name_width, entry.path, style);
         row += 1;
     }
+}
+
+fn fileTreeStartIndex(cursor: usize, visible_rows: u16, total: usize) usize {
+    if (total == 0 or visible_rows == 0) return 0;
+    const visible = @as(usize, visible_rows);
+    if (cursor < visible) return 0;
+    return cursor - visible + 1;
 }
 
 fn renderEditor(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layout.Rect) void {
@@ -78,7 +90,9 @@ fn renderEditor(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layou
     screen.writeTextClipped(rect.x, rect.y, rect.width, title, .{ .fg = 6, .bg = 0, .bold = true });
 
     var row: u16 = 1;
-    var line: usize = 0;
+    const visible_rows = if (rect.height > 1) rect.height - 1 else 0;
+    const start_line = editorStartLine(document.cursor.position.line, visible_rows, document.text.lineCount());
+    var line: usize = start_line;
     while (row < rect.height and line < document.text.lineCount()) {
         var number_buf: [8]u8 = undefined;
         const number = std.fmt.bufPrint(&number_buf, "{d:>4} ", .{line + 1}) catch "";
@@ -86,9 +100,30 @@ fn renderEditor(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layou
         if (rect.width > 5) {
             screen.writeTextClipped(rect.x + 5, rect.y + row, rect.width - 5, document.text.lineSlice(line), .{ .fg = 7, .bg = 0 });
         }
+        if (app.focus == .editor and line == document.cursor.position.line) {
+            renderCursor(screen, document, rect, row);
+        }
         row += 1;
         line += 1;
     }
+}
+
+fn editorStartLine(cursor_line: usize, visible_rows: u16, total: usize) usize {
+    if (total == 0 or visible_rows == 0) return 0;
+    const visible = @as(usize, visible_rows);
+    if (cursor_line < visible) return 0;
+    return cursor_line - visible + 1;
+}
+
+fn renderCursor(screen: *screen_mod.Screen, document: *const @import("../editor/document.zig").Document, rect: layout.Rect, row: u16) void {
+    if (rect.width <= 5) return;
+    const editor_width = rect.width - 5;
+    const column = @min(document.cursor.position.column, @as(usize, editor_width - 1));
+    const x = rect.x + 5 + @as(u16, @intCast(column));
+    const y = rect.y + row;
+    const line_text = document.text.lineSlice(document.cursor.position.line);
+    const char: u21 = if (column < line_text.len and line_text[column] >= 0x20) line_text[column] else ' ';
+    screen.setCell(x, y, .{ .char = char, .style = .{ .fg = 0, .bg = 6, .bold = true } });
 }
 
 fn renderBottomPanel(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layout.Rect) void {
@@ -211,13 +246,22 @@ fn renderStatus(screen: *screen_mod.Screen, app: *const app_mod.App, rect: layou
     const dirty = if (doc) |document| blk: {
         break :blk if (document.dirty) "dirty" else "clean";
     } else "no-doc";
+    var cursor_buf: [32]u8 = undefined;
+    const cursor_text = if (doc) |document| cursor: {
+        break :cursor std.fmt.bufPrint(&cursor_buf, "{d}:{d}", .{
+            document.cursor.position.line + 1,
+            document.cursor.position.column + 1,
+        }) catch "?:?";
+    } else "-";
     const security = posture.summarize(&app.security_findings, app.runtime.trust_state);
     var status_buf: [256]u8 = undefined;
-    const status = std.fmt.bufPrint(&status_buf, " {s} | trust:{s} | posture:{s} | {s} | diag:{d} | sec:{d} | queue:{d} | hist:{d} | build:{s} | {s}", .{
+    const status = std.fmt.bufPrint(&status_buf, " {s}/{s} | {s} @ {s} | trust:{s} | posture:{s} | diag:{d} | sec:{d} | queue:{d} | hist:{d} | build:{s} | {s}", .{
         @tagName(app.mode),
+        @tagName(app.focus),
+        dirty,
+        cursor_text,
         @tagName(app.runtime.trust_state),
         security.label,
-        dirty,
         app.diagnostics.items.items.len,
         security.high,
         app.execution_queue.queuedCount(),
@@ -278,4 +322,14 @@ test "tui renders app into screen" {
     defer screen.deinit();
 
     try std.testing.expectEqual(@as(u16, 40), screen.width);
+}
+
+test "file tree keeps selected row visible" {
+    try std.testing.expectEqual(@as(usize, 0), fileTreeStartIndex(0, 4, 10));
+    try std.testing.expectEqual(@as(usize, 2), fileTreeStartIndex(5, 4, 10));
+}
+
+test "editor keeps cursor line visible" {
+    try std.testing.expectEqual(@as(usize, 0), editorStartLine(0, 4, 10));
+    try std.testing.expectEqual(@as(usize, 2), editorStartLine(5, 4, 10));
 }

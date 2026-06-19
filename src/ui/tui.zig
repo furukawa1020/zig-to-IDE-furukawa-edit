@@ -128,11 +128,14 @@ fn renderBottomPanel(screen: *screen_mod.Screen, app: *const app_mod.App, rect: 
     if (app.pending_build_consent) |preview| {
         if (row < rect.height) {
             var line_buf: [512]u8 = undefined;
-            const text = std.fmt.bufPrint(&line_buf, "CONSENT {s} cwd={s} fs={s} net={s}", .{
+            const timeout = preview.consent.timeout_ms orelse 0;
+            const text = std.fmt.bufPrint(&line_buf, "CONSENT {s} cwd={s} fs={s} net={s} timeout={d}ms cap={d}", .{
                 preview.command,
                 preview.cwd,
                 @tagName(preview.consent.fs_policy),
                 @tagName(preview.consent.network_policy),
+                timeout,
+                preview.consent.output_limit_bytes,
             }) catch "CONSENT pending";
             screen.writeTextClipped(rect.x, rect.y + row, rect.width, text, .{ .fg = 6, .bg = 0, .bold = true });
             row += 1;
@@ -142,11 +145,14 @@ fn renderBottomPanel(screen: *screen_mod.Screen, app: *const app_mod.App, rect: 
     if (app.execution_queue.latest()) |ticket| {
         if (row < rect.height) {
             var line_buf: [512]u8 = undefined;
-            const text = std.fmt.bufPrint(&line_buf, "QUEUED {s} cwd={s} fs={s} net={s}", .{
+            const timeout = ticket.timeout_ms orelse 0;
+            const text = std.fmt.bufPrint(&line_buf, "QUEUED {s} cwd={s} fs={s} net={s} timeout={d}ms cap={d}", .{
                 ticket.display_command,
                 ticket.cwd,
                 @tagName(ticket.fs_policy),
                 @tagName(ticket.network_policy),
+                timeout,
+                ticket.output_limit_bytes,
             }) catch "QUEUED command";
             screen.writeTextClipped(rect.x, rect.y + row, rect.width, text, .{ .fg = 2, .bg = 0, .bold = true });
             row += 1;
@@ -156,17 +162,22 @@ fn renderBottomPanel(screen: *screen_mod.Screen, app: *const app_mod.App, rect: 
     if (app.execution_queue.latestHistory()) |entry| {
         if (row < rect.height) {
             var line_buf: [512]u8 = undefined;
+            const timeout = entry.timeout_ms orelse 0;
             const text = if (entry.exit_code) |code|
-                std.fmt.bufPrint(&line_buf, "LAST {s} exit={d} lines={d} sanitized={d} {s}", .{
+                std.fmt.bufPrint(&line_buf, "LAST {s} exit={d} timeout={d}ms cap={d} lines={d} sanitized={d} {s}", .{
                     @tagName(entry.state),
                     code,
+                    timeout,
+                    entry.output_limit_bytes,
                     entry.output_lines,
                     entry.sanitized_controls,
                     entry.display_command,
                 }) catch "LAST command result"
             else
-                std.fmt.bufPrint(&line_buf, "LAST {s} exit=none lines={d} sanitized={d} {s}", .{
+                std.fmt.bufPrint(&line_buf, "LAST {s} exit=none timeout={d}ms cap={d} lines={d} sanitized={d} {s}", .{
                     @tagName(entry.state),
+                    timeout,
+                    entry.output_limit_bytes,
                     entry.output_lines,
                     entry.sanitized_controls,
                     entry.display_command,

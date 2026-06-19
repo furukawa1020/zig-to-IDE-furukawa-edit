@@ -63,11 +63,17 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
         try stdout.print("command   : {s}\n", .{preview.command});
         try stdout.print("cwd       : {s}\n", .{preview.cwd});
         try stdout.print("trust     : {s}\n", .{@tagName(preview.trust_state)});
-        try stdout.print("env/fs/net: {s} / {s} / {s}\n\n", .{
+        try stdout.print("env/fs/net: {s} / {s} / {s}\n", .{
             @tagName(preview.consent.env_policy),
             @tagName(preview.consent.fs_policy),
             @tagName(preview.consent.network_policy),
         });
+        if (preview.consent.timeout_ms) |ms| {
+            try stdout.print("timeout   : {d}ms\n", .{ms});
+        } else {
+            try stdout.writeAll("timeout   : none\n");
+        }
+        try stdout.print("output cap: {d} bytes\n\n", .{preview.consent.output_limit_bytes});
     }
 
     if (instance.execution_queue.latest()) |ticket| {
@@ -75,11 +81,17 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
         try stdout.print("source    : {s}\n", .{ticket.source_command_id});
         try stdout.print("command   : {s}\n", .{ticket.display_command});
         try stdout.print("cwd       : {s}\n", .{ticket.cwd});
-        try stdout.print("env/fs/net: {s} / {s} / {s}\n\n", .{
+        try stdout.print("env/fs/net: {s} / {s} / {s}\n", .{
             @tagName(ticket.env_policy),
             @tagName(ticket.fs_policy),
             @tagName(ticket.network_policy),
         });
+        if (ticket.timeout_ms) |ms| {
+            try stdout.print("timeout   : {d}ms\n", .{ms});
+        } else {
+            try stdout.writeAll("timeout   : none\n");
+        }
+        try stdout.print("output cap: {d} bytes\n\n", .{ticket.output_limit_bytes});
     }
 
     if (instance.execution_queue.latestHistory()) |entry| {
@@ -93,7 +105,13 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
             try stdout.writeAll("exit      : none\n");
         }
         try stdout.print("lines     : {d}\n", .{entry.output_lines});
-        try stdout.print("sanitized : {d}\n\n", .{entry.sanitized_controls});
+        try stdout.print("sanitized : {d}\n", .{entry.sanitized_controls});
+        if (entry.timeout_ms) |ms| {
+            try stdout.print("timeout   : {d}ms\n", .{ms});
+        } else {
+            try stdout.writeAll("timeout   : none\n");
+        }
+        try stdout.print("output cap: {d} bytes\n\n", .{entry.output_limit_bytes});
     }
 
     try stdout.writeAll("file tree preview\n-----------------\n");

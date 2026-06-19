@@ -16,12 +16,20 @@ pub const Mode = enum {
     insert,
 };
 
+pub const Focus = enum {
+    files,
+    editor,
+    output,
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     environ: std.process.Environ,
     runtime: runtime.Runtime,
     mode: Mode,
+    focus: Focus,
+    file_cursor: usize,
     workspace: workspace.Workspace,
     documents: store.DocumentStore,
     palette: command_palette.CommandPalette,
@@ -54,6 +62,8 @@ pub const App = struct {
             .environ = environ,
             .runtime = runtime.Runtime.init(allocator),
             .mode = .normal,
+            .focus = .files,
+            .file_cursor = 0,
             .workspace = try workspace.Workspace.open(allocator, workspace_path),
             .documents = store.DocumentStore.init(allocator),
             .palette = command_palette.CommandPalette.init(allocator),
@@ -65,9 +75,11 @@ pub const App = struct {
             .execution_queue = execution_queue.Queue.init(allocator),
         };
         errdefer self.deinit();
+        self.file_cursor = self.firstFileEntryIndex() orelse 0;
 
         if (open_kind == .file) {
             _ = try self.documents.openFile(root_path);
+            self.focus = .editor;
         }
 
         return self;
@@ -105,6 +117,45 @@ pub const App = struct {
         self.clearPendingBuildConsent();
         self.pending_build_consent = preview;
         self.pending_build_source_id = owned_source_id;
+    }
+
+    pub fn selectedWorkspaceEntry(self: *const App) ?*const workspace.FileEntry {
+        if (self.workspace.entries.items.len == 0) return null;
+        const index = @min(self.file_cursor, self.workspace.entries.items.len - 1);
+        return &self.workspace.entries.items[index];
+    }
+
+    pub fn moveFileCursor(self: *App, delta: isize) void {
+        self.focus = .files;
+        if (self.workspace.entries.items.len == 0) {
+            self.file_cursor = 0;
+            return;
+        }
+
+        const max_index = self.workspace.entries.items.len - 1;
+        if (delta < 0) {
+            const amount = @as(usize, @intCast(-delta));
+            self.file_cursor = if (amount > self.file_cursor) 0 else self.file_cursor - amount;
+        } else {
+            self.file_cursor = @min(max_index, self.file_cursor + @as(usize, @intCast(delta)));
+        }
+    }
+
+    pub fn openSelectedWorkspaceEntry(self: *App) !bool {
+        const entry = self.selectedWorkspaceEntry() orelse return false;
+        if (entry.kind != .file) return false;
+        const path = try std.fs.path.join(self.allocator, &.{ self.workspace.root_path, entry.path });
+        defer self.allocator.free(path);
+        _ = try self.documents.openFile(path);
+        self.focus = .editor;
+        return true;
+    }
+
+    fn firstFileEntryIndex(self: *const App) ?usize {
+        for (self.workspace.entries.items, 0..) |entry, index| {
+            if (entry.kind == .file) return index;
+        }
+        return null;
     }
 };
 

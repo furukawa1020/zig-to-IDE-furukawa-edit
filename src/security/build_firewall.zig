@@ -25,10 +25,17 @@ fn scanLine(collection: *findings.Collection, path: []const u8, line: []const u8
     try detect(collection, path, line, line_number, "std.process", .high, "build script references process APIs");
     try detect(collection, path, line, line_number, "getEnv", .high, "build script may read environment variables");
     try detect(collection, path, line, line_number, "env_map", .medium, "build script handles environment variables");
+    try detect(collection, path, line, line_number, "lazyDependency", .medium, "build script can resolve a dependency conditionally");
+    try detect(collection, path, line, line_number, "addFetch", .high, "build script can fetch external content");
     try detect(collection, path, line, line_number, "addWriteFiles", .medium, "build script can generate files");
     try detect(collection, path, line, line_number, "addConfigHeader", .medium, "build script can generate configuration headers");
     try detect(collection, path, line, line_number, "addAnonymousModule", .medium, "build script can inject generated module content");
     try detect(collection, path, line, line_number, "linkSystemLibrary", .medium, "build links a system library outside Zig package trust");
+    try detect(collection, path, line, line_number, "linkLibC", .medium, "build links libc; native ABI boundary should be reviewed");
+    try detect(collection, path, line, line_number, "linkLibCpp", .medium, "build links libc++; native ABI boundary should be reviewed");
+    try detect(collection, path, line, line_number, "addLibraryPath", .medium, "build adds a host library search path");
+    try detect(collection, path, line, line_number, "addIncludePath", .medium, "build adds a host include search path");
+    try detect(collection, path, line, line_number, "systemIntegrationOption", .medium, "build may depend on host system integration state");
     try detect(collection, path, line, line_number, "pkg-config", .medium, "build may consult host pkg-config state");
     try detect(collection, path, line, line_number, "dependency(", .medium, "build resolves a dependency; fingerprint should be reviewed");
     try detect(collection, path, line, line_number, "ReleaseFast", .high, "build selects ReleaseFast; safety posture should be reviewed");

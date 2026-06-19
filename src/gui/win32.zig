@@ -6,6 +6,7 @@ const command_mod = @import("../core/command.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const navigation = @import("../editor/navigation.zig");
 const build_consent = @import("../security/build_consent.zig");
+const findings_mod = @import("../security/findings.zig");
 const console_mod = @import("../tasks/console.zig");
 
 pub fn run(allocator: std.mem.Allocator, root_path: []const u8) !void {
@@ -15,6 +16,7 @@ pub fn run(allocator: std.mem.Allocator, root_path: []const u8) !void {
     defer state.deinit();
     global_state = &state;
     defer global_state = null;
+    state.runZigSecurityAudit("startup");
 
     const hmodule = GetModuleHandleW(null) orelse return error.GetModuleHandleFailed;
     const hinstance: windows.HINSTANCE = @ptrCast(hmodule);
@@ -89,6 +91,91 @@ const GuiState = struct {
             .app = app,
             .collapsed_dirs = collapsed_dirs,
         };
+    }
+
+    fn openWorkspace(self: *GuiState, root_path: []const u8) void {
+        var next_app = app_mod.App.init(self.allocator, root_path) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "workspace open failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        const next_collapsed = self.allocator.alloc(bool, next_app.workspace.entries.items.len) catch |err| {
+            next_app.deinit();
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "workspace state allocation failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        @memset(next_collapsed, false);
+
+        self.app.deinit();
+        self.allocator.free(self.collapsed_dirs);
+        self.app = next_app;
+        self.collapsed_dirs = next_collapsed;
+        self.editor_scroll_line = 0;
+        self.editor_visible_rows = 24;
+        self.output_scroll_line = 0;
+        self.show_output = true;
+        self.setMessage("Workspace opened") catch {};
+        self.appendOutput(.stdout, "opened workspace: {s}\n", .{self.app.workspace.root_path});
+        self.runZigSecurityAudit("workspace open");
+    }
+
+    fn chooseAndOpenWorkspace(self: *GuiState, hwnd: windows.HWND) void {
+        const chosen = chooseFolder(self.allocator, hwnd) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "folder picker failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        const path = chosen orelse {
+            self.setMessage("Open workspace cancelled") catch {};
+            return;
+        };
+        defer self.allocator.free(path);
+        self.openWorkspace(path);
+    }
+
+    fn runZigSecurityAudit(self: *GuiState, reason: []const u8) void {
+        const result = dispatcher.dispatch(&self.app, .{ .id = "security.audit_workspace", .source = .startup }) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "zig security audit failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        switch (result) {
+            .completed => {},
+            .blocked => |message| self.appendOutput(.stderr, "zig security audit blocked: {s}\n", .{message}),
+            .unknown_command => self.appendOutput(.stderr, "zig security audit command missing\n", .{}),
+            .no_active_document => {},
+            .external_command => {},
+            .unsupported => |message| self.appendOutput(.stderr, "zig security audit unsupported: {s}\n", .{message}),
+        }
+
+        const counts = riskCounts(&self.app.security_findings);
+        self.appendOutput(
+            .stdout,
+            "zig security audit ({s}): {d} findings critical={d} high={d} medium={d} low={d}\n",
+            .{
+                reason,
+                self.app.security_findings.items.items.len,
+                counts.critical,
+                counts.high,
+                counts.medium,
+                counts.low,
+            },
+        );
+        self.appendOutput(.stdout, "checks: build.zig firewall, build.zig.zon dependency hashes, unsafe Zig builtins, FFI, allocators\n", .{});
+
+        const limit: usize = 10;
+        for (self.app.security_findings.items.items, 0..) |item, index| {
+            if (index >= limit) break;
+            self.appendOutput(
+                if (riskRank(item.risk) >= riskRank(.high)) .stderr else .stdout,
+                "{s}/{s} {s}:{d}:{d} {s}\n",
+                .{ @tagName(item.risk), @tagName(item.category), item.path, item.line + 1, item.column + 1, item.message },
+            );
+        }
+        if (self.app.security_findings.items.items.len > limit) {
+            self.appendOutput(.stdout, "... {d} more findings\n", .{self.app.security_findings.items.items.len - limit});
+        }
     }
 
     fn deinit(self: *GuiState) void {
@@ -438,6 +525,11 @@ const GuiState = struct {
         }
 
         if (pointIn(layout.sidebar, x, y)) {
+            if (pointIn(openWorkspaceButtonRect(layout), x, y)) {
+                self.chooseAndOpenWorkspace(hwnd);
+                return;
+            }
+
             self.app.focus = .files;
             const row = visibleFileRowAt(layout, self, y) orelse return;
             const index = self.entryIndexAtVisibleRank(row) orelse return;
@@ -559,8 +651,7 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         return;
     }
     if (ctrl and key == 'O') {
-        state.app.focus = .files;
-        state.setMessage("File tree focused") catch {};
+        state.chooseAndOpenWorkspace(hwnd);
         return;
     }
     if (key == VK_F6) {
@@ -661,6 +752,7 @@ fn paint(hwnd: windows.HWND) void {
         fillRect(hdc, RECT{ .left = layout.sidebar.right - 1, .top = 0, .right = layout.sidebar.right, .bottom = layout.status.top }, rgb(43, 53, 61));
 
         drawText(hdc, 18, 15, rgb(79, 230, 226), "FILES");
+        drawButton(hdc, openWorkspaceButtonRect(layout), "OPEN");
         drawFileList(hdc, state, layout);
         drawEditor(hdc, state, layout);
         if (state.show_output) drawOutput(hdc, state, layout);
@@ -873,6 +965,15 @@ fn visibleFileRowAt(layout: Layout, state: *const GuiState, y: c_int) ?usize {
     return start + row;
 }
 
+fn openWorkspaceButtonRect(layout: Layout) RECT {
+    return .{
+        .left = @max(layout.sidebar.left + 88, layout.sidebar.right - 86),
+        .top = 10,
+        .right = layout.sidebar.right - 12,
+        .bottom = 32,
+    };
+}
+
 fn pointIn(rect: RECT, x: c_int, y: c_int) bool {
     return x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom;
 }
@@ -921,6 +1022,12 @@ fn drawTextRight(hdc: windows.HDC, left: c_int, y: c_int, right: c_int, color: w
     drawText(hdc, @max(left, right - width), y, color, text);
 }
 
+fn drawButton(hdc: windows.HDC, rect: RECT, label: []const u8) void {
+    fillRect(hdc, rect, rgb(32, 42, 50));
+    fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(79, 230, 226));
+    drawTextClipped(hdc, rect.left + 10, rect.top + 5, rect.right - 6, rgb(226, 234, 242), label);
+}
+
 fn fillRect(hdc: windows.HDC, rect: RECT, color: windows.COLORREF) void {
     const brush = CreateSolidBrush(color) orelse return;
     defer _ = DeleteObject(@ptrCast(brush));
@@ -930,6 +1037,69 @@ fn fillRect(hdc: windows.HDC, rect: RECT, color: windows.COLORREF) void {
 
 fn rgb(r: u8, g: u8, b: u8) windows.COLORREF {
     return @as(windows.COLORREF, r) | (@as(windows.COLORREF, g) << 8) | (@as(windows.COLORREF, b) << 16);
+}
+
+fn chooseFolder(allocator: std.mem.Allocator, owner: windows.HWND) !?[]u8 {
+    const title = std.unicode.utf8ToUtf16LeStringLiteral("Open workspace folder");
+    var display_name: [MAX_PATH]u16 = [_]u16{0} ** MAX_PATH;
+    var info = BROWSEINFOW{
+        .hwndOwner = owner,
+        .pidlRoot = null,
+        .pszDisplayName = display_name[0..].ptr,
+        .lpszTitle = title.ptr,
+        .ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+        .lpfn = null,
+        .lParam = 0,
+        .iImage = 0,
+    };
+
+    const pidl = SHBrowseForFolderW(&info) orelse return null;
+    defer CoTaskMemFree(@ptrCast(pidl));
+
+    var path: [MAX_PATH]u16 = [_]u16{0} ** MAX_PATH;
+    if (SHGetPathFromIDListW(pidl, path[0..].ptr) == .FALSE) return error.FolderPathUnavailable;
+    const len = utf16ZLen(&path);
+    if (len == 0) return null;
+    return try std.unicode.utf16LeToUtf8Alloc(allocator, path[0..len]);
+}
+
+fn utf16ZLen(buffer: []const u16) usize {
+    for (buffer, 0..) |value, index| {
+        if (value == 0) return index;
+    }
+    return buffer.len;
+}
+
+const RiskCounts = struct {
+    info: usize = 0,
+    low: usize = 0,
+    medium: usize = 0,
+    high: usize = 0,
+    critical: usize = 0,
+};
+
+fn riskCounts(collection: *const findings_mod.Collection) RiskCounts {
+    var counts = RiskCounts{};
+    for (collection.items.items) |item| {
+        switch (item.risk) {
+            .info => counts.info += 1,
+            .low => counts.low += 1,
+            .medium => counts.medium += 1,
+            .high => counts.high += 1,
+            .critical => counts.critical += 1,
+        }
+    }
+    return counts;
+}
+
+fn riskRank(risk: findings_mod.Risk) u8 {
+    return switch (risk) {
+        .info => 0,
+        .low => 1,
+        .medium => 2,
+        .high => 3,
+        .critical => 4,
+    };
 }
 
 const RECT = extern struct {
@@ -979,6 +1149,20 @@ const WNDCLASSEXW = extern struct {
     hIconSm: ?windows.HICON,
 };
 
+const ITEMIDLIST = opaque {};
+const BFFCALLBACK = *const fn (?windows.HWND, windows.UINT, windows.LPARAM, windows.LPARAM) callconv(.winapi) c_int;
+
+const BROWSEINFOW = extern struct {
+    hwndOwner: ?windows.HWND,
+    pidlRoot: ?*const ITEMIDLIST,
+    pszDisplayName: [*]u16,
+    lpszTitle: ?windows.LPCWSTR,
+    ulFlags: windows.UINT,
+    lpfn: ?BFFCALLBACK,
+    lParam: windows.LPARAM,
+    iImage: c_int,
+};
+
 const HGDIOBJ = *opaque {};
 const WPARAM = windows.ULONG_PTR;
 const LRESULT = windows.LONG_PTR;
@@ -991,9 +1175,12 @@ const CHAR_WIDTH: c_int = 8;
 const EDITOR_TEXT_PADDING_X: c_int = 16;
 const EDITOR_TEXT_PADDING_Y: c_int = 7;
 const PALETTE_MATCH_TOP: c_int = 78;
+const MAX_PATH: usize = 260;
 
 const CS_HREDRAW: windows.UINT = 0x0002;
 const CS_VREDRAW: windows.UINT = 0x0001;
+const BIF_RETURNONLYFSDIRS: windows.UINT = 0x0001;
+const BIF_NEWDIALOGSTYLE: windows.UINT = 0x0040;
 const CW_USEDEFAULT: c_int = -2147483648;
 const IDC_ARROW: windows.LPCWSTR = @ptrFromInt(32512);
 const SW_SHOW: c_int = 5;
@@ -1059,6 +1246,10 @@ extern "user32" fn InvalidateRect(hWnd: windows.HWND, lpRect: ?*const RECT, bEra
 extern "user32" fn GetClientRect(hWnd: windows.HWND, lpRect: *RECT) callconv(.winapi) windows.BOOL;
 extern "user32" fn LoadCursorW(hInstance: ?windows.HINSTANCE, lpCursorName: windows.LPCWSTR) callconv(.winapi) ?windows.HCURSOR;
 extern "user32" fn FillRect(hDC: windows.HDC, lprc: *const RECT, hbr: windows.HBRUSH) callconv(.winapi) c_int;
+
+extern "shell32" fn SHBrowseForFolderW(lpbi: *BROWSEINFOW) callconv(.winapi) ?*ITEMIDLIST;
+extern "shell32" fn SHGetPathFromIDListW(pidl: *const ITEMIDLIST, pszPath: [*]u16) callconv(.winapi) windows.BOOL;
+extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
 
 extern "gdi32" fn SetTextColor(hdc: windows.HDC, crColor: windows.COLORREF) callconv(.winapi) windows.COLORREF;
 extern "gdi32" fn SetBkMode(hdc: windows.HDC, mode: c_int) callconv(.winapi) c_int;

@@ -26,6 +26,8 @@ pub const RunResult = union(enum) {
     empty_queue,
     blocked: []const u8,
     failed: []const u8,
+    timed_out,
+    output_limited,
 };
 
 pub fn previewLatest(queue: *const execution_queue.Queue, process_console: *console.ProcessConsole) !PreviewResult {
@@ -43,6 +45,12 @@ pub fn previewLatest(queue: *const execution_queue.Queue, process_console: *cons
     try writer.print("fs: {s}\n", .{@tagName(ticket.fs_policy)});
     try writer.print("network: {s}\n", .{@tagName(ticket.network_policy)});
     try writer.print("output_sanitized: {}\n", .{ticket.output_sanitized});
+    if (ticket.timeout_ms) |ms| {
+        try writer.print("timeout_ms: {d}\n", .{ms});
+    } else {
+        try writer.writeAll("timeout_ms: none\n");
+    }
+    try writer.print("output_limit_bytes: {d}\n", .{ticket.output_limit_bytes});
 
     try process_console.appendBytes(.stdout, text.written());
     return .rendered;
@@ -67,7 +75,13 @@ pub fn renderHistory(queue: *const execution_queue.Queue, process_console: *cons
         } else {
             try writer.writeAll(" exit=none");
         }
-        try writer.print(" lines={d} sanitized={d} cwd={s}\n", .{
+        if (entry.timeout_ms) |ms| {
+            try writer.print(" timeout_ms={d}", .{ms});
+        } else {
+            try writer.writeAll(" timeout_ms=none");
+        }
+        try writer.print(" output_limit={d} lines={d} sanitized={d} cwd={s}\n", .{
+            entry.output_limit_bytes,
             entry.output_lines,
             entry.sanitized_controls,
             entry.cwd,
@@ -115,9 +129,22 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
         .argv = argv.items,
         .cwd = .{ .path = ticket.cwd },
         .environ_map = env_ptr,
-        .stdout_limit = .limited(options.stdout_limit),
-        .stderr_limit = .limited(options.stderr_limit),
+        .stdout_limit = .limited(effectiveOutputLimit(ticket.output_limit_bytes, options.stdout_limit)),
+        .stderr_limit = .limited(effectiveOutputLimit(ticket.output_limit_bytes, options.stderr_limit)),
+        .timeout = timeoutFromMs(ticket.timeout_ms),
     }) catch |err| {
+        if (err == error.Timeout) {
+            try appendTimeoutExceeded(process_console, ticket.timeout_ms);
+            process_console.finish(-1);
+            try queue.recordHistory(&ticket, .timed_out, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+            return .timed_out;
+        }
+        if (err == error.StreamTooLong) {
+            try appendFormatted(process_console, .stderr, "output exceeded {d} byte limit\n", .{ticket.output_limit_bytes});
+            process_console.finish(-1);
+            try queue.recordHistory(&ticket, .output_limited, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+            return .output_limited;
+        }
         try appendFormatted(process_console, .stderr, "spawn failed: {s}\n", .{@errorName(err)});
         process_console.finish(-1);
         try queue.recordHistory(&ticket, .failed, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
@@ -209,6 +236,27 @@ fn termExitCode(term: std.process.Child.Term) i32 {
     };
 }
 
+fn timeoutFromMs(timeout_ms: ?u32) std.Io.Timeout {
+    const ms = timeout_ms orelse return .none;
+    return .{ .duration = .{
+        .clock = .boot,
+        .raw = .fromMilliseconds(ms),
+    } };
+}
+
+fn effectiveOutputLimit(ticket_limit: usize, option_limit: usize) usize {
+    if (ticket_limit == 0) return option_limit;
+    return @min(ticket_limit, option_limit);
+}
+
+fn appendTimeoutExceeded(process_console: *console.ProcessConsole, timeout_ms: ?u32) !void {
+    if (timeout_ms) |ms| {
+        try appendFormatted(process_console, .stderr, "timed out after {d}ms\n", .{ms});
+    } else {
+        try appendFormatted(process_console, .stderr, "timed out\n", .{});
+    }
+}
+
 fn appendFormatted(process_console: *console.ProcessConsole, stream: console.Stream, comptime fmt: []const u8, args: anytype) !void {
     var text: std.Io.Writer.Allocating = .init(process_console.allocator);
     defer text.deinit();
@@ -239,6 +287,19 @@ test "executor renders latest queued launch plan" {
 
     try std.testing.expectEqual(PreviewResult.rendered, try previewLatest(&queue, &process_console));
     try std.testing.expect(process_console.lines.items.len > 0);
+}
+
+test "timeout conversion uses boot clock duration" {
+    const timeout = timeoutFromMs(250);
+    try std.testing.expect(std.meta.activeTag(timeout) == .duration);
+    try std.testing.expectEqual(std.Io.Clock.boot, timeout.duration.clock);
+    try std.testing.expectEqual(@as(i64, 250), timeout.duration.raw.toMilliseconds());
+    try std.testing.expect(std.meta.activeTag(timeoutFromMs(null)) == .none);
+}
+
+test "effective output limit keeps the tighter cap" {
+    try std.testing.expectEqual(@as(usize, 128), effectiveOutputLimit(128, 512));
+    try std.testing.expectEqual(@as(usize, 256), effectiveOutputLimit(0, 256));
 }
 
 test "executor renders task history" {

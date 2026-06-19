@@ -7,10 +7,12 @@ const workspace_mod = @import("../workspace/workspace.zig");
 pub fn run(allocator: std.mem.Allocator, root_path: []const u8) !void {
     if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
 
+    markStage("start");
     var state = try GuiState.init(allocator, root_path);
     defer state.deinit();
     global_state = &state;
     defer global_state = null;
+    markStage("app initialized");
 
     const hmodule = GetModuleHandleW(null) orelse return error.GetModuleHandleFailed;
     const hinstance: windows.HINSTANCE = @ptrCast(hmodule);
@@ -34,6 +36,7 @@ pub fn run(allocator: std.mem.Allocator, root_path: []const u8) !void {
     };
 
     if (RegisterClassExW(&window_class) == 0) return error.RegisterClassFailed;
+    markStage("class registered");
 
     const hwnd = CreateWindowExW(
         0,
@@ -50,9 +53,11 @@ pub fn run(allocator: std.mem.Allocator, root_path: []const u8) !void {
         null,
     ) orelse return error.CreateWindowFailed;
     state.hwnd = hwnd;
+    markStage("window created");
 
     _ = ShowWindow(hwnd, SW_SHOW);
     _ = UpdateWindow(hwnd);
+    markStage("message loop");
 
     var msg: MSG = undefined;
     while (GetMessageW(&msg, null, 0, 0) != .FALSE) {
@@ -138,6 +143,7 @@ fn windowProc(hwnd: windows.HWND, msg: windows.UINT, wparam: WPARAM, lparam: win
             return 0;
         },
         WM_DESTROY => {
+            markStage("destroyed");
             PostQuitMessage(0);
             return 0;
         },
@@ -303,6 +309,17 @@ fn fillRect(hdc: windows.HDC, rect: RECT, color: windows.COLORREF) void {
 
 fn rgb(r: u8, g: u8, b: u8) windows.COLORREF {
     return @as(windows.COLORREF, r) | (@as(windows.COLORREF, g) << 8) | (@as(windows.COLORREF, b) << 16);
+}
+
+fn markStage(comptime text: []const u8) void {
+    var file = std.Io.Dir.cwd().createFile(std.Options.debug_io, ".zig-cache/zide-gui.stage", .{ .truncate = true }) catch return;
+    defer file.close(std.Options.debug_io);
+
+    var buffer: [256]u8 = undefined;
+    var writer = file.writer(std.Options.debug_io, &buffer);
+    writer.interface.writeAll(text) catch return;
+    writer.interface.writeByte('\n') catch return;
+    writer.interface.flush() catch return;
 }
 
 const RECT = extern struct {

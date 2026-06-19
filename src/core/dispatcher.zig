@@ -221,6 +221,8 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
             .empty_queue => .{ .blocked = "no approved command in execution queue" },
             .blocked => |message| .{ .blocked = message },
             .failed => |message| .{ .blocked = message },
+            .timed_out => .{ .blocked = "approved command timed out" },
+            .output_limited => .{ .blocked = "approved command exceeded output limit" },
         };
     }
 

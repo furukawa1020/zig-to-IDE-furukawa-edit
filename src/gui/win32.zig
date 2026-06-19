@@ -116,7 +116,7 @@ const GuiState = struct {
 
 var global_state: ?*GuiState = null;
 
-fn windowProc(hwnd: windows.HWND, msg: windows.UINT, wparam: windows.WPARAM, lparam: windows.LPARAM) callconv(.winapi) windows.LRESULT {
+fn windowProc(hwnd: windows.HWND, msg: windows.UINT, wparam: WPARAM, lparam: windows.LPARAM) callconv(.winapi) LRESULT {
     switch (msg) {
         WM_KEYDOWN => {
             if (global_state) |state| {
@@ -124,7 +124,7 @@ fn windowProc(hwnd: windows.HWND, msg: windows.UINT, wparam: windows.WPARAM, lpa
                     VK_UP => state.moveSelection(-1),
                     VK_DOWN => state.moveSelection(1),
                     VK_RETURN => state.openSelected(),
-                    VK_ESCAPE, 'Q' => DestroyWindow(hwnd),
+                    VK_ESCAPE, 'Q' => _ = DestroyWindow(hwnd),
                     'J' => state.moveSelection(1),
                     'K' => state.moveSelection(-1),
                     else => {},
@@ -197,7 +197,8 @@ fn drawFileList(hdc: windows.HDC, state: *GuiState, sidebar: RECT, header_height
             fillRect(hdc, RECT{ .left = 0, .top = y - 1, .right = sidebar.right - 1, .bottom = y + row_height - 1 }, rgb(51, 153, 235));
         }
 
-        const indent: c_int = @intCast(@min(entry.depth, 8) * 16);
+        const depth_px: usize = @min(entry.depth, @as(usize, 8)) * @as(usize, 16);
+        const indent: c_int = @intCast(depth_px);
         const marker = switch (entry.kind) {
             .directory => "+ ",
             .file => "  ",
@@ -319,7 +320,7 @@ const POINT = extern struct {
 const MSG = extern struct {
     hwnd: ?windows.HWND,
     message: windows.UINT,
-    wParam: windows.WPARAM,
+    wParam: WPARAM,
     lParam: windows.LPARAM,
     time: windows.DWORD,
     pt: POINT,
@@ -334,7 +335,7 @@ const PAINTSTRUCT = extern struct {
     rgbReserved: [32]u8,
 };
 
-const WNDPROC = *const fn (windows.HWND, windows.UINT, windows.WPARAM, windows.LPARAM) callconv(.winapi) windows.LRESULT;
+const WNDPROC = *const fn (windows.HWND, windows.UINT, WPARAM, windows.LPARAM) callconv(.winapi) LRESULT;
 
 const WNDCLASSEXW = extern struct {
     cbSize: windows.UINT,
@@ -352,6 +353,8 @@ const WNDCLASSEXW = extern struct {
 };
 
 const HGDIOBJ = *opaque {};
+const WPARAM = windows.ULONG_PTR;
+const LRESULT = windows.LONG_PTR;
 
 const CS_HREDRAW: windows.UINT = 0x0002;
 const CS_VREDRAW: windows.UINT = 0x0001;
@@ -364,10 +367,10 @@ const WS_OVERLAPPEDWINDOW: windows.DWORD = 0x00CF0000;
 const WM_DESTROY: windows.UINT = 0x0002;
 const WM_PAINT: windows.UINT = 0x000F;
 const WM_KEYDOWN: windows.UINT = 0x0100;
-const VK_RETURN: windows.WPARAM = 0x0D;
-const VK_ESCAPE: windows.WPARAM = 0x1B;
-const VK_UP: windows.WPARAM = 0x26;
-const VK_DOWN: windows.WPARAM = 0x28;
+const VK_RETURN: WPARAM = 0x0D;
+const VK_ESCAPE: WPARAM = 0x1B;
+const VK_UP: WPARAM = 0x26;
+const VK_DOWN: WPARAM = 0x28;
 
 extern "kernel32" fn GetModuleHandleW(lpModuleName: ?windows.LPCWSTR) callconv(.winapi) ?windows.HMODULE;
 
@@ -386,13 +389,13 @@ extern "user32" fn CreateWindowExW(
     hInstance: windows.HINSTANCE,
     lpParam: ?*anyopaque,
 ) callconv(.winapi) ?windows.HWND;
-extern "user32" fn DefWindowProcW(hWnd: windows.HWND, Msg: windows.UINT, wParam: windows.WPARAM, lParam: windows.LPARAM) callconv(.winapi) windows.LRESULT;
+extern "user32" fn DefWindowProcW(hWnd: windows.HWND, Msg: windows.UINT, wParam: WPARAM, lParam: windows.LPARAM) callconv(.winapi) LRESULT;
 extern "user32" fn DestroyWindow(hWnd: windows.HWND) callconv(.winapi) windows.BOOL;
 extern "user32" fn ShowWindow(hWnd: windows.HWND, nCmdShow: c_int) callconv(.winapi) windows.BOOL;
 extern "user32" fn UpdateWindow(hWnd: windows.HWND) callconv(.winapi) windows.BOOL;
 extern "user32" fn GetMessageW(lpMsg: *MSG, hWnd: ?windows.HWND, wMsgFilterMin: windows.UINT, wMsgFilterMax: windows.UINT) callconv(.winapi) windows.BOOL;
 extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) windows.BOOL;
-extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) windows.LRESULT;
+extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
 extern "user32" fn PostQuitMessage(nExitCode: c_int) callconv(.winapi) void;
 extern "user32" fn BeginPaint(hWnd: windows.HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) windows.HDC;
 extern "user32" fn EndPaint(hWnd: windows.HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) windows.BOOL;

@@ -107,7 +107,25 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         const path = try workspacePath(app, argument);
         defer app.allocator.free(path);
         _ = try app.documents.openFile(path);
+        app.focus = .editor;
         return .{ .completed = "opened file" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "workspace.previous_file")) {
+        app.moveFileCursor(-1);
+        return .{ .completed = "selected previous file-tree entry" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "workspace.next_file")) {
+        app.moveFileCursor(1);
+        return .{ .completed = "selected next file-tree entry" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "workspace.open_selected")) {
+        if (try app.openSelectedWorkspaceEntry()) {
+            return .{ .completed = "opened selected file" };
+        }
+        return .{ .blocked = "selected workspace entry is not a file" };
     }
 
     if (std.mem.eql(u8, definition.id, "security.scan_current")) {
@@ -359,6 +377,16 @@ test "task history command renders recorded command results" {
     const result = try dispatch(&app, .{ .id = "task.history" });
     try std.testing.expect(std.meta.activeTag(result) == .completed);
     try std.testing.expect(app.process_console.lines.items.len > 0);
+}
+
+test "open selected workspace file activates editor focus" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "workspace.open_selected" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expect(app.documents.active() != null);
+    try std.testing.expectEqual(app_mod.Focus.editor, app.focus);
 }
 
 test "critical security scan locks workspace down" {

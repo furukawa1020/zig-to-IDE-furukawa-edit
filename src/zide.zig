@@ -9,6 +9,7 @@ pub const dispatcher = @import("core/dispatcher.zig");
 pub const event = @import("core/event.zig");
 pub const event_loop = @import("core/event_loop.zig");
 pub const input_handler = @import("core/input_handler.zig");
+pub const interactive = @import("core/interactive.zig");
 pub const loop_runner = @import("core/loop_runner.zig");
 pub const runtime = @import("core/runtime.zig");
 pub const types = @import("core/types.zig");
@@ -25,6 +26,7 @@ pub const core = struct {
     pub const event = @import("core/event.zig");
     pub const event_loop = @import("core/event_loop.zig");
     pub const input_handler = @import("core/input_handler.zig");
+    pub const interactive = @import("core/interactive.zig");
     pub const loop_runner = @import("core/loop_runner.zig");
     pub const runtime = @import("core/runtime.zig");
     pub const types = @import("core/types.zig");
@@ -167,7 +169,21 @@ pub fn runWithProcess(
                 return err;
             };
             defer instance.deinit();
-            try instance.render(stdout);
+            const stdin_file = std.Io.File.stdin();
+            const stdout_file = std.Io.File.stdout();
+            if (@import("platform/terminal.zig").isInteractive(stdin_file, stdout_file, io)) {
+                _ = try interactive.run(
+                    allocator,
+                    &instance,
+                    io,
+                    stdin_file,
+                    stdout_file,
+                    stdout,
+                    .{},
+                );
+            } else {
+                try instance.render(stdout);
+            }
         },
         .demo => |kind| try demo.run(allocator, kind, stdout),
         .commands => try render.renderCommands(stdout),

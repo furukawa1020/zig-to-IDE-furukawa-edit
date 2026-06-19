@@ -5,6 +5,7 @@ const app_mod = @import("../core/app.zig");
 const command_mod = @import("../core/command.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const navigation = @import("../editor/navigation.zig");
+const build_consent = @import("../security/build_consent.zig");
 const console_mod = @import("../tasks/console.zig");
 
 pub fn run(allocator: std.mem.Allocator, root_path: []const u8) !void {
@@ -218,11 +219,24 @@ const GuiState = struct {
                 self.appendOutput(.stderr, "unsupported {s}: {s}\n", .{ id, message });
             },
             .external_command => |spec| {
-                self.setMessage("External command needs explicit approval") catch {};
-                const cwd = spec.command.cwd orelse self.app.workspace.root_path;
-                self.appendOutput(.stdout, "external command: {s}\n", .{spec.command.executable});
-                self.appendOutput(.stdout, "cwd: {s}\n", .{cwd});
-                self.appendOutput(.stdout, "Use consent commands before running external tools.\n", .{});
+                var preview = build_consent.makePreview(self.allocator, spec, self.app.runtime.trust_state) catch |err| {
+                    self.setError(err) catch {};
+                    return;
+                };
+                defer preview.deinit();
+
+                self.app.execution_queue.enqueueSpec(id, spec, preview.consent) catch |err| {
+                    self.setError(err) catch {};
+                    return;
+                };
+                self.appendOutput(.stdout, "queued external command: {s}\n", .{preview.command});
+
+                const run_result = dispatcher.dispatch(&self.app, .{ .id = "task.run_next", .source = .task }) catch |err| {
+                    self.setError(err) catch {};
+                    self.appendOutput(.stderr, "run failed: {s}\n", .{@errorName(err)});
+                    return;
+                };
+                self.handleDispatchResult("task.run_next", run_result);
             },
         }
     }

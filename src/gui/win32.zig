@@ -72,6 +72,7 @@ const GuiState = struct {
     last_error: ?[]u8 = null,
     collapsed_dirs: []bool,
     editor_scroll_line: usize = 0,
+    editor_visible_rows: usize = 24,
     output_scroll_line: usize = 0,
     show_output: bool = true,
 
@@ -322,6 +323,8 @@ const GuiState = struct {
         const doc = self.app.documents.active() orelse return;
         if (doc.cursor.position.line < self.editor_scroll_line) {
             self.editor_scroll_line = doc.cursor.position.line;
+        } else if (self.editor_visible_rows > 0 and doc.cursor.position.line >= self.editor_scroll_line + self.editor_visible_rows) {
+            self.editor_scroll_line = doc.cursor.position.line - self.editor_visible_rows + 1;
         }
     }
 
@@ -403,6 +406,22 @@ const GuiState = struct {
     fn click(self: *GuiState, hwnd: windows.HWND, x: c_int, y: c_int) void {
         _ = SetFocus(hwnd);
         const layout = layoutForWindow(hwnd, self);
+
+        if (self.app.palette.visible) {
+            const palette = paletteRect(layout.client);
+            if (pointIn(palette, x, y)) {
+                if (y >= palette.top + PALETTE_MATCH_TOP) {
+                    const row = @as(usize, @intCast(@divTrunc(y - palette.top - PALETTE_MATCH_TOP, ROW_HEIGHT)));
+                    if (row < @min(@as(usize, 10), self.app.palette.matches.items.len)) {
+                        self.app.palette.selected_index = row;
+                        self.executeSelectedPaletteCommand();
+                    }
+                }
+                return;
+            }
+            self.closePalette();
+            return;
+        }
 
         if (pointIn(layout.sidebar, x, y)) {
             self.app.focus = .files;
@@ -689,6 +708,7 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
         fillRect(hdc, RECT{ .left = editor.left, .top = HEADER_HEIGHT, .right = editor.left + GUTTER_WIDTH, .bottom = editor.bottom }, rgb(14, 18, 23));
 
         const max_rows = @max(0, @divTrunc(editor.bottom - HEADER_HEIGHT - 8, ROW_HEIGHT));
+        state.editor_visible_rows = @as(usize, @intCast(max_rows));
         var visible_line: usize = 0;
         var y = HEADER_HEIGHT + EDITOR_TEXT_PADDING_Y;
         while (visible_line < @as(usize, @intCast(max_rows)) and state.editor_scroll_line + visible_line < doc.text.lineCount()) : (visible_line += 1) {
@@ -740,16 +760,13 @@ fn drawOutput(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
 }
 
 fn drawCommandPalette(hdc: windows.HDC, state: *GuiState, client: RECT) void {
-    const width = @min(@max(client.right - client.left - 220, 420), 760);
-    const left = client.left + @divTrunc((client.right - client.left) - width, 2);
-    const top: c_int = 70;
-    const palette = RECT{ .left = left, .top = top, .right = left + width, .bottom = top + 360 };
+    const palette = paletteRect(client);
     fillRect(hdc, palette, rgb(22, 26, 31));
     fillRect(hdc, RECT{ .left = palette.left, .top = palette.top, .right = palette.right, .bottom = palette.top + 1 }, rgb(79, 230, 226));
     drawText(hdc, palette.left + 16, palette.top + 14, rgb(79, 230, 226), "COMMAND");
     drawTextClipped(hdc, palette.left + 16, palette.top + 44, palette.right - 16, rgb(235, 239, 244), state.app.palette.query.items);
 
-    var y = palette.top + 78;
+    var y = palette.top + PALETTE_MATCH_TOP;
     const max_matches: usize = 10;
     var row: usize = 0;
     while (row < max_matches and row < state.app.palette.matches.items.len) : (row += 1) {
@@ -844,6 +861,13 @@ fn visibleFileRowAt(layout: Layout, state: *const GuiState, y: c_int) ?usize {
 
 fn pointIn(rect: RECT, x: c_int, y: c_int) bool {
     return x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom;
+}
+
+fn paletteRect(client: RECT) RECT {
+    const width = @min(@max(client.right - client.left - 220, 420), 760);
+    const left = client.left + @divTrunc((client.right - client.left) - width, 2);
+    const top: c_int = 70;
+    return .{ .left = left, .top = top, .right = left + width, .bottom = top + 360 };
 }
 
 fn mouseX(lparam: windows.LPARAM) c_int {
@@ -952,6 +976,7 @@ const ROW_HEIGHT: c_int = 22;
 const CHAR_WIDTH: c_int = 8;
 const EDITOR_TEXT_PADDING_X: c_int = 16;
 const EDITOR_TEXT_PADDING_Y: c_int = 7;
+const PALETTE_MATCH_TOP: c_int = 78;
 
 const CS_HREDRAW: windows.UINT = 0x0002;
 const CS_VREDRAW: windows.UINT = 0x0001;

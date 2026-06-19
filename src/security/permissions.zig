@@ -27,6 +27,8 @@ pub const Consent = struct {
     fs_policy: FileSystemPolicy = .workspace_only,
     network_policy: NetworkPolicy = .deny,
     output_sanitized: bool = true,
+    timeout_ms: ?u32 = 60_000,
+    output_limit_bytes: usize = 512 * 1024,
 };
 
 pub const EnvPolicy = enum {

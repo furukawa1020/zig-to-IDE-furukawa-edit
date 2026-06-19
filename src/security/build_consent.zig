@@ -36,6 +36,9 @@ pub fn makePreview(allocator: std.mem.Allocator, spec: process.SpawnSpec, state:
         .locked_down => try warnings.append("locked down: security findings must be reviewed first"),
         .trusted => {},
     }
+    if (state != .trusted) {
+        try warnings.append("execution timeout is enforced for approved commands");
+    }
 
     return .{
         .allocator = allocator,
@@ -49,6 +52,8 @@ pub fn makePreview(allocator: std.mem.Allocator, spec: process.SpawnSpec, state:
             .fs_policy = if (state == .trusted) .unrestricted else .workspace_only,
             .network_policy = if (state == .trusted) .unrestricted else .deny,
             .output_sanitized = true,
+            .timeout_ms = if (state == .trusted) 120_000 else 30_000,
+            .output_limit_bytes = if (state == .trusted) 2 * 1024 * 1024 else 512 * 1024,
         },
         .warnings = try warnings.toOwnedSlice(),
     };
@@ -62,4 +67,6 @@ test "consent preview names command and trust state" {
 
     try std.testing.expect(std.mem.indexOf(u8, preview.command, "zig build test") != null);
     try std.testing.expect(preview.warnings.len > 0);
+    try std.testing.expectEqual(@as(?u32, 30_000), preview.consent.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 512 * 1024), preview.consent.output_limit_bytes);
 }

@@ -35,6 +35,7 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
     try stdout.writeAll("\x1b[1mzide\x1b[0m\n");
     try stdout.writeAll("----\n");
     try stdout.print("mode      : {s}\n", .{@tagName(instance.mode)});
+    try stdout.print("focus     : {s}\n", .{@tagName(instance.focus)});
     try stdout.print("trust     : {s}\n", .{@tagName(instance.runtime.trust_state)});
     try stdout.print("workspace : {s}\n", .{ws.root_path});
     try stdout.print("entries   : {d}\n", .{ws.entries.items.len});
@@ -57,6 +58,9 @@ pub fn renderWorkspace(stdout: anytype, instance: *const app.App) !void {
     try stdout.print("queue     : {d} approved command(s)\n", .{instance.execution_queue.queuedCount()});
     try stdout.print("history   : {d} completed command(s)\n", .{instance.execution_queue.history.items.len});
     try stdout.print("process   : {s}\n\n", .{if (instance.process_console.running) "running" else "idle"});
+    if (instance.selectedWorkspaceEntry()) |entry| {
+        try stdout.print("selected  : {s}\n\n", .{entry.path});
+    }
 
     if (instance.pending_build_consent) |preview| {
         try stdout.writeAll("pending build consent\n---------------------\n");

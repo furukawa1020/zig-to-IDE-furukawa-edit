@@ -116,7 +116,9 @@ fn joinRelative(allocator: std.mem.Allocator, parent: []const u8, name: []const 
 fn shouldSkip(name: []const u8, options: ScanOptions) bool {
     if (!options.include_hidden and name.len > 0 and name[0] == '.') return true;
     return std.mem.eql(u8, name, ".git") or
+        std.mem.eql(u8, name, ".tools") or
         std.mem.eql(u8, name, ".zig-cache") or
+        std.mem.eql(u8, name, ".zig-global-cache") or
         std.mem.eql(u8, name, "zig-cache") or
         std.mem.eql(u8, name, "zig-out") or
         std.mem.eql(u8, name, "node_modules") or
@@ -128,4 +130,11 @@ test "workspace can open current directory" {
     defer ws.deinit();
 
     try std.testing.expect(ws.root_path.len > 0);
+}
+
+test "workspace skips generated tool and cache directories" {
+    try std.testing.expect(shouldSkip(".tools", .{}));
+    try std.testing.expect(shouldSkip(".zig-cache", .{}));
+    try std.testing.expect(shouldSkip(".zig-global-cache", .{}));
+    try std.testing.expect(shouldSkip("zig-out", .{}));
 }

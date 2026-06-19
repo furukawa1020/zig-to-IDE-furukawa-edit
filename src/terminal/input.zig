@@ -31,6 +31,7 @@ pub const InputDecoder = struct {
         if (bytes[0] == '\r' or bytes[0] == '\n') return .{ .event = .{ .key = .{ .code = .enter } } };
         if (bytes[0] == '\t') return key(.tab);
         if (bytes[0] == 0x7f or bytes[0] == 0x08) return key(.backspace);
+        if (bytes[0] == 0x03 or bytes[0] == 0x11) return .{ .event = .shutdown };
         if (bytes[0] == 0x10) return .{ .event = .{ .key = .{ .code = .{ .char = 'p' }, .modifiers = .{ .ctrl = true } } } };
         if (bytes[0] < 0x20) return .invalid;
         if (bytes[0] >= 0x80) return decodeUtf8(bytes);
@@ -83,6 +84,12 @@ test "input decoder maps arrows and ctrl-p" {
     const ctrl_p_result = InputDecoder.decode(&.{0x10});
     switch (ctrl_p_result) {
         .event => |decoded| try std.testing.expect(decoded.key.modifiers.ctrl),
+        else => return error.ExpectedEvent,
+    }
+
+    const ctrl_c_result = InputDecoder.decode(&.{0x03});
+    switch (ctrl_c_result) {
+        .event => |decoded| try std.testing.expect(std.meta.activeTag(decoded) == .shutdown),
         else => return error.ExpectedEvent,
     }
 }

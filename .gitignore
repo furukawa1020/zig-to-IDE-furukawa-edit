@@ -6,6 +6,8 @@ zig-out/
 zig-*.zip
 zide
 zide.exe
+zide-gui
+zide-gui.exe
 *.pdb
 *.obj
 *.o

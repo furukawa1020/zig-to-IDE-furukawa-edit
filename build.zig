@@ -25,6 +25,8 @@ pub fn build(b: *std.Build) void {
     gui_module.linkSystemLibrary("user32", .{});
     gui_module.linkSystemLibrary("gdi32", .{});
     gui_module.linkSystemLibrary("kernel32", .{});
+    gui_module.linkSystemLibrary("shell32", .{});
+    gui_module.linkSystemLibrary("ole32", .{});
 
     const gui_exe = b.addExecutable(.{
         .name = "zide-gui",

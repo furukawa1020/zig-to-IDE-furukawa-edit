@@ -9,6 +9,8 @@ pub const State = enum {
     cancelled,
     blocked,
     failed,
+    timed_out,
+    output_limited,
 };
 
 pub const Ticket = struct {
@@ -25,6 +27,8 @@ pub const Ticket = struct {
     fs_policy: permissions.FileSystemPolicy,
     network_policy: permissions.NetworkPolicy,
     output_sanitized: bool,
+    timeout_ms: ?u32,
+    output_limit_bytes: usize,
     state: State = .queued,
 
     pub fn init(
@@ -69,6 +73,8 @@ pub const Ticket = struct {
             .fs_policy = consent.fs_policy,
             .network_policy = consent.network_policy,
             .output_sanitized = consent.output_sanitized,
+            .timeout_ms = consent.timeout_ms,
+            .output_limit_bytes = consent.output_limit_bytes,
         };
     }
 
@@ -92,6 +98,8 @@ pub const HistoryEntry = struct {
     fs_policy: permissions.FileSystemPolicy,
     network_policy: permissions.NetworkPolicy,
     output_sanitized: bool,
+    timeout_ms: ?u32,
+    output_limit_bytes: usize,
     state: State,
     exit_code: ?i32,
     output_lines: usize,
@@ -121,6 +129,8 @@ pub const HistoryEntry = struct {
             .fs_policy = ticket.fs_policy,
             .network_policy = ticket.network_policy,
             .output_sanitized = ticket.output_sanitized,
+            .timeout_ms = ticket.timeout_ms,
+            .output_limit_bytes = ticket.output_limit_bytes,
             .state = state,
             .exit_code = exit_code,
             .output_lines = output_lines,
@@ -255,10 +265,14 @@ test "execution queue owns command ticket" {
         .fs_policy = .workspace_only,
         .network_policy = .deny,
         .output_sanitized = true,
+        .timeout_ms = 30_000,
+        .output_limit_bytes = 128 * 1024,
     });
 
     try std.testing.expectEqual(@as(usize, 1), queue.queuedCount());
     try std.testing.expectEqualStrings("zig build test", queue.latest().?.display_command);
+    try std.testing.expectEqual(@as(?u32, 30_000), queue.latest().?.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 128 * 1024), queue.latest().?.output_limit_bytes);
 }
 
 test "execution queue hands ownership to runner" {
@@ -278,6 +292,8 @@ test "execution queue hands ownership to runner" {
         .fs_policy = .workspace_only,
         .network_policy = .deny,
         .output_sanitized = true,
+        .timeout_ms = 30_000,
+        .output_limit_bytes = 128 * 1024,
     });
 
     var ticket = queue.takeNextQueued() orelse return error.ExpectedTicket;

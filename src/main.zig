@@ -28,6 +28,7 @@ test {
     _ = @import("core/event.zig");
     _ = @import("core/event_loop.zig");
     _ = @import("core/input_handler.zig");
+    _ = @import("core/interactive.zig");
     _ = @import("core/loop_runner.zig");
     _ = @import("core/runtime.zig");
     _ = @import("core/types.zig");

@@ -46,21 +46,51 @@ fn handleKey(app: *app_mod.App, key: event.KeyEvent) !Outcome {
     }
 
     switch (key.code) {
+        .enter => if (app.focus == .files) {
+            return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "workspace.open_selected", .source = .keybinding }) };
+        } else return .ignored,
+        .tab => {
+            app.focus = if (app.focus == .files) .editor else .files;
+            return .redraw;
+        },
         .arrow_left => return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.move_left", .source = .keybinding }) },
         .arrow_right => return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.move_right", .source = .keybinding }) },
-        .arrow_up => return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.move_up", .source = .keybinding }) },
-        .arrow_down => return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.move_down", .source = .keybinding }) },
+        .arrow_up => if (fileTreeHasControl(app)) {
+            return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "workspace.previous_file", .source = .keybinding }) };
+        } else return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.move_up", .source = .keybinding }) },
+        .arrow_down => if (fileTreeHasControl(app)) {
+            return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "workspace.next_file", .source = .keybinding }) };
+        } else return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.move_down", .source = .keybinding }) },
         .char => |char| {
             if (key.modifiers.ctrl and (char == 'p' or char == 'P')) {
                 return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "view.command_palette", .source = .keybinding }) };
             }
+            if (key.modifiers.ctrl and (char == 'e' or char == 'E')) {
+                app.focus = .files;
+                return .redraw;
+            }
+            if (fileTreeHasControl(app) and (char == 'j' or char == 'J')) {
+                return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "workspace.next_file", .source = .keybinding }) };
+            }
+            if (fileTreeHasControl(app) and (char == 'k' or char == 'K')) {
+                return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "workspace.previous_file", .source = .keybinding }) };
+            }
+            if (fileTreeHasControl(app) and (char == 'o' or char == 'O')) {
+                return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "workspace.open_selected", .source = .keybinding }) };
+            }
             if (char == 'i') {
+                if (app.documents.active_index == null) return .ignored;
+                app.focus = .editor;
                 return .{ .command_result = try dispatcher.dispatch(app, .{ .id = "editor.enter_insert", .source = .keybinding }) };
             }
             return .ignored;
         },
         else => return .ignored,
     }
+}
+
+fn fileTreeHasControl(app: *const app_mod.App) bool {
+    return app.focus == .files or app.documents.active_index == null;
 }
 
 fn handleInsertKey(app: *app_mod.App, key: event.KeyEvent) !Outcome {
@@ -155,4 +185,15 @@ test "ctrl-p opens command palette through input handler" {
     } });
     try @import("std").testing.expect(@import("std").meta.activeTag(outcome) == .command_result);
     try @import("std").testing.expect(app.palette.visible);
+}
+
+test "enter opens selected file from focused file tree" {
+    var app = try app_mod.App.init(@import("std").testing.allocator, ".");
+    defer app.deinit();
+
+    app.focus = .files;
+    const outcome = try handle(&app, .{ .key = .{ .code = .enter } });
+    try @import("std").testing.expect(@import("std").meta.activeTag(outcome) == .command_result);
+    try @import("std").testing.expect(app.documents.active() != null);
+    try @import("std").testing.expectEqual(app_mod.Focus.editor, app.focus);
 }

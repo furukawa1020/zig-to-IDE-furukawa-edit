@@ -68,7 +68,14 @@ fn resolveGitDir(allocator: std.mem.Allocator, workspace_root: []const u8, colle
         .directory => return dot_git,
         .file => {
             const bytes = try readFile(allocator, dot_git, 16 * 1024);
-            defer bytes and actual Git metadata may live outside the workspace", git_dir);
+            defer allocator.free(bytes);
+            const resolved = (try parseGitdirFile(allocator, workspace_root, bytes)) orelse {
+                try collection.append(.git_trust, .medium, ".git", 0, 0, ".git file does not contain a gitdir pointer", "");
+                allocator.free(dot_git);
+                return null;
+            };
+            if (!isInsideWorkspace(workspace_root, resolved)) {
+                try collection.append(.git_trust, .high, ".git", 0, 0, ".git points outside the workspace; Git metadata trust crosses a directory boundary", resolved);
             }
             allocator.free(dot_git);
             return resolved;

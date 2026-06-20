@@ -60,6 +60,19 @@ pub const Collection = struct {
         self.items.clearRetainingCapacity();
     }
 
+    pub fn clearCategory(self: *Collection, category: Category) void {
+        var index: usize = 0;
+        while (index < self.items.items.len) {
+            if (self.items.items[index].category != category) {
+                index += 1;
+                continue;
+            }
+
+            var removed = self.items.orderedRemove(index);
+            removed.deinit(self.allocator);
+        }
+    }
+
     pub fn append(
         self: *Collection,
         category: Category,
@@ -117,4 +130,18 @@ fn riskRank(risk: Risk) u8 {
         .high => 3,
         .critical => 4,
     };
+}
+
+test "clearCategory removes only matching findings" {
+    var collection = Collection.init(std.testing.allocator);
+    defer collection.deinit();
+
+    try collection.append(.git_trust, .medium, ".git/config", 0, 0, "git", "");
+    try collection.append(.build_firewall, .high, "build.zig", 0, 0, "build", "");
+    try collection.append(.git_trust, .high, ".git/hooks", 0, 0, "hook", "");
+
+    collection.clearCategory(.git_trust);
+
+    try std.testing.expectEqual(@as(usize, 1), collection.items.items.len);
+    try std.testing.expectEqual(Category.build_firewall, collection.items.items[0].category);
 }

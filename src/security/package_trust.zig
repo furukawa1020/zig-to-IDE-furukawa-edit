@@ -38,10 +38,18 @@ pub fn scanZon(allocator: std.mem.Allocator, source: []const u8, options: ScanOp
         if (std.mem.indexOf(u8, line, ".hash")) |column| {
             current_dependency_has_hash = true;
             try collection.append(.package_trust, .info, options.path, line_number, column, "dependency fingerprint/hash is present", line);
+            if (looksEmptyHash(line)) {
+                try collection.append(.package_trust, .high, options.path, line_number, column, "dependency hash appears empty", line);
+            }
         }
 
         if (std.mem.indexOf(u8, line, ".url")) |column| {
-            try collection.append(.package_trust, .medium, options.path, line_number, column, "dependency fetched from URL; source and fingerprint should be reviewed", line);
+            const risk: findings.Risk = if (looksPlainHttp(line)) .high else .medium;
+            const message = if (risk == .high)
+                "dependency fetched over non-HTTPS URL"
+            else
+                "dependency fetched from URL; source and fingerprint should be reviewed";
+            try collection.append(.package_trust, risk, options.path, line_number, column, message, line);
         }
 
         if (std.mem.indexOf(u8, line, ".path")) |column| {
@@ -66,6 +74,14 @@ fn looksLikeDependencyName(line: []const u8) bool {
     return std.mem.indexOf(u8, line, ".hash") == null and
         std.mem.indexOf(u8, line, ".url") == null and
         std.mem.indexOf(u8, line, ".path") == null;
+}
+
+fn looksPlainHttp(line: []const u8) bool {
+    return std.mem.indexOf(u8, line, "http://") != null;
+}
+
+fn looksEmptyHash(line: []const u8) bool {
+    return std.mem.indexOf(u8, line, "\"\"") != null;
 }
 
 test "package trust detects url and missing hash" {

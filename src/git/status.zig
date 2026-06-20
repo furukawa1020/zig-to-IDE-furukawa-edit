@@ -93,8 +93,8 @@ fn parseGitdirFile(allocator: std.mem.Allocator, workspace_root: []const u8, byt
     if (!startsWithIgnoreCase(trimmed, "gitdir:")) return null;
     const value = std.mem.trim(u8, trimmed["gitdir:".len..], " \t\r\n");
     if (value.len == 0) return null;
-    if (std.fs.path.isAbsolute(value)) return allocator.dupe(u8, value);
-    return std.fs.path.join(allocator, &.{ workspace_root, value });
+    if (std.fs.path.isAbsolute(value)) return try allocator.dupe(u8, value);
+    return try std.fs.path.join(allocator, &.{ workspace_root, value });
 }
 
 fn scanConfigFile(

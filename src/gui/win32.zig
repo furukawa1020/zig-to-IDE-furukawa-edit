@@ -1040,6 +1040,10 @@ fn rgb(r: u8, g: u8, b: u8) windows.COLORREF {
 }
 
 fn chooseFolder(allocator: std.mem.Allocator, owner: windows.HWND) !?[]u8 {
+    const hr = OleInitialize(null);
+    const ole_initialized = hr >= 0;
+    defer if (ole_initialized) OleUninitialize();
+
     const title = std.unicode.utf8ToUtf16LeStringLiteral("Open workspace folder");
     var display_name: [MAX_PATH]u16 = [_]u16{0} ** MAX_PATH;
     var info = BROWSEINFOW{
@@ -1166,6 +1170,7 @@ const BROWSEINFOW = extern struct {
 const HGDIOBJ = *opaque {};
 const WPARAM = windows.ULONG_PTR;
 const LRESULT = windows.LONG_PTR;
+const HRESULT = c_long;
 
 const STATUS_HEIGHT: c_int = 30;
 const HEADER_HEIGHT: c_int = 42;
@@ -1249,6 +1254,8 @@ extern "user32" fn FillRect(hDC: windows.HDC, lprc: *const RECT, hbr: windows.HB
 
 extern "shell32" fn SHBrowseForFolderW(lpbi: *BROWSEINFOW) callconv(.winapi) ?*ITEMIDLIST;
 extern "shell32" fn SHGetPathFromIDListW(pidl: *const ITEMIDLIST, pszPath: [*]u16) callconv(.winapi) windows.BOOL;
+extern "ole32" fn OleInitialize(pvReserved: ?*anyopaque) callconv(.winapi) HRESULT;
+extern "ole32" fn OleUninitialize() callconv(.winapi) void;
 extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
 
 extern "gdi32" fn SetTextColor(hdc: windows.HDC, crColor: windows.COLORREF) callconv(.winapi) windows.COLORREF;

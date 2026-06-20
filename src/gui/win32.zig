@@ -162,7 +162,7 @@ const GuiState = struct {
                 counts.low,
             },
         );
-        self.appendOutput(.stdout, "checks: build.zig firewall, build.zig.zon dependency hashes, unsafe Zig builtins, FFI, allocators, git config/hooks/submodules\n", .{});
+        self.appendOutput(.stdout, "checks: build.zig firewall, build.zig.zon dependency hashes, unsafe Zig builtins, FFI, allocators, git config/hooks/submodules/attributes\n", .{});
 
         const limit: usize = 10;
         for (self.app.security_findings.items.items, 0..) |item, index| {

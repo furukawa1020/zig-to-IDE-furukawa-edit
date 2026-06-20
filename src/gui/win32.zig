@@ -162,7 +162,7 @@ const GuiState = struct {
                 counts.low,
             },
         );
-        self.appendOutput(.stdout, "checks: build.zig firewall, build.zig.zon dependency hashes, unsafe Zig builtins, FFI, allocators\n", .{});
+        self.appendOutput(.stdout, "checks: build.zig firewall, build.zig.zon dependency hashes, unsafe Zig builtins, FFI, allocators, git config/hooks/submodules\n", .{});
 
         const limit: usize = 10;
         for (self.app.security_findings.items.items, 0..) |item, index| {
@@ -529,6 +529,10 @@ const GuiState = struct {
                 self.chooseAndOpenWorkspace(hwnd);
                 return;
             }
+            if (pointIn(gitAuditButtonRect(layout), x, y)) {
+                self.executeCommand("git.status");
+                return;
+            }
 
             self.app.focus = .files;
             const row = visibleFileRowAt(layout, self, y) orelse return;
@@ -650,6 +654,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         state.executeCommand("task.run_next");
         return;
     }
+    if (ctrl and key == 'G') {
+        state.executeCommand("git.status");
+        return;
+    }
     if (ctrl and key == 'O') {
         state.chooseAndOpenWorkspace(hwnd);
         return;
@@ -753,6 +761,7 @@ fn paint(hwnd: windows.HWND) void {
 
         drawText(hdc, 18, 15, rgb(79, 230, 226), "FILES");
         drawButton(hdc, openWorkspaceButtonRect(layout), "OPEN");
+        drawButton(hdc, gitAuditButtonRect(layout), "GIT");
         drawFileList(hdc, state, layout);
         drawEditor(hdc, state, layout);
         if (state.show_output) drawOutput(hdc, state, layout);
@@ -967,7 +976,16 @@ fn visibleFileRowAt(layout: Layout, state: *const GuiState, y: c_int) ?usize {
 
 fn openWorkspaceButtonRect(layout: Layout) RECT {
     return .{
-        .left = @max(layout.sidebar.left + 88, layout.sidebar.right - 86),
+        .left = @max(layout.sidebar.left + 88, layout.sidebar.right - 142),
+        .top = 10,
+        .right = layout.sidebar.right - 72,
+        .bottom = 32,
+    };
+}
+
+fn gitAuditButtonRect(layout: Layout) RECT {
+    return .{
+        .left = layout.sidebar.right - 66,
         .top = 10,
         .right = layout.sidebar.right - 12,
         .bottom = 32,

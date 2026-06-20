@@ -6,6 +6,7 @@ const command = @import("command.zig");
 const navigation = @import("../editor/navigation.zig");
 const process = @import("../platform/process.zig");
 const executor = @import("../tasks/executor.zig");
+const git_status = @import("../git/status.zig");
 const permissions = @import("../security/permissions.zig");
 const posture = @import("../security/posture.zig");
 const security_findings = @import("../security/findings.zig");
@@ -251,6 +252,18 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         };
     }
 
+    if (std.mem.eql(u8, definition.id, "git.status")) {
+        var audit = try git_status.auditRepository(app.allocator, app.workspace.root_path, .{});
+        defer audit.deinit();
+
+        for (audit.items.items) |item| {
+            try app.security_findings.appendFinding(item);
+        }
+        try renderGitAudit(app, &audit);
+        applyPostureGuard(app);
+        return .{ .completed = "git metadata audit complete" };
+    }
+
     if (std.mem.eql(u8, definition.id, "zig.build")) {
         app.clearPendingBuildConsent();
         return .{ .external_command = zigCommand(app, .build) };
@@ -315,6 +328,29 @@ fn workspacePath(app: *app_mod.App, path: []const u8) ![]u8 {
         return app.allocator.dupe(u8, path);
     }
     return std.fs.path.join(app.allocator, &.{ app.workspace.root_path, path });
+}
+
+fn renderGitAudit(app: *app_mod.App, audit: *const security_findings.Collection) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.print("git metadata audit: {d} findings\n", .{audit.items.items.len});
+    for (audit.items.items, 0..) |item, index| {
+        if (index >= 12) {
+            try writer.print("... {d} more git findings\n", .{audit.items.items.len - index});
+            break;
+        }
+        try writer.print("{s}/{s} {s}:{d}:{d} {s}\n", .{
+            @tagName(item.risk),
+            @tagName(item.category),
+            item.path,
+            item.line + 1,
+            item.column + 1,
+            item.message,
+        });
+    }
+    try app.process_console.appendBytes(.stdout, text.written());
 }
 
 test "dispatch opens command palette" {

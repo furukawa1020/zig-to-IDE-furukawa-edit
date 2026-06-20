@@ -18,6 +18,7 @@ pub const Category = enum {
     output_sanitizer,
     ide_self_protection,
     allocator_policy,
+    git_trust,
 };
 
 pub const Finding = struct {

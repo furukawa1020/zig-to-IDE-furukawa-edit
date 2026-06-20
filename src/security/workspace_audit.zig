@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_firewall = @import("build_firewall.zig");
 const findings = @import("findings.zig");
+const git_status = @import("../git/status.zig");
 const package_trust = @import("package_trust.zig");
 const workspace = @import("../workspace/workspace.zig");
 const zig_scanner = @import("zig_scanner.zig");
@@ -15,6 +16,10 @@ pub fn auditWorkspace(allocator: std.mem.Allocator, ws: *const workspace.Workspa
     errdefer collection.deinit();
 
     try collection.append(.workspace_trust, .info, ws.root_path, 0, 0, "workspace opened in static audit mode; open is not execute", "");
+
+    var git_findings = try git_status.auditRepository(allocator, ws.root_path, .{});
+    defer git_findings.deinit();
+    try appendAll(&collection, &git_findings);
 
     var scanned: usize = 0;
     var truncated = false;

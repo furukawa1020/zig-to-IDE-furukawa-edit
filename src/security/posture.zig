@@ -11,6 +11,7 @@ pub const Summary = struct {
     ffi_boundary: usize = 0,
     secret_flow: usize = 0,
     allocator_policy: usize = 0,
+    git_trust: usize = 0,
     recommended_trust: trust.TrustState = .untrusted,
     label: []const u8 = "CLEAR",
 };
@@ -37,6 +38,7 @@ pub fn summarize(collection: *const findings.Collection, current_trust: trust.Tr
             .ffi_boundary => summary.ffi_boundary += 1,
             .secret_flow => summary.secret_flow += 1,
             .allocator_policy => summary.allocator_policy += 1,
+            .git_trust => summary.git_trust += 1,
             else => {},
         }
     }

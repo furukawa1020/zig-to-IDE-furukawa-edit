@@ -24,6 +24,12 @@ fn scanLine(collection: *findings.Collection, path: []const u8, line: []const u8
     try detect(collection, path, line, line_number, "@alignCast", .ffi_boundary, .high, "alignment cast must be justified at the boundary");
     try detect(collection, path, line, line_number, "@ptrFromInt", .ffi_boundary, .critical, "integer-to-pointer conversion can create invalid pointers");
     try detect(collection, path, line, line_number, "@intFromPtr", .ffi_boundary, .medium, "pointer value is being exposed as an integer");
+    try detect(collection, path, line, line_number, "@fieldParentPtr", .ffi_boundary, .high, "field-to-parent pointer recovery requires layout and lifetime proof");
+    try detect(collection, path, line, line_number, "@addrSpaceCast", .ffi_boundary, .high, "address-space cast crosses a memory domain boundary");
+    try detect(collection, path, line, line_number, "@constCast", .ffi_boundary, .medium, "const cast weakens mutation guarantees at a boundary");
+    try detect(collection, path, line, line_number, "@volatileCast", .ffi_boundary, .medium, "volatile cast changes observable memory semantics");
+    try detect(collection, path, line, line_number, "@bitCast", .ffi_boundary, .medium, "bit cast relies on exact representation invariants");
+    try detect(collection, path, line, line_number, "allowzero", .ffi_boundary, .high, "allowzero pointer accepts address zero; null invariants must be explicit");
     try detect(collection, path, line, line_number, "@setRuntimeSafety(false)", .safety_profile, .high, "runtime safety checks disabled in this scope");
     try detect(collection, path, line, line_number, "@cImport", .ffi_boundary, .high, "C import expands the trusted computing boundary");
     try detect(collection, path, line, line_number, "[*c]", .ffi_boundary, .high, "C pointer type requires explicit null and lifetime checks");
@@ -35,10 +41,19 @@ fn scanLine(collection: *findings.Collection, path: []const u8, line: []const u8
     try detect(collection, path, line, line_number, "std.heap.page_allocator", .allocator_policy, .medium, "page allocator should be justified for long-lived allocations");
     try detect(collection, path, line, line_number, "ArenaAllocator", .allocator_policy, .low, "arena lifetime should be bounded to a visible scope");
     try detect(collection, path, line, line_number, "GeneralPurposeAllocator", .allocator_policy, .info, "general purpose allocator boundary detected");
+    try detect(collection, path, line, line_number, "std.process.run", .build_firewall, .high, "Zig source can spawn a child process");
+    try detect(collection, path, line, line_number, "std.process.Child", .build_firewall, .high, "Zig source constructs a child process");
+    try detect(collection, path, line, line_number, "std.Io.Dir.delete", .allocator_policy, .high, "filesystem deletion boundary requires workspace policy");
+    try detect(collection, path, line, line_number, "deleteTree", .allocator_policy, .critical, "recursive deletion boundary requires explicit review");
+    try detect(collection, path, line, line_number, "threadlocal", .safety_profile, .medium, "threadlocal state can hide cross-thread invariants");
     try detect(collection, path, line, line_number, "ReleaseFast", .safety_profile, .high, "ReleaseFast removes runtime safety checks unless explicitly overridden");
 
     if (std.mem.indexOf(u8, line, "catch unreachable")) |column| {
         try collection.append(.safety_profile, .medium, path, line_number, column, "catch unreachable turns recoverable failure into a safety boundary", line);
+    }
+
+    if (std.mem.indexOf(u8, line, "unreachable")) |column| {
+        try collection.append(.safety_profile, .medium, path, line_number, column, "unreachable is a proof obligation; invalid proof can become undefined behavior", line);
     }
 
     if (std.mem.indexOf(u8, line, "undefined")) |column| {

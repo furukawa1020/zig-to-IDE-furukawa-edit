@@ -256,6 +256,7 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         var audit = try git_status.auditRepository(app.allocator, app.workspace.root_path, .{});
         defer audit.deinit();
 
+        app.security_findings.clearCategory(.git_trust);
         for (audit.items.items) |item| {
             try app.security_findings.appendFinding(item);
         }

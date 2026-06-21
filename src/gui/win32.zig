@@ -132,6 +132,70 @@ const QuickPanel = struct {
     }
 };
 
+const SearchPanel = struct {
+    allocator: std.mem.Allocator,
+    visible: bool = false,
+    query: std.array_list.Managed(u8),
+    selected_index: usize = 0,
+    results: ?[]workspace_search.Result = null,
+
+    fn init(allocator: std.mem.Allocator) SearchPanel {
+        return .{
+            .allocator = allocator,
+            .query = std.array_list.Managed(u8).init(allocator),
+        };
+    }
+
+    fn deinit(self: *SearchPanel) void {
+        self.clearResults();
+        self.query.deinit();
+        self.* = undefined;
+    }
+
+    fn clear(self: *SearchPanel) void {
+        self.clearResults();
+        self.query.clearRetainingCapacity();
+        self.selected_index = 0;
+        self.visible = false;
+    }
+
+    fn refresh(self: *SearchPanel, app: *const app_mod.App, query: []const u8) !void {
+        self.clearResults();
+        self.query.clearRetainingCapacity();
+        try self.query.appendSlice(query);
+        self.selected_index = 0;
+
+        if (query.len == 0) {
+            self.visible = false;
+            return;
+        }
+
+        self.results = try workspace_search.search(self.allocator, &app.workspace, query, .{
+            .max_file_bytes = 512 * 1024,
+            .max_results = 512,
+        });
+        self.visible = true;
+    }
+
+    fn itemCount(self: *const SearchPanel) usize {
+        return if (self.results) |items| items.len else 0;
+    }
+
+    fn selectedResult(self: *const SearchPanel) ?*const workspace_search.Result {
+        const items = self.results orelse return null;
+        if (items.len == 0) return null;
+        return &items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn clearResults(self: *SearchPanel) void {
+        if (self.results) |items| {
+            for (items) |*item| item.deinit(self.allocator);
+            self.allocator.free(items);
+            self.results = null;
+        }
+    }
+};
+
 pub fn run(allocator: std.mem.Allocator, root_path: []const u8) !void {
     if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
 
@@ -202,6 +266,7 @@ const GuiState = struct {
     output_scroll_line: usize = 0,
     show_output: bool = true,
     quick_panel: QuickPanel,
+    search_panel: SearchPanel,
 
     fn init(allocator: std.mem.Allocator, root_path: []const u8) !GuiState {
         var app = try app_mod.App.init(allocator, root_path);
@@ -215,6 +280,7 @@ const GuiState = struct {
             .app = app,
             .collapsed_dirs = collapsed_dirs,
             .quick_panel = QuickPanel.init(allocator),
+            .search_panel = SearchPanel.init(allocator),
         };
     }
 
@@ -241,6 +307,7 @@ const GuiState = struct {
         self.output_scroll_line = 0;
         self.show_output = true;
         self.quick_panel.close();
+        self.search_panel.clear();
         self.setMessage("Workspace opened") catch {};
         self.appendOutput(.stdout, "opened workspace: {s}\n", .{self.app.workspace.root_path});
         self.runZigSecurityAudit("workspace open");
@@ -306,6 +373,7 @@ const GuiState = struct {
 
     fn deinit(self: *GuiState) void {
         if (self.last_error) |message| self.allocator.free(message);
+        self.search_panel.deinit();
         self.quick_panel.deinit();
         self.allocator.free(self.collapsed_dirs);
         self.app.deinit();
@@ -397,6 +465,24 @@ const GuiState = struct {
         self.executeCommand(definition.id);
     }
 
+    fn switchDocument(self: *GuiState, index: usize) void {
+        self.app.documents.switchTo(index) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureCursorVisible();
+        self.setMessage("Switched document") catch {};
+    }
+
+    fn switchDocumentByDelta(self: *GuiState, delta: isize) void {
+        self.app.documents.moveActive(delta);
+        self.app.focus = .editor;
+        self.ensureCursorVisible();
+        self.setMessage("Switched document") catch {};
+    }
+
     fn executeCommand(self: *GuiState, id: []const u8) void {
         if (std.mem.eql(u8, id, "workspace.find_file")) {
             self.openQuickPanel(.find_file);
@@ -429,6 +515,31 @@ const GuiState = struct {
         }) catch {};
     }
 
+    fn quickPanelInsertText(self: *GuiState, bytes: []const u8) void {
+        self.quick_panel.insertText(&self.app, bytes) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.refreshSearchPanelFromQuickPanel();
+    }
+
+    fn quickPanelDeleteBackward(self: *GuiState) void {
+        self.quick_panel.deleteBackward(&self.app) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.refreshSearchPanelFromQuickPanel();
+    }
+
+    fn refreshSearchPanelFromQuickPanel(self: *GuiState) void {
+        if (!self.quick_panel.visible or self.quick_panel.mode != .search_workspace) return;
+        self.search_panel.refresh(&self.app, self.quick_panel.query.items) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "search refresh failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+    }
+
     fn executeSelectedQuickPanelItem(self: *GuiState) void {
         switch (self.quick_panel.mode) {
             .find_file => {
@@ -455,6 +566,14 @@ const GuiState = struct {
                 self.openRelativeFile(path, offset);
             },
         }
+    }
+
+    fn openSelectedSearchPanelItem(self: *GuiState) void {
+        const item = self.search_panel.selectedResult() orelse {
+            self.setMessage("No search result selected") catch {};
+            return;
+        };
+        self.openRelativeFile(item.path, item.byte_offset);
     }
 
     fn openRelativeFile(self: *GuiState, relative: []const u8, offset: ?usize) void {
@@ -484,6 +603,11 @@ const GuiState = struct {
         self.app.mode = .insert;
         self.ensureCursorVisible();
         self.setMessage("Opened file") catch {};
+    }
+
+    fn jumpToNextDiagnostic(self: *GuiState) void {
+        self.executeCommand("diagnostics.next");
+        self.ensureCursorVisible();
     }
 
     fn handleDispatchResult(self: *GuiState, id: []const u8, result: dispatcher.Result) void {
@@ -771,8 +895,40 @@ const GuiState = struct {
         }
 
         if (pointIn(layout.editor, x, y)) {
+            if (pointIn(saveButtonRect(layout), x, y)) {
+                self.executeCommand("file.save");
+                return;
+            }
+            if (pointIn(runButtonRect(layout), x, y)) {
+                self.executeCommand("task.run_next");
+                return;
+            }
+            if (pointIn(testButtonRect(layout), x, y)) {
+                self.executeCommand("zig.test");
+                return;
+            }
+            if (pointIn(buildButtonRect(layout), x, y)) {
+                self.executeCommand("zig.build");
+                return;
+            }
+            if (documentTabAt(layout, self, x, y)) |index| {
+                self.switchDocument(index);
+                return;
+            }
+            if (y < HEADER_HEIGHT) return;
             self.setEditorCursorFromPoint(layout, x, y);
             return;
+        }
+
+        if (searchResultsRect(layout, self)) |rect| {
+            if (pointIn(rect, x, y)) {
+                const row = searchResultRowAt(rect, y) orelse return;
+                if (row < self.search_panel.itemCount()) {
+                    self.search_panel.selected_index = row;
+                    self.openSelectedSearchPanelItem();
+                }
+                return;
+            }
         }
 
         if (pointIn(layout.output, x, y)) {
@@ -847,7 +1003,7 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
             VK_UP => state.quick_panel.moveSelection(-1),
             VK_DOWN => state.quick_panel.moveSelection(1),
             VK_RETURN => state.executeSelectedQuickPanelItem(),
-            VK_BACK => state.quick_panel.deleteBackward(&state.app) catch |err| state.setError(err) catch {},
+            VK_BACK => state.quickPanelDeleteBackward(),
             else => {},
         }
         return;
@@ -903,6 +1059,14 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (ctrl and key == 'O') {
         state.chooseAndOpenWorkspace(hwnd);
+        return;
+    }
+    if (ctrl and key == VK_TAB) {
+        state.switchDocumentByDelta(if (shift) -1 else 1);
+        return;
+    }
+    if (key == VK_F8) {
+        state.jumpToNextDiagnostic();
         return;
     }
     if (key == VK_F6) {
@@ -964,7 +1128,7 @@ fn handleChar(state: *GuiState, key: WPARAM) void {
         if (codepoint >= 0x20 and codepoint != 0x7f) {
             var buffer: [4]u8 = undefined;
             const len = std.unicode.utf8Encode(codepoint, &buffer) catch return;
-            state.quick_panel.insertText(&state.app, buffer[0..len]) catch |err| state.setError(err) catch {};
+            state.quickPanelInsertText(buffer[0..len]);
         }
         return;
     }
@@ -1068,11 +1232,9 @@ fn drawFileList(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
 
 fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
     const editor = layout.editor;
+    drawEditorHeader(hdc, state, layout);
     const active = state.app.documents.active();
     if (active) |doc| {
-        const title = doc.path orelse "untitled";
-        drawTextClipped(hdc, editor.left + 20, 15, editor.right - 24, rgb(79, 230, 226), title);
-        if (doc.dirty) drawText(hdc, editor.right - 72, 15, rgb(255, 207, 92), "dirty");
         fillRect(hdc, RECT{ .left = editor.left, .top = HEADER_HEIGHT, .right = editor.left + GUTTER_WIDTH, .bottom = editor.bottom }, rgb(14, 18, 23));
 
         const max_rows = @max(0, @divTrunc(editor.bottom - HEADER_HEIGHT - 8, ROW_HEIGHT));
@@ -1096,21 +1258,54 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
             y += ROW_HEIGHT;
         }
     } else {
-        drawText(hdc, editor.left + 22, 15, rgb(79, 230, 226), "zide workbench");
         drawText(hdc, editor.left + 22, HEADER_HEIGHT + 10, rgb(199, 206, 214), "Click a file to open it.");
         drawText(hdc, editor.left + 22, HEADER_HEIGHT + 38, rgb(126, 138, 150), "F1 opens commands. Ctrl+S saves. Ctrl+B prepares build.");
     }
 }
 
+fn drawEditorHeader(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
+    drawButton(hdc, saveButtonRect(layout), "SAVE");
+    drawButton(hdc, buildButtonRect(layout), "BUILD");
+    drawButton(hdc, testButtonRect(layout), "TEST");
+    drawButton(hdc, runButtonRect(layout), "RUN");
+
+    const active_index = state.app.documents.activeIndex();
+    const max_right = documentTabMaxRight(layout);
+    var index: usize = 0;
+    while (index < state.app.documents.documents.items.len) : (index += 1) {
+        const rect = documentTabRect(layout, index);
+        if (rect.left >= max_right) break;
+        const clipped = RECT{ .left = rect.left, .top = rect.top, .right = @min(rect.right, max_right), .bottom = rect.bottom };
+        const active = active_index != null and active_index.? == index;
+        fillRect(hdc, clipped, if (active) rgb(51, 153, 235) else rgb(27, 34, 41));
+        if (active) fillRect(hdc, RECT{ .left = clipped.left, .top = clipped.top, .right = clipped.right, .bottom = clipped.top + 1 }, rgb(255, 207, 92));
+
+        const doc = state.app.documents.documents.items[index];
+        const path = doc.path orelse "untitled";
+        var label_buf: [220]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ std.fs.path.basename(path), if (doc.dirty) "*" else "" }) catch path;
+        drawTextClipped(hdc, clipped.left + 10, clipped.top + 5, clipped.right - 8, if (active) rgb(16, 19, 22) else rgb(220, 226, 232), label);
+    }
+
+    if (state.app.documents.documents.items.len == 0) {
+        drawText(hdc, layout.editor.left + 22, 15, rgb(79, 230, 226), "zide workbench");
+    }
+}
+
 fn drawOutput(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
-    fillRect(hdc, RECT{ .left = layout.output.left, .top = layout.output.top, .right = layout.output.right, .bottom = layout.output.top + 1 }, rgb(43, 53, 61));
-    drawText(hdc, layout.output.left + 16, layout.output.top + 10, rgb(79, 230, 226), "OUTPUT");
+    if (searchResultsRect(layout, state)) |rect| {
+        drawSearchResults(hdc, state, rect);
+    }
+
+    const output = consoleOutputRect(layout, state);
+    fillRect(hdc, RECT{ .left = output.left, .top = output.top, .right = output.right, .bottom = output.top + 1 }, rgb(43, 53, 61));
+    drawText(hdc, output.left + 16, output.top + 10, rgb(79, 230, 226), "OUTPUT");
 
     const lines = state.app.process_console.lines.items;
-    const rows = @max(0, @divTrunc(layout.output.bottom - layout.output.top - HEADER_HEIGHT, ROW_HEIGHT));
+    const rows = @max(0, @divTrunc(output.bottom - output.top - HEADER_HEIGHT, ROW_HEIGHT));
     const max_start = if (lines.len > @as(usize, @intCast(rows))) lines.len - @as(usize, @intCast(rows)) else 0;
     const start = @min(state.output_scroll_line, max_start);
-    var y = layout.output.top + HEADER_HEIGHT;
+    var y = output.top + HEADER_HEIGHT;
     var row: usize = 0;
     while (row < @as(usize, @intCast(rows)) and start + row < lines.len) : (row += 1) {
         const line = lines[start + row];
@@ -1118,12 +1313,41 @@ fn drawOutput(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
             .stdout => rgb(200, 207, 216),
             .stderr => rgb(255, 125, 125),
         };
-        drawTextClipped(hdc, layout.output.left + 16, y, layout.output.right - 16, color, line.text);
+        drawTextClipped(hdc, output.left + 16, y, output.right - 16, color, line.text);
         y += ROW_HEIGHT;
     }
 
     if (lines.len == 0) {
-        drawText(hdc, layout.output.left + 16, layout.output.top + HEADER_HEIGHT, rgb(116, 128, 140), "No output yet");
+        drawText(hdc, output.left + 16, output.top + HEADER_HEIGHT, rgb(116, 128, 140), "No output yet");
+    }
+}
+
+fn drawSearchResults(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
+    fillRect(hdc, rect, rgb(13, 17, 21));
+    fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
+    drawText(hdc, rect.left + 16, rect.top + 10, rgb(79, 230, 226), "SEARCH RESULTS");
+    drawTextClipped(hdc, rect.left + 150, rect.top + 10, rect.right - 16, rgb(180, 190, 200), state.search_panel.query.items);
+
+    const items = state.search_panel.results orelse {
+        drawText(hdc, rect.left + 16, rect.top + HEADER_HEIGHT, rgb(116, 128, 140), "No matches");
+        return;
+    };
+
+    const rows = @max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT, ROW_HEIGHT));
+    var row: usize = 0;
+    var y = rect.top + HEADER_HEIGHT;
+    while (row < @as(usize, @intCast(rows)) and row < items.len) : (row += 1) {
+        const selected = row == state.search_panel.selected_index;
+        if (selected) {
+            fillRect(hdc, RECT{ .left = rect.left + 8, .top = y - 2, .right = rect.right - 8, .bottom = y + ROW_HEIGHT - 2 }, rgb(51, 153, 235));
+        }
+        const color = if (selected) rgb(16, 19, 22) else rgb(205, 213, 222);
+        const item = items[row];
+        var location_buf: [320]u8 = undefined;
+        const location = std.fmt.bufPrint(&location_buf, "{s}:{d}:{d}", .{ item.path, item.line + 1, item.column + 1 }) catch item.path;
+        drawTextClipped(hdc, rect.left + 18, y, rect.left + 320, color, location);
+        drawTextClipped(hdc, rect.left + 330, y, rect.right - 16, color, item.preview);
+        y += ROW_HEIGHT;
     }
 }
 
@@ -1290,6 +1514,90 @@ fn gitAuditButtonRect(layout: Layout) RECT {
         .right = layout.sidebar.right - 12,
         .bottom = 32,
     };
+}
+
+fn toolbarButtonRect(layout: Layout, slot_from_right: c_int) RECT {
+    const width: c_int = 54;
+    const gap: c_int = 8;
+    const right = layout.editor.right - 12 - slot_from_right * (width + gap);
+    return .{
+        .left = right - width,
+        .top = 10,
+        .right = right,
+        .bottom = 32,
+    };
+}
+
+fn saveButtonRect(layout: Layout) RECT {
+    return toolbarButtonRect(layout, 0);
+}
+
+fn runButtonRect(layout: Layout) RECT {
+    return toolbarButtonRect(layout, 1);
+}
+
+fn testButtonRect(layout: Layout) RECT {
+    return toolbarButtonRect(layout, 2);
+}
+
+fn buildButtonRect(layout: Layout) RECT {
+    return toolbarButtonRect(layout, 3);
+}
+
+fn documentTabMaxRight(layout: Layout) c_int {
+    return buildButtonRect(layout).left - 10;
+}
+
+fn documentTabRect(layout: Layout, index: usize) RECT {
+    const width: c_int = 150;
+    const gap: c_int = 4;
+    const left = layout.editor.left + 12 + @as(c_int, @intCast(index)) * (width + gap);
+    return .{
+        .left = left,
+        .top = 9,
+        .right = left + width,
+        .bottom = 33,
+    };
+}
+
+fn documentTabAt(layout: Layout, state: *const GuiState, x: c_int, y: c_int) ?usize {
+    const max_right = documentTabMaxRight(layout);
+    for (state.app.documents.documents.items, 0..) |_, index| {
+        var rect = documentTabRect(layout, index);
+        if (rect.left >= max_right) break;
+        rect.right = @min(rect.right, max_right);
+        if (pointIn(rect, x, y)) return index;
+    }
+    return null;
+}
+
+fn searchResultsRect(layout: Layout, state: *const GuiState) ?RECT {
+    if (!state.show_output or !state.search_panel.visible) return null;
+    if (layout.output.bottom - layout.output.top < 160) return null;
+    const height = @min(@max(@divTrunc(layout.output.bottom - layout.output.top, 2), 110), 170);
+    return .{
+        .left = layout.output.left,
+        .top = layout.output.top,
+        .right = layout.output.right,
+        .bottom = layout.output.top + height,
+    };
+}
+
+fn consoleOutputRect(layout: Layout, state: *const GuiState) RECT {
+    if (searchResultsRect(layout, state)) |search_rect| {
+        return .{
+            .left = layout.output.left,
+            .top = search_rect.bottom,
+            .right = layout.output.right,
+            .bottom = layout.output.bottom,
+        };
+    }
+    return layout.output;
+}
+
+fn searchResultRowAt(rect: RECT, y: c_int) ?usize {
+    if (y < rect.top + HEADER_HEIGHT or y >= rect.bottom) return null;
+    return @as(usize, @intCast(@divTrunc(y - rect.top - HEADER_HEIGHT, ROW_HEIGHT)));
 }
 
 fn pointIn(rect: RECT, x: c_int, y: c_int) bool {
@@ -1538,6 +1846,7 @@ const VK_DOWN: WPARAM = 0x28;
 const VK_DELETE: WPARAM = 0x2E;
 const VK_F1: WPARAM = 0x70;
 const VK_F6: WPARAM = 0x75;
+const VK_F8: WPARAM = 0x77;
 
 extern "kernel32" fn GetModuleHandleW(lpModuleName: ?windows.LPCWSTR) callconv(.winapi) ?windows.HMODULE;
 

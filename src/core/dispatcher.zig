@@ -7,11 +7,13 @@ const navigation = @import("../editor/navigation.zig");
 const process = @import("../platform/process.zig");
 const executor = @import("../tasks/executor.zig");
 const git_status = @import("../git/status.zig");
+const diagnostic_model = @import("../diagnostics/model.zig");
 const file_finder = @import("../search/file_finder.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const permissions = @import("../security/permissions.zig");
 const posture = @import("../security/posture.zig");
 const security_findings = @import("../security/findings.zig");
+const types = @import("types.zig");
 const workspace_audit = @import("../security/workspace_audit.zig");
 const zig_scanner = @import("../security/zig_scanner.zig");
 
@@ -101,6 +103,9 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
     }
 
     if (std.mem.eql(u8, definition.id, "file.save")) {
+        const doc = app.documents.active() orelse return .no_active_document;
+        _ = doc.path orelse return .{ .blocked = "active document has no file path" };
+        if (try runSaveSafetyCheck(app)) |message| return .{ .blocked = message };
         try app.documents.saveActive(.{});
         return .{ .completed = "saved" };
     }
@@ -143,6 +148,15 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "workspace search complete" };
     }
 
+    if (std.mem.eql(u8, definition.id, "diagnostics.next")) {
+        if (app.diagnostics.items.items.len == 0) return .{ .blocked = "no diagnostics available" };
+        const index = findNextDiagnosticIndex(app) orelse return .{ .blocked = "no diagnostics available" };
+        if (!try openDiagnostic(app, app.diagnostics.items.items[index])) {
+            return .{ .blocked = "diagnostic target could not be opened" };
+        }
+        return .{ .completed = "jumped to diagnostic" };
+    }
+
     if (std.mem.eql(u8, definition.id, "security.scan_current")) {
         const doc = app.documents.active() orelse return .no_active_document;
         const path = doc.path orelse "(scratch)";
@@ -161,6 +175,7 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
                 item.evidence,
             );
         }
+        try syncDiagnosticsFromSecurity(app);
         applyPostureGuard(app);
         return .{ .completed = "security scan complete" };
     }
@@ -173,6 +188,7 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         for (audit.items.items) |item| {
             try app.security_findings.appendFinding(item);
         }
+        try syncDiagnosticsFromSecurity(app);
         applyPostureGuard(app);
         return .{ .completed = "workspace security audit complete" };
     }
@@ -275,6 +291,7 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
             try app.security_findings.appendFinding(item);
         }
         try renderGitAudit(app, &audit);
+        try syncDiagnosticsFromSecurity(app);
         applyPostureGuard(app);
         return .{ .completed = "git metadata audit complete" };
     }
@@ -343,6 +360,132 @@ fn workspacePath(app: *app_mod.App, path: []const u8) ![]u8 {
         return app.allocator.dupe(u8, path);
     }
     return std.fs.path.join(app.allocator, &.{ app.workspace.root_path, path });
+}
+
+fn runSaveSafetyCheck(app: *app_mod.App) !?[]const u8 {
+    const doc = app.documents.active() orelse return null;
+    const path = doc.path orelse return null;
+    if (!std.mem.endsWith(u8, path, ".zig")) return null;
+
+    var scan = try zig_scanner.scanSource(app.allocator, doc.text.bytes, .{ .path = path });
+    defer scan.deinit();
+
+    app.security_findings.clearPath(path);
+    for (scan.items.items) |item| {
+        try app.security_findings.appendFinding(item);
+    }
+    try syncDiagnosticsFromSecurity(app);
+    try renderSaveSafetyCheck(app, path, &scan);
+    applyPostureGuard(app);
+
+    if (scan.countRiskAtLeast(.critical) > 0) {
+        return "save blocked by critical Zig security finding";
+    }
+    return null;
+}
+
+fn renderSaveSafetyCheck(app: *app_mod.App, path: []const u8, scan: *const security_findings.Collection) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.print("save safety check: {s} -> {d} findings\n", .{ path, scan.items.items.len });
+    for (scan.items.items, 0..) |item, index| {
+        if (index >= 8) {
+            try writer.print("... {d} more save findings\n", .{scan.items.items.len - index});
+            break;
+        }
+        try writer.print("{s}/{s} {d}:{d} {s}\n", .{
+            @tagName(item.risk),
+            @tagName(item.category),
+            item.line + 1,
+            item.column + 1,
+            item.message,
+        });
+    }
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn syncDiagnosticsFromSecurity(app: *app_mod.App) !void {
+    app.diagnostics.clear();
+    for (app.security_findings.items.items) |item| {
+        try app.diagnostics.append(.{
+            .source = .internal,
+            .severity = severityForRisk(item.risk),
+            .path = item.path,
+            .range = types.Range.empty(.{
+                .line = item.line,
+                .column = item.column,
+                .byte_offset = 0,
+            }),
+            .message = item.message,
+        });
+    }
+}
+
+fn severityForRisk(risk: security_findings.Risk) types.Severity {
+    return switch (risk) {
+        .critical, .high => .err,
+        .medium => .warning,
+        .low, .info => .info,
+    };
+}
+
+fn findNextDiagnosticIndex(app: *app_mod.App) ?usize {
+    if (app.diagnostics.items.items.len == 0) return null;
+    const active = app.documents.active();
+    const active_path = if (active) |doc| doc.path else null;
+    const active_position = if (active) |doc| doc.cursor.position else types.Position.start();
+
+    if (active_path) |path| {
+        var fallback: ?usize = null;
+        for (app.diagnostics.items.items, 0..) |item, index| {
+            if (!pathMatchesDiagnostic(path, item.path)) continue;
+            if (fallback == null) fallback = index;
+            if (positionAfter(item.range.start, active_position)) return index;
+        }
+        if (fallback) |index| return index;
+    }
+
+    return 0;
+}
+
+fn openDiagnostic(app: *app_mod.App, diagnostic: diagnostic_model.Diagnostic) !bool {
+    const active = app.documents.active();
+    if (active) |doc| {
+        if (doc.path) |path| {
+            if (pathMatchesDiagnostic(path, diagnostic.path)) {
+                return setDiagnosticCursor(doc, diagnostic);
+            }
+        }
+    }
+
+    const path = try workspacePath(app, diagnostic.path);
+    defer app.allocator.free(path);
+    const index = app.documents.openFile(path) catch return false;
+    app.focus = .editor;
+    return setDiagnosticCursor(&app.documents.documents.items[index], diagnostic);
+}
+
+fn setDiagnosticCursor(doc: *@import("../editor/document.zig").Document, diagnostic: diagnostic_model.Diagnostic) bool {
+    const offset = doc.text.lineColumnToOffset(diagnostic.range.start.line, diagnostic.range.start.column) catch return false;
+    const position = doc.positionFromOffset(offset) catch return false;
+    navigation.setCursor(doc, position);
+    return true;
+}
+
+fn positionAfter(left: types.Position, right: types.Position) bool {
+    if (left.line != right.line) return left.line > right.line;
+    return left.column > right.column;
+}
+
+fn pathMatchesDiagnostic(document_path: []const u8, diagnostic_path: []const u8) bool {
+    if (std.mem.eql(u8, document_path, diagnostic_path)) return true;
+    if (!std.mem.endsWith(u8, document_path, diagnostic_path)) return false;
+    const prefix_len = document_path.len - diagnostic_path.len;
+    if (prefix_len == 0) return true;
+    const boundary = document_path[prefix_len - 1];
+    return boundary == '/' or boundary == '\\';
 }
 
 fn renderFileFinder(app: *app_mod.App, query: []const u8) !void {
@@ -500,6 +643,30 @@ test "workspace search command renders literal matches" {
     const result = try dispatch(&app, .{ .id = "workspace.search", .argument = "workspace.search" });
     try std.testing.expect(std.meta.activeTag(result) == .completed);
     try std.testing.expect(app.process_console.lines.items.len > 0);
+}
+
+test "save blocks critical Zig security findings" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+    _ = try app.documents.createScratch("danger.zig", "const p = @ptrFromInt(0xdeadbeef);\n");
+
+    const result = try dispatch(&app, .{ .id = "file.save" });
+    try std.testing.expect(std.meta.activeTag(result) == .blocked);
+    try std.testing.expect(app.diagnostics.items.items.len > 0);
+}
+
+test "diagnostics next jumps within active document" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+    _ = try app.documents.createScratch("danger.zig", "const p = @ptrFromInt(0xdeadbeef);\n");
+
+    const scan = try dispatch(&app, .{ .id = "security.scan_current" });
+    try std.testing.expect(std.meta.activeTag(scan) == .completed);
+
+    const jump = try dispatch(&app, .{ .id = "diagnostics.next" });
+    try std.testing.expect(std.meta.activeTag(jump) == .completed);
+    const doc = app.documents.active() orelse return error.ExpectedDocument;
+    try std.testing.expectEqual(@as(usize, 0), doc.cursor.position.line);
 }
 
 test "critical security scan locks workspace down" {

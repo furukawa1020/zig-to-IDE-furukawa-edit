@@ -7,6 +7,8 @@ const navigation = @import("../editor/navigation.zig");
 const process = @import("../platform/process.zig");
 const executor = @import("../tasks/executor.zig");
 const git_status = @import("../git/status.zig");
+const file_finder = @import("../search/file_finder.zig");
+const workspace_search = @import("../search/workspace_search.zig");
 const permissions = @import("../security/permissions.zig");
 const posture = @import("../security/posture.zig");
 const security_findings = @import("../security/findings.zig");
@@ -127,6 +129,18 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
             return .{ .completed = "opened selected file" };
         }
         return .{ .blocked = "selected workspace entry is not a file" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "workspace.find_file")) {
+        const query = request.argument orelse return .{ .unsupported = "workspace.find_file requires a query argument" };
+        try renderFileFinder(app, query);
+        return .{ .completed = "file search complete" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "workspace.search")) {
+        const query = request.argument orelse return .{ .unsupported = "workspace.search requires a query argument" };
+        try renderWorkspaceSearch(app, query);
+        return .{ .completed = "workspace search complete" };
     }
 
     if (std.mem.eql(u8, definition.id, "security.scan_current")) {
@@ -331,6 +345,50 @@ fn workspacePath(app: *app_mod.App, path: []const u8) ![]u8 {
     return std.fs.path.join(app.allocator, &.{ app.workspace.root_path, path });
 }
 
+fn renderFileFinder(app: *app_mod.App, query: []const u8) !void {
+    const matches = try file_finder.find(app.allocator, &app.workspace, query, 24);
+    defer app.allocator.free(matches);
+
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.print("find file: \"{s}\" -> {d} matches\n", .{ query, matches.len });
+    for (matches, 0..) |match, index| {
+        if (index >= 20) {
+            try writer.print("... {d} more file matches\n", .{matches.len - index});
+            break;
+        }
+        try writer.print("{d}. {s} [{s}] score={d}\n", .{ index + 1, match.path, @tagName(match.language), match.score });
+    }
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn renderWorkspaceSearch(app: *app_mod.App, query: []const u8) !void {
+    const results = try workspace_search.search(app.allocator, &app.workspace, query, .{
+        .max_file_bytes = 512 * 1024,
+        .max_results = 256,
+    });
+    defer {
+        for (results) |*item| item.deinit(app.allocator);
+        app.allocator.free(results);
+    }
+
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.print("workspace search: \"{s}\" -> {d} matches\n", .{ query, results.len });
+    for (results, 0..) |item, index| {
+        if (index >= 20) {
+            try writer.print("... {d} more search matches\n", .{results.len - index});
+            break;
+        }
+        try writer.print("{s}:{d}:{d}: {s}\n", .{ item.path, item.line + 1, item.column + 1, item.preview });
+    }
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
 fn renderGitAudit(app: *app_mod.App, audit: *const security_findings.Collection) !void {
     var text: std.Io.Writer.Allocating = .init(app.allocator);
     defer text.deinit();
@@ -424,6 +482,24 @@ test "open selected workspace file activates editor focus" {
     try std.testing.expect(std.meta.activeTag(result) == .completed);
     try std.testing.expect(app.documents.active() != null);
     try std.testing.expectEqual(app_mod.Focus.editor, app.focus);
+}
+
+test "workspace find file command renders matches" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "workspace.find_file", .argument = "dispatcher" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expect(app.process_console.lines.items.len > 0);
+}
+
+test "workspace search command renders literal matches" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "workspace.search", .argument = "workspace.search" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expect(app.process_console.lines.items.len > 0);
 }
 
 test "critical security scan locks workspace down" {

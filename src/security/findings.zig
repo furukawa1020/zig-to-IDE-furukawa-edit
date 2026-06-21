@@ -73,6 +73,19 @@ pub const Collection = struct {
         }
     }
 
+    pub fn clearPath(self: *Collection, path: []const u8) void {
+        var index: usize = 0;
+        while (index < self.items.items.len) {
+            if (!std.mem.eql(u8, self.items.items[index].path, path)) {
+                index += 1;
+                continue;
+            }
+
+            var removed = self.items.orderedRemove(index);
+            removed.deinit(self.allocator);
+        }
+    }
+
     pub fn append(
         self: *Collection,
         category: Category,
@@ -144,4 +157,18 @@ test "clearCategory removes only matching findings" {
 
     try std.testing.expectEqual(@as(usize, 1), collection.items.items.len);
     try std.testing.expectEqual(Category.build_firewall, collection.items.items[0].category);
+}
+
+test "clearPath removes only matching findings" {
+    var collection = Collection.init(std.testing.allocator);
+    defer collection.deinit();
+
+    try collection.append(.ffi_boundary, .high, "src/a.zig", 0, 0, "a", "");
+    try collection.append(.ffi_boundary, .high, "src/b.zig", 0, 0, "b", "");
+    try collection.append(.safety_profile, .medium, "src/a.zig", 1, 0, "a2", "");
+
+    collection.clearPath("src/a.zig");
+
+    try std.testing.expectEqual(@as(usize, 1), collection.items.items.len);
+    try std.testing.expectEqualStrings("src/b.zig", collection.items.items[0].path);
 }

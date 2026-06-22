@@ -99,6 +99,7 @@ pub const tasks = struct {
     pub const console = @import("tasks/console.zig");
     pub const execution_queue = @import("tasks/execution_queue.zig");
     pub const executor = @import("tasks/executor.zig");
+    pub const registry = @import("tasks/registry.zig");
     pub const task = @import("tasks/task.zig");
 };
 

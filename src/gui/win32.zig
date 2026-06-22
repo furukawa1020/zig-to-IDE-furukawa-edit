@@ -5,6 +5,7 @@ const app_mod = @import("../core/app.zig");
 const command_mod = @import("../core/command.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const navigation = @import("../editor/navigation.zig");
+const zig_output = @import("../diagnostics/zig_output.zig");
 const file_finder = @import("../search/file_finder.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const build_consent = @import("../security/build_consent.zig");
@@ -502,6 +503,24 @@ const GuiState = struct {
         self.show_output = true;
     }
 
+    fn runTaskByName(self: *GuiState, name: []const u8) void {
+        const queued = dispatcher.dispatch(&self.app, .{ .id = "task.run", .argument = name, .source = .command_palette }) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "task queue failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult("task.run", queued);
+        if (std.meta.activeTag(queued) != .completed) return;
+
+        const run_result = dispatcher.dispatch(&self.app, .{ .id = "task.run_next", .source = .task }) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "task run failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult("task.run_next", run_result);
+        self.show_output = true;
+    }
+
     fn openQuickPanel(self: *GuiState, mode: QuickPanelMode) void {
         self.app.palette.close();
         self.quick_panel.open(mode, &self.app) catch |err| {
@@ -605,9 +624,62 @@ const GuiState = struct {
         self.setMessage("Opened file") catch {};
     }
 
+    fn openRelativeLocation(self: *GuiState, relative: []const u8, line: usize, column: usize) void {
+        const absolute = std.fs.path.join(self.allocator, &.{ self.app.workspace.root_path, relative }) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        defer self.allocator.free(absolute);
+
+        const index = self.app.documents.openFile(absolute) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "open failed: {s}: {s}\n", .{ relative, @errorName(err) });
+            return;
+        };
+        const doc = &self.app.documents.documents.items[index];
+        const offset = doc.text.lineColumnToOffset(line, column) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        const position = doc.positionFromOffset(offset) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        navigation.setCursor(doc, position);
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureCursorVisible();
+        self.setMessage("Opened diagnostic") catch {};
+    }
+
     fn jumpToNextDiagnostic(self: *GuiState) void {
         self.executeCommand("diagnostics.next");
         self.ensureCursorVisible();
+    }
+
+    fn openConsoleLineAt(self: *GuiState, layout: Layout, y: c_int) void {
+        const output = consoleOutputRect(layout, self);
+        if (y < output.top + HEADER_HEIGHT or y >= output.bottom) {
+            self.app.focus = .output;
+            return;
+        }
+
+        const rows = @max(0, @divTrunc(output.bottom - output.top - HEADER_HEIGHT, ROW_HEIGHT));
+        const lines = self.app.process_console.lines.items;
+        const max_start = if (lines.len > @as(usize, @intCast(rows))) lines.len - @as(usize, @intCast(rows)) else 0;
+        const start = @min(self.output_scroll_line, max_start);
+        const row = @as(usize, @intCast(@divTrunc(y - output.top - HEADER_HEIGHT, ROW_HEIGHT)));
+        if (start + row >= lines.len) {
+            self.app.focus = .output;
+            return;
+        }
+
+        const line = lines[start + row];
+        const parsed = zig_output.parseLine(line.text) orelse {
+            self.app.focus = .output;
+            return;
+        };
+        self.openRelativeLocation(parsed.path, parsed.line, parsed.column);
     }
 
     fn handleDispatchResult(self: *GuiState, id: []const u8, result: dispatcher.Result) void {
@@ -900,15 +972,15 @@ const GuiState = struct {
                 return;
             }
             if (pointIn(runButtonRect(layout), x, y)) {
-                self.executeCommand("task.run_next");
+                self.runTaskByName("run");
                 return;
             }
             if (pointIn(testButtonRect(layout), x, y)) {
-                self.executeCommand("zig.test");
+                self.runTaskByName("test");
                 return;
             }
             if (pointIn(buildButtonRect(layout), x, y)) {
-                self.executeCommand("zig.build");
+                self.runTaskByName("build");
                 return;
             }
             if (documentTabAt(layout, self, x, y)) |index| {
@@ -932,7 +1004,7 @@ const GuiState = struct {
         }
 
         if (pointIn(layout.output, x, y)) {
-            self.app.focus = .output;
+            self.openConsoleLineAt(layout, y);
             return;
         }
     }
@@ -1042,15 +1114,15 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         return;
     }
     if (ctrl and key == 'B') {
-        state.executeCommand("zig.build");
+        state.runTaskByName("build");
         return;
     }
     if (ctrl and key == 'T') {
-        state.executeCommand("zig.test");
+        state.runTaskByName("test");
         return;
     }
     if (ctrl and key == 'R') {
-        state.executeCommand("task.run_next");
+        state.runTaskByName("run");
         return;
     }
     if (ctrl and key == 'G') {

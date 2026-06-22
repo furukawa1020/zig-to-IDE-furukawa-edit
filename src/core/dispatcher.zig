@@ -6,8 +6,10 @@ const command = @import("command.zig");
 const navigation = @import("../editor/navigation.zig");
 const process = @import("../platform/process.zig");
 const executor = @import("../tasks/executor.zig");
+const task_registry = @import("../tasks/registry.zig");
 const git_status = @import("../git/status.zig");
 const diagnostic_model = @import("../diagnostics/model.zig");
+const zig_output = @import("../diagnostics/zig_output.zig");
 const file_finder = @import("../search/file_finder.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const permissions = @import("../security/permissions.zig");
@@ -250,6 +252,12 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "approved command queued" };
     }
 
+    if (std.mem.eql(u8, definition.id, "task.run")) {
+        const name = request.argument orelse "run";
+        if (try queueConfiguredTask(app, name)) |message| return .{ .blocked = message };
+        return .{ .completed = "task queued" };
+    }
+
     if (std.mem.eql(u8, definition.id, "task.preview_next")) {
         return switch (try executor.previewLatest(&app.execution_queue, &app.process_console)) {
             .rendered => .{ .completed = "launch plan rendered" },
@@ -258,15 +266,14 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
     }
 
     if (std.mem.eql(u8, definition.id, "task.run_next")) {
-        return switch (try executor.runNext(&app.execution_queue, &app.process_console, .{
+        const run_result = try executor.runNext(&app.execution_queue, &app.process_console, .{
             .workspace_root = app.workspace.root_path,
             .io = app.io,
             .environ = app.environ,
-        })) {
-            .ran => |exit_code| if (exit_code == 0)
-                .{ .completed = "approved command finished" }
-            else
-                .{ .completed = "approved command finished with non-zero exit" },
+        });
+        try syncDiagnosticsFromConsole(app);
+        return switch (run_result) {
+            .ran => |exit_code| if (exit_code == 0) .{ .completed = "approved command finished" } else .{ .completed = "approved command finished with non-zero exit" },
             .empty_queue => .{ .blocked = "no approved command in execution queue" },
             .blocked => |message| .{ .blocked = message },
             .failed => |message| .{ .blocked = message },
@@ -360,6 +367,53 @@ fn workspacePath(app: *app_mod.App, path: []const u8) ![]u8 {
         return app.allocator.dupe(u8, path);
     }
     return std.fs.path.join(app.allocator, &.{ app.workspace.root_path, path });
+}
+
+fn queueConfiguredTask(app: *app_mod.App, name: []const u8) !?[]const u8 {
+    var registry = try task_registry.loadProjectTasks(app.allocator, app.workspace.root_path);
+    defer registry.deinit();
+
+    for (registry.diagnostics.items) |message| {
+        try appendConsole(app, .stderr, "task config: {s}\n", .{message});
+    }
+
+    const task = registry.find(name) orelse {
+        try renderTaskList(app, &registry, name);
+        return "task not found";
+    };
+
+    var plan = try task_registry.makeSpawnPlan(app.allocator, app.workspace.root_path, task);
+    defer plan.deinit();
+
+    if (!permissions.allowsWorkspacePath(plan.consent.fs_policy, app.workspace.root_path, plan.consent.cwd)) {
+        try appendConsole(app, .stderr, "task blocked: cwd outside workspace: {s}\n", .{plan.consent.cwd});
+        return "task cwd is outside workspace";
+    }
+
+    try app.execution_queue.enqueueSpec("task.run", plan.spec, plan.consent);
+    try appendConsole(app, .stdout, "queued task: {s}\n{s}\n", .{ task.name, plan.command_display });
+    return null;
+}
+
+fn renderTaskList(app: *app_mod.App, registry: *const task_registry.Registry, missing: []const u8) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.print("task not found: {s}\n", .{missing});
+    try writer.writeAll("available tasks\n");
+    for (registry.tasks.items) |task| {
+        try writer.print("- {s}\n", .{task.name});
+    }
+    try app.process_console.appendBytes(.stderr, text.written());
+}
+
+fn syncDiagnosticsFromConsole(app: *app_mod.App) !void {
+    for (app.process_console.lines.items) |line| {
+        if (zig_output.parseLine(line.text)) |parsed| {
+            try app.diagnostics.append(zig_output.toDiagnostic(parsed));
+        }
+    }
 }
 
 fn runSaveSafetyCheck(app: *app_mod.App) !?[]const u8 {
@@ -555,6 +609,13 @@ fn renderGitAudit(app: *app_mod.App, audit: *const security_findings.Collection)
     try app.process_console.appendBytes(.stdout, text.written());
 }
 
+fn appendConsole(app: *app_mod.App, stream: @import("../tasks/console.zig").Stream, comptime fmt: []const u8, args: anytype) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    try text.writer.print(fmt, args);
+    try app.process_console.appendBytes(stream, text.written());
+}
+
 test "dispatch opens command palette" {
     var app = try app_mod.App.init(std.testing.allocator, ".");
     defer app.deinit();
@@ -615,6 +676,27 @@ test "task history command renders recorded command results" {
     const result = try dispatch(&app, .{ .id = "task.history" });
     try std.testing.expect(std.meta.activeTag(result) == .completed);
     try std.testing.expect(app.process_console.lines.items.len > 0);
+}
+
+test "task run queues default project task when trusted" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+    app.runtime.trust_state = .trusted;
+
+    const result = try dispatch(&app, .{ .id = "task.run", .argument = "run" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expectEqual(@as(usize, 1), app.execution_queue.queuedCount());
+}
+
+test "console diagnostics sync parses Zig compiler output" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+
+    try app.process_console.appendBytes(.stderr, "src/main.zig:2:3: error: nope\n");
+    try syncDiagnosticsFromConsole(&app);
+
+    try std.testing.expectEqual(@as(usize, 1), app.diagnostics.items.items.len);
+    try std.testing.expectEqualStrings("src/main.zig", app.diagnostics.items.items[0].path);
 }
 
 test "open selected workspace file activates editor focus" {

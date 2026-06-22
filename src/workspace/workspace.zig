@@ -60,6 +60,14 @@ pub const Workspace = struct {
         return count;
     }
 
+    pub fn refresh(self: *Workspace) !void {
+        for (self.entries.items) |entry| {
+            self.allocator.free(entry.path);
+        }
+        self.entries.clearRetainingCapacity();
+        try self.scanTopLevel();
+    }
+
     fn scanTopLevel(self: *Workspace) !void {
         try self.scanRecursive("", 0);
     }

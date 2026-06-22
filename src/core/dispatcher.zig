@@ -4,6 +4,7 @@ const build_commands = @import("../build/commands.zig");
 const build_consent = @import("../security/build_consent.zig");
 const command = @import("command.zig");
 const navigation = @import("../editor/navigation.zig");
+const editor_save = @import("../editor/save.zig");
 const process = @import("../platform/process.zig");
 const executor = @import("../tasks/executor.zig");
 const task_registry = @import("../tasks/registry.zig");
@@ -110,6 +111,36 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         if (try runSaveSafetyCheck(app)) |message| return .{ .blocked = message };
         try app.documents.saveActive(.{});
         return .{ .completed = "saved" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "file.new")) {
+        const argument = request.argument orelse return .{ .unsupported = "file.new requires a workspace-relative path" };
+        const relative = std.mem.trim(u8, argument, " \t\r\n");
+        if (validateNewWorkspaceFilePath(relative)) |message| return .{ .blocked = message };
+
+        const path = try workspacePath(app, relative);
+        defer app.allocator.free(path);
+        if (!permissions.allowsWrite(.workspace_only, app.workspace.root_path, path)) {
+            return .{ .blocked = "new file path is outside workspace" };
+        }
+
+        if (std.fs.path.dirname(path)) |parent| {
+            try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, parent);
+        }
+        const exists = exists: {
+            _ = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => break :exists false,
+                else => return err,
+            };
+            break :exists true;
+        };
+        if (exists) return .{ .blocked = "file already exists" };
+
+        try editor_save.saveBytes(app.allocator, path, "", .{});
+        try app.workspace.refresh();
+        _ = try app.documents.openFile(path);
+        app.focus = .editor;
+        return .{ .completed = "created file" };
     }
 
     if (std.mem.eql(u8, definition.id, "file.open")) {
@@ -367,6 +398,31 @@ fn workspacePath(app: *app_mod.App, path: []const u8) ![]u8 {
         return app.allocator.dupe(u8, path);
     }
     return std.fs.path.join(app.allocator, &.{ app.workspace.root_path, path });
+}
+
+fn validateNewWorkspaceFilePath(path: []const u8) ?[]const u8 {
+    if (path.len == 0) return "new file path is empty";
+    if (std.fs.path.isAbsolute(path)) return "new file path must be relative to workspace";
+    if (path.len >= 2 and path[1] == ':') return "new file path must not use a drive prefix";
+    if (path[0] == '/' or path[0] == '\\') return "new file path must not start at filesystem root";
+    if (path[path.len - 1] == '/' or path[path.len - 1] == '\\') return "new file path must include a file name";
+
+    var start: usize = 0;
+    while (start <= path.len) {
+        var end = start;
+        while (end < path.len and path[end] != '/' and path[end] != '\\') : (end += 1) {}
+        const segment = path[start..end];
+        if (std.mem.eql(u8, segment, "..")) return "new file path must not contain parent traversal";
+        if (std.ascii.eqlIgnoreCase(segment, ".git")) return "new file path must not write inside .git";
+        if (std.ascii.eqlIgnoreCase(segment, ".tools")) return "new file path must not write inside .tools";
+        if (std.ascii.eqlIgnoreCase(segment, ".zig-cache") or std.ascii.eqlIgnoreCase(segment, ".zig-global-cache")) {
+            return "new file path must not write inside Zig cache directories";
+        }
+        if (std.ascii.eqlIgnoreCase(segment, "zig-out")) return "new file path must not write inside zig-out";
+        if (end == path.len) break;
+        start = end + 1;
+    }
+    return null;
 }
 
 fn queueConfiguredTask(app: *app_mod.App, name: []const u8) !?[]const u8 {
@@ -725,6 +781,31 @@ test "workspace search command renders literal matches" {
     const result = try dispatch(&app, .{ .id = "workspace.search", .argument = "workspace.search" });
     try std.testing.expect(std.meta.activeTag(result) == .completed);
     try std.testing.expect(app.process_console.lines.items.len > 0);
+}
+
+test "file new creates a workspace file and opens it" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "file.new", .argument = "src/new_file.zig" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    _ = try tmp.dir.statFile(std.Options.debug_io, "src/new_file.zig", .{});
+    const doc = app.documents.active() orelse return error.ExpectedDocument;
+    try std.testing.expect(doc.path != null);
+    try std.testing.expect(std.mem.endsWith(u8, doc.path.?, "src\\new_file.zig") or std.mem.endsWith(u8, doc.path.?, "src/new_file.zig"));
+}
+
+test "file new rejects workspace escape paths" {
+    try std.testing.expect(validateNewWorkspaceFilePath("../outside.zig") != null);
+    try std.testing.expect(validateNewWorkspaceFilePath(".git/hooks/pre-commit") != null);
+    try std.testing.expect(validateNewWorkspaceFilePath("zig-out/generated.zig") != null);
 }
 
 test "save blocks critical Zig security findings" {

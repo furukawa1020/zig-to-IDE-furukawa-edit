@@ -48,6 +48,7 @@ pub const Definition = struct {
 
 const definitions = [_]Definition{
     .{ .id = "file.open", .title = "Open File", .description = "Open a file in the workspace.", .default_key = "ctrl-o", .scope = .file, .capability = .safe },
+    .{ .id = "file.new", .title = "New File", .description = "Create a new file inside the workspace.", .default_key = "ctrl-n", .scope = .file, .capability = .workspace_write },
     .{ .id = "file.save", .title = "Save File", .description = "Save the current buffer with atomic write.", .default_key = "ctrl-s", .scope = .file, .capability = .workspace_write },
     .{ .id = "editor.enter_insert", .title = "Enter Insert Mode", .description = "Switch to insert mode.", .default_key = "i", .scope = .editor, .capability = .safe },
     .{ .id = "editor.exit_insert", .title = "Exit Insert Mode", .description = "Switch back to normal mode.", .default_key = "escape", .scope = .editor, .capability = .safe },

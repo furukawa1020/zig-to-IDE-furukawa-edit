@@ -2,6 +2,11 @@ const std = @import("std");
 const document = @import("document.zig");
 const save = @import("save.zig");
 
+pub const ClosePolicy = enum {
+    allow_dirty,
+    deny_dirty,
+};
+
 pub const DocumentStore = struct {
     allocator: std.mem.Allocator,
     documents: std.array_list.Managed(document.Document),
@@ -71,6 +76,33 @@ pub const DocumentStore = struct {
         self.active_index = next;
     }
 
+    pub fn closeAt(self: *DocumentStore, index: usize, policy: ClosePolicy) !void {
+        if (index >= self.documents.items.len) return error.DocumentIndexOutOfBounds;
+        if (policy == .deny_dirty and self.documents.items[index].dirty) return error.DirtyDocument;
+
+        var doc = self.documents.orderedRemove(index);
+        doc.deinit();
+
+        if (self.documents.items.len == 0) {
+            self.active_index = null;
+            return;
+        }
+
+        const previous_active = self.active_index orelse 0;
+        if (previous_active == index) {
+            self.active_index = @min(index, self.documents.items.len - 1);
+        } else if (previous_active > index) {
+            self.active_index = previous_active - 1;
+        } else {
+            self.active_index = previous_active;
+        }
+    }
+
+    pub fn closeActive(self: *DocumentStore, policy: ClosePolicy) !void {
+        const index = self.activeIndex() orelse return error.NoActiveDocument;
+        try self.closeAt(index, policy);
+    }
+
     pub fn active(self: *DocumentStore) ?*document.Document {
         const index = self.activeIndex() orelse return null;
         return &self.documents.items[index];
@@ -117,4 +149,16 @@ test "document store switches active document" {
     try std.testing.expectEqual(@as(?usize, 0), store.activeIndex());
     store.moveActive(-1);
     try std.testing.expectEqual(@as(?usize, 1), store.activeIndex());
+}
+
+test "document store closes active document" {
+    var store = DocumentStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    _ = try store.createScratch("one.zig", "const one = 1;\n");
+    _ = try store.createScratch("two.zig", "const two = 2;\n");
+
+    try store.closeActive(.allow_dirty);
+    try std.testing.expectEqual(@as(usize, 1), store.documents.items.len);
+    try std.testing.expectEqual(@as(?usize, 0), store.activeIndex());
 }

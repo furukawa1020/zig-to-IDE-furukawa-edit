@@ -6,6 +6,7 @@ const command_mod = @import("../core/command.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const navigation = @import("../editor/navigation.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
+const symbols_mod = @import("../language/symbols.zig");
 const file_finder = @import("../search/file_finder.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const build_consent = @import("../security/build_consent.zig");
@@ -18,6 +19,7 @@ const QuickPanelMode = enum {
     search_workspace,
     run_task,
     new_file,
+    document_symbols,
 };
 
 const BottomPanel = enum {
@@ -37,6 +39,19 @@ const TaskMatch = struct {
     }
 };
 
+const SymbolMatch = struct {
+    name: []u8,
+    kind: symbols_mod.SymbolKind,
+    line: usize,
+    column: usize,
+    byte_offset: usize,
+
+    fn deinit(self: *SymbolMatch, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
 const QuickPanel = struct {
     allocator: std.mem.Allocator,
     visible: bool = false,
@@ -46,6 +61,7 @@ const QuickPanel = struct {
     file_matches: ?[]file_finder.Match = null,
     search_results: ?[]workspace_search.Result = null,
     task_matches: ?[]TaskMatch = null,
+    symbol_matches: ?[]SymbolMatch = null,
 
     fn init(allocator: std.mem.Allocator) QuickPanel {
         return .{
@@ -110,6 +126,7 @@ const QuickPanel = struct {
             .search_workspace => if (self.search_results) |items| items.len else 0,
             .run_task => if (self.task_matches) |items| items.len else 0,
             .new_file => if (self.query.items.len > 0) 1 else 0,
+            .document_symbols => if (self.symbol_matches) |items| items.len else 0,
         };
     }
 
@@ -127,6 +144,12 @@ const QuickPanel = struct {
 
     fn selectedTask(self: *const QuickPanel) ?*const TaskMatch {
         const items = self.task_matches orelse return null;
+        if (items.len == 0) return null;
+        return &items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn selectedSymbol(self: *const QuickPanel) ?*const SymbolMatch {
+        const items = self.symbol_matches orelse return null;
         if (items.len == 0) return null;
         return &items[@min(self.selected_index, items.len - 1)];
     }
@@ -169,6 +192,35 @@ const QuickPanel = struct {
                 self.task_matches = try matches.toOwnedSlice();
             },
             .new_file => {},
+            .document_symbols => {
+                const active_index = app.documents.activeIndex() orelse return;
+                const doc = &app.documents.documents.items[active_index];
+                const path = doc.path orelse "(scratch)";
+                var index = try symbols_mod.collectTopLevel(self.allocator, doc.text.bytes, path);
+                defer index.deinit();
+
+                var matches = std.array_list.Managed(SymbolMatch).init(self.allocator);
+                errdefer {
+                    for (matches.items) |*item| item.deinit(self.allocator);
+                    matches.deinit();
+                }
+
+                for (index.symbols) |symbol| {
+                    const kind_name = @tagName(symbol.kind);
+                    const name_match = command_mod.fuzzyScore(self.query.items, symbol.name) != null;
+                    const kind_match = command_mod.fuzzyScore(self.query.items, kind_name) != null;
+                    if (self.query.items.len != 0 and !name_match and !kind_match) continue;
+                    try matches.append(.{
+                        .name = try self.allocator.dupe(u8, symbol.name),
+                        .kind = symbol.kind,
+                        .line = symbol.range.start.line,
+                        .column = symbol.range.start.column,
+                        .byte_offset = symbol.range.start.byte_offset,
+                    });
+                }
+
+                self.symbol_matches = try matches.toOwnedSlice();
+            },
         }
         if (self.selected_index >= self.itemCount()) self.selected_index = 0;
     }
@@ -187,6 +239,11 @@ const QuickPanel = struct {
             for (items) |*item| item.deinit(self.allocator);
             self.allocator.free(items);
             self.task_matches = null;
+        }
+        if (self.symbol_matches) |items| {
+            for (items) |*item| item.deinit(self.allocator);
+            self.allocator.free(items);
+            self.symbol_matches = null;
         }
     }
 };
@@ -569,6 +626,14 @@ const GuiState = struct {
             self.openNewFilePanel();
             return;
         }
+        if (std.mem.eql(u8, id, "symbol.goto_symbol")) {
+            self.openSymbolPanel();
+            return;
+        }
+        if (std.mem.eql(u8, id, "symbol.goto_definition")) {
+            self.gotoLocalDefinitionAtCursor();
+            return;
+        }
         if (std.mem.eql(u8, id, "workspace.find_file")) {
             self.openQuickPanel(.find_file);
             return;
@@ -618,6 +683,10 @@ const GuiState = struct {
         self.openQuickPanel(.new_file);
     }
 
+    fn openSymbolPanel(self: *GuiState) void {
+        self.openQuickPanel(.document_symbols);
+    }
+
     fn openDiagnosticsPanel(self: *GuiState) void {
         self.show_output = true;
         self.bottom_panel = .diagnostics;
@@ -649,6 +718,7 @@ const GuiState = struct {
             .search_workspace => "Search workspace",
             .run_task => "Run task",
             .new_file => "New file",
+            .document_symbols => "Document symbols",
         }) catch {};
     }
 
@@ -739,6 +809,15 @@ const GuiState = struct {
                     self.ensureCursorVisible();
                 }
             },
+            .document_symbols => {
+                const item = self.quick_panel.selectedSymbol() orelse {
+                    self.setMessage("No symbol selected") catch {};
+                    return;
+                };
+                const offset = item.byte_offset;
+                self.quick_panel.close();
+                self.jumpToActiveDocumentOffset(offset, "Opened symbol");
+            },
         }
     }
 
@@ -805,6 +884,52 @@ const GuiState = struct {
         self.app.mode = .insert;
         self.ensureCursorVisible();
         self.setMessage("Opened diagnostic") catch {};
+    }
+
+    fn jumpToActiveDocumentOffset(self: *GuiState, offset: usize, message: []const u8) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("No active document") catch {};
+            return;
+        };
+        const clamped = @min(offset, doc.text.bytes.len);
+        const position = doc.positionFromOffset(clamped) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        navigation.setCursor(doc, position);
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureCursorVisible();
+        self.setMessage(message) catch {};
+    }
+
+    fn gotoLocalDefinitionAtCursor(self: *GuiState) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("No active document") catch {};
+            return;
+        };
+        const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse {
+            self.setMessage("No identifier under cursor") catch {};
+            return;
+        };
+        const path = doc.path orelse "(scratch)";
+        var index = symbols_mod.collectTopLevel(self.allocator, doc.text.bytes, path) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        defer index.deinit();
+
+        for (index.symbols) |symbol| {
+            if (!std.mem.eql(u8, symbol.name, name)) continue;
+            navigation.setCursor(doc, symbol.range.start);
+            self.app.focus = .editor;
+            self.app.mode = .insert;
+            self.ensureCursorVisible();
+            self.setMessage("Jumped to definition") catch {};
+            return;
+        }
+
+        self.setMessage("No local top-level definition") catch {};
     }
 
     fn jumpToNextDiagnostic(self: *GuiState) void {
@@ -1228,6 +1353,10 @@ const GuiState = struct {
                 self.openSecurityPanel();
                 return;
             }
+            if (pointIn(symbolButtonRect(layout), x, y)) {
+                self.openSymbolPanel();
+                return;
+            }
             if (documentTabAt(layout, self, x, y)) |index| {
                 self.switchDocument(index);
                 return;
@@ -1356,6 +1485,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         state.openTasksPanel();
         return;
     }
+    if (ctrl and shift and key == 'O') {
+        state.openSymbolPanel();
+        return;
+    }
     if (ctrl and key == 'P') {
         state.openQuickPanel(.find_file);
         return;
@@ -1418,6 +1551,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (key == VK_F8) {
         state.jumpToNextDiagnostic();
+        return;
+    }
+    if (key == VK_F12) {
+        state.executeCommand("symbol.goto_definition");
         return;
     }
     if (key == VK_F6) {
@@ -1646,6 +1783,7 @@ fn drawEditorHeader(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
     drawButton(hdc, taskButtonRect(layout), "TASK");
     drawButton(hdc, diagButtonRect(layout), "DIAG");
     drawButton(hdc, secButtonRect(layout), "SEC");
+    drawButton(hdc, symbolButtonRect(layout), "SYM");
 
     const active_index = state.app.documents.activeIndex();
     const max_right = documentTabMaxRight(layout);
@@ -1858,6 +1996,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .search_workspace => "SEARCH",
         .run_task => "TASKS",
         .new_file => "NEW FILE",
+        .document_symbols => "SYMBOLS",
     };
     drawText(hdc, panel.left + 16, panel.top + 14, rgb(79, 230, 226), title);
     drawTextClipped(hdc, panel.left + 16, panel.top + 44, panel.right - 16, rgb(235, 239, 244), state.quick_panel.query.items);
@@ -1896,6 +2035,15 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
             },
             .new_file => {
                 drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, "Create inside workspace");
+            },
+            .document_symbols => {
+                const items = state.quick_panel.symbol_matches orelse break;
+                const item = items[row];
+                var location_buf: [64]u8 = undefined;
+                const location = std.fmt.bufPrint(&location_buf, "{d}:{d}", .{ item.line + 1, item.column + 1 }) catch "";
+                drawTextClipped(hdc, panel.left + 18, y, panel.left + 240, color, item.name);
+                drawTextClipped(hdc, panel.left + 250, y, panel.left + 390, color, @tagName(item.kind));
+                drawTextClipped(hdc, panel.left + 400, y, panel.right - 16, color, location);
             },
         }
         y += ROW_HEIGHT;
@@ -2060,8 +2208,12 @@ fn secButtonRect(layout: Layout) RECT {
     return toolbarButtonRect(layout, 6);
 }
 
+fn symbolButtonRect(layout: Layout) RECT {
+    return toolbarButtonRect(layout, 7);
+}
+
 fn documentTabMaxRight(layout: Layout) c_int {
-    return secButtonRect(layout).left - 10;
+    return symbolButtonRect(layout).left - 10;
 }
 
 fn documentTabRect(layout: Layout, index: usize) RECT {
@@ -2179,6 +2331,27 @@ fn wheelDelta(wparam: WPARAM) i16 {
 
 fn isUtf8Continuation(byte: u8) bool {
     return (byte & 0xc0) == 0x80;
+}
+
+fn identifierAtOffset(source: []const u8, offset: usize) ?[]const u8 {
+    if (source.len == 0) return null;
+    var at = @min(offset, source.len - 1);
+    if (!isIdentifierByte(source[at])) {
+        if (offset == 0) return null;
+        at = @min(offset - 1, source.len - 1);
+        if (!isIdentifierByte(source[at])) return null;
+    }
+
+    var start = at;
+    while (start > 0 and isIdentifierByte(source[start - 1])) : (start -= 1) {}
+    var end = at + 1;
+    while (end < source.len and isIdentifierByte(source[end])) : (end += 1) {}
+    if (start == end) return null;
+    return source[start..end];
+}
+
+fn isIdentifierByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
 
 fn isKeyDown(vk: c_int) bool {
@@ -2418,6 +2591,7 @@ const VK_DELETE: WPARAM = 0x2E;
 const VK_F1: WPARAM = 0x70;
 const VK_F6: WPARAM = 0x75;
 const VK_F8: WPARAM = 0x77;
+const VK_F12: WPARAM = 0x7B;
 
 extern "kernel32" fn GetModuleHandleW(lpModuleName: ?windows.LPCWSTR) callconv(.winapi) ?windows.HMODULE;
 

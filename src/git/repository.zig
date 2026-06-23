@@ -126,7 +126,7 @@ const LooseBlob = struct {
 };
 
 const IgnorePattern = struct {
-    text: []u8,
+    text: []const u8,
     directory_only: bool = false,
     anchored: bool = false,
 
@@ -295,7 +295,7 @@ fn loadIgnoreRules(allocator: std.mem.Allocator, workspace_root: []const u8, max
         var anchored = false;
         if (line[0] == '/') {
             anchored = true;
-            line = std.mem.trimLeft(u8, line[1..], "/\\");
+            line = std.mem.trim(u8, line[1..], "/\\");
         }
 
         var directory_only = false;
@@ -810,4 +810,15 @@ test "added and removed stats count logical lines" {
     try std.testing.expectEqual(@as(usize, 2), addedStats("a\nb").additions);
     try std.testing.expectEqual(@as(usize, 1), addedStats("a\n").additions);
     try std.testing.expectEqual(@as(usize, 0), removedStats("").deletions);
+}
+
+test "ignore patterns match directories and wildcards" {
+    const dir_pattern = IgnorePattern{ .text = "zig-out", .directory_only = true };
+    try std.testing.expect(ignorePatternMatches(dir_pattern, "zig-out/bin/zide.exe"));
+    try std.testing.expect(ignorePatternMatches(dir_pattern, "nested/zig-out/file"));
+
+    const exe_pattern = IgnorePattern{ .text = "*.exe" };
+    try std.testing.expect(ignorePatternMatches(exe_pattern, "zide.exe"));
+    try std.testing.expect(ignorePatternMatches(exe_pattern, "bin/zide.exe"));
+    try std.testing.expect(!ignorePatternMatches(exe_pattern, "src/main.zig"));
 }

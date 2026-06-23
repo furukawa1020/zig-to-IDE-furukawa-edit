@@ -127,6 +127,7 @@ pub const debug_layer = struct {
 };
 
 pub const git = struct {
+    pub const repository = @import("git/repository.zig");
     pub const status = @import("git/status.zig");
 };
 

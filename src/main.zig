@@ -51,6 +51,7 @@ test {
     _ = @import("editor/selection.zig");
     _ = @import("editor/store.zig");
     _ = @import("editor/undo.zig");
+    _ = @import("git/repository.zig");
     _ = @import("git/status.zig");
     _ = @import("language/highlight.zig");
     _ = @import("language/modes.zig");

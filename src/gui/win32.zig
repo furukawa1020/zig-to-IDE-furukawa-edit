@@ -1658,7 +1658,9 @@ fn paint(hwnd: windows.HWND) void {
         if (state.text_font) |font| SelectObject(hdc, @ptrCast(font)) else null
     else
         null;
-    defer if (old_font) |font| _ = SelectObject(hdc, font);
+    defer {
+        if (old_font) |font| _ = SelectObject(hdc, font);
+    }
 
     var client: RECT = undefined;
     _ = GetClientRect(hwnd, &client);

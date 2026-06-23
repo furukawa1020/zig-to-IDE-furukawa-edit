@@ -710,6 +710,8 @@ fn renderGitOverview(app: *app_mod.App, overview: *const git_repository.Overview
         }
     }
 
+    try writer.print("ignored   : {d} untracked file(s) hidden by .gitignore\n", .{overview.ignored_untracked});
+
     try writer.print("changes   : {d}", .{overview.changes.len});
     if (overview.change_limit_hit) try writer.writeAll(" (truncated)");
     try writer.writeByte('\n');

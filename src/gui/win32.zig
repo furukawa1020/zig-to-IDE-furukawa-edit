@@ -360,6 +360,7 @@ pub fn run(allocator: std.mem.Allocator, root_path: []const u8) !void {
         null,
     ) orelse return error.CreateWindowFailed;
     state.hwnd = hwnd;
+    state.text_font = createTextFont();
 
     _ = SetWindowTextW(hwnd, title.ptr);
     _ = ShowWindow(hwnd, SW_SHOW);
@@ -376,6 +377,7 @@ const GuiState = struct {
     allocator: std.mem.Allocator,
     app: app_mod.App,
     hwnd: ?windows.HWND = null,
+    text_font: ?HFONT = null,
     last_error: ?[]u8 = null,
     collapsed_dirs: []bool,
     editor_scroll_line: usize = 0,
@@ -511,6 +513,7 @@ const GuiState = struct {
     }
 
     fn deinit(self: *GuiState) void {
+        if (self.text_font) |font| _ = DeleteObject(@ptrCast(font));
         if (self.last_error) |message| self.allocator.free(message);
         self.search_panel.deinit();
         self.quick_panel.deinit();
@@ -1651,6 +1654,12 @@ fn paint(hwnd: windows.HWND) void {
     const hdc = BeginPaint(hwnd, &ps);
     defer _ = EndPaint(hwnd, &ps);
 
+    const old_font = if (global_state) |state|
+        if (state.text_font) |font| SelectObject(hdc, @ptrCast(font)) else null
+    else
+        null;
+    defer if (old_font) |font| _ = SelectObject(hdc, font);
+
     var client: RECT = undefined;
     _ = GetClientRect(hwnd, &client);
 
@@ -2367,18 +2376,26 @@ fn drawText(hdc: windows.HDC, x: c_int, y: c_int, color: windows.COLORREF, text:
     _ = SetBkMode(hdc, TRANSPARENT);
     _ = SetTextColor(hdc, color);
     if (text.len == 0) return;
-    _ = TextOutA(hdc, x, y, text.ptr, @intCast(text.len));
+
+    const clipped = clipUtf8BytePrefix(text, MAX_DRAW_TEXT_BYTES);
+    var utf16: [MAX_DRAW_TEXT_BYTES]u16 = undefined;
+    const len = std.unicode.wtf8ToWtf16Le(&utf16, clipped) catch {
+        drawAsciiFallback(hdc, x, y, clipped);
+        return;
+    };
+    if (len == 0) return;
+    _ = TextOutW(hdc, x, y, utf16[0..len].ptr, @intCast(len));
 }
 
 fn drawTextClipped(hdc: windows.HDC, x: c_int, y: c_int, right: c_int, color: windows.COLORREF, text: []const u8) void {
     if (right <= x) return;
-    const available_columns: usize = @intCast(@max(@divTrunc(right - x, 8), 1));
-    const clipped = if (text.len > available_columns) text[0..available_columns] else text;
+    const available_columns: usize = @intCast(@max(@divTrunc(right - x, CHAR_WIDTH), 1));
+    const clipped = clipTextCells(text, available_columns);
     drawText(hdc, x, y, color, clipped);
 }
 
 fn drawTextRight(hdc: windows.HDC, left: c_int, y: c_int, right: c_int, color: windows.COLORREF, text: []const u8) void {
-    const width: c_int = @intCast(text.len * 8);
+    const width: c_int = @intCast(displayCells(text) * CHAR_WIDTH);
     drawText(hdc, @max(left, right - width), y, color, text);
 }
 
@@ -2386,6 +2403,74 @@ fn drawButton(hdc: windows.HDC, rect: RECT, label: []const u8) void {
     fillRect(hdc, rect, rgb(32, 42, 50));
     fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(79, 230, 226));
     drawTextClipped(hdc, rect.left + 10, rect.top + 5, rect.right - 6, rgb(226, 234, 242), label);
+}
+
+fn createTextFont() ?HFONT {
+    const face = std.unicode.utf8ToUtf16LeStringLiteral("Consolas");
+    return CreateFontW(
+        -16,
+        0,
+        0,
+        0,
+        FW_NORMAL,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        FIXED_PITCH | FF_MODERN,
+        face.ptr,
+    );
+}
+
+fn drawAsciiFallback(hdc: windows.HDC, x: c_int, y: c_int, text: []const u8) void {
+    var buffer: [MAX_DRAW_TEXT_BYTES]u16 = undefined;
+    const len = @min(text.len, buffer.len);
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const byte = text[i];
+        buffer[i] = if (byte >= 0x20 and byte < 0x7f) @as(u16, byte) else replacement_char;
+    }
+    if (len == 0) return;
+    _ = TextOutW(hdc, x, y, buffer[0..len].ptr, @intCast(len));
+}
+
+fn clipTextCells(text: []const u8, max_cells: usize) []const u8 {
+    if (max_cells == 0 or text.len == 0) return "";
+    var view = std.unicode.Wtf8View.init(text) catch {
+        return clipUtf8BytePrefix(text, max_cells);
+    };
+    var iter = view.iterator();
+    var cells: usize = 0;
+    var end: usize = 0;
+    while (iter.nextCodepointSlice()) |slice| {
+        const width: usize = if (slice.len == 1 and slice[0] < 0x80) 1 else 2;
+        if (cells + width > max_cells) break;
+        cells += width;
+        end += slice.len;
+        if (end >= MAX_DRAW_TEXT_BYTES) break;
+    }
+    return text[0..end];
+}
+
+fn clipUtf8BytePrefix(text: []const u8, max_bytes: usize) []const u8 {
+    if (max_bytes == 0) return "";
+    if (text.len <= max_bytes) return text;
+    var end = max_bytes;
+    while (end > 0 and isUtf8Continuation(text[end])) : (end -= 1) {}
+    return text[0..end];
+}
+
+fn displayCells(text: []const u8) usize {
+    var view = std.unicode.Wtf8View.init(text) catch return text.len;
+    var iter = view.iterator();
+    var cells: usize = 0;
+    while (iter.nextCodepointSlice()) |slice| {
+        cells += if (slice.len == 1 and slice[0] < 0x80) 1 else 2;
+    }
+    return cells;
 }
 
 fn fillRect(hdc: windows.HDC, rect: RECT, color: windows.COLORREF) void {
@@ -2559,6 +2644,7 @@ const BROWSEINFOW = extern struct {
 };
 
 const HGDIOBJ = *opaque {};
+const HFONT = *opaque {};
 const WPARAM = windows.ULONG_PTR;
 const LRESULT = windows.LONG_PTR;
 const HRESULT = c_long;
@@ -2573,6 +2659,8 @@ const EDITOR_TEXT_PADDING_X: c_int = 16;
 const EDITOR_TEXT_PADDING_Y: c_int = 7;
 const PALETTE_MATCH_TOP: c_int = 78;
 const MAX_PATH: usize = 260;
+const MAX_DRAW_TEXT_BYTES: usize = 4096;
+const replacement_char: u16 = 0xFFFD;
 
 const CS_HREDRAW: windows.UINT = 0x0002;
 const CS_VREDRAW: windows.UINT = 0x0001;
@@ -2583,6 +2671,13 @@ const IDC_ARROW: windows.LPCWSTR = @ptrFromInt(32512);
 const SW_SHOW: c_int = 5;
 const TRANSPARENT: c_int = 1;
 const WS_OVERLAPPEDWINDOW: windows.DWORD = 0x00CF0000;
+const FW_NORMAL: c_int = 400;
+const DEFAULT_CHARSET: windows.DWORD = 1;
+const OUT_DEFAULT_PRECIS: windows.DWORD = 0;
+const CLIP_DEFAULT_PRECIS: windows.DWORD = 0;
+const CLEARTYPE_QUALITY: windows.DWORD = 5;
+const FIXED_PITCH: windows.DWORD = 0x01;
+const FF_MODERN: windows.DWORD = 0x30;
 
 const WM_DESTROY: windows.UINT = 0x0002;
 const WM_SIZE: windows.UINT = 0x0005;
@@ -2654,6 +2749,23 @@ extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
 
 extern "gdi32" fn SetTextColor(hdc: windows.HDC, crColor: windows.COLORREF) callconv(.winapi) windows.COLORREF;
 extern "gdi32" fn SetBkMode(hdc: windows.HDC, mode: c_int) callconv(.winapi) c_int;
-extern "gdi32" fn TextOutA(hdc: windows.HDC, x: c_int, y: c_int, lpString: [*]const u8, c: c_int) callconv(.winapi) windows.BOOL;
+extern "gdi32" fn TextOutW(hdc: windows.HDC, x: c_int, y: c_int, lpString: [*]const u16, c: c_int) callconv(.winapi) windows.BOOL;
+extern "gdi32" fn CreateFontW(
+    cHeight: c_int,
+    cWidth: c_int,
+    cEscapement: c_int,
+    cOrientation: c_int,
+    cWeight: c_int,
+    bItalic: windows.DWORD,
+    bUnderline: windows.DWORD,
+    bStrikeOut: windows.DWORD,
+    iCharSet: windows.DWORD,
+    iOutPrecision: windows.DWORD,
+    iClipPrecision: windows.DWORD,
+    iQuality: windows.DWORD,
+    iPitchAndFamily: windows.DWORD,
+    pszFaceName: windows.LPCWSTR,
+) callconv(.winapi) ?HFONT;
+extern "gdi32" fn SelectObject(hdc: windows.HDC, h: HGDIOBJ) callconv(.winapi) ?HGDIOBJ;
 extern "gdi32" fn CreateSolidBrush(color: windows.COLORREF) callconv(.winapi) ?windows.HBRUSH;
 extern "gdi32" fn DeleteObject(ho: HGDIOBJ) callconv(.winapi) windows.BOOL;

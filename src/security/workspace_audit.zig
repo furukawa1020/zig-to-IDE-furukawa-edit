@@ -3,6 +3,7 @@ const build_firewall = @import("build_firewall.zig");
 const findings = @import("findings.zig");
 const git_status = @import("../git/status.zig");
 const package_trust = @import("package_trust.zig");
+const polyglot_scanner = @import("polyglot_scanner.zig");
 const workspace = @import("../workspace/workspace.zig");
 const zig_scanner = @import("zig_scanner.zig");
 
@@ -29,7 +30,7 @@ pub fn auditWorkspace(allocator: std.mem.Allocator, ws: *const workspace.Workspa
             break;
         }
         if (entry.kind != .file) continue;
-        if (!isInteresting(entry.path)) continue;
+        if (!isInteresting(entry.path, entry.language)) continue;
         scanned += 1;
 
         const absolute = try std.fs.path.join(allocator, &.{ ws.root_path, entry.path });
@@ -58,6 +59,12 @@ pub fn auditWorkspace(allocator: std.mem.Allocator, ws: *const workspace.Workspa
             defer zig_findings.deinit();
             try appendAll(&collection, &zig_findings);
         }
+
+        if (polyglot_scanner.isInterestingPath(entry.path, entry.language)) {
+            var polyglot_findings = try polyglot_scanner.scanSource(allocator, bytes, .{ .path = entry.path, .language = entry.language });
+            defer polyglot_findings.deinit();
+            try appendAll(&collection, &polyglot_findings);
+        }
     }
 
     if (truncated) {
@@ -73,9 +80,10 @@ fn appendAll(target: *findings.Collection, source: *const findings.Collection) !
     }
 }
 
-fn isInteresting(path: []const u8) bool {
+fn isInteresting(path: []const u8, language: @import("../language/modes.zig").LanguageMode) bool {
     return std.mem.endsWith(u8, path, ".zig") or
-        std.mem.eql(u8, path, "build.zig.zon");
+        std.mem.eql(u8, path, "build.zig.zon") or
+        polyglot_scanner.isInterestingPath(path, language);
 }
 
 fn readFile(allocator: std.mem.Allocator, absolute: []const u8, max_bytes: usize) ![]u8 {

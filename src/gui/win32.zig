@@ -6,6 +6,7 @@ const command_mod = @import("../core/command.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const navigation = @import("../editor/navigation.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
+const highlight = @import("../language/highlight.zig");
 const modes = @import("../language/modes.zig");
 const symbols_mod = @import("../language/symbols.zig");
 const file_finder = @import("../search/file_finder.zig");
@@ -1774,7 +1775,15 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
                 fillRect(hdc, RECT{ .left = editor.left + GUTTER_WIDTH, .top = y - 2, .right = editor.right, .bottom = y + ROW_HEIGHT - 2 }, rgb(20, 27, 34));
             }
             drawTextRight(hdc, editor.left + 10, y, editor.left + GUTTER_WIDTH - 12, rgb(105, 116, 128), number);
-            drawTextClipped(hdc, editor.left + GUTTER_WIDTH + EDITOR_TEXT_PADDING_X, y, editor.right - 20, rgb(224, 229, 235), doc.text.lineSlice(line));
+            drawHighlightedLine(
+                hdc,
+                state,
+                doc.language,
+                editor.left + GUTTER_WIDTH + EDITOR_TEXT_PADDING_X,
+                y,
+                editor.right - 20,
+                doc.text.lineSlice(line),
+            );
             if (current_line) {
                 const caret_x = editor.left + GUTTER_WIDTH + EDITOR_TEXT_PADDING_X + @as(c_int, @intCast(doc.cursor.position.column)) * CHAR_WIDTH;
                 fillRect(hdc, RECT{ .left = caret_x, .top = y - 2, .right = caret_x + 2, .bottom = y + ROW_HEIGHT - 4 }, rgb(255, 255, 255));

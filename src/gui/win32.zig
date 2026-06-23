@@ -2187,9 +2187,10 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
     const cursor = if (state.app.documents.active()) |doc| doc.cursor.position else null;
     const dirty = if (state.app.documents.active()) |doc| doc.dirty else false;
     const language = if (state.app.documents.active()) |doc| modes.label(doc.language) else "none";
+    const current_risk = currentDocumentRiskCounts(state);
     const text = std.fmt.bufPrint(
         &buffer,
-        " {s}/{s}  |  line:{d} col:{d} {s} lang:{s} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
+        " {s}/{s}  |  line:{d} col:{d} {s} lang:{s} risk:{d}/{d}/{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
         .{
             mode,
             focus,
@@ -2197,6 +2198,9 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
             if (cursor) |position| position.column + 1 else 0,
             if (dirty) "dirty" else "clean",
             language,
+            current_risk.critical,
+            current_risk.high,
+            current_risk.medium,
             state.app.workspace.entries.items.len,
             state.app.workspace.countCodeFiles(),
             state.app.workspace.countRecognizedLanguages(),
@@ -2709,6 +2713,23 @@ const RiskCounts = struct {
 fn riskCounts(collection: *const findings_mod.Collection) RiskCounts {
     var counts = RiskCounts{};
     for (collection.items.items) |item| {
+        switch (item.risk) {
+            .info => counts.info += 1,
+            .low => counts.low += 1,
+            .medium => counts.medium += 1,
+            .high => counts.high += 1,
+            .critical => counts.critical += 1,
+        }
+    }
+    return counts;
+}
+
+fn currentDocumentRiskCounts(state: *GuiState) RiskCounts {
+    const doc = state.app.documents.active() orelse return .{};
+    const path = doc.path orelse return .{};
+    var counts = RiskCounts{};
+    for (state.app.security_findings.items.items) |item| {
+        if (!pathMatches(path, item.path)) continue;
         switch (item.risk) {
             .info => counts.info += 1,
             .low => counts.low += 1,

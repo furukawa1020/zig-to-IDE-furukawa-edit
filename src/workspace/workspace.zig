@@ -60,6 +60,28 @@ pub const Workspace = struct {
         return count;
     }
 
+    pub fn countRecognizedLanguages(self: *const Workspace) usize {
+        var present = [_]bool{false} ** @typeInfo(modes.LanguageMode).@"enum".fields.len;
+        for (self.entries.items) |entry| {
+            if (!modes.isRecognized(entry.language)) continue;
+            present[@intFromEnum(entry.language)] = true;
+        }
+
+        var count: usize = 0;
+        for (present) |value| {
+            if (value) count += 1;
+        }
+        return count;
+    }
+
+    pub fn countCodeFiles(self: *const Workspace) usize {
+        var count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.kind == .file and modes.isCode(entry.language)) count += 1;
+        }
+        return count;
+    }
+
     pub fn refresh(self: *Workspace) !void {
         for (self.entries.items) |entry| {
             self.allocator.free(entry.path);

@@ -72,6 +72,7 @@ test {
     _ = @import("security/build_consent.zig");
     _ = @import("security/build_firewall.zig");
     _ = @import("security/package_trust.zig");
+    _ = @import("security/polyglot_scanner.zig");
     _ = @import("security/permissions.zig");
     _ = @import("security/posture.zig");
     _ = @import("security/output_sanitizer.zig");

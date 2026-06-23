@@ -134,6 +134,7 @@ pub const security = struct {
     pub const build_firewall = @import("security/build_firewall.zig");
     pub const findings = @import("security/findings.zig");
     pub const package_trust = @import("security/package_trust.zig");
+    pub const polyglot_scanner = @import("security/polyglot_scanner.zig");
     pub const output_sanitizer = @import("security/output_sanitizer.zig");
     pub const permissions = @import("security/permissions.zig");
     pub const posture = @import("security/posture.zig");

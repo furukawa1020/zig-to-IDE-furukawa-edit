@@ -2189,7 +2189,13 @@ fn drawGitPanelRow(hdc: windows.HDC, rect: RECT, overview: git_repository.Overvi
     const change = overview.changes[change_index];
     const color = gitChangeColor(change.status);
     drawText(hdc, rect.left + 16, y, color, gitChangeLabel(change.status));
-    drawTextClipped(hdc, rect.left + 52, y, rect.right - 16, color, change.path);
+    var stats_buf: [48]u8 = undefined;
+    const stats = if (change.diff_available)
+        std.fmt.bufPrint(&stats_buf, "+{d} -{d}", .{ change.additions, change.deletions }) catch ""
+    else
+        "diff n/a";
+    drawTextClipped(hdc, rect.left + 52, y, rect.right - 120, color, change.path);
+    drawTextRight(hdc, rect.right - 112, y, rect.right - 16, color, stats);
 }
 
 fn gitPanelRowCount(overview: git_repository.Overview) usize {

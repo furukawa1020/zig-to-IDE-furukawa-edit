@@ -1,5 +1,6 @@
 const std = @import("std");
 const workspace_mod = @import("../workspace/workspace.zig");
+const flate = std.compress.flate;
 
 pub const ChangeStatus = enum {
     modified,
@@ -10,6 +11,9 @@ pub const ChangeStatus = enum {
 pub const Change = struct {
     path: []u8,
     status: ChangeStatus,
+    additions: usize = 0,
+    deletions: usize = 0,
+    diff_available: bool = false,
 
     pub fn deinit(self: *Change, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -65,6 +69,7 @@ pub const Overview = struct {
     index_entries: usize = 0,
     clean_tracked: usize = 0,
     workflow_files: usize = 0,
+    ignored_untracked: usize = 0,
     change_limit_hit: bool = false,
     unsupported_index: bool = false,
 
@@ -104,6 +109,51 @@ const IndexEntry = struct {
     }
 };
 
+const DiffStats = struct {
+    additions: usize = 0,
+    deletions: usize = 0,
+    available: bool = false,
+};
+
+const LooseBlob = struct {
+    allocation: []u8,
+    body: []const u8,
+
+    fn deinit(self: *LooseBlob, allocator: std.mem.Allocator) void {
+        allocator.free(self.allocation);
+        self.* = undefined;
+    }
+};
+
+const IgnorePattern = struct {
+    text: []u8,
+    directory_only: bool = false,
+    anchored: bool = false,
+
+    fn deinit(self: *IgnorePattern, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        self.* = undefined;
+    }
+};
+
+const IgnoreRules = struct {
+    allocator: std.mem.Allocator,
+    patterns: []IgnorePattern = &.{},
+
+    fn deinit(self: *IgnoreRules) void {
+        for (self.patterns) |*pattern| pattern.deinit(self.allocator);
+        if (self.patterns.len > 0) self.allocator.free(self.patterns);
+        self.* = undefined;
+    }
+
+    fn isIgnored(self: *const IgnoreRules, path: []const u8) bool {
+        for (self.patterns) |pattern| {
+            if (ignorePatternMatches(pattern, path)) return true;
+        }
+        return false;
+    }
+};
+
 pub fn inspect(allocator: std.mem.Allocator, workspace: *const workspace_mod.Workspace, options: InspectOptions) !Overview {
     var overview = Overview{ .allocator = allocator };
     errdefer overview.deinit();
@@ -129,7 +179,9 @@ pub fn inspect(allocator: std.mem.Allocator, workspace: *const workspace_mod.Wor
 
     overview.index_version = index.version;
     overview.index_entries = index.entries.len;
-    try collectChanges(allocator, workspace, &index, options, &overview);
+    var ignore_rules = try loadIgnoreRules(allocator, workspace.root_path, options.max_file_bytes);
+    defer ignore_rules.deinit();
+    try collectChanges(allocator, workspace, &index, &ignore_rules, options, &overview);
 
     return overview;
 }
@@ -138,6 +190,7 @@ fn collectChanges(
     allocator: std.mem.Allocator,
     workspace: *const workspace_mod.Workspace,
     index: *const Index,
+    ignore_rules: *const IgnoreRules,
     options: InspectOptions,
     overview: *Overview,
 ) !void {
@@ -158,11 +211,14 @@ fn collectChanges(
 
         const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, absolute, allocator, .limited(options.max_file_bytes)) catch |err| switch (err) {
             error.FileNotFound => {
-                try appendChange(&changes, allocator, entry.path, .deleted);
+                var old_blob = readLooseBlob(allocator, overview.git_dir.?, entry.object_id, options.max_file_bytes) catch null;
+                defer if (old_blob) |*blob| blob.deinit(allocator);
+                const stats = if (old_blob) |blob| removedStats(blob.body) else DiffStats{};
+                try appendChange(&changes, allocator, entry.path, .deleted, stats);
                 continue;
             },
             else => {
-                try appendChange(&changes, allocator, entry.path, .modified);
+                try appendChange(&changes, allocator, entry.path, .modified, .{});
                 continue;
             },
         };
@@ -172,7 +228,10 @@ fn collectChanges(
         if (std.mem.eql(u8, object_id[0..], entry.object_id[0..])) {
             overview.clean_tracked += 1;
         } else {
-            try appendChange(&changes, allocator, entry.path, .modified);
+            var old_blob = readLooseBlob(allocator, overview.git_dir.?, entry.object_id, options.max_file_bytes) catch null;
+            defer if (old_blob) |*blob| blob.deinit(allocator);
+            const stats = if (old_blob) |blob| changedStats(blob.body, bytes) else DiffStats{};
+            try appendChange(&changes, allocator, entry.path, .modified, stats);
         }
     }
 
@@ -187,20 +246,76 @@ fn collectChanges(
             const normalized = try duplicateWithSlashes(allocator, file.path);
             defer allocator.free(normalized);
             if (isTracked(index.entries, normalized)) continue;
-            try appendChange(&changes, allocator, normalized, .untracked);
+            if (ignore_rules.isIgnored(normalized)) {
+                overview.ignored_untracked += 1;
+                continue;
+            }
+            const stats = addedFileStats(allocator, workspace.root_path, normalized, options.max_file_bytes) catch DiffStats{};
+            try appendChange(&changes, allocator, normalized, .untracked, stats);
         }
     }
 
     overview.changes = try changes.toOwnedSlice();
 }
 
-fn appendChange(changes: *std.array_list.Managed(Change), allocator: std.mem.Allocator, path: []const u8, status: ChangeStatus) !void {
+fn appendChange(changes: *std.array_list.Managed(Change), allocator: std.mem.Allocator, path: []const u8, status: ChangeStatus, stats: DiffStats) !void {
     var change = Change{
         .path = try allocator.dupe(u8, path),
         .status = status,
+        .additions = stats.additions,
+        .deletions = stats.deletions,
+        .diff_available = stats.available,
     };
     errdefer change.deinit(allocator);
     try changes.append(change);
+}
+
+fn loadIgnoreRules(allocator: std.mem.Allocator, workspace_root: []const u8, max_bytes: usize) !IgnoreRules {
+    const ignore_path = try std.fs.path.join(allocator, &.{ workspace_root, ".gitignore" });
+    defer allocator.free(ignore_path);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, ignore_path, allocator, .limited(max_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return .{ .allocator = allocator },
+        else => return err,
+    };
+    defer allocator.free(bytes);
+
+    var patterns = std.array_list.Managed(IgnorePattern).init(allocator);
+    errdefer {
+        for (patterns.items) |*pattern| pattern.deinit(allocator);
+        patterns.deinit();
+    }
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw| {
+        var line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] == '!') continue;
+
+        var anchored = false;
+        if (line[0] == '/') {
+            anchored = true;
+            line = std.mem.trimLeft(u8, line[1..], "/\\");
+        }
+
+        var directory_only = false;
+        while (line.len > 0 and (line[line.len - 1] == '/' or line[line.len - 1] == '\\')) {
+            directory_only = true;
+            line = line[0 .. line.len - 1];
+        }
+        if (line.len == 0) continue;
+
+        try patterns.append(.{
+            .text = try duplicateWithSlashes(allocator, line),
+            .directory_only = directory_only,
+            .anchored = anchored,
+        });
+    }
+
+    return .{
+        .allocator = allocator,
+        .patterns = try patterns.toOwnedSlice(),
+    };
 }
 
 fn readHead(allocator: std.mem.Allocator, overview: *Overview, git_dir: []const u8) !void {
@@ -456,6 +571,86 @@ fn startsWithNormalized(path: []const u8, prefix: []const u8) bool {
     return true;
 }
 
+fn addedFileStats(allocator: std.mem.Allocator, workspace_root: []const u8, path: []const u8, max_bytes: usize) !DiffStats {
+    const absolute = try std.fs.path.join(allocator, &.{ workspace_root, path });
+    defer allocator.free(absolute);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, absolute, allocator, .limited(max_bytes));
+    defer allocator.free(bytes);
+    return addedStats(bytes);
+}
+
+fn readLooseBlob(allocator: std.mem.Allocator, git_dir: []const u8, object_id: [20]u8, max_body_bytes: usize) !LooseBlob {
+    var hex: [40]u8 = undefined;
+    hexObjectId(&hex, object_id);
+
+    const object_path = try std.fs.path.join(allocator, &.{ git_dir, "objects", hex[0..2], hex[2..40] });
+    defer allocator.free(object_path);
+
+    const compressed = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, object_path, allocator, .limited(max_body_bytes + 1024));
+    defer allocator.free(compressed);
+
+    var reader: std.Io.Reader = .fixed(compressed);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    var decompress: flate.Decompress = .init(&reader, .zlib, &.{});
+    _ = try decompress.reader.streamRemaining(&output.writer);
+    const decompressed = try output.toOwnedSlice();
+    errdefer allocator.free(decompressed);
+
+    const nul = std.mem.indexOfScalar(u8, decompressed, 0) orelse return error.InvalidGitObject;
+    const header = decompressed[0..nul];
+    if (!startsWith(header, "blob ")) return error.UnsupportedGitObject;
+    const body = decompressed[nul + 1 ..];
+    if (body.len > max_body_bytes) return error.FileTooBig;
+
+    return .{
+        .allocation = decompressed,
+        .body = body,
+    };
+}
+
+fn changedStats(old: []const u8, new: []const u8) DiffStats {
+    if (std.mem.eql(u8, old, new)) return .{ .available = true };
+
+    var prefix: usize = 0;
+    const min_len = @min(old.len, new.len);
+    while (prefix < min_len and old[prefix] == new[prefix]) : (prefix += 1) {}
+    while (prefix > 0 and old[prefix - 1] != '\n') : (prefix -= 1) {}
+
+    var old_end = old.len;
+    var new_end = new.len;
+    while (old_end > prefix and new_end > prefix and old[old_end - 1] == new[new_end - 1]) {
+        old_end -= 1;
+        new_end -= 1;
+    }
+    while (old_end < old.len and old_end > prefix and old[old_end - 1] != '\n') : (old_end += 1) {}
+    while (new_end < new.len and new_end > prefix and new[new_end - 1] != '\n') : (new_end += 1) {}
+
+    return .{
+        .additions = countLines(new[prefix..new_end]),
+        .deletions = countLines(old[prefix..old_end]),
+        .available = true,
+    };
+}
+
+fn addedStats(bytes: []const u8) DiffStats {
+    return .{ .additions = countLines(bytes), .available = true };
+}
+
+fn removedStats(bytes: []const u8) DiffStats {
+    return .{ .deletions = countLines(bytes), .available = true };
+}
+
+fn countLines(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+    var count: usize = 0;
+    for (bytes) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    if (bytes[bytes.len - 1] != '\n') count += 1;
+    return count;
+}
+
 fn gitBlobSha1(bytes: []const u8) [20]u8 {
     var hasher = std.crypto.hash.Sha1.init(.{});
     var header_buf: [64]u8 = undefined;
@@ -465,6 +660,14 @@ fn gitBlobSha1(bytes: []const u8) [20]u8 {
     var digest: [20]u8 = undefined;
     hasher.final(&digest);
     return digest;
+}
+
+fn hexObjectId(out: *[40]u8, object_id: [20]u8) void {
+    const digits = "0123456789abcdef";
+    for (object_id, 0..) |byte, index| {
+        out[index * 2] = digits[byte >> 4];
+        out[index * 2 + 1] = digits[byte & 0x0f];
+    }
 }
 
 fn isTracked(entries: []const IndexEntry, path: []const u8) bool {
@@ -528,4 +731,20 @@ test "git blob sha1 matches known empty blob id" {
     const digest = gitBlobSha1("");
     const expected = [_]u8{ 0xe6, 0x9d, 0xe2, 0x9b, 0xb2, 0xd1, 0xd6, 0x43, 0x4b, 0x8b, 0x29, 0xae, 0x77, 0x5a, 0xd8, 0xc2, 0xe4, 0x8c, 0x53, 0x91 };
     try std.testing.expectEqualSlices(u8, expected[0..], digest[0..]);
+}
+
+test "line diff stats report changed middle" {
+    const stats = changedStats(
+        "one\ntwo\nthree\n",
+        "one\nTWO\nthree\n",
+    );
+    try std.testing.expect(stats.available);
+    try std.testing.expectEqual(@as(usize, 1), stats.additions);
+    try std.testing.expectEqual(@as(usize, 1), stats.deletions);
+}
+
+test "added and removed stats count logical lines" {
+    try std.testing.expectEqual(@as(usize, 2), addedStats("a\nb").additions);
+    try std.testing.expectEqual(@as(usize, 1), addedStats("a\n").additions);
+    try std.testing.expectEqual(@as(usize, 0), removedStats("").deletions);
 }

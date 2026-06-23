@@ -2607,6 +2607,14 @@ fn severityColor(severity: @import("../core/types.zig").Severity) windows.COLORR
     };
 }
 
+fn severityRank(severity: types.Severity) u8 {
+    return switch (severity) {
+        .info => 0,
+        .warning => 1,
+        .err => 2,
+    };
+}
+
 fn riskColor(risk: findings_mod.Risk) windows.COLORREF {
     return switch (risk) {
         .critical => rgb(255, 90, 90),
@@ -2615,6 +2623,31 @@ fn riskColor(risk: findings_mod.Risk) windows.COLORREF {
         .low => rgb(127, 211, 255),
         .info => rgb(149, 163, 178),
     };
+}
+
+fn pathMatches(document_path: []const u8, candidate: []const u8) bool {
+    if (candidate.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(document_path, candidate)) return true;
+    return pathEndsWithNormalized(document_path, candidate);
+}
+
+fn pathEndsWithNormalized(path: []const u8, suffix: []const u8) bool {
+    if (suffix.len > path.len) return false;
+    var path_index = path.len;
+    var suffix_index = suffix.len;
+    while (suffix_index > 0) {
+        if (path_index == 0) return false;
+        path_index -= 1;
+        suffix_index -= 1;
+        if (!pathByteEqual(path[path_index], suffix[suffix_index])) return false;
+    }
+    if (path_index == 0) return true;
+    return path[path_index - 1] == '/' or path[path_index - 1] == '\\';
+}
+
+fn pathByteEqual(left: u8, right: u8) bool {
+    if ((left == '/' or left == '\\') and (right == '/' or right == '\\')) return true;
+    return std.ascii.toLower(left) == std.ascii.toLower(right);
 }
 
 fn languageColor(mode: modes.LanguageMode) windows.COLORREF {

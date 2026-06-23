@@ -8,6 +8,7 @@ const editor_save = @import("../editor/save.zig");
 const process = @import("../platform/process.zig");
 const executor = @import("../tasks/executor.zig");
 const task_registry = @import("../tasks/registry.zig");
+const git_repository = @import("../git/repository.zig");
 const git_status = @import("../git/status.zig");
 const diagnostic_model = @import("../diagnostics/model.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
@@ -318,6 +319,14 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
             .rendered => .{ .completed = "task history rendered" },
             .empty_history => .{ .blocked = "no approved command history" },
         };
+    }
+
+    if (std.mem.eql(u8, definition.id, "git.overview") or std.mem.eql(u8, definition.id, "github.overview")) {
+        var overview = try git_repository.inspect(app.allocator, &app.workspace, .{});
+        defer overview.deinit();
+
+        try renderGitOverview(app, &overview);
+        return .{ .completed = "git overview complete" };
     }
 
     if (std.mem.eql(u8, definition.id, "git.status")) {
@@ -665,6 +674,68 @@ fn renderGitAudit(app: *app_mod.App, audit: *const security_findings.Collection)
     try app.process_console.appendBytes(.stdout, text.written());
 }
 
+fn renderGitOverview(app: *app_mod.App, overview: *const git_repository.Overview) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("git/github overview (pure Zig, no git executable)\n");
+    if (!overview.present) {
+        try writer.writeAll("no .git metadata found for this workspace\n");
+        try app.process_console.appendBytes(.stdout, text.written());
+        return;
+    }
+
+    try writer.print("branch    : {s}\n", .{overview.branch orelse "(detached or unknown)"});
+    if (overview.commit) |commit| try writer.print("commit    : {s}\n", .{commit});
+    if (overview.index_version) |version| {
+        try writer.print("index     : v{d}, tracked={d}, clean={d}\n", .{ version, overview.index_entries, overview.clean_tracked });
+    } else if (overview.unsupported_index) {
+        try writer.writeAll("index     : unsupported Git index version; file status skipped\n");
+    } else {
+        try writer.writeAll("index     : not found\n");
+    }
+    try writer.print("workflows : {d} GitHub Actions workflow file(s)\n", .{overview.workflow_files});
+
+    if (overview.remotes.len == 0) {
+        try writer.writeAll("remotes   : none\n");
+    } else {
+        try writer.writeAll("remotes\n");
+        for (overview.remotes) |remote| {
+            try writer.print("- {s}: {s}\n", .{ remote.name, remote.url });
+            if (remote.github) |github| {
+                try writer.print("  github : {s}\n", .{github.web_url});
+                try writer.print("  actions: {s}\n", .{github.actions_url});
+            }
+        }
+    }
+
+    try writer.print("changes   : {d}", .{overview.changes.len});
+    if (overview.change_limit_hit) try writer.writeAll(" (truncated)");
+    try writer.writeByte('\n');
+
+    const limit = @min(overview.changes.len, 80);
+    for (overview.changes[0..limit]) |change| {
+        try writer.print("{s} {s}\n", .{ gitChangeLabel(change.status), change.path });
+    }
+    if (overview.changes.len > limit) {
+        try writer.print("... {d} more changes\n", .{overview.changes.len - limit});
+    }
+    if (overview.changes.len == 0) {
+        try writer.writeAll("working tree appears clean against the Git index\n");
+    }
+
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn gitChangeLabel(status: git_repository.ChangeStatus) []const u8 {
+    return switch (status) {
+        .modified => "M ",
+        .deleted => "D ",
+        .untracked => "??",
+    };
+}
+
 fn appendConsole(app: *app_mod.App, stream: @import("../tasks/console.zig").Stream, comptime fmt: []const u8, args: anytype) !void {
     var text: std.Io.Writer.Allocating = .init(app.allocator);
     defer text.deinit();
@@ -779,6 +850,15 @@ test "workspace search command renders literal matches" {
     defer app.deinit();
 
     const result = try dispatch(&app, .{ .id = "workspace.search", .argument = "workspace.search" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expect(app.process_console.lines.items.len > 0);
+}
+
+test "git overview command renders repository output" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "git.overview" });
     try std.testing.expect(std.meta.activeTag(result) == .completed);
     try std.testing.expect(app.process_console.lines.items.len > 0);
 }

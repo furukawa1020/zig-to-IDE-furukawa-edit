@@ -2065,7 +2065,7 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
     const language = if (state.app.documents.active()) |doc| modes.label(doc.language) else "none";
     const text = std.fmt.bufPrint(
         &buffer,
-        " {s}/{s}  |  line:{d} col:{d} {s} lang:{s} | files:{d} code:{d} langs:{d} zig:{d} output:{s} | {s}",
+        " {s}/{s}  |  line:{d} col:{d} {s} lang:{s} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
         .{
             mode,
             focus,

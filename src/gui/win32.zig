@@ -6,6 +6,7 @@ const command_mod = @import("../core/command.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const navigation = @import("../editor/navigation.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
+const modes = @import("../language/modes.zig");
 const symbols_mod = @import("../language/symbols.zig");
 const file_finder = @import("../search/file_finder.zig");
 const workspace_search = @import("../search/workspace_search.zig");
@@ -1706,7 +1707,7 @@ fn drawFileList(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
             rgb(18, 20, 22)
         else switch (entry.kind) {
             .directory => rgb(229, 232, 236),
-            .file => if (entry.language == .zig) rgb(63, 217, 84) else rgb(205, 211, 217),
+            .file => languageColor(entry.language),
             .other => rgb(121, 133, 145),
         };
 
@@ -2061,16 +2062,20 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
     const message = state.last_error orelse "ready";
     const cursor = if (state.app.documents.active()) |doc| doc.cursor.position else null;
     const dirty = if (state.app.documents.active()) |doc| doc.dirty else false;
+    const language = if (state.app.documents.active()) |doc| modes.label(doc.language) else "none";
     const text = std.fmt.bufPrint(
         &buffer,
-        " {s}/{s}  |  line:{d} col:{d} {s} | files:{d} docs:{d} zig:{d} output:{s} | {s}",
+        " {s}/{s}  |  line:{d} col:{d} {s} lang:{s} | files:{d} code:{d} langs:{d} zig:{d} output:{s} | {s}",
         .{
             mode,
             focus,
             if (cursor) |position| position.line + 1 else 0,
             if (cursor) |position| position.column + 1 else 0,
             if (dirty) "dirty" else "clean",
+            language,
             state.app.workspace.entries.items.len,
+            state.app.workspace.countCodeFiles(),
+            state.app.workspace.countRecognizedLanguages(),
             state.app.documents.documents.items.len,
             state.app.workspace.countZigFamily(),
             if (state.show_output) "on" else "off",

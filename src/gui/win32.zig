@@ -2417,6 +2417,19 @@ fn riskColor(risk: findings_mod.Risk) windows.COLORREF {
     };
 }
 
+fn languageColor(mode: modes.LanguageMode) windows.COLORREF {
+    return switch (modes.family(mode)) {
+        .zig => rgb(63, 217, 84),
+        .native => rgb(255, 183, 89),
+        .script => rgb(233, 137, 255),
+        .web => rgb(90, 196, 255),
+        .data => rgb(151, 210, 143),
+        .config => rgb(255, 207, 92),
+        .prose => rgb(205, 211, 217),
+        .unknown => rgb(121, 133, 145),
+    };
+}
+
 fn chooseFolder(allocator: std.mem.Allocator, owner: windows.HWND) !?[]u8 {
     const hr = OleInitialize(null);
     const ole_initialized = hr >= 0;

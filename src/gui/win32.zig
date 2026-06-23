@@ -2109,8 +2109,8 @@ fn drawGitPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     var header_buf: [260]u8 = undefined;
     const header = std.fmt.bufPrint(
         &header_buf,
-        "GIT  branch:{s} changes:{d} remotes:{d} workflows:{d}",
-        .{ overview.branch orelse "(detached)", overview.changes.len, overview.remotes.len, overview.workflow_files },
+        "GIT  branch:{s} changes:{d} ignored:{d} remotes:{d} workflows:{d}",
+        .{ overview.branch orelse "(detached)", overview.changes.len, overview.ignored_untracked, overview.remotes.len, overview.workflow_files },
     ) catch "GIT";
     drawTextClipped(hdc, rect.left + 16, rect.top + 10, rect.right - 16, rgb(79, 230, 226), header);
 

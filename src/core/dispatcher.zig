@@ -716,7 +716,11 @@ fn renderGitOverview(app: *app_mod.App, overview: *const git_repository.Overview
 
     const limit = @min(overview.changes.len, 80);
     for (overview.changes[0..limit]) |change| {
-        try writer.print("{s} {s}\n", .{ gitChangeLabel(change.status), change.path });
+        if (change.diff_available) {
+            try writer.print("{s} +{d} -{d} {s}\n", .{ gitChangeLabel(change.status), change.additions, change.deletions, change.path });
+        } else {
+            try writer.print("{s} diff:n/a {s}\n", .{ gitChangeLabel(change.status), change.path });
+        }
     }
     if (overview.changes.len > limit) {
         try writer.print("... {d} more changes\n", .{overview.changes.len - limit});

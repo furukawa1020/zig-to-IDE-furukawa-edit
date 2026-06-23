@@ -4,6 +4,7 @@ const windows = std.os.windows;
 const app_mod = @import("../core/app.zig");
 const command_mod = @import("../core/command.zig");
 const dispatcher = @import("../core/dispatcher.zig");
+const types = @import("../core/types.zig");
 const navigation = @import("../editor/navigation.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
 const highlight = @import("../language/highlight.zig");
@@ -1771,6 +1772,11 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
             var number_buf: [32]u8 = undefined;
             const number = std.fmt.bufPrint(&number_buf, "{d}", .{line + 1}) catch "";
             const current_line = line == doc.cursor.position.line;
+            const marker = editorLineMarker(state, doc.path, line);
+            if (marker.hasAny()) {
+                fillRect(hdc, RECT{ .left = editor.left + GUTTER_WIDTH, .top = y - 2, .right = editor.right, .bottom = y + ROW_HEIGHT - 2 }, markerBackgroundColor(marker));
+                fillRect(hdc, RECT{ .left = editor.left + GUTTER_WIDTH - 5, .top = y - 2, .right = editor.left + GUTTER_WIDTH - 1, .bottom = y + ROW_HEIGHT - 2 }, markerStripeColor(marker));
+            }
             if (current_line) {
                 fillRect(hdc, RECT{ .left = editor.left + GUTTER_WIDTH, .top = y - 2, .right = editor.right, .bottom = y + ROW_HEIGHT - 2 }, rgb(20, 27, 34));
             }
@@ -1827,6 +1833,104 @@ fn drawEditorHeader(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
     if (state.app.documents.documents.items.len == 0) {
         drawText(hdc, layout.editor.left + 22, 15, rgb(79, 230, 226), "zide workbench");
     }
+}
+
+const EditorLineMarker = struct {
+    severity: ?types.Severity = null,
+    risk: ?findings_mod.Risk = null,
+
+    fn hasAny(self: EditorLineMarker) bool {
+        return self.severity != null or self.risk != null;
+    }
+};
+
+fn editorLineMarker(state: *const GuiState, document_path: ?[]const u8, line: usize) EditorLineMarker {
+    const path = document_path orelse return .{};
+    var marker = EditorLineMarker{};
+
+    for (state.app.diagnostics.items.items) |item| {
+        if (item.range.start.line != line) continue;
+        if (!pathMatches(path, item.path)) continue;
+        if (marker.severity == null or severityRank(item.severity) > severityRank(marker.severity.?)) {
+            marker.severity = item.severity;
+        }
+    }
+
+    for (state.app.security_findings.items.items) |item| {
+        if (item.line != line) continue;
+        if (!pathMatches(path, item.path)) continue;
+        if (marker.risk == null or riskRank(item.risk) > riskRank(marker.risk.?)) {
+            marker.risk = item.risk;
+        }
+    }
+
+    return marker;
+}
+
+fn markerStripeColor(marker: EditorLineMarker) windows.COLORREF {
+    if (marker.risk) |risk| return riskColor(risk);
+    if (marker.severity) |severity| return severityColor(severity);
+    return rgb(121, 133, 145);
+}
+
+fn markerBackgroundColor(marker: EditorLineMarker) windows.COLORREF {
+    if (marker.risk) |risk| {
+        return switch (risk) {
+            .critical, .high => rgb(39, 19, 24),
+            .medium => rgb(38, 30, 16),
+            .low, .info => rgb(18, 28, 34),
+        };
+    }
+    if (marker.severity) |severity| {
+        return switch (severity) {
+            .err => rgb(39, 19, 24),
+            .warning => rgb(38, 30, 16),
+            .info => rgb(18, 28, 34),
+        };
+    }
+    return rgb(20, 27, 34);
+}
+
+fn drawHighlightedLine(hdc: windows.HDC, state: *GuiState, mode: modes.LanguageMode, x: c_int, y: c_int, right: c_int, line: []const u8) void {
+    if (right <= x) return;
+    if (!modes.isCode(mode) and mode != .json and mode != .yaml and mode != .toml and mode != .xml and mode != .sql) {
+        drawTextClipped(hdc, x, y, right, rgb(224, 229, 235), line);
+        return;
+    }
+
+    const spans = highlight.collectLine(state.allocator, line, mode) catch {
+        drawTextClipped(hdc, x, y, right, rgb(224, 229, 235), line);
+        return;
+    };
+    defer state.allocator.free(spans);
+
+    if (spans.len == 0) {
+        drawTextClipped(hdc, x, y, right, rgb(224, 229, 235), line);
+        return;
+    }
+
+    for (spans) |span| {
+        if (span.end <= span.start or span.start >= line.len) continue;
+        const segment = line[span.start..@min(span.end, line.len)];
+        const segment_x = x + @as(c_int, @intCast(displayCells(line[0..span.start]) * CHAR_WIDTH));
+        if (segment_x >= right) break;
+        drawTextClipped(hdc, segment_x, y, right, highlightColor(span.role), segment);
+    }
+}
+
+fn highlightColor(role: highlight.Role) windows.COLORREF {
+    return switch (role) {
+        .plain => rgb(224, 229, 235),
+        .keyword => rgb(119, 190, 255),
+        .type_name => rgb(255, 207, 128),
+        .string => rgb(165, 214, 167),
+        .number => rgb(255, 190, 130),
+        .comment => rgb(121, 133, 145),
+        .doc_comment => rgb(145, 170, 150),
+        .builtin => rgb(218, 169, 255),
+        .operator, .punctuation => rgb(174, 184, 194),
+        .unsafe_boundary => rgb(255, 118, 118),
+    };
 }
 
 fn drawOutput(hdc: windows.HDC, state: *GuiState, layout: Layout) void {

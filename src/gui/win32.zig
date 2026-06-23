@@ -6,6 +6,7 @@ const command_mod = @import("../core/command.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const types = @import("../core/types.zig");
 const navigation = @import("../editor/navigation.zig");
+const git_repository = @import("../git/repository.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
 const highlight = @import("../language/highlight.zig");
 const modes = @import("../language/modes.zig");
@@ -27,6 +28,7 @@ const QuickPanelMode = enum {
 
 const BottomPanel = enum {
     output,
+    git,
     diagnostics,
     security,
 };
@@ -387,10 +389,12 @@ const GuiState = struct {
     output_scroll_line: usize = 0,
     diagnostics_scroll_line: usize = 0,
     security_scroll_line: usize = 0,
+    git_scroll_line: usize = 0,
     show_output: bool = true,
     bottom_panel: BottomPanel = .output,
     quick_panel: QuickPanel,
     search_panel: SearchPanel,
+    git_overview: ?git_repository.Overview = null,
 
     fn init(allocator: std.mem.Allocator, root_path: []const u8) !GuiState {
         var app = try app_mod.App.init(allocator, root_path);
@@ -431,8 +435,10 @@ const GuiState = struct {
         self.output_scroll_line = 0;
         self.diagnostics_scroll_line = 0;
         self.security_scroll_line = 0;
+        self.git_scroll_line = 0;
         self.show_output = true;
         self.bottom_panel = .output;
+        self.clearGitOverview();
         self.quick_panel.close();
         self.search_panel.clear();
         self.setMessage("Workspace opened") catch {};
@@ -517,6 +523,7 @@ const GuiState = struct {
     fn deinit(self: *GuiState) void {
         if (self.text_font) |font| _ = DeleteObject(@ptrCast(font));
         if (self.last_error) |message| self.allocator.free(message);
+        self.clearGitOverview();
         self.search_panel.deinit();
         self.quick_panel.deinit();
         self.allocator.free(self.collapsed_dirs);
@@ -648,6 +655,10 @@ const GuiState = struct {
             self.openQuickPanel(.search_workspace);
             return;
         }
+        if (std.mem.eql(u8, id, "git.overview") or std.mem.eql(u8, id, "github.overview")) {
+            self.openGitPanel();
+            return;
+        }
         if (std.mem.eql(u8, id, "view.toggle_diagnostics")) {
             self.openDiagnosticsPanel();
             return;
@@ -706,6 +717,31 @@ const GuiState = struct {
         self.security_scroll_line = 0;
         self.runZigSecurityAudit("manual");
         self.setMessage("Security findings") catch {};
+    }
+
+    fn openGitPanel(self: *GuiState) void {
+        self.show_output = true;
+        self.bottom_panel = .git;
+        self.git_scroll_line = 0;
+        self.refreshGitOverview();
+    }
+
+    fn refreshGitOverview(self: *GuiState) void {
+        self.clearGitOverview();
+        const overview = git_repository.inspect(self.allocator, &self.app.workspace, .{}) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "git overview failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.git_overview = overview;
+        self.setMessage(if (overview.present) "Git overview" else "No Git repository") catch {};
+    }
+
+    fn clearGitOverview(self: *GuiState) void {
+        if (self.git_overview) |*overview| {
+            overview.deinit();
+            self.git_overview = null;
+        }
     }
 
     fn openQuickPanel(self: *GuiState, mode: QuickPanelMode) void {
@@ -984,11 +1020,35 @@ const GuiState = struct {
         self.openRelativeLocation(parsed.path, parsed.line, parsed.column);
     }
 
+    fn openGitPanelRow(self: *GuiState, row: usize) void {
+        const overview = self.git_overview orelse return;
+        const workflow_start = gitPanelWorkflowStartRow(overview);
+        if (row >= workflow_start and row < workflow_start + overview.workflow_paths.len) {
+            self.openRelativeFile(overview.workflow_paths[row - workflow_start], null);
+            return;
+        }
+
+        const change_row_start = gitPanelChangeStartRow(overview);
+        if (row < change_row_start) return;
+        const change_index = row - change_row_start;
+        if (change_index >= overview.changes.len) return;
+        const change = overview.changes[change_index];
+        if (change.status == .deleted) {
+            self.setMessage("Deleted file cannot be opened") catch {};
+            return;
+        }
+        self.openRelativeFile(change.path, null);
+    }
+
     fn handleDispatchResult(self: *GuiState, id: []const u8, result: dispatcher.Result) void {
         switch (result) {
             .completed => |message| {
                 self.setMessage(message) catch {};
                 self.appendOutput(.stdout, "{s}: {s}\n", .{ id, message });
+                if (self.git_overview != null and (std.mem.eql(u8, id, "file.save") or std.mem.eql(u8, id, "file.new"))) {
+                    self.refreshGitOverview();
+                    self.setMessage(message) catch {};
+                }
             },
             .blocked => |message| {
                 self.setMessage(message) catch {};
@@ -1204,6 +1264,11 @@ const GuiState = struct {
     fn scrollBottomPanel(self: *GuiState, layout: Layout, delta: isize) void {
         switch (self.bottom_panel) {
             .output => self.scrollOutput(delta),
+            .git => {
+                const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
+                const total = if (self.git_overview) |overview| gitPanelRowCount(overview) else 0;
+                scrollIndex(&self.git_scroll_line, total, visible, delta);
+            },
             .diagnostics => {
                 const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
                 scrollIndex(&self.diagnostics_scroll_line, self.app.diagnostics.items.items.len, visible, delta);
@@ -1313,7 +1378,7 @@ const GuiState = struct {
                 return;
             }
             if (pointIn(gitAuditButtonRect(layout), x, y)) {
-                self.executeCommand("git.status");
+                self.executeCommand("git.overview");
                 return;
             }
 
@@ -1388,10 +1453,12 @@ const GuiState = struct {
             if (bottomPanelTabAt(layout.output, x, y)) |panel| {
                 self.bottom_panel = panel;
                 self.show_output = true;
+                if (panel == .git and self.git_overview == null) self.refreshGitOverview();
                 return;
             }
             switch (self.bottom_panel) {
                 .output => self.openConsoleLineAt(layout, y),
+                .git => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.openGitPanelRow(self.git_scroll_line + row),
                 .diagnostics => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToDiagnostic(self.diagnostics_scroll_line + row),
                 .security => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToSecurityFinding(self.security_scroll_line + row),
             }
@@ -1528,7 +1595,7 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         return;
     }
     if (ctrl and key == 'G') {
-        state.executeCommand("git.status");
+        state.executeCommand("git.overview");
         return;
     }
     if (ctrl and key == 'O') {
@@ -1726,12 +1793,45 @@ fn drawFileList(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
 
         drawText(hdc, 16 + indent, y + 3, color, marker);
         drawTextClipped(hdc, 36 + indent, y + 3, layout.sidebar.right - 12, color, entry.path);
+        if (gitMarkerForEntry(state, entry.path, entry.kind == .directory)) |git_marker| {
+            drawTextRight(hdc, layout.sidebar.right - 34, y + 3, layout.sidebar.right - 12, gitChangeColor(git_marker.status), git_marker.label);
+        }
         y += ROW_HEIGHT;
     }
 
     if (state.app.workspace.entries.items.len == 0) {
         drawText(hdc, 18, SIDEBAR_FILE_TOP + 4, rgb(140, 148, 158), "No files found");
     }
+}
+
+const GitMarker = struct {
+    label: []const u8,
+    status: git_repository.ChangeStatus,
+};
+
+fn gitMarkerForEntry(state: *const GuiState, entry_path: []const u8, is_directory: bool) ?GitMarker {
+    const overview = state.git_overview orelse return null;
+    if (!overview.present) return null;
+    for (overview.changes) |change| {
+        if (is_directory) {
+            if (pathIsInsideDirectory(change.path, entry_path)) {
+                return .{ .label = "*", .status = change.status };
+            }
+        } else if (pathMatches(entry_path, change.path)) {
+            return .{ .label = gitChangeLabel(change.status), .status = change.status };
+        }
+    }
+    return null;
+}
+
+fn pathIsInsideDirectory(path: []const u8, directory: []const u8) bool {
+    if (directory.len == 0) return false;
+    if (path.len <= directory.len) return false;
+    var i: usize = 0;
+    while (i < directory.len) : (i += 1) {
+        if (!pathByteEqual(path[i], directory[i])) return false;
+    }
+    return path[directory.len] == '/' or path[directory.len] == '\\';
 }
 
 fn drawSecurityStrip(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
@@ -1943,6 +2043,7 @@ fn drawOutput(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
             }
             drawConsoleOutput(hdc, state, consoleOutputRect(layout, state));
         },
+        .git => drawGitPanel(hdc, state, content),
         .diagnostics => drawDiagnosticsPanel(hdc, state, content),
         .security => drawSecurityPanel(hdc, state, content),
     }
@@ -1952,6 +2053,7 @@ fn drawBottomPanelTabs(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + HEADER_HEIGHT }, rgb(12, 16, 20));
     fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
     drawBottomPanelTab(hdc, rect, .output, state.bottom_panel == .output, "OUTPUT");
+    drawBottomPanelTab(hdc, rect, .git, state.bottom_panel == .git, "GIT");
     drawBottomPanelTab(hdc, rect, .diagnostics, state.bottom_panel == .diagnostics, "DIAG");
     drawBottomPanelTab(hdc, rect, .security, state.bottom_panel == .security, "SEC");
 }
@@ -1986,6 +2088,148 @@ fn drawConsoleOutput(hdc: windows.HDC, state: *GuiState, output: RECT) void {
     if (lines.len == 0) {
         drawText(hdc, output.left + 16, output.top + HEADER_HEIGHT, rgb(116, 128, 140), "No output yet");
     }
+}
+
+fn drawGitPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
+    fillRect(hdc, rect, rgb(10, 12, 14));
+    fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
+
+    const overview = state.git_overview orelse {
+        drawText(hdc, rect.left + 16, rect.top + 10, rgb(79, 230, 226), "GIT");
+        drawText(hdc, rect.left + 16, rect.top + HEADER_HEIGHT, rgb(116, 128, 140), "Click GIT or press Ctrl+G to inspect this workspace");
+        return;
+    };
+
+    if (!overview.present) {
+        drawText(hdc, rect.left + 16, rect.top + 10, rgb(79, 230, 226), "GIT");
+        drawText(hdc, rect.left + 16, rect.top + HEADER_HEIGHT, rgb(116, 128, 140), "No Git metadata found");
+        return;
+    }
+
+    var header_buf: [260]u8 = undefined;
+    const header = std.fmt.bufPrint(
+        &header_buf,
+        "GIT  branch:{s} changes:{d} remotes:{d} workflows:{d}",
+        .{ overview.branch orelse "(detached)", overview.changes.len, overview.remotes.len, overview.workflow_files },
+    ) catch "GIT";
+    drawTextClipped(hdc, rect.left + 16, rect.top + 10, rect.right - 16, rgb(79, 230, 226), header);
+
+    const rows = @max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT, ROW_HEIGHT));
+    const total_rows = gitPanelRowCount(overview);
+    const start = @min(state.git_scroll_line, if (total_rows > @as(usize, @intCast(rows))) total_rows - @as(usize, @intCast(rows)) else 0);
+    var y = rect.top + HEADER_HEIGHT;
+    var row: usize = 0;
+    while (row < @as(usize, @intCast(rows)) and start + row < total_rows) : (row += 1) {
+        drawGitPanelRow(hdc, rect, overview, start + row, y);
+        y += ROW_HEIGHT;
+    }
+}
+
+fn drawGitPanelRow(hdc: windows.HDC, rect: RECT, overview: git_repository.Overview, row: usize, y: c_int) void {
+    if (row == 0) {
+        if (overview.commit) |commit| {
+            drawTextClipped(hdc, rect.left + 16, y, rect.right - 16, rgb(180, 190, 200), commit);
+        } else {
+            drawText(hdc, rect.left + 16, y, rgb(116, 128, 140), "No commit resolved");
+        }
+        return;
+    }
+
+    var current: usize = 1;
+    for (overview.remotes) |remote| {
+        if (row == current) {
+            var remote_buf: [520]u8 = undefined;
+            const text = std.fmt.bufPrint(&remote_buf, "remote {s}: {s}", .{ remote.name, remote.url }) catch remote.url;
+            drawTextClipped(hdc, rect.left + 16, y, rect.right - 16, rgb(210, 218, 226), text);
+            return;
+        }
+        current += 1;
+        if (remote.github) |github| {
+            if (row == current) {
+                drawTextClipped(hdc, rect.left + 34, y, rect.right - 16, rgb(127, 211, 255), github.web_url);
+                return;
+            }
+            current += 1;
+            if (row == current) {
+                drawTextClipped(hdc, rect.left + 34, y, rect.right - 16, rgb(127, 211, 255), github.actions_url);
+                return;
+            }
+            current += 1;
+        }
+    }
+
+    if (row == current) {
+        var workflow_buf: [160]u8 = undefined;
+        const text = std.fmt.bufPrint(&workflow_buf, "GitHub Actions workflows: {d}", .{overview.workflow_paths.len}) catch "GitHub Actions workflows";
+        drawText(hdc, rect.left + 16, y, rgb(255, 207, 92), text);
+        return;
+    }
+    current += 1;
+
+    for (overview.workflow_paths) |path| {
+        if (row == current) {
+            drawTextClipped(hdc, rect.left + 34, y, rect.right - 16, rgb(127, 211, 255), path);
+            return;
+        }
+        current += 1;
+    }
+
+    if (row == current) {
+        if (overview.changes.len == 0) {
+            drawText(hdc, rect.left + 16, y, rgb(116, 128, 140), "Working tree appears clean against the Git index");
+        } else {
+            drawText(hdc, rect.left + 16, y, rgb(255, 207, 92), "Changes");
+        }
+        return;
+    }
+    current += 1;
+
+    const change_index = row - current;
+    if (change_index >= overview.changes.len) return;
+    const change = overview.changes[change_index];
+    const color = gitChangeColor(change.status);
+    drawText(hdc, rect.left + 16, y, color, gitChangeLabel(change.status));
+    drawTextClipped(hdc, rect.left + 52, y, rect.right - 16, color, change.path);
+}
+
+fn gitPanelRowCount(overview: git_repository.Overview) usize {
+    var count: usize = 1;
+    for (overview.remotes) |remote| {
+        count += 1;
+        if (remote.github != null) count += 2;
+    }
+    count += 1 + overview.workflow_paths.len;
+    count += 1 + overview.changes.len;
+    return count;
+}
+
+fn gitPanelWorkflowStartRow(overview: git_repository.Overview) usize {
+    var row: usize = 2;
+    for (overview.remotes) |remote| {
+        row += 1;
+        if (remote.github != null) row += 2;
+    }
+    return row;
+}
+
+fn gitPanelChangeStartRow(overview: git_repository.Overview) usize {
+    return gitPanelWorkflowStartRow(overview) + overview.workflow_paths.len + 1;
+}
+
+fn gitChangeLabel(status: git_repository.ChangeStatus) []const u8 {
+    return switch (status) {
+        .modified => "M ",
+        .deleted => "D ",
+        .untracked => "??",
+    };
+}
+
+fn gitChangeColor(status: git_repository.ChangeStatus) windows.COLORREF {
+    return switch (status) {
+        .modified => rgb(255, 207, 92),
+        .deleted => rgb(255, 118, 118),
+        .untracked => rgb(127, 211, 255),
+    };
 }
 
 fn drawDiagnosticsPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
@@ -2188,9 +2432,10 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
     const dirty = if (state.app.documents.active()) |doc| doc.dirty else false;
     const language = if (state.app.documents.active()) |doc| modes.label(doc.language) else "none";
     const current_risk = currentDocumentRiskCounts(state);
+    const git_changes = if (state.git_overview) |overview| overview.changes.len else 0;
     const text = std.fmt.bufPrint(
         &buffer,
-        " {s}/{s}  |  line:{d} col:{d} {s} lang:{s} risk:{d}/{d}/{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
+        " {s}/{s}  |  line:{d} col:{d} {s} lang:{s} risk:{d}/{d}/{d} git:{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
         .{
             mode,
             focus,
@@ -2201,6 +2446,7 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
             current_risk.critical,
             current_risk.high,
             current_risk.medium,
+            git_changes,
             state.app.workspace.entries.items.len,
             state.app.workspace.countCodeFiles(),
             state.app.workspace.countRecognizedLanguages(),
@@ -2421,8 +2667,9 @@ fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
     const gap: c_int = 6;
     const index: c_int = switch (panel) {
         .output => 0,
-        .diagnostics => 1,
-        .security => 2,
+        .git => 1,
+        .diagnostics => 2,
+        .security => 3,
     };
     const left = rect.left + 12 + index * (width + gap);
     return .{ .left = left, .top = rect.top + 9, .right = left + width, .bottom = rect.top + 33 };
@@ -2430,7 +2677,7 @@ fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
 
 fn bottomPanelTabAt(rect: RECT, x: c_int, y: c_int) ?BottomPanel {
     if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const panels = [_]BottomPanel{ .output, .diagnostics, .security };
+    const panels = [_]BottomPanel{ .output, .git, .diagnostics, .security };
     for (panels) |panel| {
         if (pointIn(bottomPanelTabRect(rect, panel), x, y)) return panel;
     }

@@ -571,6 +571,69 @@ fn startsWithNormalized(path: []const u8, prefix: []const u8) bool {
     return true;
 }
 
+fn ignorePatternMatches(pattern: IgnorePattern, path: []const u8) bool {
+    if (pattern.text.len == 0) return false;
+    if (pattern.anchored or containsSlash(pattern.text)) {
+        if (pattern.directory_only) {
+            return pathMatchesDirectoryPrefix(path, pattern.text);
+        }
+        return wildcardMatch(pattern.text, path);
+    }
+
+    var start: usize = 0;
+    while (start <= path.len) {
+        var end = start;
+        while (end < path.len and path[end] != '/' and path[end] != '\\') : (end += 1) {}
+        const segment = path[start..end];
+        if (wildcardMatch(pattern.text, segment)) return true;
+        if (pattern.directory_only and pathMatchesDirectoryPrefix(path[start..], pattern.text)) return true;
+        if (end == path.len) break;
+        start = end + 1;
+    }
+    return false;
+}
+
+fn pathMatchesDirectoryPrefix(path: []const u8, directory: []const u8) bool {
+    if (path.len < directory.len) return false;
+    if (!wildcardMatch(directory, path[0..directory.len])) return false;
+    if (path.len == directory.len) return true;
+    return path[directory.len] == '/' or path[directory.len] == '\\';
+}
+
+fn containsSlash(bytes: []const u8) bool {
+    return std.mem.indexOfAny(u8, bytes, "/\\") != null;
+}
+
+fn wildcardMatch(pattern: []const u8, value: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
+        return std.mem.eql(u8, pattern, value);
+    }
+
+    var p: usize = 0;
+    var v: usize = 0;
+    var star: ?usize = null;
+    var match_after_star: usize = 0;
+    while (v < value.len) {
+        if (p < pattern.len and pattern[p] == '*') {
+            star = p;
+            p += 1;
+            match_after_star = v;
+        } else if (p < pattern.len and pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if (star) |star_index| {
+            p = star_index + 1;
+            match_after_star += 1;
+            v = match_after_star;
+        } else {
+            return false;
+        }
+    }
+
+    while (p < pattern.len and pattern[p] == '*') : (p += 1) {}
+    return p == pattern.len;
+}
+
 fn addedFileStats(allocator: std.mem.Allocator, workspace_root: []const u8, path: []const u8, max_bytes: usize) !DiffStats {
     const absolute = try std.fs.path.join(allocator, &.{ workspace_root, path });
     defer allocator.free(absolute);

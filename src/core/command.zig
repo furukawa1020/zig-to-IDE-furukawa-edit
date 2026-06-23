@@ -87,7 +87,9 @@ const definitions = [_]Definition{
     .{ .id = "security.approve_consent", .title = "Approve Build Consent", .description = "Queue the pending build/test command after explicit review.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "security.dismiss_consent", .title = "Dismiss Build Consent", .description = "Clear the pending build consent preview.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "debug.start", .title = "Start Debugging", .description = "Launch the configured debug session.", .default_key = "f5", .scope = .task, .capability = .external_command },
+    .{ .id = "git.overview", .title = "Git and GitHub Overview", .description = "Read branch, remotes, GitHub links, and file changes without executing Git.", .default_key = "ctrl-g", .scope = .workspace, .capability = .safe },
     .{ .id = "git.status", .title = "Git Security Status", .description = "Read Git metadata without executing Git hooks, filters, or fsmonitor.", .default_key = "", .scope = .workspace, .capability = .safe },
+    .{ .id = "github.overview", .title = "GitHub Overview", .description = "Show GitHub repository and Actions links inferred from local Git remotes.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "demo.run", .title = "Run Demo", .description = "Run an internal zide demo.", .default_key = "", .scope = .demo, .capability = .safe },
 };
 

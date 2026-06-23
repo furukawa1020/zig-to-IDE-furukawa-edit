@@ -494,7 +494,7 @@ const GuiState = struct {
                 counts.low,
             },
         );
-        self.appendOutput(.stdout, "checks: build.zig firewall, build.zig.zon dependency hashes, unsafe Zig builtins, FFI, allocators, git config/hooks/submodules/attributes\n", .{});
+        self.appendOutput(.stdout, "checks: build.zig firewall, build.zig.zon hashes, unsafe Zig/FFI/allocators, polyglot scripts/secrets/process boundaries, git config/hooks/submodules/attributes\n", .{});
 
         const limit: usize = 10;
         for (self.app.security_findings.items.items, 0..) |item, index| {
@@ -2018,7 +2018,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 const items = state.quick_panel.file_matches orelse break;
                 const item = items[row];
                 drawTextClipped(hdc, panel.left + 18, y, panel.right - 112, color, item.path);
-                drawTextClipped(hdc, panel.right - 106, y, panel.right - 16, color, @tagName(item.language));
+                drawTextClipped(hdc, panel.right - 106, y, panel.right - 16, color, modes.label(item.language));
             },
             .search_workspace => {
                 const items = state.quick_panel.search_results orelse break;

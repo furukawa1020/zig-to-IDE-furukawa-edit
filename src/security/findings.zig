@@ -19,6 +19,7 @@ pub const Category = enum {
     ide_self_protection,
     allocator_policy,
     git_trust,
+    polyglot_trust,
 };
 
 pub const Finding = struct {

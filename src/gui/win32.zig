@@ -2106,11 +2106,21 @@ fn drawGitPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
         return;
     }
 
-    var header_buf: [260]u8 = undefined;
+    const workflow_risk = workflowRiskCounts(state, overview);
+    var header_buf: [360]u8 = undefined;
     const header = std.fmt.bufPrint(
         &header_buf,
-        "GIT  branch:{s} changes:{d} ignored:{d} remotes:{d} workflows:{d}",
-        .{ overview.branch orelse "(detached)", overview.changes.len, overview.ignored_untracked, overview.remotes.len, overview.workflow_files },
+        "GIT  branch:{s} changes:{d} ignored:{d} remotes:{d} workflows:{d} wf-risk:{d}/{d}/{d}",
+        .{
+            overview.branch orelse "(detached)",
+            overview.changes.len,
+            overview.ignored_untracked,
+            overview.remotes.len,
+            overview.workflow_files,
+            workflow_risk.critical,
+            workflow_risk.high,
+            workflow_risk.medium,
+        },
     ) catch "GIT";
     drawTextClipped(hdc, rect.left + 16, rect.top + 10, rect.right - 16, rgb(79, 230, 226), header);
 
@@ -2120,12 +2130,12 @@ fn drawGitPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     var y = rect.top + HEADER_HEIGHT;
     var row: usize = 0;
     while (row < @as(usize, @intCast(rows)) and start + row < total_rows) : (row += 1) {
-        drawGitPanelRow(hdc, rect, overview, start + row, y);
+        drawGitPanelRow(hdc, state, rect, overview, start + row, y);
         y += ROW_HEIGHT;
     }
 }
 
-fn drawGitPanelRow(hdc: windows.HDC, rect: RECT, overview: git_repository.Overview, row: usize, y: c_int) void {
+fn drawGitPanelRow(hdc: windows.HDC, state: *GuiState, rect: RECT, overview: git_repository.Overview, row: usize, y: c_int) void {
     if (row == 0) {
         if (overview.commit) |commit| {
             drawTextClipped(hdc, rect.left + 16, y, rect.right - 16, rgb(180, 190, 200), commit);
@@ -2168,7 +2178,16 @@ fn drawGitPanelRow(hdc: windows.HDC, rect: RECT, overview: git_repository.Overvi
 
     for (overview.workflow_paths) |path| {
         if (row == current) {
-            drawTextClipped(hdc, rect.left + 34, y, rect.right - 16, rgb(127, 211, 255), path);
+            const counts = pathRiskCounts(state, path);
+            const worst = highestRisk(counts);
+            const color = if (worst) |risk| riskColor(risk) else rgb(127, 211, 255);
+            var risk_buf: [64]u8 = undefined;
+            const risk_label = if (worst != null)
+                std.fmt.bufPrint(&risk_buf, "risk {d}/{d}/{d}", .{ counts.critical, counts.high, counts.medium }) catch "risk"
+            else
+                "clear";
+            drawTextClipped(hdc, rect.left + 34, y, rect.right - 132, color, path);
+            drawTextRight(hdc, rect.right - 124, y, rect.right - 16, color, risk_label);
             return;
         }
         current += 1;
@@ -2187,15 +2206,21 @@ fn drawGitPanelRow(hdc: windows.HDC, rect: RECT, overview: git_repository.Overvi
     const change_index = row - current;
     if (change_index >= overview.changes.len) return;
     const change = overview.changes[change_index];
-    const color = gitChangeColor(change.status);
+    const counts = pathRiskCounts(state, change.path);
+    const worst = highestRisk(counts);
+    const color = if (worst) |risk| riskColor(risk) else gitChangeColor(change.status);
     drawText(hdc, rect.left + 16, y, color, gitChangeLabel(change.status));
     var stats_buf: [48]u8 = undefined;
-    const stats = if (change.diff_available)
+    const stats = if (change.diff_available and worst != null)
+        std.fmt.bufPrint(&stats_buf, "+{d} -{d} r{d}/{d}/{d}", .{ change.additions, change.deletions, counts.critical, counts.high, counts.medium }) catch ""
+    else if (change.diff_available)
         std.fmt.bufPrint(&stats_buf, "+{d} -{d}", .{ change.additions, change.deletions }) catch ""
+    else if (worst != null)
+        std.fmt.bufPrint(&stats_buf, "r{d}/{d}/{d}", .{ counts.critical, counts.high, counts.medium }) catch "risk"
     else
         "diff n/a";
-    drawTextClipped(hdc, rect.left + 52, y, rect.right - 120, color, change.path);
-    drawTextRight(hdc, rect.right - 112, y, rect.right - 16, color, stats);
+    drawTextClipped(hdc, rect.left + 52, y, rect.right - 164, color, change.path);
+    drawTextRight(hdc, rect.right - 156, y, rect.right - 16, color, stats);
 }
 
 fn gitPanelRowCount(overview: git_repository.Overview) usize {
@@ -2980,18 +3005,51 @@ fn riskCounts(collection: *const findings_mod.Collection) RiskCounts {
 fn currentDocumentRiskCounts(state: *GuiState) RiskCounts {
     const doc = state.app.documents.active() orelse return .{};
     const path = doc.path orelse return .{};
+    return pathRiskCounts(state, path);
+}
+
+fn workflowRiskCounts(state: *GuiState, overview: git_repository.Overview) RiskCounts {
+    var counts = RiskCounts{};
+    for (overview.workflow_paths) |path| {
+        addRiskCounts(&counts, pathRiskCounts(state, path));
+    }
+    return counts;
+}
+
+fn pathRiskCounts(state: *const GuiState, path: []const u8) RiskCounts {
     var counts = RiskCounts{};
     for (state.app.security_findings.items.items) |item| {
         if (!pathMatches(path, item.path)) continue;
-        switch (item.risk) {
-            .info => counts.info += 1,
-            .low => counts.low += 1,
-            .medium => counts.medium += 1,
-            .high => counts.high += 1,
-            .critical => counts.critical += 1,
-        }
+        addRisk(&counts, item.risk);
     }
     return counts;
+}
+
+fn addRisk(counts: *RiskCounts, risk: findings_mod.Risk) void {
+    switch (risk) {
+        .info => counts.info += 1,
+        .low => counts.low += 1,
+        .medium => counts.medium += 1,
+        .high => counts.high += 1,
+        .critical => counts.critical += 1,
+    }
+}
+
+fn addRiskCounts(counts: *RiskCounts, other: RiskCounts) void {
+    counts.info += other.info;
+    counts.low += other.low;
+    counts.medium += other.medium;
+    counts.high += other.high;
+    counts.critical += other.critical;
+}
+
+fn highestRisk(counts: RiskCounts) ?findings_mod.Risk {
+    if (counts.critical > 0) return .critical;
+    if (counts.high > 0) return .high;
+    if (counts.medium > 0) return .medium;
+    if (counts.low > 0) return .low;
+    if (counts.info > 0) return .info;
+    return null;
 }
 
 fn riskRank(risk: findings_mod.Risk) u8 {

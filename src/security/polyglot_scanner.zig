@@ -111,6 +111,11 @@ fn scanLanguageLine(collection: *findings.Collection, options: ScanOptions, line
             if (indexOfIgnoreCase(path, ".github") != null) {
                 try detect(collection, path, line, line_number, "pull_request_target", .high, "GitHub Actions pull_request_target expands trust boundary");
                 try detect(collection, path, line, line_number, "permissions: write-all", .high, "GitHub Actions grants broad write permissions");
+                try detect(collection, path, line, line_number, "id-token: write", .high, "GitHub Actions can mint OIDC tokens for external cloud trust");
+                try detect(collection, path, line, line_number, "contents: write", .medium, "GitHub Actions can write repository contents");
+                try detect(collection, path, line, line_number, "persist-credentials: true", .medium, "checkout persists repository credentials into the workflow workspace");
+                try detect(collection, path, line, line_number, "self-hosted", .high, "workflow targets a self-hosted runner trust boundary");
+                try detectUnpinnedActionUse(collection, path, line, line_number);
             }
         },
         else => {},
@@ -145,11 +150,32 @@ fn detectSecret(
     }
 }
 
+fn detectUnpinnedActionUse(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    const uses_at = indexOfIgnoreCase(line, "uses:") orelse return;
+    var value = std.mem.trim(u8, line[uses_at + "uses:".len ..], " \t'\"");
+    if (value.len == 0) return;
+    if (startsWithIgnoreCase(value, "./") or startsWithIgnoreCase(value, "../") or startsWithIgnoreCase(value, "docker://")) return;
+
+    const at = std.mem.indexOfScalar(u8, value, '@') orelse {
+        try collection.append(.polyglot_trust, .medium, path, line_number, uses_at, "GitHub Action reference is not pinned to a version or commit", line);
+        return;
+    };
+    value = std.mem.trim(u8, value[at + 1 ..], " \t'\"");
+    if (!isFullSha(value)) {
+        try collection.append(.polyglot_trust, .medium, path, line_number, uses_at, "GitHub Action reference is not pinned to a full commit SHA", line);
+    }
+}
+
 fn hasPipeToShell(line: []const u8) ?usize {
     const download = indexOfIgnoreCase(line, "curl") orelse indexOfIgnoreCase(line, "wget") orelse return null;
     if (std.mem.indexOfScalar(u8, line, '|') == null) return null;
     if (indexOfIgnoreCase(line, " sh") != null or indexOfIgnoreCase(line, " bash") != null or indexOfIgnoreCase(line, "pwsh") != null) return download;
     return null;
+}
+
+fn startsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
+    if (haystack.len < prefix.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[0..prefix.len], prefix);
 }
 
 fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
@@ -159,6 +185,14 @@ fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
         if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
     }
     return null;
+}
+
+fn isFullSha(value: []const u8) bool {
+    if (value.len != 40) return false;
+    for (value) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
 }
 
 test "polyglot scanner detects script execution boundaries" {
@@ -183,4 +217,26 @@ test "polyglot scanner detects native and secret boundaries" {
     defer collection.deinit();
 
     try std.testing.expect(collection.countRiskAtLeast(.critical) >= 2);
+}
+
+test "polyglot scanner detects GitHub Actions trust edges" {
+    var collection = try scanSource(std.testing.allocator,
+        \\on: pull_request_target
+        \\permissions: write-all
+        \\jobs:
+        \\  ci:
+        \\    runs-on: self-hosted
+        \\    permissions:
+        \\      id-token: write
+        \\      contents: write
+        \\    steps:
+        \\      - uses: actions/checkout@v4
+        \\        with:
+        \\          persist-credentials: true
+        \\
+    , .{ .path = ".github/workflows/ci.yml", .language = .yaml });
+    defer collection.deinit();
+
+    try std.testing.expect(collection.countRiskAtLeast(.high) >= 4);
+    try std.testing.expect(collection.countRiskAtLeast(.medium) >= 3);
 }

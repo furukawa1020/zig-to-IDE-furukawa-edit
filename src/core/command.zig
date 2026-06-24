@@ -79,7 +79,7 @@ const definitions = [_]Definition{
     .{ .id = "symbol.find_references", .title = "Find References", .description = "Find references for the selected symbol.", .default_key = "shift-f12", .scope = .zig, .capability = .safe },
     .{ .id = "symbol.rename", .title = "Rename Symbol", .description = "Rename a symbol with preview and undo.", .default_key = "f2", .scope = .zig, .capability = .workspace_write },
     .{ .id = "diagnostics.next", .title = "Next Diagnostic", .description = "Jump to the next diagnostic.", .default_key = "f8", .scope = .workspace, .capability = .safe },
-    .{ .id = "security.scan_current", .title = "Scan Current File", .description = "Scan the current Zig file for security boundaries.", .default_key = "ctrl-alt-s", .scope = .zig, .capability = .safe },
+    .{ .id = "security.scan_current", .title = "Scan Current File", .description = "Scan the current file for Zig and polyglot security boundaries.", .default_key = "ctrl-alt-s", .scope = .workspace, .capability = .safe },
     .{ .id = "security.audit_workspace", .title = "Audit Workspace", .description = "Run static Security Workbench audit for the workspace.", .default_key = "ctrl-alt-a", .scope = .workspace, .capability = .safe },
     .{ .id = "security.mark_reviewed", .title = "Mark Workspace Reviewed", .description = "Mark the workspace as reviewed without allowing execution.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "security.trust_workspace", .title = "Trust Workspace", .description = "Trust audited workspace when no high-risk findings are present.", .default_key = "", .scope = .workspace, .capability = .safe },

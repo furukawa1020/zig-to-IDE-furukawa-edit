@@ -19,6 +19,8 @@ const posture = @import("../security/posture.zig");
 const security_findings = @import("../security/findings.zig");
 const types = @import("types.zig");
 const workspace_audit = @import("../security/workspace_audit.zig");
+const modes = @import("../language/modes.zig");
+const polyglot_scanner = @import("../security/polyglot_scanner.zig");
 const zig_scanner = @import("../security/zig_scanner.zig");
 
 pub const Result = union(enum) {
@@ -194,7 +196,7 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
     if (std.mem.eql(u8, definition.id, "security.scan_current")) {
         const doc = app.documents.active() orelse return .no_active_document;
         const path = doc.path orelse "(scratch)";
-        var scan = try zig_scanner.scanSource(app.allocator, doc.text.bytes, .{ .path = path });
+        var scan = try scanDocumentSecurity(app.allocator, path, doc.language, doc.text.bytes);
         defer scan.deinit();
 
         app.security_findings.clear();
@@ -484,9 +486,9 @@ fn syncDiagnosticsFromConsole(app: *app_mod.App) !void {
 fn runSaveSafetyCheck(app: *app_mod.App) !?[]const u8 {
     const doc = app.documents.active() orelse return null;
     const path = doc.path orelse return null;
-    if (!std.mem.endsWith(u8, path, ".zig")) return null;
+    if (!modes.isZigFamily(doc.language) and !polyglot_scanner.isInterestingPath(path, doc.language)) return null;
 
-    var scan = try zig_scanner.scanSource(app.allocator, doc.text.bytes, .{ .path = path });
+    var scan = try scanDocumentSecurity(app.allocator, path, doc.language, doc.text.bytes);
     defer scan.deinit();
 
     app.security_findings.clearPath(path);
@@ -498,9 +500,24 @@ fn runSaveSafetyCheck(app: *app_mod.App) !?[]const u8 {
     applyPostureGuard(app);
 
     if (scan.countRiskAtLeast(.critical) > 0) {
-        return "save blocked by critical Zig security finding";
+        return "save blocked by critical security finding";
     }
     return null;
+}
+
+fn scanDocumentSecurity(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    language: modes.LanguageMode,
+    source: []const u8,
+) !security_findings.Collection {
+    if (modes.isZigFamily(language)) {
+        return try zig_scanner.scanSource(allocator, source, .{ .path = path });
+    }
+    if (polyglot_scanner.isInterestingPath(path, language)) {
+        return try polyglot_scanner.scanSource(allocator, source, .{ .path = path, .language = language });
+    }
+    return security_findings.Collection.init(allocator);
 }
 
 fn renderSaveSafetyCheck(app: *app_mod.App, path: []const u8, scan: *const security_findings.Collection) !void {
@@ -898,6 +915,16 @@ test "save blocks critical Zig security findings" {
     var app = try app_mod.App.init(std.testing.allocator, ".");
     defer app.deinit();
     _ = try app.documents.createScratch("danger.zig", "const p = @ptrFromInt(0xdeadbeef);\n");
+
+    const result = try dispatch(&app, .{ .id = "file.save" });
+    try std.testing.expect(std.meta.activeTag(result) == .blocked);
+    try std.testing.expect(app.diagnostics.items.items.len > 0);
+}
+
+test "save blocks critical polyglot security findings" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+    _ = try app.documents.createScratch(".env", "PRIVATE KEY\n");
 
     const result = try dispatch(&app, .{ .id = "file.save" });
     try std.testing.expect(std.meta.activeTag(result) == .blocked);

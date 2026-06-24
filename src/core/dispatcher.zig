@@ -931,6 +931,31 @@ test "save blocks critical polyglot security findings" {
     try std.testing.expect(app.diagnostics.items.items.len > 0);
 }
 
+test "save scans package manifest security findings" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const package_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "package.json" });
+    defer std.testing.allocator.free(package_path);
+    _ = try app.documents.createScratch(package_path,
+        \\"scripts": {
+        \\  "postinstall": "powershell -c whoami"
+        \\}
+        \\
+    );
+
+    const result = try dispatch(&app, .{ .id = "file.save" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expect(app.diagnostics.items.items.len > 0);
+}
+
 test "diagnostics next jumps within active document" {
     var app = try app_mod.App.init(std.testing.allocator, ".");
     defer app.deinit();

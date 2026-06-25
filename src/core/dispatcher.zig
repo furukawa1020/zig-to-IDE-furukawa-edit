@@ -337,6 +337,18 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return try fetchGitHubLive(app);
     }
 
+    if (std.mem.eql(u8, definition.id, "github.issues")) {
+        return try fetchGitHubIssues(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "github.actions.failures")) {
+        return try fetchGitHubActionsFailureLog(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "github.pr.create_draft")) {
+        return try createDraftGitHubPullRequest(app, request.argument);
+    }
+
     if (std.mem.eql(u8, definition.id, "git.status")) {
         var audit = try git_status.auditRepository(app.allocator, app.workspace.root_path, .{});
         defer audit.deinit();
@@ -760,6 +772,34 @@ fn renderGitOverview(app: *app_mod.App, overview: *const git_repository.Overview
     try app.process_console.appendBytes(.stdout, text.written());
 }
 
+const GitHubAuth = struct {
+    allocator: std.mem.Allocator,
+    token: ?github_client.Token = null,
+
+    fn init(app: *app_mod.App) !GitHubAuth {
+        return .{
+            .allocator = app.allocator,
+            .token = try github_client.tokenFromEnv(app.allocator, app.environ),
+        };
+    }
+
+    fn deinit(self: *GitHubAuth) void {
+        if (self.token) |*token| token.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn options(self: *const GitHubAuth) github_client.FetchOptions {
+        return .{
+            .token = if (self.token) |token| token.value else null,
+            .token_source = if (self.token) |token| token.source else .none,
+        };
+    }
+
+    fn hasToken(self: *const GitHubAuth) bool {
+        return self.token != null;
+    }
+};
+
 fn fetchGitHubLive(app: *app_mod.App) !Result {
     var overview = try git_repository.inspect(app.allocator, &app.workspace, .{});
     defer overview.deinit();
@@ -769,14 +809,10 @@ fn fetchGitHubLive(app: *app_mod.App) !Result {
         return .{ .blocked = "no GitHub remote found" };
     };
 
-    var token = try github_client.tokenFromEnv(app.allocator, app.environ);
-    defer if (token) |*value| value.deinit(app.allocator);
+    var auth = try GitHubAuth.init(app);
+    defer auth.deinit();
 
-    const options = github_client.FetchOptions{
-        .token = if (token) |value| value.value else null,
-        .token_source = if (token) |value| value.source else .none,
-    };
-    var live = github_client.fetchLiveOverview(app.allocator, app.io, remote.owner, remote.repo, options) catch |err| {
+    var live = github_client.fetchLiveOverview(app.allocator, app.io, remote.owner, remote.repo, auth.options()) catch |err| {
         try appendConsole(app, .stderr, "github live fetch failed for {s}/{s}: {s}\n", .{ remote.owner, remote.repo, @errorName(err) });
         return .{ .blocked = "github live fetch failed" };
     };
@@ -784,6 +820,121 @@ fn fetchGitHubLive(app: *app_mod.App) !Result {
 
     try renderGitHubLive(app, &live);
     return .{ .completed = "github live overview fetched" };
+}
+
+fn fetchGitHubIssues(app: *app_mod.App) !Result {
+    var overview = try git_repository.inspect(app.allocator, &app.workspace, .{});
+    defer overview.deinit();
+
+    const remote = firstGitHubRemote(&overview) orelse {
+        try appendConsole(app, .stdout, "github issues: no GitHub remote found\n", .{});
+        return .{ .blocked = "no GitHub remote found" };
+    };
+
+    var auth = try GitHubAuth.init(app);
+    defer auth.deinit();
+
+    const issues = github_client.fetchIssues(app.allocator, app.io, remote.owner, remote.repo, auth.options()) catch |err| {
+        try appendConsole(app, .stderr, "github issues fetch failed for {s}/{s}: {s}\n", .{ remote.owner, remote.repo, @errorName(err) });
+        return .{ .blocked = "github issues fetch failed" };
+    };
+    defer {
+        for (issues) |*issue| issue.deinit(app.allocator);
+        if (issues.len > 0) app.allocator.free(issues);
+    }
+
+    try renderGitHubIssues(app, remote.owner, remote.repo, issues, auth.options().token_source);
+    return .{ .completed = "github issues fetched" };
+}
+
+fn fetchGitHubActionsFailureLog(app: *app_mod.App) !Result {
+    var overview = try git_repository.inspect(app.allocator, &app.workspace, .{});
+    defer overview.deinit();
+
+    const remote = firstGitHubRemote(&overview) orelse {
+        try appendConsole(app, .stdout, "github actions failures: no GitHub remote found\n", .{});
+        return .{ .blocked = "no GitHub remote found" };
+    };
+
+    var auth = try GitHubAuth.init(app);
+    defer auth.deinit();
+
+    var failure = github_client.fetchLatestFailureLog(app.allocator, app.io, remote.owner, remote.repo, auth.options()) catch |err| {
+        try appendConsole(app, .stderr, "github actions failure log fetch failed for {s}/{s}: {s}\n", .{ remote.owner, remote.repo, @errorName(err) });
+        return .{ .blocked = "github actions failure log fetch failed" };
+    };
+    defer failure.deinit(app.allocator);
+
+    try renderGitHubFailureLog(app, remote.owner, remote.repo, &failure, auth.options().token_source);
+    return .{ .completed = "github actions failure log fetched" };
+}
+
+fn createDraftGitHubPullRequest(app: *app_mod.App, argument: ?[]const u8) !Result {
+    var overview = try git_repository.inspect(app.allocator, &app.workspace, .{});
+    defer overview.deinit();
+
+    const remote = firstGitHubRemote(&overview) orelse {
+        try appendConsole(app, .stdout, "github pr create: no GitHub remote found\n", .{});
+        return .{ .blocked = "no GitHub remote found" };
+    };
+
+    const branch = overview.branch orelse {
+        try appendConsole(app, .stderr, "github pr create blocked: current Git branch is unknown\n", .{});
+        return .{ .blocked = "current Git branch is unknown" };
+    };
+
+    var auth = try GitHubAuth.init(app);
+    defer auth.deinit();
+    if (!auth.hasToken()) {
+        try appendConsole(app, .stderr, "github pr create blocked: set GITHUB_TOKEN or GH_TOKEN first\n", .{});
+        return .{ .blocked = "GITHUB_TOKEN or GH_TOKEN required" };
+    }
+
+    var repository = github_client.fetchRepository(app.allocator, app.io, remote.owner, remote.repo, auth.options()) catch |err| {
+        try appendConsole(app, .stderr, "github repository fetch failed for {s}/{s}: {s}\n", .{ remote.owner, remote.repo, @errorName(err) });
+        return .{ .blocked = "github repository fetch failed" };
+    };
+    defer repository.deinit(app.allocator);
+
+    const base = if (repository.default_branch.len > 0) repository.default_branch else "main";
+    if (std.mem.eql(u8, branch, base)) {
+        try appendConsole(app, .stderr, "github pr create blocked: current branch {s} is the base branch\n", .{branch});
+        return .{ .blocked = "current branch is the base branch" };
+    }
+
+    const trimmed_title = if (argument) |value| std.mem.trim(u8, value, " \t\r\n") else "";
+    const title = if (trimmed_title.len > 0)
+        try app.allocator.dupe(u8, trimmed_title)
+    else
+        try std.fmt.allocPrint(app.allocator, "Draft: {s}", .{branch});
+    defer app.allocator.free(title);
+
+    const body = try std.fmt.allocPrint(app.allocator,
+        \\Created from ZIDE secure GitHub integration.
+        \\
+        \\Head: {s}
+        \\Base: {s}
+        \\Workspace trust: {s}
+        \\
+        \\ZIDE sends this network write only through an explicit command with a GitHub token.
+        \\
+    , .{ branch, base, @tagName(app.runtime.trust_state) });
+    defer app.allocator.free(body);
+
+    var pull = github_client.createDraftPullRequest(app.allocator, app.io, remote.owner, remote.repo, auth.options(), .{
+        .title = title,
+        .head = branch,
+        .base = base,
+        .body = body,
+        .draft = true,
+    }) catch |err| {
+        try appendConsole(app, .stderr, "github draft PR create failed for {s}/{s}: {s}\n", .{ remote.owner, remote.repo, @errorName(err) });
+        return .{ .blocked = "github draft PR create failed" };
+    };
+    defer pull.deinit(app.allocator);
+
+    try renderCreatedPullRequest(app, remote.owner, remote.repo, base, branch, &pull, auth.options().token_source);
+    return .{ .completed = "github draft pull request created" };
 }
 
 fn firstGitHubRemote(overview: *const git_repository.Overview) ?git_repository.GitHubRemote {

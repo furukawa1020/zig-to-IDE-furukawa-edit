@@ -13,6 +13,7 @@ pub const Scope = enum {
 pub const Capability = enum {
     safe,
     network_read,
+    network_write,
     workspace_write,
     external_command,
 };
@@ -92,6 +93,9 @@ const definitions = [_]Definition{
     .{ .id = "git.status", .title = "Git Security Status", .description = "Read Git metadata without executing Git hooks, filters, or fsmonitor.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "github.overview", .title = "GitHub Overview", .description = "Show GitHub repository and Actions links inferred from local Git remotes.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "github.fetch", .title = "Fetch GitHub Live Overview", .description = "Fetch read-only GitHub repo, PR, and Actions data with optional GITHUB_TOKEN.", .default_key = "", .scope = .workspace, .capability = .network_read },
+    .{ .id = "github.issues", .title = "Fetch GitHub Issues", .description = "Fetch open GitHub issues and pull requests for the current repository.", .default_key = "", .scope = .workspace, .capability = .network_read },
+    .{ .id = "github.actions.failures", .title = "Fetch Actions Failure Log", .description = "Fetch the latest failed GitHub Actions job log excerpt.", .default_key = "", .scope = .workspace, .capability = .network_read },
+    .{ .id = "github.pr.create_draft", .title = "Create Draft GitHub PR", .description = "Create a draft PR from the current branch to the default branch using GITHUB_TOKEN.", .default_key = "", .scope = .workspace, .capability = .network_write },
     .{ .id = "demo.run", .title = "Run Demo", .description = "Run an internal zide demo.", .default_key = "", .scope = .demo, .capability = .safe },
 };
 

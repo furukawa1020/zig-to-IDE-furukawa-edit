@@ -3154,6 +3154,39 @@ fn displayCells(text: []const u8) usize {
     return cells;
 }
 
+fn setClipboardUtf8(hwnd: ?windows.HWND, text: []const u8) !void {
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, text);
+    defer std.heap.page_allocator.free(wide);
+
+    const bytes = (wide.len + 1) * @sizeOf(u16);
+    const handle = GlobalAlloc(GMEM_MOVEABLE, bytes) orelse return error.ClipboardAllocationFailed;
+    errdefer _ = GlobalFree(handle);
+
+    const locked = GlobalLock(handle) orelse return error.ClipboardLockFailed;
+    const target: [*]u16 = @ptrCast(@alignCast(locked));
+    @memcpy(target[0 .. wide.len + 1], wide.ptr[0 .. wide.len + 1]);
+    _ = GlobalUnlock(handle);
+
+    if (OpenClipboard(hwnd) == .FALSE) return error.ClipboardOpenFailed;
+    defer _ = CloseClipboard();
+
+    if (EmptyClipboard() == .FALSE) return error.ClipboardClearFailed;
+    if (SetClipboardData(CF_UNICODETEXT, handle) == null) return error.ClipboardSetFailed;
+}
+
+fn getClipboardUtf8(allocator: std.mem.Allocator, hwnd: ?windows.HWND) ![]u8 {
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT) == .FALSE) return error.NoClipboardText;
+    if (OpenClipboard(hwnd) == .FALSE) return error.ClipboardOpenFailed;
+    defer _ = CloseClipboard();
+
+    const handle = GetClipboardData(CF_UNICODETEXT) orelse return error.NoClipboardText;
+    const locked = GlobalLock(handle) orelse return error.ClipboardLockFailed;
+    defer _ = GlobalUnlock(handle);
+
+    const wide_z: [*:0]const u16 = @ptrCast(@alignCast(locked));
+    return try std.unicode.utf16LeToUtf8Alloc(allocator, std.mem.span(wide_z));
+}
+
 fn fillRect(hdc: windows.HDC, rect: RECT, color: windows.COLORREF) void {
     const brush = CreateSolidBrush(color) orelse return;
     defer _ = DeleteObject(@ptrCast(brush));

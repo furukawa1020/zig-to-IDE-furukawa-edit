@@ -5,6 +5,7 @@ const app_mod = @import("../core/app.zig");
 const command_mod = @import("../core/command.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const types = @import("../core/types.zig");
+const document_mod = @import("../editor/document.zig");
 const navigation = @import("../editor/navigation.zig");
 const git_repository = @import("../git/repository.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
@@ -38,6 +39,11 @@ const GitPanelAction = enum {
     issues,
     failures,
     draft_pr,
+};
+
+const SelectionRange = struct {
+    start: usize,
+    end: usize,
 };
 
 const TaskMatch = struct {
@@ -397,6 +403,7 @@ const GuiState = struct {
     diagnostics_scroll_line: usize = 0,
     security_scroll_line: usize = 0,
     git_scroll_line: usize = 0,
+    selection_anchor: ?usize = null,
     show_output: bool = true,
     bottom_panel: BottomPanel = .output,
     quick_panel: QuickPanel,
@@ -443,6 +450,7 @@ const GuiState = struct {
         self.diagnostics_scroll_line = 0;
         self.security_scroll_line = 0;
         self.git_scroll_line = 0;
+        self.clearSelection();
         self.show_output = true;
         self.bottom_panel = .output;
         self.clearGitOverview();
@@ -628,6 +636,7 @@ const GuiState = struct {
             self.setError(err) catch {};
             return;
         };
+        self.clearSelection();
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureCursorVisible();
@@ -636,6 +645,7 @@ const GuiState = struct {
 
     fn switchDocumentByDelta(self: *GuiState, delta: isize) void {
         self.app.documents.moveActive(delta);
+        self.clearSelection();
         self.app.focus = .editor;
         self.ensureCursorVisible();
         self.setMessage("Switched document") catch {};
@@ -861,6 +871,7 @@ const GuiState = struct {
                 };
                 self.handleDispatchResult("file.new", result);
                 if (std.meta.activeTag(result) == .completed) {
+                    self.clearSelection();
                     self.syncCollapsedDirs();
                     self.app.mode = .insert;
                     self.app.focus = .editor;
@@ -901,6 +912,7 @@ const GuiState = struct {
         };
 
         const doc = &self.app.documents.documents.items[index];
+        self.clearSelection();
         if (offset) |byte_offset| {
             const clamped = @min(byte_offset, doc.text.bytes.len);
             const position = doc.positionFromOffset(clamped) catch |err| {
@@ -929,6 +941,7 @@ const GuiState = struct {
             return;
         };
         const doc = &self.app.documents.documents.items[index];
+        self.clearSelection();
         const offset = doc.text.lineColumnToOffset(line, column) catch |err| {
             self.setError(err) catch {};
             return;
@@ -949,6 +962,7 @@ const GuiState = struct {
             self.setMessage("No active document") catch {};
             return;
         };
+        self.clearSelection();
         const clamped = @min(offset, doc.text.bytes.len);
         const position = doc.positionFromOffset(clamped) catch |err| {
             self.setError(err) catch {};
@@ -979,6 +993,7 @@ const GuiState = struct {
 
         for (index.symbols) |symbol| {
             if (!std.mem.eql(u8, symbol.name, name)) continue;
+            self.clearSelection();
             navigation.setCursor(doc, symbol.range.start);
             self.app.focus = .editor;
             self.app.mode = .insert;
@@ -1160,10 +1175,18 @@ const GuiState = struct {
             self.setMessage("Open a file before typing") catch {};
             return;
         };
-        doc.insert(doc.cursor.position.byte_offset, bytes) catch |err| {
-            self.setError(err) catch {};
-            return;
-        };
+        if (self.selectedRange(doc)) |range| {
+            doc.replaceRange(range.start, range.end, bytes) catch |err| {
+                self.setError(err) catch {};
+                return;
+            };
+            self.clearSelection();
+        } else {
+            doc.insert(doc.cursor.position.byte_offset, bytes) catch |err| {
+                self.setError(err) catch {};
+                return;
+            };
+        }
         self.app.mode = .insert;
         self.app.focus = .editor;
         self.ensureCursorVisible();
@@ -1176,6 +1199,7 @@ const GuiState = struct {
             return;
         };
         if (changed) {
+            self.clearSelection();
             const offset = @min(doc.cursor.position.byte_offset, doc.text.bytes.len);
             doc.cursor.position = doc.positionFromOffset(offset) catch doc.cursor.position;
             self.ensureCursorVisible();
@@ -1192,6 +1216,7 @@ const GuiState = struct {
             return;
         };
         if (changed) {
+            self.clearSelection();
             const offset = @min(doc.cursor.position.byte_offset, doc.text.bytes.len);
             doc.cursor.position = doc.positionFromOffset(offset) catch doc.cursor.position;
             self.ensureCursorVisible();
@@ -1209,12 +1234,17 @@ const GuiState = struct {
             }
             return;
         };
+        self.clearSelection();
         self.app.focus = if (self.app.documents.active() != null) .editor else .files;
         self.setMessage("Closed document") catch {};
     }
 
     fn deleteBackward(self: *GuiState) void {
         const doc = self.app.documents.active() orelse return;
+        if (self.deleteSelectedRange(doc)) {
+            self.ensureCursorVisible();
+            return;
+        }
         const current = doc.cursor.position.byte_offset;
         if (current == 0) return;
         const previous = doc.text.previousByteOffset(current) catch return;
@@ -1227,6 +1257,10 @@ const GuiState = struct {
 
     fn deleteForward(self: *GuiState) void {
         const doc = self.app.documents.active() orelse return;
+        if (self.deleteSelectedRange(doc)) {
+            self.ensureCursorVisible();
+            return;
+        }
         const current = doc.cursor.position.byte_offset;
         const next = doc.text.nextByteOffset(current) catch return;
         if (next == current) return;
@@ -1237,12 +1271,21 @@ const GuiState = struct {
         self.ensureCursorVisible();
     }
 
-    fn moveCursor(self: *GuiState, move: navigation.Move) void {
+    fn moveCursor(self: *GuiState, move: navigation.Move, extend_selection: bool) void {
         const doc = self.app.documents.active() orelse return;
+        const anchor = doc.cursor.position.byte_offset;
+        if (extend_selection and self.selection_anchor == null) {
+            self.selection_anchor = anchor;
+        }
         navigation.moveCursor(doc, move) catch |err| {
             self.setError(err) catch {};
             return;
         };
+        if (!extend_selection) {
+            self.clearSelection();
+        } else if (self.selection_anchor) |selection_anchor| {
+            if (selection_anchor == doc.cursor.position.byte_offset) self.clearSelection();
+        }
         self.app.focus = .editor;
         self.ensureCursorVisible();
     }
@@ -1250,6 +1293,7 @@ const GuiState = struct {
     fn setEditorCursorFromPoint(self: *GuiState, layout: Layout, x: c_int, y: c_int) void {
         const doc = self.app.documents.active() orelse return;
         if (!pointIn(layout.editor, x, y)) return;
+        const anchor = doc.cursor.position.byte_offset;
 
         const text_x = layout.editor.left + GUTTER_WIDTH + EDITOR_TEXT_PADDING_X;
         const text_y = layout.editor.top + HEADER_HEIGHT + EDITOR_TEXT_PADDING_Y;
@@ -1260,10 +1304,89 @@ const GuiState = struct {
         const clamped_line = if (doc.text.lineCount() == 0) 0 else @min(line, doc.text.lineCount() - 1);
         const offset = doc.text.lineColumnToOffset(clamped_line, column) catch return;
         const position = doc.positionFromOffset(offset) catch return;
+        if (isKeyDown(VK_SHIFT)) {
+            if (self.selection_anchor == null) self.selection_anchor = anchor;
+        } else {
+            self.clearSelection();
+        }
         navigation.setCursor(doc, position);
+        if (self.selection_anchor) |selection_anchor| {
+            if (selection_anchor == doc.cursor.position.byte_offset) self.clearSelection();
+        }
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureCursorVisible();
+    }
+
+    fn clearSelection(self: *GuiState) void {
+        self.selection_anchor = null;
+    }
+
+    fn selectedRange(self: *const GuiState, doc: *const document_mod.Document) ?SelectionRange {
+        const anchor_raw = self.selection_anchor orelse return null;
+        const cursor_raw = doc.cursor.position.byte_offset;
+        const anchor = @min(anchor_raw, doc.text.bytes.len);
+        const cursor = @min(cursor_raw, doc.text.bytes.len);
+        if (anchor == cursor) return null;
+        return if (anchor < cursor)
+            .{ .start = anchor, .end = cursor }
+        else
+            .{ .start = cursor, .end = anchor };
+    }
+
+    fn deleteSelectedRange(self: *GuiState, doc: *document_mod.Document) bool {
+        const range = self.selectedRange(doc) orelse return false;
+        doc.deleteRange(range.start, range.end) catch |err| {
+            self.setError(err) catch {};
+            return false;
+        };
+        self.clearSelection();
+        return true;
+    }
+
+    fn selectAll(self: *GuiState) void {
+        const doc = self.app.documents.active() orelse return;
+        self.selection_anchor = 0;
+        const position = doc.positionFromOffset(doc.text.bytes.len) catch return;
+        navigation.setCursor(doc, position);
+        self.app.focus = .editor;
+        self.ensureCursorVisible();
+        self.setMessage("Selected all") catch {};
+    }
+
+    fn copySelectionToClipboard(self: *GuiState) bool {
+        const doc = self.app.documents.active() orelse return false;
+        const range = self.selectedRange(doc) orelse {
+            self.setMessage("No selection to copy") catch {};
+            return false;
+        };
+        setClipboardUtf8(self.hwnd, doc.text.bytes[range.start..range.end]) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "clipboard copy failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        self.setMessage("Copied selection") catch {};
+        return true;
+    }
+
+    fn cutSelectionToClipboard(self: *GuiState) void {
+        const doc = self.app.documents.active() orelse return;
+        if (!self.copySelectionToClipboard()) return;
+        _ = self.deleteSelectedRange(doc);
+        self.ensureCursorVisible();
+        self.setMessage("Cut selection") catch {};
+    }
+
+    fn pasteFromClipboard(self: *GuiState) void {
+        const text = getClipboardUtf8(self.allocator, self.hwnd) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "clipboard paste failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(text);
+        if (text.len == 0) return;
+        self.insertText(text);
+        self.setMessage("Pasted") catch {};
     }
 
     fn ensureCursorVisible(self: *GuiState) void {

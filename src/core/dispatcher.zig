@@ -10,6 +10,7 @@ const executor = @import("../tasks/executor.zig");
 const task_registry = @import("../tasks/registry.zig");
 const git_repository = @import("../git/repository.zig");
 const git_status = @import("../git/status.zig");
+const github_client = @import("../github/client.zig");
 const diagnostic_model = @import("../diagnostics/model.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
 const file_finder = @import("../search/file_finder.zig");
@@ -330,6 +331,10 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
 
         try renderGitOverview(app, &overview);
         return .{ .completed = "git overview complete" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "github.fetch")) {
+        return try fetchGitHubLive(app);
     }
 
     if (std.mem.eql(u8, definition.id, "git.status")) {
@@ -753,6 +758,83 @@ fn renderGitOverview(app: *app_mod.App, overview: *const git_repository.Overview
     }
 
     try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn fetchGitHubLive(app: *app_mod.App) !Result {
+    var overview = try git_repository.inspect(app.allocator, &app.workspace, .{});
+    defer overview.deinit();
+
+    const remote = firstGitHubRemote(&overview) orelse {
+        try appendConsole(app, .stdout, "github live: no GitHub remote found\n", .{});
+        return .{ .blocked = "no GitHub remote found" };
+    };
+
+    var token = try github_client.tokenFromEnv(app.allocator, app.environ);
+    defer if (token) |*value| value.deinit(app.allocator);
+
+    const options = github_client.FetchOptions{
+        .token = if (token) |value| value.value else null,
+        .token_source = if (token) |value| value.source else .none,
+    };
+    var live = github_client.fetchLiveOverview(app.allocator, app.io, remote.owner, remote.repo, options) catch |err| {
+        try appendConsole(app, .stderr, "github live fetch failed for {s}/{s}: {s}\n", .{ remote.owner, remote.repo, @errorName(err) });
+        return .{ .blocked = "github live fetch failed" };
+    };
+    defer live.deinit();
+
+    try renderGitHubLive(app, &live);
+    return .{ .completed = "github live overview fetched" };
+}
+
+fn firstGitHubRemote(overview: *const git_repository.Overview) ?git_repository.GitHubRemote {
+    for (overview.remotes) |remote| {
+        if (remote.github) |github| return github;
+    }
+    return null;
+}
+
+fn renderGitHubLive(app: *app_mod.App, live: *const github_client.LiveOverview) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("github live overview (read-only REST API)\n");
+    try writer.print("repo      : {s}\n", .{live.repository.full_name});
+    try writer.print("url       : {s}\n", .{live.repository.html_url});
+    try writer.print("branch    : {s}\n", .{live.repository.default_branch});
+    try writer.print("visibility: {s}\n", .{if (live.repository.private) "private" else "public"});
+    try writer.print("token     : {s}\n", .{tokenSourceLabel(live.token_source)});
+    try writer.print("stars     : {d}, forks={d}, open issues={d}\n", .{ live.repository.stargazers_count, live.repository.forks_count, live.repository.open_issues_count });
+
+    try writer.print("open PRs  : {d} shown\n", .{live.pulls.len});
+    for (live.pulls, 0..) |pull, index| {
+        if (index >= 8) {
+            try writer.print("... {d} more PRs in fetched page\n", .{live.pulls.len - index});
+            break;
+        }
+        try writer.print("#{d} {s}{s} by {s}\n", .{
+            pull.number,
+            if (pull.draft) "[draft] " else "",
+            pull.title,
+            pull.user,
+        });
+    }
+
+    try writer.print("actions   : {d} recent run(s)\n", .{live.runs.len});
+    for (live.runs, 0..) |run, index| {
+        if (index >= 5) break;
+        try writer.print("- {s}: {s}/{s}\n", .{ run.name, run.status, run.conclusion });
+    }
+
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn tokenSourceLabel(source: github_client.TokenSource) []const u8 {
+    return switch (source) {
+        .none => "none",
+        .github_token => "GITHUB_TOKEN present",
+        .gh_token => "GH_TOKEN present",
+    };
 }
 
 fn gitChangeLabel(status: git_repository.ChangeStatus) []const u8 {

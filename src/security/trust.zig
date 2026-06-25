@@ -47,6 +47,20 @@ pub const Policy = struct {
             };
         }
 
+        if (capability == .network_write) {
+            return switch (self.state) {
+                .untrusted => .{ .block = "untrusted workspace: network writes are blocked" },
+                .reviewed => .{ .block = "reviewed workspace is not trusted for network writes yet" },
+                .locked_down => .{ .block = "workspace is locked down by security policy" },
+                .trusted => if (reason == .automatic)
+                    .{ .confirm = "automatic network write requires consent" }
+                else
+                    .allow,
+                .hardened => .{ .confirm = "hardened mode requires per-network-write consent" },
+                .paranoid => .{ .confirm = "paranoid mode requires explicit network-write review" },
+            };
+        }
+
         if (capability != .external_command) return .allow;
 
         return switch (self.state) {
@@ -78,4 +92,13 @@ test "network reads require manual intent" {
     const policy = Policy{ .state = .untrusted };
     try @import("std").testing.expect(policy.canRun(.network_read, .manual));
     try @import("std").testing.expect(!policy.canRun(.network_read, .automatic));
+}
+
+test "network writes require trusted manual intent" {
+    const untrusted = Policy{ .state = .untrusted };
+    try @import("std").testing.expect(!untrusted.canRun(.network_write, .manual));
+
+    const trusted = Policy{ .state = .trusted };
+    try @import("std").testing.expect(trusted.canRun(.network_write, .manual));
+    try @import("std").testing.expect(!trusted.canRun(.network_write, .automatic));
 }

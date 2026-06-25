@@ -86,6 +86,30 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "redo" };
     }
 
+    if (std.mem.eql(u8, definition.id, "editor.delete_line")) {
+        const doc = app.documents.active() orelse return .no_active_document;
+        if (try doc.deleteLine(doc.cursor.position.line)) return .{ .completed = "deleted line" };
+        return .{ .blocked = "no line to delete" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "editor.duplicate_line")) {
+        const doc = app.documents.active() orelse return .no_active_document;
+        if (try doc.duplicateLine(doc.cursor.position.line)) return .{ .completed = "duplicated line" };
+        return .{ .blocked = "no line to duplicate" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "editor.move_line_up")) {
+        const doc = app.documents.active() orelse return .no_active_document;
+        if (try doc.moveLineUp(doc.cursor.position.line)) return .{ .completed = "moved line up" };
+        return .{ .blocked = "line is already at top" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "editor.move_line_down")) {
+        const doc = app.documents.active() orelse return .no_active_document;
+        if (try doc.moveLineDown(doc.cursor.position.line)) return .{ .completed = "moved line down" };
+        return .{ .blocked = "line is already at bottom" };
+    }
+
     if (std.mem.eql(u8, definition.id, "editor.move_left")) {
         const doc = app.documents.active() orelse return .no_active_document;
         try navigation.moveCursor(doc, .left);

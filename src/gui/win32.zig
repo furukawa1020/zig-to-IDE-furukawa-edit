@@ -1294,18 +1294,8 @@ const GuiState = struct {
 
     fn setEditorCursorFromPoint(self: *GuiState, layout: Layout, x: c_int, y: c_int) void {
         const doc = self.app.documents.active() orelse return;
-        if (!pointIn(layout.editor, x, y)) return;
         const anchor = doc.cursor.position.byte_offset;
-
-        const text_x = layout.editor.left + GUTTER_WIDTH + EDITOR_TEXT_PADDING_X;
-        const text_y = layout.editor.top + HEADER_HEIGHT + EDITOR_TEXT_PADDING_Y;
-        const rel_y = if (y <= text_y) 0 else y - text_y;
-        const rel_x = if (x <= text_x) 0 else x - text_x;
-        const line = self.editor_scroll_line + @as(usize, @intCast(@divTrunc(rel_y, ROW_HEIGHT)));
-        const column = @as(usize, @intCast(@divTrunc(rel_x, CHAR_WIDTH)));
-        const clamped_line = if (doc.text.lineCount() == 0) 0 else @min(line, doc.text.lineCount() - 1);
-        const offset = doc.text.lineColumnToOffset(clamped_line, column) catch return;
-        const position = doc.positionFromOffset(offset) catch return;
+        const position = self.editorPositionFromPoint(layout, x, y) orelse return;
         if (isKeyDown(VK_SHIFT)) {
             if (self.selection_anchor == null) self.selection_anchor = anchor;
         } else {
@@ -1318,6 +1308,58 @@ const GuiState = struct {
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureCursorVisible();
+    }
+
+    fn beginEditorDrag(self: *GuiState, layout: Layout, x: c_int, y: c_int) void {
+        const doc = self.app.documents.active() orelse return;
+        const previous = doc.cursor.position.byte_offset;
+        const position = self.editorPositionFromPoint(layout, x, y) orelse return;
+        if (isKeyDown(VK_SHIFT)) {
+            if (self.selection_anchor == null) self.selection_anchor = previous;
+        } else {
+            self.selection_anchor = position.byte_offset;
+        }
+        navigation.setCursor(doc, position);
+        self.editor_dragging = true;
+        if (self.hwnd) |window| _ = SetCapture(window);
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureCursorVisible();
+    }
+
+    fn updateEditorDrag(self: *GuiState, layout: Layout, x: c_int, y: c_int) void {
+        if (!self.editor_dragging) return;
+        const doc = self.app.documents.active() orelse return;
+        const position = self.editorPositionFromPoint(layout, x, y) orelse return;
+        navigation.setCursor(doc, position);
+        self.app.focus = .editor;
+        self.ensureCursorVisible();
+    }
+
+    fn endEditorDrag(self: *GuiState) void {
+        if (!self.editor_dragging) return;
+        self.editor_dragging = false;
+        _ = ReleaseCapture();
+        if (self.app.documents.active()) |doc| {
+            if (self.selectedRange(doc) == null) self.clearSelection();
+        }
+    }
+
+    fn editorPositionFromPoint(self: *GuiState, layout: Layout, x: c_int, y: c_int) ?types.Position {
+        const doc = self.app.documents.active() orelse return null;
+        if (doc.text.lineCount() == 0) return types.Position.start();
+
+        const text_x = layout.editor.left + GUTTER_WIDTH + EDITOR_TEXT_PADDING_X;
+        const text_y = layout.editor.top + HEADER_HEIGHT + EDITOR_TEXT_PADDING_Y;
+        const clamped_y = @min(@max(y, text_y), @max(text_y, layout.editor.bottom - 1));
+        const clamped_x = @max(x, text_x);
+        const rel_y = clamped_y - text_y;
+        const rel_x = clamped_x - text_x;
+        const line = self.editor_scroll_line + @as(usize, @intCast(@divTrunc(rel_y, ROW_HEIGHT)));
+        const column = @as(usize, @intCast(@divTrunc(rel_x, CHAR_WIDTH)));
+        const clamped_line = @min(line, doc.text.lineCount() - 1);
+        const offset = doc.text.lineColumnToOffset(clamped_line, column) catch return null;
+        return doc.positionFromOffset(offset) catch null;
     }
 
     fn clearSelection(self: *GuiState) void {
@@ -1595,7 +1637,7 @@ const GuiState = struct {
                 return;
             }
             if (y < HEADER_HEIGHT) return;
-            self.setEditorCursorFromPoint(layout, x, y);
+            self.beginEditorDrag(layout, x, y);
             return;
         }
 

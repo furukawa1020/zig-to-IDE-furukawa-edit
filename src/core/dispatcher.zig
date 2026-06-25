@@ -20,6 +20,7 @@ const security_findings = @import("../security/findings.zig");
 const types = @import("types.zig");
 const workspace_audit = @import("../security/workspace_audit.zig");
 const modes = @import("../language/modes.zig");
+const package_trust = @import("../security/package_trust.zig");
 const polyglot_scanner = @import("../security/polyglot_scanner.zig");
 const zig_scanner = @import("../security/zig_scanner.zig");
 
@@ -511,7 +512,10 @@ fn scanDocumentSecurity(
     language: modes.LanguageMode,
     source: []const u8,
 ) !security_findings.Collection {
-    if (modes.isZigFamily(language)) {
+    if (language == .zon or std.mem.eql(u8, path, "build.zig.zon")) {
+        return try package_trust.scanZon(allocator, source, .{ .path = path });
+    }
+    if (language == .zig) {
         return try zig_scanner.scanSource(allocator, source, .{ .path = path });
     }
     if (polyglot_scanner.isInterestingPath(path, language)) {

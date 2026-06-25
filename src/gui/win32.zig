@@ -1773,6 +1773,22 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         state.openNewFilePanel();
         return;
     }
+    if (ctrl and key == 'A') {
+        state.selectAll();
+        return;
+    }
+    if (ctrl and key == 'C') {
+        _ = state.copySelectionToClipboard();
+        return;
+    }
+    if (ctrl and key == 'X') {
+        state.cutSelectionToClipboard();
+        return;
+    }
+    if (ctrl and key == 'V') {
+        state.pasteFromClipboard();
+        return;
+    }
     if (ctrl and key == 'W') {
         state.closeActiveDocument();
         return;
@@ -1826,12 +1842,12 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         VK_DELETE => {
             if (state.app.mode == .insert and state.app.focus == .editor) state.deleteForward();
         },
-        VK_LEFT => state.moveCursor(.left),
-        VK_RIGHT => state.moveCursor(.right),
-        VK_UP => if (state.app.focus == .files) state.moveSelection(-1) else state.moveCursor(.up),
-        VK_DOWN => if (state.app.focus == .files) state.moveSelection(1) else state.moveCursor(.down),
-        VK_HOME => state.moveCursor(.line_start),
-        VK_END => state.moveCursor(.line_end),
+        VK_LEFT => state.moveCursor(.left, shift),
+        VK_RIGHT => state.moveCursor(.right, shift),
+        VK_UP => if (state.app.focus == .files) state.moveSelection(-1) else state.moveCursor(.up, shift),
+        VK_DOWN => if (state.app.focus == .files) state.moveSelection(1) else state.moveCursor(.down, shift),
+        VK_HOME => state.moveCursor(.line_start, shift),
+        VK_END => state.moveCursor(.line_end, shift),
         VK_PRIOR => if (state.app.focus == .editor) state.scrollEditor(-12) else state.moveSelection(-12),
         VK_NEXT => if (state.app.focus == .editor) state.scrollEditor(12) else state.moveSelection(12),
         'I' => {

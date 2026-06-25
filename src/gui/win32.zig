@@ -1103,6 +1103,10 @@ const GuiState = struct {
                     self.refreshGitOverview();
                     self.setMessage(message) catch {};
                 }
+                if (isEditorLineCommand(id)) {
+                    self.clearSelection();
+                    self.ensureCursorVisible();
+                }
             },
             .blocked => |message| {
                 self.setMessage(message) catch {};
@@ -1752,6 +1756,7 @@ fn windowProc(hwnd: windows.HWND, msg: windows.UINT, wparam: WPARAM, lparam: win
 fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     const ctrl = isKeyDown(VK_CONTROL);
     const shift = isKeyDown(VK_SHIFT);
+    const alt = isKeyDown(VK_MENU);
 
     if (state.quick_panel.visible) {
         switch (key) {
@@ -1807,6 +1812,14 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (ctrl and key == 'B') {
         state.runTaskByName("build");
+        return;
+    }
+    if (ctrl and shift and key == 'D') {
+        state.executeCommand("editor.duplicate_line");
+        return;
+    }
+    if (ctrl and shift and key == 'K') {
+        state.executeCommand("editor.delete_line");
         return;
     }
     if (ctrl and key == 'D') {
@@ -1875,6 +1888,14 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (key == VK_F6) {
         state.show_output = !state.show_output;
+        return;
+    }
+    if (alt and key == VK_UP and state.app.focus == .editor) {
+        state.executeCommand("editor.move_line_up");
+        return;
+    }
+    if (alt and key == VK_DOWN and state.app.focus == .editor) {
+        state.executeCommand("editor.move_line_down");
         return;
     }
 
@@ -3113,6 +3134,13 @@ fn isKeyDown(vk: c_int) bool {
     return (@as(u16, @bitCast(GetKeyState(vk))) & 0x8000) != 0;
 }
 
+fn isEditorLineCommand(id: []const u8) bool {
+    return std.mem.eql(u8, id, "editor.delete_line") or
+        std.mem.eql(u8, id, "editor.duplicate_line") or
+        std.mem.eql(u8, id, "editor.move_line_up") or
+        std.mem.eql(u8, id, "editor.move_line_down");
+}
+
 fn drawText(hdc: windows.HDC, x: c_int, y: c_int, color: windows.COLORREF, text: []const u8) void {
     _ = SetBkMode(hdc, TRANSPARENT);
     _ = SetTextColor(hdc, color);
@@ -3554,6 +3582,7 @@ const VK_TAB: WPARAM = 0x09;
 const VK_RETURN: WPARAM = 0x0D;
 const VK_SHIFT: c_int = 0x10;
 const VK_CONTROL: c_int = 0x11;
+const VK_MENU: c_int = 0x12;
 const VK_ESCAPE: WPARAM = 0x1B;
 const VK_PRIOR: WPARAM = 0x21;
 const VK_NEXT: WPARAM = 0x22;

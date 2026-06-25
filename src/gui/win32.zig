@@ -33,6 +33,13 @@ const BottomPanel = enum {
     security,
 };
 
+const GitPanelAction = enum {
+    live,
+    issues,
+    failures,
+    draft_pr,
+};
+
 const TaskMatch = struct {
     name: []u8,
     executable: []u8,
@@ -671,6 +678,15 @@ const GuiState = struct {
         };
         self.handleDispatchResult(id, result);
         if (!std.mem.startsWith(u8, id, "editor.")) self.show_output = true;
+        if (std.mem.startsWith(u8, id, "github.") and !std.mem.eql(u8, id, "github.overview")) {
+            self.bottom_panel = .output;
+        }
+    }
+
+    fn executeGitPanelAction(self: *GuiState, action: GitPanelAction) void {
+        self.executeCommand(gitPanelActionCommand(action));
+        self.show_output = true;
+        self.bottom_panel = .output;
     }
 
     fn runTaskByName(self: *GuiState, name: []const u8) void {
@@ -1477,6 +1493,13 @@ const GuiState = struct {
                 if (panel == .git and self.git_overview == null) self.refreshGitOverview();
                 return;
             }
+            if (self.bottom_panel == .git) {
+                const content = bottomPanelContentRect(layout.output);
+                if (gitPanelActionAt(content, x, y)) |action| {
+                    self.executeGitPanelAction(action);
+                    return;
+                }
+            }
             switch (self.bottom_panel) {
                 .output => self.openConsoleLineAt(layout, y),
                 .git => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.openGitPanelRow(self.git_scroll_line + row),
@@ -2143,7 +2166,9 @@ fn drawGitPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
             workflow_risk.medium,
         },
     ) catch "GIT";
-    drawTextClipped(hdc, rect.left + 16, rect.top + 10, rect.right - 16, rgb(79, 230, 226), header);
+    const header_right = if (gitPanelHasActionButtons(rect)) gitPanelActionButtonRect(rect, .live).left - 12 else rect.right - 16;
+    drawTextClipped(hdc, rect.left + 16, rect.top + 10, header_right, rgb(79, 230, 226), header);
+    drawGitPanelActions(hdc, rect);
 
     const rows = @max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT, ROW_HEIGHT));
     const total_rows = gitPanelRowCount(overview);
@@ -2280,6 +2305,64 @@ fn gitPanelUrlAtRow(overview: git_repository.Overview, row: usize) ?[]const u8 {
         }
     }
     return null;
+}
+
+fn drawGitPanelActions(hdc: windows.HDC, rect: RECT) void {
+    if (!gitPanelHasActionButtons(rect)) return;
+    const actions = [_]GitPanelAction{ .live, .issues, .failures, .draft_pr };
+    for (actions) |action| {
+        drawButton(hdc, gitPanelActionButtonRect(rect, action), gitPanelActionLabel(action));
+    }
+}
+
+fn gitPanelActionAt(rect: RECT, x: c_int, y: c_int) ?GitPanelAction {
+    if (!gitPanelHasActionButtons(rect)) return null;
+    if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
+    const actions = [_]GitPanelAction{ .live, .issues, .failures, .draft_pr };
+    for (actions) |action| {
+        if (pointIn(gitPanelActionButtonRect(rect, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn gitPanelHasActionButtons(rect: RECT) bool {
+    return rect.right - rect.left >= 520;
+}
+
+fn gitPanelActionButtonRect(rect: RECT, action: GitPanelAction) RECT {
+    const width: c_int = 76;
+    const gap: c_int = 8;
+    const slot: c_int = switch (action) {
+        .draft_pr => 0,
+        .failures => 1,
+        .issues => 2,
+        .live => 3,
+    };
+    const right = rect.right - 12 - slot * (width + gap);
+    return .{
+        .left = right - width,
+        .top = rect.top + 8,
+        .right = right,
+        .bottom = rect.top + 32,
+    };
+}
+
+fn gitPanelActionLabel(action: GitPanelAction) []const u8 {
+    return switch (action) {
+        .live => "LIVE",
+        .issues => "ISSUES",
+        .failures => "FAIL",
+        .draft_pr => "PR",
+    };
+}
+
+fn gitPanelActionCommand(action: GitPanelAction) []const u8 {
+    return switch (action) {
+        .live => "github.fetch",
+        .issues => "github.issues",
+        .failures => "github.actions.failures",
+        .draft_pr => "github.pr.create_draft",
+    };
 }
 
 fn gitChangeLabel(status: git_repository.ChangeStatus) []const u8 {

@@ -11,6 +11,7 @@ pub fn isInterestingPath(path: []const u8, language: modes.LanguageMode) bool {
     if (modes.isZigFamily(language)) return false;
     if (modes.isCode(language)) return true;
     if (language == .env or language == .dockerfile or language == .makefile or language == .json or language == .yaml or language == .toml or language == .hcl) return true;
+    if (isCiCdPath(path)) return true;
     const base = std.fs.path.basename(path);
     return std.mem.eql(u8, base, "package.json") or
         std.mem.eql(u8, base, "requirements.txt") or
@@ -45,6 +46,11 @@ fn scanGenericLine(collection: *findings.Collection, path: []const u8, line: []c
     try detectSecret(collection, path, line, line_number, "NPM_TOKEN", .high, "npm token-like variable appears in workspace text");
     try detectSecret(collection, path, line, line_number, "OPENAI_API_KEY", .high, "OpenAI API key-like variable appears in workspace text");
     try detectSecret(collection, path, line, line_number, "SLACK_BOT_TOKEN", .high, "Slack token-like variable appears in workspace text");
+    try detectSecret(collection, path, line, line_number, "CI_JOB_TOKEN", .high, "CI job token-like variable appears in workspace text");
+    try detectSecret(collection, path, line, line_number, "SYSTEM_ACCESSTOKEN", .high, "Azure Pipelines access token-like variable appears in workspace text");
+    try detectSecret(collection, path, line, line_number, "CIRCLE_TOKEN", .high, "CircleCI token-like variable appears in workspace text");
+    try detectSecret(collection, path, line, line_number, "BITBUCKET_TOKEN", .high, "Bitbucket token-like variable appears in workspace text");
+    try detectSecret(collection, path, line, line_number, "DOCKER_PASSWORD", .high, "Docker registry password-like variable appears in workspace text");
     try detectSecret(collection, path, line, line_number, "DATABASE_URL=", .medium, "database connection string appears in workspace text");
     try detectSecret(collection, path, line, line_number, "api_key", .high, "API key-like assignment appears in workspace text");
     try detectSecret(collection, path, line, line_number, "password=", .high, "password-like assignment appears in workspace text");
@@ -103,6 +109,12 @@ fn scanLanguageLine(collection: *findings.Collection, options: ScanOptions, line
             try detect(collection, path, line, line_number, "system(", .high, "Ruby shell execution boundary detected");
             try detect(collection, path, line, line_number, "Open3", .medium, "Ruby process boundary detected");
         },
+        .groovy => {
+            try detect(collection, path, line, line_number, "evaluate(", .high, "Groovy dynamic evaluation boundary detected");
+            try detect(collection, path, line, line_number, "GroovyShell", .high, "Groovy shell evaluation boundary detected");
+            try detect(collection, path, line, line_number, "ProcessBuilder", .high, "Groovy process execution boundary detected");
+            try detect(collection, path, line, line_number, ".execute(", .high, "Groovy process execution boundary detected");
+        },
         .dockerfile => {
             try detect(collection, path, line, line_number, "ADD http://", .high, "Dockerfile fetches remote content without TLS");
             try detect(collection, path, line, line_number, "ADD https://", .medium, "Dockerfile fetches remote content during build");
@@ -144,7 +156,17 @@ fn scanLanguageLine(collection: *findings.Collection, options: ScanOptions, line
 
 fn scanPathSpecificLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
     const base = std.fs.path.basename(path);
-    if (std.mem.eql(u8, base, "package.json")) {
+    if (isGitLabCiPath(path)) {
+        try scanGitLabCiLine(collection, path, line, line_number);
+    } else if (isCircleCiPath(path)) {
+        try scanCircleCiLine(collection, path, line, line_number);
+    } else if (isAzurePipelinesPath(path)) {
+        try scanAzurePipelinesLine(collection, path, line, line_number);
+    } else if (isJenkinsfilePath(path)) {
+        try scanJenkinsfileLine(collection, path, line, line_number);
+    } else if (isBitbucketPipelinesPath(path)) {
+        try scanBitbucketPipelinesLine(collection, path, line, line_number);
+    } else if (std.mem.eql(u8, base, "package.json")) {
         try scanPackageJsonLine(collection, path, line, line_number);
     } else if (std.mem.eql(u8, base, "requirements.txt")) {
         try scanRequirementsLine(collection, path, line, line_number);
@@ -207,6 +229,53 @@ fn scanComposeLine(collection: *findings.Collection, path: []const u8, line: []c
     try detect(collection, path, line, line_number, "/var/run/docker.sock", .critical, "compose mounts Docker socket into a container");
     try detect(collection, path, line, line_number, "SYS_ADMIN", .high, "compose grants SYS_ADMIN capability");
     try detect(collection, path, line, line_number, "cap_add:", .medium, "compose grants extra Linux capabilities");
+}
+
+fn scanGitLabCiLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detect(collection, path, line, line_number, "privileged: true", .high, "GitLab CI service or runner runs privileged");
+    try detect(collection, path, line, line_number, "docker:dind", .high, "GitLab CI uses Docker-in-Docker trust boundary");
+    try detect(collection, path, line, line_number, "image: docker:latest", .medium, "GitLab CI uses a floating Docker image tag");
+    try detect(collection, path, line, line_number, "services:", .low, "GitLab CI starts service containers; review network trust");
+    try detect(collection, path, line, line_number, "GIT_SSL_NO_VERIFY", .high, "GitLab CI disables git TLS verification");
+    try detect(collection, path, line, line_number, "CI_DEBUG_TRACE: true", .medium, "GitLab CI debug trace can expose secrets in logs");
+    try detect(collection, path, line, line_number, "id_tokens:", .high, "GitLab CI can mint OIDC tokens for external cloud trust");
+}
+
+fn scanCircleCiLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detect(collection, path, line, line_number, "setup_remote_docker", .medium, "CircleCI remote Docker expands build trust boundary");
+    try detect(collection, path, line, line_number, "docker_layer_caching: true", .medium, "CircleCI Docker layer cache can preserve mutable build state");
+    try detect(collection, path, line, line_number, "machine: true", .medium, "CircleCI job uses a full VM executor");
+    try detect(collection, path, line, line_number, "add_ssh_keys", .high, "CircleCI injects SSH keys into the job");
+    try detect(collection, path, line, line_number, "context:", .medium, "CircleCI context can inject shared secrets");
+    try detect(collection, path, line, line_number, "sudo ", .medium, "CircleCI step invokes sudo");
+}
+
+fn scanAzurePipelinesLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detect(collection, path, line, line_number, "persistCredentials: true", .high, "Azure Pipelines checkout persists repository credentials");
+    try detect(collection, path, line, line_number, "System.AccessToken", .high, "Azure Pipelines exposes the system access token");
+    try detect(collection, path, line, line_number, "checkout: self", .low, "Azure Pipelines checks out repository content into the job");
+    try detect(collection, path, line, line_number, "downloadSecureFile", .medium, "Azure Pipelines downloads a secure file into the job");
+    try detect(collection, path, line, line_number, "AzureKeyVault", .medium, "Azure Pipelines reads secrets from Key Vault");
+    try detect(collection, path, line, line_number, "sudo ", .medium, "Azure Pipelines step invokes sudo");
+}
+
+fn scanJenkinsfileLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detect(collection, path, line, line_number, "withCredentials", .high, "Jenkinsfile injects credentials into pipeline scope");
+    try detect(collection, path, line, line_number, "credentials(", .high, "Jenkinsfile references managed credentials");
+    try detect(collection, path, line, line_number, "sshagent", .high, "Jenkinsfile injects SSH agent credentials");
+    try detect(collection, path, line, line_number, "sh ", .medium, "Jenkinsfile runs a shell step");
+    try detect(collection, path, line, line_number, "bat ", .medium, "Jenkinsfile runs a Windows batch step");
+    try detect(collection, path, line, line_number, "powershell ", .medium, "Jenkinsfile runs a PowerShell step");
+    try detect(collection, path, line, line_number, "agent any", .low, "Jenkinsfile can run on any available agent");
+    try detect(collection, path, line, line_number, "/var/run/docker.sock", .critical, "Jenkinsfile exposes Docker socket to a build step");
+}
+
+fn scanBitbucketPipelinesLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detect(collection, path, line, line_number, "docker: true", .medium, "Bitbucket Pipelines enables Docker service trust boundary");
+    try detect(collection, path, line, line_number, "services:", .low, "Bitbucket Pipelines starts service containers; review network trust");
+    try detect(collection, path, line, line_number, "caches:", .low, "Bitbucket Pipelines cache can preserve mutable build state");
+    try detect(collection, path, line, line_number, "oidc: true", .high, "Bitbucket Pipelines can mint OIDC tokens for external cloud trust");
+    try detect(collection, path, line, line_number, "clone:", .low, "Bitbucket Pipelines custom clone settings affect source trust");
 }
 
 fn scanTerraformLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
@@ -326,6 +395,42 @@ fn isKubernetesPath(path: []const u8) bool {
         indexOfIgnoreCase(base, "pod") != null or
         indexOfIgnoreCase(base, "service") != null or
         indexOfIgnoreCase(base, "ingress") != null;
+}
+
+fn isCiCdPath(path: []const u8) bool {
+    return isGitLabCiPath(path) or
+        isCircleCiPath(path) or
+        isAzurePipelinesPath(path) or
+        isJenkinsfilePath(path) or
+        isBitbucketPipelinesPath(path);
+}
+
+fn isGitLabCiPath(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    return std.ascii.eqlIgnoreCase(base, ".gitlab-ci.yml") or std.ascii.eqlIgnoreCase(base, ".gitlab-ci.yaml");
+}
+
+fn isCircleCiPath(path: []const u8) bool {
+    if (indexOfIgnoreCase(path, ".circleci/") == null and indexOfIgnoreCase(path, ".circleci\\") == null) return false;
+    const base = std.fs.path.basename(path);
+    return std.ascii.eqlIgnoreCase(base, "config.yml") or std.ascii.eqlIgnoreCase(base, "config.yaml");
+}
+
+fn isAzurePipelinesPath(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    return std.ascii.eqlIgnoreCase(base, "azure-pipelines.yml") or
+        std.ascii.eqlIgnoreCase(base, "azure-pipelines.yaml") or
+        startsWithIgnoreCase(base, "azure-pipelines.");
+}
+
+fn isJenkinsfilePath(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    return std.ascii.eqlIgnoreCase(base, "Jenkinsfile") or startsWithIgnoreCase(base, "Jenkinsfile.");
+}
+
+fn isBitbucketPipelinesPath(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    return std.ascii.eqlIgnoreCase(base, "bitbucket-pipelines.yml") or std.ascii.eqlIgnoreCase(base, "bitbucket-pipelines.yaml");
 }
 
 fn hasPipeToShell(line: []const u8) ?usize {
@@ -477,4 +582,65 @@ test "polyglot scanner detects Terraform and Kubernetes exposure" {
     defer kube.deinit();
     try std.testing.expect(kube.countRiskAtLeast(.critical) >= 1);
     try std.testing.expect(kube.countRiskAtLeast(.high) >= 3);
+}
+
+test "polyglot scanner detects CI provider trust edges" {
+    var gitlab = try scanSource(std.testing.allocator,
+        \\image: docker:latest
+        \\services:
+        \\  - docker:dind
+        \\variables:
+        \\  CI_DEBUG_TRACE: true
+        \\id_tokens:
+        \\  VAULT_ID_TOKEN:
+        \\
+    , .{ .path = ".gitlab-ci.yml", .language = .yaml });
+    defer gitlab.deinit();
+    try std.testing.expect(gitlab.countRiskAtLeast(.high) >= 2);
+    try std.testing.expect(gitlab.countRiskAtLeast(.medium) >= 2);
+
+    var circle = try scanSource(std.testing.allocator,
+        \\jobs:
+        \\  build:
+        \\    machine: true
+        \\    steps:
+        \\      - setup_remote_docker
+        \\      - add_ssh_keys
+        \\
+    , .{ .path = ".circleci/config.yml", .language = .yaml });
+    defer circle.deinit();
+    try std.testing.expect(circle.countRiskAtLeast(.high) >= 1);
+    try std.testing.expect(circle.countRiskAtLeast(.medium) >= 2);
+
+    var azure = try scanSource(std.testing.allocator,
+        \\steps:
+        \\  - checkout: self
+        \\    persistCredentials: true
+        \\  - script: echo $(System.AccessToken)
+        \\  - task: downloadSecureFile@1
+        \\
+    , .{ .path = "azure-pipelines.yml", .language = .yaml });
+    defer azure.deinit();
+    try std.testing.expect(azure.countRiskAtLeast(.high) >= 2);
+    try std.testing.expect(azure.countRiskAtLeast(.medium) >= 1);
+
+    var jenkins = try scanSource(std.testing.allocator,
+        \\pipeline {
+        \\  agent any
+        \\  stages {
+        \\    stage('deploy') {
+        \\      steps {
+        \\        withCredentials([string(credentialsId: 'prod', variable: 'TOKEN')]) {
+        \\          sh 'docker run -v /var/run/docker.sock:/var/run/docker.sock deploy'
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+        \\
+    , .{ .path = "Jenkinsfile", .language = .groovy });
+    defer jenkins.deinit();
+    try std.testing.expect(jenkins.countRiskAtLeast(.critical) >= 1);
+    try std.testing.expect(jenkins.countRiskAtLeast(.high) >= 2);
+    try std.testing.expect(jenkins.countRiskAtLeast(.medium) >= 1);
 }

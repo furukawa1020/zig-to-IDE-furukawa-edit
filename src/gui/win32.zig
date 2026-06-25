@@ -1703,6 +1703,22 @@ fn windowProc(hwnd: windows.HWND, msg: windows.UINT, wparam: WPARAM, lparam: win
             }
             return 0;
         },
+        WM_MOUSEMOVE => {
+            if (global_state) |state| {
+                if (state.editor_dragging) {
+                    state.updateEditorDrag(layoutForWindow(hwnd, state), mouseX(lparam), mouseY(lparam));
+                    _ = InvalidateRect(hwnd, null, .FALSE);
+                }
+            }
+            return 0;
+        },
+        WM_LBUTTONUP => {
+            if (global_state) |state| {
+                state.endEditorDrag();
+                _ = InvalidateRect(hwnd, null, .FALSE);
+            }
+            return 0;
+        },
         WM_MOUSEWHEEL => {
             if (global_state) |state| {
                 const delta = wheelDelta(wparam);
@@ -1886,12 +1902,12 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         VK_DELETE => {
             if (state.app.mode == .insert and state.app.focus == .editor) state.deleteForward();
         },
-        VK_LEFT => state.moveCursor(.left, shift),
-        VK_RIGHT => state.moveCursor(.right, shift),
+        VK_LEFT => state.moveCursor(if (ctrl) .word_left else .left, shift),
+        VK_RIGHT => state.moveCursor(if (ctrl) .word_right else .right, shift),
         VK_UP => if (state.app.focus == .files) state.moveSelection(-1) else state.moveCursor(.up, shift),
         VK_DOWN => if (state.app.focus == .files) state.moveSelection(1) else state.moveCursor(.down, shift),
-        VK_HOME => state.moveCursor(.line_start, shift),
-        VK_END => state.moveCursor(.line_end, shift),
+        VK_HOME => state.moveCursor(if (ctrl) .file_start else .line_start, shift),
+        VK_END => state.moveCursor(if (ctrl) .file_end else .line_end, shift),
         VK_PRIOR => if (state.app.focus == .editor) state.scrollEditor(-12) else state.moveSelection(-12),
         VK_NEXT => if (state.app.focus == .editor) state.scrollEditor(12) else state.moveSelection(12),
         'I' => {

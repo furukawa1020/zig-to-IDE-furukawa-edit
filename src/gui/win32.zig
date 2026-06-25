@@ -2046,6 +2046,7 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
     if (active) |doc| {
         fillRect(hdc, RECT{ .left = editor.left, .top = HEADER_HEIGHT, .right = editor.left + GUTTER_WIDTH, .bottom = editor.bottom }, rgb(14, 18, 23));
 
+        const selection = state.selectedRange(doc);
         const max_rows = @max(0, @divTrunc(editor.bottom - HEADER_HEIGHT - 8, ROW_HEIGHT));
         state.editor_visible_rows = @as(usize, @intCast(max_rows));
         var visible_line: usize = 0;
@@ -2062,6 +2063,9 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
             }
             if (current_line) {
                 fillRect(hdc, RECT{ .left = editor.left + GUTTER_WIDTH, .top = y - 2, .right = editor.right, .bottom = y + ROW_HEIGHT - 2 }, rgb(20, 27, 34));
+            }
+            if (selection) |range| {
+                drawSelectionForLine(hdc, editor, doc, line, range, y);
             }
             drawTextRight(hdc, editor.left + 10, y, editor.left + GUTTER_WIDTH - 12, rgb(105, 116, 128), number);
             drawHighlightedLine(

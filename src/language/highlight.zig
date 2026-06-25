@@ -109,7 +109,7 @@ fn commentStart(line: []const u8, index: usize, mode: modes.LanguageMode) ?Role 
     if (index + 3 < line.len and std.mem.eql(u8, line[index .. index + 4], "<!--")) return .comment;
 
     return switch (mode) {
-        .shell, .powershell, .python, .ruby, .yaml, .toml, .dockerfile, .makefile => if (line[index] == '#') .comment else null,
+        .shell, .powershell, .python, .ruby, .yaml, .toml, .hcl, .dockerfile, .makefile => if (line[index] == '#') .comment else null,
         .sql => if (index + 1 < line.len and line[index] == '-' and line[index + 1] == '-') .comment else null,
         else => null,
     };
@@ -152,7 +152,7 @@ fn isKeyword(text: []const u8, mode: modes.LanguageMode) bool {
         return inList(text, &.{ "and", "begin", "break", "catch", "class", "def", "do", "else", "elseif", "end", "except", "finally", "for", "function", "if", "in", "local", "module", "not", "or", "return", "then", "try", "while", "yield" });
     }
     return switch (mode) {
-        .json, .yaml, .toml => inList(text, &.{ "true", "false", "null" }),
+        .json, .yaml, .toml, .hcl => inList(text, &.{ "true", "false", "null" }),
         .sql => inList(text, &.{ "select", "from", "where", "join", "insert", "update", "delete", "create", "drop", "alter", "table", "index", "into", "values", "and", "or", "not", "null" }),
         else => false,
     };

@@ -593,6 +593,7 @@ const GuiState = struct {
             return;
         }
 
+        self.clearSelection();
         self.app.mode = .insert;
         self.app.focus = .editor;
         self.ensureCursorVisible();
@@ -3442,6 +3443,7 @@ const BROWSEINFOW = extern struct {
 
 const HGDIOBJ = *opaque {};
 const HFONT = *opaque {};
+const HGLOBAL = *anyopaque;
 const WPARAM = windows.ULONG_PTR;
 const LRESULT = windows.LONG_PTR;
 const HRESULT = c_long;
@@ -3476,6 +3478,8 @@ const CLIP_DEFAULT_PRECIS: windows.DWORD = 0;
 const CLEARTYPE_QUALITY: windows.DWORD = 5;
 const FIXED_PITCH: windows.DWORD = 0x01;
 const FF_MODERN: windows.DWORD = 0x30;
+const GMEM_MOVEABLE: windows.UINT = 0x0002;
+const CF_UNICODETEXT: windows.UINT = 13;
 
 const WM_DESTROY: windows.UINT = 0x0002;
 const WM_SIZE: windows.UINT = 0x0005;
@@ -3505,6 +3509,10 @@ const VK_F8: WPARAM = 0x77;
 const VK_F12: WPARAM = 0x7B;
 
 extern "kernel32" fn GetModuleHandleW(lpModuleName: ?windows.LPCWSTR) callconv(.winapi) ?windows.HMODULE;
+extern "kernel32" fn GlobalAlloc(uFlags: windows.UINT, dwBytes: usize) callconv(.winapi) ?HGLOBAL;
+extern "kernel32" fn GlobalLock(hMem: HGLOBAL) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalUnlock(hMem: HGLOBAL) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn GlobalFree(hMem: HGLOBAL) callconv(.winapi) ?HGLOBAL;
 
 extern "shell32" fn ShellExecuteW(
     hwnd: ?windows.HWND,
@@ -3535,6 +3543,12 @@ extern "user32" fn DestroyWindow(hWnd: windows.HWND) callconv(.winapi) windows.B
 extern "user32" fn SetWindowTextW(hWnd: windows.HWND, lpString: windows.LPCWSTR) callconv(.winapi) windows.BOOL;
 extern "user32" fn SetFocus(hWnd: windows.HWND) callconv(.winapi) ?windows.HWND;
 extern "user32" fn GetKeyState(nVirtKey: c_int) callconv(.winapi) c_short;
+extern "user32" fn OpenClipboard(hWndNewOwner: ?windows.HWND) callconv(.winapi) windows.BOOL;
+extern "user32" fn CloseClipboard() callconv(.winapi) windows.BOOL;
+extern "user32" fn EmptyClipboard() callconv(.winapi) windows.BOOL;
+extern "user32" fn SetClipboardData(uFormat: windows.UINT, hMem: HGLOBAL) callconv(.winapi) ?HGLOBAL;
+extern "user32" fn GetClipboardData(uFormat: windows.UINT) callconv(.winapi) ?HGLOBAL;
+extern "user32" fn IsClipboardFormatAvailable(format: windows.UINT) callconv(.winapi) windows.BOOL;
 extern "user32" fn ShowWindow(hWnd: windows.HWND, nCmdShow: c_int) callconv(.winapi) windows.BOOL;
 extern "user32" fn UpdateWindow(hWnd: windows.HWND) callconv(.winapi) windows.BOOL;
 extern "user32" fn GetMessageW(lpMsg: *MSG, hWnd: ?windows.HWND, wMsgFilterMin: windows.UINT, wMsgFilterMax: windows.UINT) callconv(.winapi) windows.BOOL;

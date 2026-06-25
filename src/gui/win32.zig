@@ -404,6 +404,7 @@ const GuiState = struct {
     security_scroll_line: usize = 0,
     git_scroll_line: usize = 0,
     selection_anchor: ?usize = null,
+    editor_dragging: bool = false,
     show_output: bool = true,
     bottom_panel: BottomPanel = .output,
     quick_panel: QuickPanel,

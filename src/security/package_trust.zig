@@ -41,6 +41,9 @@ pub fn scanZon(allocator: std.mem.Allocator, source: []const u8, options: ScanOp
             if (looksEmptyHash(line)) {
                 try collection.append(.package_trust, .high, options.path, line_number, column, "dependency hash appears empty", line);
             }
+            if (looksWeakHash(line)) {
+                try collection.append(.package_trust, .medium, options.path, line_number, column, "dependency hash looks too short or placeholder-like", line);
+            }
         }
 
         if (std.mem.indexOf(u8, line, ".url")) |column| {
@@ -50,10 +53,11 @@ pub fn scanZon(allocator: std.mem.Allocator, source: []const u8, options: ScanOp
             else
                 "dependency fetched from URL; source and fingerprint should be reviewed";
             try collection.append(.package_trust, risk, options.path, line_number, column, message, line);
+            try scanUrlTrustEdges(&collection, options.path, line, line_number);
         }
 
         if (std.mem.indexOf(u8, line, ".path")) |column| {
-            const risk: findings.Risk = if (std.mem.indexOf(u8, line, "../") != null) .high else .low;
+            const risk = pathDependencyRisk(line);
             try collection.append(.package_trust, risk, options.path, line_number, column, "dependency uses local path; boundary should be reviewed", line);
         }
     }
@@ -77,11 +81,83 @@ fn looksLikeDependencyName(line: []const u8) bool {
 }
 
 fn looksPlainHttp(line: []const u8) bool {
-    return std.mem.indexOf(u8, line, "http://") != null;
+    return indexOfIgnoreCase(line, "http://") != null;
 }
 
 fn looksEmptyHash(line: []const u8) bool {
     return std.mem.indexOf(u8, line, "\"\"") != null;
+}
+
+fn looksWeakHash(line: []const u8) bool {
+    const value = quotedValue(line) orelse return false;
+    if (value.len == 0) return false;
+    if (value.len < 32) return true;
+    return indexOfIgnoreCase(value, "todo") != null or
+        indexOfIgnoreCase(value, "replace") != null or
+        std.mem.eql(u8, value, "...");
+}
+
+fn pathDependencyRisk(line: []const u8) findings.Risk {
+    const value = quotedValue(line) orelse line;
+    if (std.mem.indexOf(u8, value, "../") != null or std.mem.indexOf(u8, value, "..\\") != null) return .high;
+    if (std.mem.startsWith(u8, value, "/") or std.mem.startsWith(u8, value, "~/")) return .high;
+    if (value.len >= 3 and std.ascii.isAlphabetic(value[0]) and value[1] == ':' and (value[2] == '/' or value[2] == '\\')) return .high;
+    return .low;
+}
+
+fn scanUrlTrustEdges(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detect(collection, path, line, line_number, "git://", .critical, "dependency uses unauthenticated git transport");
+    try detect(collection, path, line, line_number, "file://", .high, "dependency URL reads from local filesystem");
+    try detect(collection, path, line, line_number, "localhost", .high, "dependency URL depends on the local host");
+    try detect(collection, path, line, line_number, "127.0.0.1", .high, "dependency URL depends on loopback host state");
+    try detect(collection, path, line, line_number, "archive/refs/heads", .high, "dependency URL points at a moving branch archive");
+    try detect(collection, path, line, line_number, "/tarball/main", .high, "dependency URL points at a moving branch tarball");
+    try detect(collection, path, line, line_number, "/tarball/master", .high, "dependency URL points at a moving branch tarball");
+    try detect(collection, path, line, line_number, "/zipball/main", .high, "dependency URL points at a moving branch archive");
+    try detect(collection, path, line, line_number, "/zipball/master", .high, "dependency URL points at a moving branch archive");
+    try detect(collection, path, line, line_number, "releases/latest", .medium, "dependency URL points at a moving latest release");
+    try detect(collection, path, line, line_number, ".git", .medium, "dependency URL references a VCS endpoint; prefer immutable archive plus hash");
+}
+
+fn detect(
+    collection: *findings.Collection,
+    path: []const u8,
+    line: []const u8,
+    line_number: usize,
+    needle: []const u8,
+    risk: findings.Risk,
+    message: []const u8,
+) !void {
+    if (indexOfIgnoreCase(line, needle)) |column| {
+        try collection.append(.package_trust, risk, path, line_number, column, message, line);
+    }
+}
+
+fn quotedValue(line: []const u8) ?[]const u8 {
+    const first = std.mem.indexOfScalar(u8, line, '"') orelse return null;
+    var index = first + 1;
+    var escaped = false;
+    while (index < line.len) : (index += 1) {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (line[index] == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (line[index] == '"') return line[first + 1 .. index];
+    }
+    return null;
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
 }
 
 test "package trust detects url and missing hash" {
@@ -98,4 +174,30 @@ test "package trust detects url and missing hash" {
     defer collection.deinit();
 
     try std.testing.expect(collection.countRiskAtLeast(.medium) >= 1);
+}
+
+test "package trust detects mutable and host-local dependencies" {
+    var collection = try scanZon(std.testing.allocator,
+        \\.{
+        \\  .dependencies = .{
+        \\    .moving = .{
+        \\      .url = "https://github.com/example/pkg/archive/refs/heads/main.tar.gz",
+        \\      .hash = "TODO",
+        \\    },
+        \\    .git_transport = .{
+        \\      .url = "git://example.test/pkg.git",
+        \\      .hash = "1220abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef",
+        \\    },
+        \\    .local = .{
+        \\      .path = "C:\\vendor\\pkg",
+        \\    },
+        \\  },
+        \\}
+        \\
+    , .{});
+    defer collection.deinit();
+
+    try std.testing.expect(collection.countRiskAtLeast(.critical) >= 1);
+    try std.testing.expect(collection.countRiskAtLeast(.high) >= 2);
+    try std.testing.expect(collection.countRiskAtLeast(.medium) >= 2);
 }

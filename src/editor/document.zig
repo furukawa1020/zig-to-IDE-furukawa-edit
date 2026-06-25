@@ -54,6 +54,48 @@ pub const Document = struct {
         self.dirty = true;
     }
 
+    pub fn deleteLine(self: *Document, line: usize) !bool {
+        if (line >= self.text.lineCount()) return false;
+        const range = self.lineRange(line) orelse return false;
+        try self.deleteRange(range.start, range.end);
+        const target_line = @min(line, if (self.text.lineCount() == 0) 0 else self.text.lineCount() - 1);
+        const target_offset = self.text.lineColumnToOffset(target_line, 0) catch @min(range.start, self.text.bytes.len);
+        self.cursor.position = try self.positionFromOffset(target_offset);
+        return true;
+    }
+
+    pub fn duplicateLine(self: *Document, line: usize) !bool {
+        if (line >= self.text.lineCount()) return false;
+        const range = self.lineRange(line) orelse return false;
+        const content = self.text.bytes[range.start..range.content_end];
+        const line_ending = self.text.bytes[range.content_end..range.end];
+        const column = self.cursor.position.column;
+
+        var duplicated: std.Io.Writer.Allocating = .init(self.allocator);
+        defer duplicated.deinit();
+        if (line_ending.len == 0) try duplicated.writer.writeAll(self.preferredNewline());
+        try duplicated.writer.writeAll(content);
+        if (line_ending.len > 0) try duplicated.writer.writeAll(line_ending);
+
+        const inserted = duplicated.written();
+        try self.insert(range.end, inserted);
+        const new_line = @min(line + 1, if (self.text.lineCount() == 0) 0 else self.text.lineCount() - 1);
+        const target_column = @min(column, self.text.lineSlice(new_line).len);
+        const target_offset = try self.text.lineColumnToOffset(new_line, target_column);
+        self.cursor.position = try self.positionFromOffset(target_offset);
+        return true;
+    }
+
+    pub fn moveLineUp(self: *Document, line: usize) !bool {
+        if (line == 0 or line >= self.text.lineCount()) return false;
+        return try self.moveAdjacentLines(line - 1, line, line - 1);
+    }
+
+    pub fn moveLineDown(self: *Document, line: usize) !bool {
+        if (line + 1 >= self.text.lineCount()) return false;
+        return try self.moveAdjacentLines(line, line + 1, line + 1);
+    }
+
     pub fn undo(self: *Document) !bool {
         const changed = try self.undo_stack.undo(&self.text);
         if (changed) self.dirty = true;
@@ -70,6 +112,48 @@ pub const Document = struct {
         const lc = try self.text.offsetToLineColumn(offset);
         return .{ .line = lc.line, .column = lc.column, .byte_offset = offset };
     }
+
+    fn moveAdjacentLines(self: *Document, first_line: usize, second_line: usize, target_line: usize) !bool {
+        const first = self.lineRange(first_line) orelse return false;
+        const second = self.lineRange(second_line) orelse return false;
+        const column = self.cursor.position.column;
+
+        var replacement: std.Io.Writer.Allocating = .init(self.allocator);
+        defer replacement.deinit();
+        try replacement.writer.writeAll(self.text.bytes[second.start..second.content_end]);
+        try replacement.writer.writeAll(self.text.bytes[first.content_end..second.start]);
+        try replacement.writer.writeAll(self.text.bytes[first.start..first.content_end]);
+        try replacement.writer.writeAll(self.text.bytes[second.content_end..second.end]);
+
+        try self.replaceRange(first.start, second.end, replacement.written());
+        const target_column = @min(column, self.text.lineSlice(target_line).len);
+        const target_offset = try self.text.lineColumnToOffset(target_line, target_column);
+        self.cursor.position = try self.positionFromOffset(target_offset);
+        return true;
+    }
+
+    fn lineRange(self: *const Document, line: usize) ?LineRange {
+        const start = self.text.lineStart(line) orelse return null;
+        const content_end = start + self.text.lineSlice(line).len;
+        const end = if (line + 1 < self.text.lineCount())
+            self.text.lineStart(line + 1) orelse self.text.bytes.len
+        else
+            self.text.bytes.len;
+        return .{ .start = start, .content_end = content_end, .end = end };
+    }
+
+    fn preferredNewline(self: *const Document) []const u8 {
+        return switch (self.text.newline) {
+            .crlf => "\r\n",
+            else => "\n",
+        };
+    }
+};
+
+const LineRange = struct {
+    start: usize,
+    content_end: usize,
+    end: usize,
 };
 
 test "document edit tracks dirty and undo" {
@@ -82,4 +166,34 @@ test "document edit tracks dirty and undo" {
 
     try std.testing.expect(try doc.undo());
     try std.testing.expectEqualStrings("pub fn main() void {}\n", doc.text.bytes);
+}
+
+test "document line operations duplicate delete and move" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "a\nb\nc\n");
+    defer doc.deinit();
+
+    try std.testing.expect(try doc.duplicateLine(1));
+    try std.testing.expectEqualStrings("a\nb\nb\nc\n", doc.text.bytes);
+
+    try std.testing.expect(try doc.deleteLine(1));
+    try std.testing.expectEqualStrings("a\nb\nc\n", doc.text.bytes);
+}
+
+test "document line operations move distinct lines" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "a\nb\nc\n");
+    defer doc.deinit();
+
+    try std.testing.expect(try doc.moveLineUp(2));
+    try std.testing.expectEqualStrings("a\nc\nb\n", doc.text.bytes);
+
+    try std.testing.expect(try doc.moveLineDown(0));
+    try std.testing.expectEqualStrings("c\na\nb\n", doc.text.bytes);
+}
+
+test "document line duplicate handles final line without newline" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "a\nb");
+    defer doc.deinit();
+
+    try std.testing.expect(try doc.duplicateLine(1));
+    try std.testing.expectEqualStrings("a\nb\nb", doc.text.bytes);
 }

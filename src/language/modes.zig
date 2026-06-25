@@ -26,6 +26,7 @@ pub const LanguageMode = enum {
     php,
     ruby,
     lua,
+    groovy,
     javascript,
     jsx,
     typescript,
@@ -79,6 +80,7 @@ const all_modes = [_]LanguageMode{
     .php,
     .ruby,
     .lua,
+    .groovy,
     .javascript,
     .jsx,
     .typescript,
@@ -106,6 +108,8 @@ pub fn detect(path: []const u8) LanguageMode {
     if (std.mem.eql(u8, base, "Makefile")) return .makefile;
     if (std.mem.eql(u8, base, "Dockerfile")) return .dockerfile;
     if (std.mem.startsWith(u8, base, "Dockerfile.")) return .dockerfile;
+    if (std.mem.eql(u8, base, "Jenkinsfile")) return .groovy;
+    if (std.mem.startsWith(u8, base, "Jenkinsfile.")) return .groovy;
     if (std.mem.eql(u8, base, ".gitignore")) return .gitignore;
     if (std.mem.eql(u8, base, ".env")) return .env;
     if (std.mem.startsWith(u8, base, ".env.")) return .env;
@@ -151,6 +155,8 @@ pub fn detect(path: []const u8) LanguageMode {
     if (std.mem.eql(u8, ext, ".php")) return .php;
     if (std.mem.eql(u8, ext, ".rb")) return .ruby;
     if (std.mem.eql(u8, ext, ".lua")) return .lua;
+    if (std.mem.eql(u8, ext, ".groovy")) return .groovy;
+    if (std.mem.eql(u8, ext, ".gradle")) return .groovy;
     if (std.mem.eql(u8, ext, ".js")) return .javascript;
     if (std.mem.eql(u8, ext, ".mjs")) return .javascript;
     if (std.mem.eql(u8, ext, ".cjs")) return .javascript;
@@ -191,7 +197,7 @@ pub fn family(mode: LanguageMode) LanguageFamily {
     return switch (mode) {
         .zig, .zon => .zig,
         .c, .cpp, .go, .rust, .java, .csharp, .swift, .kotlin, .scala => .native,
-        .shell, .powershell, .python, .php, .ruby, .lua => .script,
+        .shell, .powershell, .python, .php, .ruby, .lua, .groovy => .script,
         .javascript, .jsx, .typescript, .tsx, .html, .css, .dart, .vue, .svelte => .web,
         .json, .yaml, .toml, .hcl, .xml, .sql => .data,
         .env, .gitignore, .makefile, .dockerfile => .config,
@@ -227,6 +233,7 @@ pub fn label(mode: LanguageMode) []const u8 {
         .php => "php",
         .ruby => "ruby",
         .lua => "lua",
+        .groovy => "groovy",
         .javascript => "javascript",
         .jsx => "jsx",
         .typescript => "typescript",
@@ -252,6 +259,8 @@ test "detect Zig and non-Zig files" {
     try std.testing.expectEqual(LanguageMode.dockerfile, detect("Dockerfile.prod"));
     try std.testing.expectEqual(LanguageMode.hcl, detect("infra/main.tf"));
     try std.testing.expectEqual(LanguageMode.hcl, detect("terraform.tfvars"));
+    try std.testing.expectEqual(LanguageMode.groovy, detect("Jenkinsfile"));
+    try std.testing.expectEqual(LanguageMode.groovy, detect("build.gradle"));
     try std.testing.expectEqual(LanguageMode.powershell, detect("tools/install.ps1"));
     try std.testing.expectEqual(LanguageMode.tsx, detect("frontend/App.tsx"));
     try std.testing.expectEqual(LanguageFamily.web, family(.typescript));

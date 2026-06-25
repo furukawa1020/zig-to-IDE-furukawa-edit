@@ -10,7 +10,7 @@ pub const ScanOptions = struct {
 pub fn isInterestingPath(path: []const u8, language: modes.LanguageMode) bool {
     if (modes.isZigFamily(language)) return false;
     if (modes.isCode(language)) return true;
-    if (language == .env or language == .dockerfile or language == .makefile or language == .json or language == .yaml or language == .toml) return true;
+    if (language == .env or language == .dockerfile or language == .makefile or language == .json or language == .yaml or language == .toml or language == .hcl) return true;
     const base = std.fs.path.basename(path);
     return std.mem.eql(u8, base, "package.json") or
         std.mem.eql(u8, base, "requirements.txt") or
@@ -131,6 +131,12 @@ fn scanLanguageLine(collection: *findings.Collection, options: ScanOptions, line
                 try detect(collection, path, line, line_number, "github.event.pull_request.head", .high, "workflow references untrusted pull request head context");
                 try detectUnpinnedActionUse(collection, path, line, line_number);
             }
+            if (isKubernetesPath(path)) {
+                try scanKubernetesYamlLine(collection, path, line, line_number);
+            }
+        },
+        .hcl => {
+            try scanTerraformLine(collection, path, line, line_number);
         },
         else => {},
     }
@@ -150,6 +156,8 @@ fn scanPathSpecificLine(collection: *findings.Collection, path: []const u8, line
         try scanJvmBuildLine(collection, path, line, line_number);
     } else if (std.mem.eql(u8, base, "docker-compose.yml") or std.mem.eql(u8, base, "docker-compose.yaml") or std.mem.eql(u8, base, "compose.yml") or std.mem.eql(u8, base, "compose.yaml")) {
         try scanComposeLine(collection, path, line, line_number);
+    } else if (isKubernetesPath(path)) {
+        try scanKubernetesYamlLine(collection, path, line, line_number);
     }
 }
 
@@ -199,6 +207,35 @@ fn scanComposeLine(collection: *findings.Collection, path: []const u8, line: []c
     try detect(collection, path, line, line_number, "/var/run/docker.sock", .critical, "compose mounts Docker socket into a container");
     try detect(collection, path, line, line_number, "SYS_ADMIN", .high, "compose grants SYS_ADMIN capability");
     try detect(collection, path, line, line_number, "cap_add:", .medium, "compose grants extra Linux capabilities");
+}
+
+fn scanTerraformLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detect(collection, path, line, line_number, "0.0.0.0/0", .high, "Terraform exposes a resource to the public IPv4 internet");
+    try detect(collection, path, line, line_number, "::/0", .high, "Terraform exposes a resource to the public IPv6 internet");
+    try detect(collection, path, line, line_number, "publicly_accessible = true", .high, "Terraform enables public accessibility");
+    try detect(collection, path, line, line_number, "associate_public_ip_address = true", .medium, "Terraform assigns a public IP address");
+    try detect(collection, path, line, line_number, "acl = \"public-read\"", .high, "Terraform grants public read access");
+    try detect(collection, path, line, line_number, "acl = \"public-read-write\"", .critical, "Terraform grants public read/write access");
+    try detect(collection, path, line, line_number, "skip_final_snapshot = true", .medium, "Terraform disables final database snapshot protection");
+    try detect(collection, path, line, line_number, "deletion_protection = false", .medium, "Terraform disables deletion protection");
+    try detect(collection, path, line, line_number, "disable_api_termination = false", .low, "Terraform allows instance API termination");
+    try detect(collection, path, line, line_number, "0.0.0.0/0\", 22", .critical, "Terraform exposes SSH to the public internet");
+    try detect(collection, path, line, line_number, "from_port = 22", .medium, "Terraform security group opens SSH; verify CIDR restrictions");
+    try detect(collection, path, line, line_number, "from_port = 3389", .medium, "Terraform security group opens RDP; verify CIDR restrictions");
+}
+
+fn scanKubernetesYamlLine(collection: *findings.Collection, path: []const u8, line: []const u8, line_number: usize) !void {
+    try detect(collection, path, line, line_number, "privileged: true", .high, "Kubernetes container runs privileged");
+    try detect(collection, path, line, line_number, "hostNetwork: true", .high, "Kubernetes pod uses host networking");
+    try detect(collection, path, line, line_number, "hostPID: true", .high, "Kubernetes pod uses host PID namespace");
+    try detect(collection, path, line, line_number, "hostIPC: true", .high, "Kubernetes pod uses host IPC namespace");
+    try detect(collection, path, line, line_number, "runAsUser: 0", .medium, "Kubernetes container explicitly runs as root");
+    try detect(collection, path, line, line_number, "allowPrivilegeEscalation: true", .high, "Kubernetes allows privilege escalation");
+    try detect(collection, path, line, line_number, "readOnlyRootFilesystem: false", .medium, "Kubernetes root filesystem is writable");
+    try detect(collection, path, line, line_number, "imagePullPolicy: Always", .low, "Kubernetes always pulls mutable image tags");
+    try detect(collection, path, line, line_number, "image: latest", .medium, "Kubernetes uses a floating latest image tag");
+    try detect(collection, path, line, line_number, "type: LoadBalancer", .medium, "Kubernetes service may expose workload publicly");
+    try detect(collection, path, line, line_number, "/var/run/docker.sock", .critical, "Kubernetes mounts Docker socket into a pod");
 }
 
 fn detect(

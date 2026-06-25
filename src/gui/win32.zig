@@ -3546,6 +3546,8 @@ const WM_PAINT: windows.UINT = 0x000F;
 const WM_KEYDOWN: windows.UINT = 0x0100;
 const WM_CHAR: windows.UINT = 0x0102;
 const WM_LBUTTONDOWN: windows.UINT = 0x0201;
+const WM_LBUTTONUP: windows.UINT = 0x0202;
+const WM_MOUSEMOVE: windows.UINT = 0x0200;
 const WM_MOUSEWHEEL: windows.UINT = 0x020A;
 const VK_BACK: WPARAM = 0x08;
 const VK_TAB: WPARAM = 0x09;
@@ -3601,6 +3603,8 @@ extern "user32" fn DefWindowProcW(hWnd: windows.HWND, Msg: windows.UINT, wParam:
 extern "user32" fn DestroyWindow(hWnd: windows.HWND) callconv(.winapi) windows.BOOL;
 extern "user32" fn SetWindowTextW(hWnd: windows.HWND, lpString: windows.LPCWSTR) callconv(.winapi) windows.BOOL;
 extern "user32" fn SetFocus(hWnd: windows.HWND) callconv(.winapi) ?windows.HWND;
+extern "user32" fn SetCapture(hWnd: windows.HWND) callconv(.winapi) ?windows.HWND;
+extern "user32" fn ReleaseCapture() callconv(.winapi) windows.BOOL;
 extern "user32" fn GetKeyState(nVirtKey: c_int) callconv(.winapi) c_short;
 extern "user32" fn OpenClipboard(hWndNewOwner: ?windows.HWND) callconv(.winapi) windows.BOOL;
 extern "user32" fn CloseClipboard() callconv(.winapi) windows.BOOL;

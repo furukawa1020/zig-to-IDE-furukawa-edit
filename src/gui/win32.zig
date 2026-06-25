@@ -504,7 +504,7 @@ const GuiState = struct {
                 counts.low,
             },
         );
-        self.appendOutput(.stdout, "checks: build.zig firewall, build.zig.zon hashes, unsafe Zig/FFI/allocators, polyglot scripts/secrets/process boundaries, git config/hooks/submodules/attributes\n", .{});
+        self.appendOutput(.stdout, "checks: build.zig firewall, build.zig.zon package trust, unsafe Zig/FFI/allocators, polyglot scripts/secrets/process boundaries, IaC/CI/CD trust edges, git config/hooks/submodules/attributes\n", .{});
 
         const limit: usize = 10;
         for (self.app.security_findings.items.items, 0..) |item, index| {
@@ -1022,6 +1022,11 @@ const GuiState = struct {
 
     fn openGitPanelRow(self: *GuiState, row: usize) void {
         const overview = self.git_overview orelse return;
+        if (gitPanelUrlAtRow(overview, row)) |url| {
+            self.openExternalUrl(url);
+            return;
+        }
+
         const workflow_start = gitPanelWorkflowStartRow(overview);
         if (row >= workflow_start and row < workflow_start + overview.workflow_paths.len) {
             self.openRelativeFile(overview.workflow_paths[row - workflow_start], null);
@@ -1038,6 +1043,22 @@ const GuiState = struct {
             return;
         }
         self.openRelativeFile(change.path, null);
+    }
+
+    fn openExternalUrl(self: *GuiState, url: []const u8) void {
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, url) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        defer self.allocator.free(wide);
+
+        const operation = std.unicode.utf8ToUtf16LeStringLiteral("open");
+        const result = ShellExecuteW(self.hwnd, operation.ptr, wide.ptr, null, null, SW_SHOWNORMAL);
+        if (@intFromPtr(result) <= 32) {
+            self.setMessage("Could not open GitHub URL") catch {};
+            return;
+        }
+        self.setMessage("Opened GitHub URL") catch {};
     }
 
     fn handleDispatchResult(self: *GuiState, id: []const u8, result: dispatcher.Result) void {
@@ -2247,6 +2268,20 @@ fn gitPanelChangeStartRow(overview: git_repository.Overview) usize {
     return gitPanelWorkflowStartRow(overview) + overview.workflow_paths.len + 1;
 }
 
+fn gitPanelUrlAtRow(overview: git_repository.Overview, row: usize) ?[]const u8 {
+    var current: usize = 1;
+    for (overview.remotes) |remote| {
+        current += 1;
+        if (remote.github) |github| {
+            if (row == current) return github.web_url;
+            current += 1;
+            if (row == current) return github.actions_url;
+            current += 1;
+        }
+    }
+    return null;
+}
+
 fn gitChangeLabel(status: git_repository.ChangeStatus) []const u8 {
     return switch (status) {
         .modified => "M ",
@@ -3149,6 +3184,7 @@ const BIF_NEWDIALOGSTYLE: windows.UINT = 0x0040;
 const CW_USEDEFAULT: c_int = -2147483648;
 const IDC_ARROW: windows.LPCWSTR = @ptrFromInt(32512);
 const SW_SHOW: c_int = 5;
+const SW_SHOWNORMAL: c_int = 1;
 const TRANSPARENT: c_int = 1;
 const WS_OVERLAPPEDWINDOW: windows.DWORD = 0x00CF0000;
 const FW_NORMAL: c_int = 400;
@@ -3187,6 +3223,15 @@ const VK_F8: WPARAM = 0x77;
 const VK_F12: WPARAM = 0x7B;
 
 extern "kernel32" fn GetModuleHandleW(lpModuleName: ?windows.LPCWSTR) callconv(.winapi) ?windows.HMODULE;
+
+extern "shell32" fn ShellExecuteW(
+    hwnd: ?windows.HWND,
+    lpOperation: ?windows.LPCWSTR,
+    lpFile: windows.LPCWSTR,
+    lpParameters: ?windows.LPCWSTR,
+    lpDirectory: ?windows.LPCWSTR,
+    nShowCmd: c_int,
+) callconv(.winapi) windows.HINSTANCE;
 
 extern "user32" fn RegisterClassExW(lpWndClass: *const WNDCLASSEXW) callconv(.winapi) windows.ATOM;
 extern "user32" fn CreateWindowExW(

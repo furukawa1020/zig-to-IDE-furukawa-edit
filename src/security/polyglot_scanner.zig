@@ -309,6 +309,25 @@ fn detectUnpinnedActionUse(collection: *findings.Collection, path: []const u8, l
     }
 }
 
+fn isKubernetesPath(path: []const u8) bool {
+    if (indexOfIgnoreCase(path, "k8s/") != null or
+        indexOfIgnoreCase(path, "k8s\\") != null or
+        indexOfIgnoreCase(path, "kubernetes/") != null or
+        indexOfIgnoreCase(path, "kubernetes\\") != null or
+        indexOfIgnoreCase(path, "manifests/") != null or
+        indexOfIgnoreCase(path, "manifests\\") != null)
+    {
+        return true;
+    }
+    const base = std.fs.path.basename(path);
+    return indexOfIgnoreCase(base, "deployment") != null or
+        indexOfIgnoreCase(base, "daemonset") != null or
+        indexOfIgnoreCase(base, "statefulset") != null or
+        indexOfIgnoreCase(base, "pod") != null or
+        indexOfIgnoreCase(base, "service") != null or
+        indexOfIgnoreCase(base, "ingress") != null;
+}
+
 fn hasPipeToShell(line: []const u8) ?usize {
     const download = indexOfIgnoreCase(line, "curl") orelse indexOfIgnoreCase(line, "wget") orelse return null;
     if (std.mem.indexOfScalar(u8, line, '|') == null) return null;
@@ -424,4 +443,38 @@ test "polyglot scanner detects compose container breakouts" {
 
     try std.testing.expect(collection.countRiskAtLeast(.critical) >= 1);
     try std.testing.expect(collection.countRiskAtLeast(.high) >= 4);
+}
+
+test "polyglot scanner detects Terraform and Kubernetes exposure" {
+    var terraform = try scanSource(std.testing.allocator,
+        \\resource "aws_security_group_rule" "ssh" {
+        \\  cidr_blocks = ["0.0.0.0/0"]
+        \\  from_port = 22
+        \\}
+        \\resource "aws_s3_bucket" "public" {
+        \\  acl = "public-read-write"
+        \\}
+        \\
+    , .{ .path = "infra/main.tf", .language = .hcl });
+    defer terraform.deinit();
+    try std.testing.expect(terraform.countRiskAtLeast(.critical) >= 1);
+    try std.testing.expect(terraform.countRiskAtLeast(.high) >= 1);
+
+    var kube = try scanSource(std.testing.allocator,
+        \\apiVersion: v1
+        \\kind: Pod
+        \\spec:
+        \\  hostNetwork: true
+        \\  containers:
+        \\    - image: latest
+        \\      securityContext:
+        \\        privileged: true
+        \\        allowPrivilegeEscalation: true
+        \\      volumeMounts:
+        \\        - mountPath: /var/run/docker.sock
+        \\
+    , .{ .path = "k8s/pod.yaml", .language = .yaml });
+    defer kube.deinit();
+    try std.testing.expect(kube.countRiskAtLeast(.critical) >= 1);
+    try std.testing.expect(kube.countRiskAtLeast(.high) >= 3);
 }

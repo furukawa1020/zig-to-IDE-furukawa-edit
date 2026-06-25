@@ -131,6 +131,10 @@ pub const git = struct {
     pub const status = @import("git/status.zig");
 };
 
+pub const github = struct {
+    pub const client = @import("github/client.zig");
+};
+
 pub const security = struct {
     pub const build_consent = @import("security/build_consent.zig");
     pub const build_firewall = @import("security/build_firewall.zig");

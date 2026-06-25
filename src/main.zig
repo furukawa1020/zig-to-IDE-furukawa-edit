@@ -53,6 +53,7 @@ test {
     _ = @import("editor/undo.zig");
     _ = @import("git/repository.zig");
     _ = @import("git/status.zig");
+    _ = @import("github/client.zig");
     _ = @import("language/highlight.zig");
     _ = @import("language/modes.zig");
     _ = @import("language/semantic.zig");

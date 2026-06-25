@@ -974,8 +974,100 @@ fn renderGitHubLive(app: *app_mod.App, live: *const github_client.LiveOverview) 
     try writer.print("actions   : {d} recent run(s)\n", .{live.runs.len});
     for (live.runs, 0..) |run, index| {
         if (index >= 5) break;
-        try writer.print("- {s}: {s}/{s}\n", .{ run.name, run.status, run.conclusion });
+        try writer.print("- #{d} {s}: {s}/{s}\n", .{ run.id, run.name, run.status, run.conclusion });
     }
+
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn renderGitHubIssues(
+    app: *app_mod.App,
+    owner: []const u8,
+    repo: []const u8,
+    issues: []const github_client.Issue,
+    token_source: github_client.TokenSource,
+) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("github issues (read-only REST API)\n");
+    try writer.print("repo : {s}/{s}\n", .{ owner, repo });
+    try writer.print("token: {s}\n", .{tokenSourceLabel(token_source)});
+    try writer.print("open : {d} item(s) shown\n", .{issues.len});
+
+    for (issues, 0..) |issue, index| {
+        if (index >= 20) break;
+        try writer.print("#{d} [{s}] {s} by {s} comments={d}\n", .{
+            issue.number,
+            if (issue.pull_request) "PR" else "issue",
+            issue.title,
+            issue.user,
+            issue.comments,
+        });
+        if (issue.html_url.len > 0) try writer.print("  {s}\n", .{issue.html_url});
+    }
+    if (issues.len == 0) {
+        try writer.writeAll("no open issues or pull requests returned\n");
+    }
+
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn renderGitHubFailureLog(
+    app: *app_mod.App,
+    owner: []const u8,
+    repo: []const u8,
+    failure: *const github_client.FailureLog,
+    token_source: github_client.TokenSource,
+) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("github actions latest failure log (read-only REST API)\n");
+    try writer.print("repo : {s}/{s}\n", .{ owner, repo });
+    try writer.print("token: {s}\n", .{tokenSourceLabel(token_source)});
+    try writer.print("run  : #{d} {s} {s}/{s}\n", .{ failure.run.id, failure.run.name, failure.run.status, failure.run.conclusion });
+    if (failure.run.html_url.len > 0) try writer.print("       {s}\n", .{failure.run.html_url});
+    try writer.print("job  : #{d} {s} {s}/{s}\n", .{ failure.job.id, failure.job.name, failure.job.status, failure.job.conclusion });
+    if (failure.job.html_url.len > 0) try writer.print("       {s}\n", .{failure.job.html_url});
+    if (failure.truncated) {
+        try writer.writeAll("log  : tail excerpt, truncated to 64 KiB\n");
+    } else {
+        try writer.writeAll("log  : full fetched job log\n");
+    }
+    try writer.writeAll("----- log begin -----\n");
+    try writer.writeAll(failure.log_excerpt);
+    if (failure.log_excerpt.len == 0 or failure.log_excerpt[failure.log_excerpt.len - 1] != '\n') {
+        try writer.writeByte('\n');
+    }
+    try writer.writeAll("----- log end -----\n");
+
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn renderCreatedPullRequest(
+    app: *app_mod.App,
+    owner: []const u8,
+    repo: []const u8,
+    base: []const u8,
+    head: []const u8,
+    pull: *const github_client.PullRequest,
+    token_source: github_client.TokenSource,
+) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("github draft pull request created (network write)\n");
+    try writer.print("repo : {s}/{s}\n", .{ owner, repo });
+    try writer.print("token: {s}\n", .{tokenSourceLabel(token_source)});
+    try writer.print("from : {s}\n", .{head});
+    try writer.print("to   : {s}\n", .{base});
+    try writer.print("pr   : #{d} {s}\n", .{ pull.number, pull.title });
+    try writer.print("url  : {s}\n", .{pull.html_url});
+    try writer.print("draft: {s}\n", .{if (pull.draft) "yes" else "no"});
 
     try app.process_console.appendBytes(.stdout, text.written());
 }

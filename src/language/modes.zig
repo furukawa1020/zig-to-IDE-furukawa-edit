@@ -8,6 +8,7 @@ pub const LanguageMode = enum {
     json,
     yaml,
     toml,
+    hcl,
     xml,
     env,
     gitignore,
@@ -60,6 +61,7 @@ const all_modes = [_]LanguageMode{
     .json,
     .yaml,
     .toml,
+    .hcl,
     .xml,
     .env,
     .gitignore,
@@ -114,6 +116,7 @@ pub fn detect(path: []const u8) LanguageMode {
     if (std.mem.eql(u8, base, "tsconfig.json")) return .json;
     if (std.mem.eql(u8, base, "docker-compose.yml")) return .yaml;
     if (std.mem.eql(u8, base, "docker-compose.yaml")) return .yaml;
+    if (std.mem.eql(u8, base, "terraform.tfvars")) return .hcl;
 
     const ext = std.fs.path.extension(base);
     if (std.mem.eql(u8, ext, ".zig")) return .zig;
@@ -124,6 +127,9 @@ pub fn detect(path: []const u8) LanguageMode {
     if (std.mem.eql(u8, ext, ".yaml")) return .yaml;
     if (std.mem.eql(u8, ext, ".yml")) return .yaml;
     if (std.mem.eql(u8, ext, ".toml")) return .toml;
+    if (std.mem.eql(u8, ext, ".tf")) return .hcl;
+    if (std.mem.eql(u8, ext, ".tfvars")) return .hcl;
+    if (std.mem.eql(u8, ext, ".hcl")) return .hcl;
     if (std.mem.eql(u8, ext, ".xml")) return .xml;
     if (std.mem.eql(u8, ext, ".env")) return .env;
     if (std.mem.eql(u8, ext, ".sh")) return .shell;
@@ -187,7 +193,7 @@ pub fn family(mode: LanguageMode) LanguageFamily {
         .c, .cpp, .go, .rust, .java, .csharp, .swift, .kotlin, .scala => .native,
         .shell, .powershell, .python, .php, .ruby, .lua => .script,
         .javascript, .jsx, .typescript, .tsx, .html, .css, .dart, .vue, .svelte => .web,
-        .json, .yaml, .toml, .xml, .sql => .data,
+        .json, .yaml, .toml, .hcl, .xml, .sql => .data,
         .env, .gitignore, .makefile, .dockerfile => .config,
         .markdown, .text => .prose,
         .unknown => .unknown,
@@ -203,6 +209,7 @@ pub fn label(mode: LanguageMode) []const u8 {
         .json => "json",
         .yaml => "yaml",
         .toml => "toml",
+        .hcl => "hcl",
         .xml => "xml",
         .env => "env",
         .gitignore => "gitignore",
@@ -243,6 +250,8 @@ test "detect Zig and non-Zig files" {
     try std.testing.expectEqual(LanguageMode.python, detect("demo.py"));
     try std.testing.expectEqual(LanguageMode.go, detect("go.mod"));
     try std.testing.expectEqual(LanguageMode.dockerfile, detect("Dockerfile.prod"));
+    try std.testing.expectEqual(LanguageMode.hcl, detect("infra/main.tf"));
+    try std.testing.expectEqual(LanguageMode.hcl, detect("terraform.tfvars"));
     try std.testing.expectEqual(LanguageMode.powershell, detect("tools/install.ps1"));
     try std.testing.expectEqual(LanguageMode.tsx, detect("frontend/App.tsx"));
     try std.testing.expectEqual(LanguageFamily.web, family(.typescript));

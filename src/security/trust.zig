@@ -37,6 +37,16 @@ pub const Policy = struct {
             };
         }
 
+        if (capability == .network_read) {
+            return switch (self.state) {
+                .locked_down => .{ .block = "workspace is locked down by security policy" },
+                else => if (reason == .automatic)
+                    .{ .confirm = "automatic network read requires consent" }
+                else
+                    .allow,
+            };
+        }
+
         if (capability != .external_command) return .allow;
 
         return switch (self.state) {
@@ -62,4 +72,10 @@ test "untrusted workspaces block automatic external commands" {
 test "trusted manual external command is allowed" {
     const policy = Policy{ .state = .trusted };
     try @import("std").testing.expect(policy.canRun(.external_command, .manual));
+}
+
+test "network reads require manual intent" {
+    const policy = Policy{ .state = .untrusted };
+    try @import("std").testing.expect(policy.canRun(.network_read, .manual));
+    try @import("std").testing.expect(!policy.canRun(.network_read, .automatic));
 }

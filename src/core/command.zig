@@ -12,6 +12,7 @@ pub const Scope = enum {
 
 pub const Capability = enum {
     safe,
+    network_read,
     workspace_write,
     external_command,
 };
@@ -90,6 +91,7 @@ const definitions = [_]Definition{
     .{ .id = "git.overview", .title = "Git and GitHub Overview", .description = "Read branch, remotes, GitHub links, and file changes without executing Git.", .default_key = "ctrl-g", .scope = .workspace, .capability = .safe },
     .{ .id = "git.status", .title = "Git Security Status", .description = "Read Git metadata without executing Git hooks, filters, or fsmonitor.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "github.overview", .title = "GitHub Overview", .description = "Show GitHub repository and Actions links inferred from local Git remotes.", .default_key = "", .scope = .workspace, .capability = .safe },
+    .{ .id = "github.fetch", .title = "Fetch GitHub Live Overview", .description = "Fetch read-only GitHub repo, PR, and Actions data with optional GITHUB_TOKEN.", .default_key = "", .scope = .workspace, .capability = .network_read },
     .{ .id = "demo.run", .title = "Run Demo", .description = "Run an internal zide demo.", .default_key = "", .scope = .demo, .capability = .safe },
 };
 

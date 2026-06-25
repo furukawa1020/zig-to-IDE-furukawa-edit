@@ -2089,6 +2089,29 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
     }
 }
 
+fn drawSelectionForLine(
+    hdc: windows.HDC,
+    editor: RECT,
+    doc: *const document_mod.Document,
+    line: usize,
+    range: SelectionRange,
+    y: c_int,
+) void {
+    const line_start = doc.text.lineStart(line) orelse return;
+    const line_text = doc.text.lineSlice(line);
+    const line_end = line_start + line_text.len;
+    if (range.end <= line_start or range.start > line_end) return;
+
+    const start_col = if (range.start <= line_start) 0 else range.start - line_start;
+    var end_col = if (range.end <= line_end) range.end - line_start else line_text.len + 1;
+    if (end_col <= start_col) end_col = start_col + 1;
+
+    const x = editor.left + GUTTER_WIDTH + EDITOR_TEXT_PADDING_X + @as(c_int, @intCast(start_col)) * CHAR_WIDTH;
+    const right = @min(editor.right - 20, x + @as(c_int, @intCast(end_col - start_col)) * CHAR_WIDTH);
+    if (right <= x) return;
+    fillRect(hdc, .{ .left = x, .top = y - 2, .right = right, .bottom = y + ROW_HEIGHT - 4 }, rgb(37, 74, 105));
+}
+
 fn drawEditorHeader(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
     drawButton(hdc, saveButtonRect(layout), "SAVE");
     drawButton(hdc, buildButtonRect(layout), "BUILD");

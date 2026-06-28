@@ -54,6 +54,11 @@ const ReplaceRequest = struct {
     replace: []const u8,
 };
 
+const SearchDirection = enum {
+    forward,
+    backward,
+};
+
 const TaskMatch = struct {
     name: []u8,
     executable: []u8,
@@ -456,6 +461,8 @@ const GuiState = struct {
     git_scroll_line: usize = 0,
     selection_anchor: ?usize = null,
     editor_dragging: bool = false,
+    last_document_search_query: std.array_list.Managed(u8),
+    last_document_search_options: literal_search.Options = .{},
     show_output: bool = true,
     bottom_panel: BottomPanel = .output,
     quick_panel: QuickPanel,
@@ -473,6 +480,7 @@ const GuiState = struct {
             .allocator = allocator,
             .app = app,
             .collapsed_dirs = collapsed_dirs,
+            .last_document_search_query = std.array_list.Managed(u8).init(allocator),
             .quick_panel = QuickPanel.init(allocator),
             .search_panel = SearchPanel.init(allocator),
         };
@@ -593,6 +601,7 @@ const GuiState = struct {
         self.clearGitOverview();
         self.search_panel.deinit();
         self.quick_panel.deinit();
+        self.last_document_search_query.deinit();
         self.allocator.free(self.collapsed_dirs);
         self.app.deinit();
     }
@@ -729,6 +738,14 @@ const GuiState = struct {
             self.openQuickPanel(.replace_document);
             return;
         }
+        if (std.mem.eql(u8, id, "editor.find_next")) {
+            self.findLastDocumentSearch(.forward);
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.find_previous")) {
+            self.findLastDocumentSearch(.backward);
+            return;
+        }
         if (std.mem.eql(u8, id, "workspace.search")) {
             self.openQuickPanel(.search_workspace);
             return;
@@ -838,7 +855,7 @@ const GuiState = struct {
             self.appendOutput(.stderr, "quick panel failed: {s}\n", .{@errorName(err)});
             return;
         };
-        self.seedQuickPanelFromSelection(mode);
+        if (!self.seedQuickPanelFromSelection(mode)) self.seedQuickPanelFromLastSearch(mode);
         if (mode == .search_workspace) {
             self.show_output = true;
             self.bottom_panel = .output;
@@ -854,14 +871,36 @@ const GuiState = struct {
         }) catch {};
     }
 
-    fn seedQuickPanelFromSelection(self: *GuiState, mode: QuickPanelMode) void {
-        if (mode != .find_document and mode != .replace_document) return;
-        const doc = self.app.documents.active() orelse return;
-        const range = self.selectedRange(doc) orelse return;
-        if (range.end <= range.start or range.end - range.start > 160) return;
+    fn seedQuickPanelFromSelection(self: *GuiState, mode: QuickPanelMode) bool {
+        if (mode != .find_document and mode != .replace_document) return false;
+        const doc = self.app.documents.active() orelse return false;
+        const range = self.selectedRange(doc) orelse return false;
+        if (range.end <= range.start or range.end - range.start > 160) return false;
 
         self.quick_panel.query.clearRetainingCapacity();
         self.quick_panel.query.appendSlice(doc.text.bytes[range.start..range.end]) catch |err| {
+            self.setError(err) catch {};
+            return false;
+        };
+        if (mode == .replace_document) {
+            self.quick_panel.query.appendSlice("=>") catch |err| {
+                self.setError(err) catch {};
+                return false;
+            };
+        }
+        self.quick_panel.rebuild(&self.app) catch |err| {
+            self.setError(err) catch {};
+            return false;
+        };
+        self.rememberDocumentSearchFromQuickPanel();
+        return true;
+    }
+
+    fn seedQuickPanelFromLastSearch(self: *GuiState, mode: QuickPanelMode) void {
+        if (mode != .find_document and mode != .replace_document) return;
+        if (self.last_document_search_query.items.len == 0) return;
+        self.quick_panel.query.clearRetainingCapacity();
+        self.quick_panel.query.appendSlice(self.last_document_search_query.items) catch |err| {
             self.setError(err) catch {};
             return;
         };
@@ -871,6 +910,7 @@ const GuiState = struct {
                 return;
             };
         }
+        self.quick_panel.search_options = self.last_document_search_options;
         self.quick_panel.rebuild(&self.app) catch |err| {
             self.setError(err) catch {};
             return;
@@ -882,6 +922,7 @@ const GuiState = struct {
             self.setError(err) catch {};
             return;
         };
+        self.rememberDocumentSearchFromQuickPanel();
         self.refreshSearchPanelFromQuickPanel();
     }
 
@@ -890,6 +931,7 @@ const GuiState = struct {
             self.setError(err) catch {};
             return;
         };
+        self.rememberDocumentSearchFromQuickPanel();
         self.refreshSearchPanelFromQuickPanel();
     }
 
@@ -909,6 +951,7 @@ const GuiState = struct {
             self.setError(err) catch {};
             return;
         };
+        self.rememberDocumentSearchFromQuickPanel();
         self.setMessage(if (self.quick_panel.search_options.case_sensitive) "Find: case sensitive" else "Find: ignore case") catch {};
     }
 
@@ -919,7 +962,31 @@ const GuiState = struct {
             self.setError(err) catch {};
             return;
         };
+        self.rememberDocumentSearchFromQuickPanel();
         self.setMessage(if (self.quick_panel.search_options.whole_word) "Find: whole word" else "Find: partial word") catch {};
+    }
+
+    fn rememberDocumentSearchFromQuickPanel(self: *GuiState) void {
+        if (!isDocumentSearchMode(self.quick_panel.mode)) return;
+        const query = if (self.quick_panel.mode == .replace_document) blk: {
+            const request = parseReplaceRequest(self.quick_panel.query.items) orelse return;
+            break :blk request.find;
+        } else self.quick_panel.query.items;
+        if (query.len == 0) return;
+        self.last_document_search_query.clearRetainingCapacity();
+        self.last_document_search_query.appendSlice(query) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.last_document_search_options = self.quick_panel.search_options;
+    }
+
+    fn moveQuickPanelDocumentMatch(self: *GuiState, delta: isize) void {
+        if (!isDocumentSearchMode(self.quick_panel.mode)) return;
+        self.quick_panel.moveSelection(delta);
+        const item = self.quick_panel.selectedDocumentMatch() orelse return;
+        self.selectActiveDocumentRange(item.byte_offset, item.end_offset, "Selected search match");
+        self.quick_panel.visible = true;
     }
 
     fn executeSelectedQuickPanelItem(self: *GuiState) void {
@@ -1220,6 +1287,40 @@ const GuiState = struct {
         self.app.mode = .insert;
         self.ensureCursorVisible();
         self.setMessage("Replaced all matches") catch {};
+    }
+
+    fn findLastDocumentSearch(self: *GuiState, direction: SearchDirection) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("No active document") catch {};
+            return;
+        };
+        if (self.last_document_search_query.items.len == 0) {
+            self.openQuickPanel(.find_document);
+            return;
+        }
+
+        const matches = literal_search.findAll(self.allocator, doc.text.bytes, self.last_document_search_query.items, self.last_document_search_options) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        defer self.allocator.free(matches);
+        if (matches.len == 0) {
+            self.setMessage("No matches") catch {};
+            return;
+        }
+
+        const cursor = doc.cursor.position.byte_offset;
+        const selected = self.selectedRange(doc);
+        const pivot = switch (direction) {
+            .forward => if (selected) |range| range.end else cursor,
+            .backward => if (selected) |range| range.start else cursor,
+        };
+        const index = switch (direction) {
+            .forward => findNextMatchIndex(matches, pivot),
+            .backward => findPreviousMatchIndex(matches, pivot),
+        };
+        const match = matches[index];
+        self.selectActiveDocumentRange(match.start, match.end, "Found match");
     }
 
     fn gotoLocalDefinitionAtCursor(self: *GuiState) void {
@@ -2009,6 +2110,7 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
             VK_UP => state.quick_panel.moveSelection(-1),
             VK_DOWN => state.quick_panel.moveSelection(1),
             VK_RETURN => if (ctrl and state.quick_panel.mode == .replace_document) state.replaceAllFromQuickPanel() else state.executeSelectedQuickPanelItem(),
+            VK_F3 => state.moveQuickPanelDocumentMatch(if (shift) -1 else 1),
             VK_F6 => state.toggleQuickPanelCaseSensitive(),
             VK_F7 => state.toggleQuickPanelWholeWord(),
             VK_BACK => state.quickPanelDeleteBackward(),
@@ -2059,6 +2161,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (key == VK_F1) {
         state.openPalette();
+        return;
+    }
+    if (key == VK_F3) {
+        state.findLastDocumentSearch(if (shift) .backward else .forward);
         return;
     }
     if (ctrl and key == 'S') {
@@ -3048,7 +3154,11 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
     drawText(hdc, panel.left + 16, panel.top + 14, rgb(79, 230, 226), title);
     if (isDocumentSearchMode(state.quick_panel.mode)) {
         var options_buf: [120]u8 = undefined;
-        const options = std.fmt.bufPrint(&options_buf, "F6 {s}  F7 {s}{s}", .{
+        const count = state.quick_panel.itemCount();
+        const current = if (count == 0) 0 else @min(state.quick_panel.selected_index + 1, count);
+        const options = std.fmt.bufPrint(&options_buf, "{d}/{d}  F3 next  F6 {s}  F7 {s}{s}", .{
+            current,
+            count,
             if (state.quick_panel.search_options.case_sensitive) "case" else "ignore",
             if (state.quick_panel.search_options.whole_word) "word" else "partial",
             if (state.quick_panel.mode == .replace_document) "  Ctrl+Enter all" else "",
@@ -3207,6 +3317,22 @@ fn findDocumentMatches(
 
 fn isDocumentSearchMode(mode: QuickPanelMode) bool {
     return mode == .find_document or mode == .replace_document;
+}
+
+fn findNextMatchIndex(matches: []const literal_search.Match, pivot: usize) usize {
+    for (matches, 0..) |match, index| {
+        if (match.start >= pivot) return index;
+    }
+    return 0;
+}
+
+fn findPreviousMatchIndex(matches: []const literal_search.Match, pivot: usize) usize {
+    var index = matches.len;
+    while (index > 0) {
+        index -= 1;
+        if (matches[index].end <= pivot) return index;
+    }
+    return matches.len - 1;
 }
 
 fn parseReplaceRequest(query: []const u8) ?ReplaceRequest {
@@ -3938,6 +4064,7 @@ const VK_RIGHT: WPARAM = 0x27;
 const VK_DOWN: WPARAM = 0x28;
 const VK_DELETE: WPARAM = 0x2E;
 const VK_F1: WPARAM = 0x70;
+const VK_F3: WPARAM = 0x72;
 const VK_F6: WPARAM = 0x75;
 const VK_F7: WPARAM = 0x76;
 const VK_F8: WPARAM = 0x77;

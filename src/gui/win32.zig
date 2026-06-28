@@ -95,6 +95,7 @@ const QuickPanel = struct {
     allocator: std.mem.Allocator,
     visible: bool = false,
     mode: QuickPanelMode = .find_file,
+    search_options: literal_search.Options = .{},
     query: std.array_list.Managed(u8),
     selected_index: usize = 0,
     file_matches: ?[]file_finder.Match = null,
@@ -212,7 +213,7 @@ const QuickPanel = struct {
                 if (self.query.items.len > 0) {
                     const active_index = app.documents.activeIndex() orelse return;
                     const doc = &app.documents.documents.items[active_index];
-                    self.document_matches = try findDocumentMatches(self.allocator, doc, self.query.items, 128);
+                    self.document_matches = try findDocumentMatches(self.allocator, doc, self.query.items, self.search_options, 128);
                 }
             },
             .replace_document => {
@@ -220,7 +221,7 @@ const QuickPanel = struct {
                 if (request.find.len > 0) {
                     const active_index = app.documents.activeIndex() orelse return;
                     const doc = &app.documents.documents.items[active_index];
-                    self.document_matches = try findDocumentMatches(self.allocator, doc, request.find, 128);
+                    self.document_matches = try findDocumentMatches(self.allocator, doc, request.find, self.search_options, 128);
                 }
             },
             .search_workspace => {
@@ -901,6 +902,26 @@ const GuiState = struct {
         };
     }
 
+    fn toggleQuickPanelCaseSensitive(self: *GuiState) void {
+        if (!isDocumentSearchMode(self.quick_panel.mode)) return;
+        self.quick_panel.search_options.case_sensitive = !self.quick_panel.search_options.case_sensitive;
+        self.quick_panel.rebuild(&self.app) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.setMessage(if (self.quick_panel.search_options.case_sensitive) "Find: case sensitive" else "Find: ignore case") catch {};
+    }
+
+    fn toggleQuickPanelWholeWord(self: *GuiState) void {
+        if (!isDocumentSearchMode(self.quick_panel.mode)) return;
+        self.quick_panel.search_options.whole_word = !self.quick_panel.search_options.whole_word;
+        self.quick_panel.rebuild(&self.app) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.setMessage(if (self.quick_panel.search_options.whole_word) "Find: whole word" else "Find: partial word") catch {};
+    }
+
     fn executeSelectedQuickPanelItem(self: *GuiState) void {
         switch (self.quick_panel.mode) {
             .find_file => {
@@ -1129,6 +1150,76 @@ const GuiState = struct {
         self.app.mode = .insert;
         self.ensureCursorVisible();
         self.setMessage("Replaced match") catch {};
+    }
+
+    fn replaceAllFromQuickPanel(self: *GuiState) void {
+        if (self.quick_panel.mode != .replace_document) return;
+        const request = parseReplaceRequest(self.quick_panel.query.items) orelse {
+            self.setMessage("Type search=>replacement") catch {};
+            return;
+        };
+        const find = self.allocator.dupe(u8, request.find) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        defer self.allocator.free(find);
+        const replacement = self.allocator.dupe(u8, request.replace) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        defer self.allocator.free(replacement);
+        const options = self.quick_panel.search_options;
+        self.quick_panel.close();
+        self.replaceAllActiveDocumentMatches(find, replacement, options);
+    }
+
+    fn replaceAllActiveDocumentMatches(self: *GuiState, find: []const u8, replacement: []const u8, options: literal_search.Options) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("No active document") catch {};
+            return;
+        };
+        const matches = literal_search.findAll(self.allocator, doc.text.bytes, find, options) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        defer self.allocator.free(matches);
+        if (matches.len == 0) {
+            self.setMessage("No matches to replace") catch {};
+            return;
+        }
+
+        var next: std.Io.Writer.Allocating = .init(self.allocator);
+        defer next.deinit();
+        var cursor: usize = 0;
+        for (matches) |match| {
+            next.writer.writeAll(doc.text.bytes[cursor..match.start]) catch |err| {
+                self.setError(err) catch {};
+                return;
+            };
+            next.writer.writeAll(replacement) catch |err| {
+                self.setError(err) catch {};
+                return;
+            };
+            cursor = match.end;
+        }
+        next.writer.writeAll(doc.text.bytes[cursor..]) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+
+        const first_start = matches[0].start;
+        doc.replaceRange(0, doc.text.bytes.len, next.written()) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        const target = @min(first_start + replacement.len, doc.text.bytes.len);
+        const position = doc.positionFromOffset(target) catch doc.cursor.position;
+        navigation.setCursor(doc, position);
+        self.clearSelection();
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureCursorVisible();
+        self.setMessage("Replaced all matches") catch {};
     }
 
     fn gotoLocalDefinitionAtCursor(self: *GuiState) void {
@@ -1917,7 +2008,9 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
             VK_ESCAPE => state.quick_panel.close(),
             VK_UP => state.quick_panel.moveSelection(-1),
             VK_DOWN => state.quick_panel.moveSelection(1),
-            VK_RETURN => state.executeSelectedQuickPanelItem(),
+            VK_RETURN => if (ctrl and state.quick_panel.mode == .replace_document) state.replaceAllFromQuickPanel() else state.executeSelectedQuickPanelItem(),
+            VK_F6 => state.toggleQuickPanelCaseSensitive(),
+            VK_F7 => state.toggleQuickPanelWholeWord(),
             VK_BACK => state.quickPanelDeleteBackward(),
             else => {},
         }
@@ -2307,6 +2400,7 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
             if (current_line) {
                 fillRect(hdc, RECT{ .left = editor.left + GUTTER_WIDTH, .top = y - 2, .right = editor.right, .bottom = y + ROW_HEIGHT - 2 }, rgb(20, 27, 34));
             }
+            drawSearchHighlightsForLine(hdc, state, editor, doc, line, y);
             if (selection) |range| {
                 drawSelectionForLine(hdc, editor, doc, line, range, y);
             }
@@ -2329,6 +2423,30 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
     } else {
         drawText(hdc, editor.left + 22, HEADER_HEIGHT + 10, rgb(199, 206, 214), "Click a file to open it.");
         drawText(hdc, editor.left + 22, HEADER_HEIGHT + 38, rgb(126, 138, 150), "F1 opens commands. Ctrl+S saves. Ctrl+B prepares build.");
+    }
+}
+
+fn drawSearchHighlightsForLine(
+    hdc: windows.HDC,
+    state: *const GuiState,
+    editor: RECT,
+    doc: *const document_mod.Document,
+    line: usize,
+    y: c_int,
+) void {
+    if (!state.quick_panel.visible or !isDocumentSearchMode(state.quick_panel.mode)) return;
+    const items = state.quick_panel.document_matches orelse return;
+    const line_start = doc.text.lineStart(line) orelse return;
+    const line_end = line_start + doc.text.lineSlice(line).len;
+    for (items) |item| {
+        if (item.end_offset <= line_start or item.byte_offset > line_end) continue;
+        const start_col = if (item.byte_offset <= line_start) 0 else item.byte_offset - line_start;
+        var end_col = if (item.end_offset <= line_end) item.end_offset - line_start else line_end - line_start;
+        if (end_col <= start_col) end_col = start_col + 1;
+        const x = editor.left + GUTTER_WIDTH + EDITOR_TEXT_PADDING_X + @as(c_int, @intCast(start_col)) * CHAR_WIDTH;
+        const right = @min(editor.right - 20, x + @as(c_int, @intCast(end_col - start_col)) * CHAR_WIDTH);
+        if (right <= x) continue;
+        fillRect(hdc, .{ .left = x, .top = y - 2, .right = right, .bottom = y + ROW_HEIGHT - 4 }, rgb(70, 57, 28));
     }
 }
 
@@ -2928,6 +3046,15 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .document_symbols => "SYMBOLS",
     };
     drawText(hdc, panel.left + 16, panel.top + 14, rgb(79, 230, 226), title);
+    if (isDocumentSearchMode(state.quick_panel.mode)) {
+        var options_buf: [120]u8 = undefined;
+        const options = std.fmt.bufPrint(&options_buf, "F6 {s}  F7 {s}{s}", .{
+            if (state.quick_panel.search_options.case_sensitive) "case" else "ignore",
+            if (state.quick_panel.search_options.whole_word) "word" else "partial",
+            if (state.quick_panel.mode == .replace_document) "  Ctrl+Enter all" else "",
+        }) catch "";
+        drawTextRight(hdc, panel.left + 260, panel.top + 14, panel.right - 16, rgb(180, 190, 200), options);
+    }
     drawTextClipped(hdc, panel.left + 16, panel.top + 44, panel.right - 16, rgb(235, 239, 244), state.quick_panel.query.items);
 
     var y = panel.top + PALETTE_MATCH_TOP;
@@ -3049,9 +3176,10 @@ fn findDocumentMatches(
     allocator: std.mem.Allocator,
     doc: *const document_mod.Document,
     query: []const u8,
+    options: literal_search.Options,
     max_results: usize,
 ) ![]DocumentMatch {
-    const literal_matches = try literal_search.findAll(allocator, doc.text.bytes, query, .{});
+    const literal_matches = try literal_search.findAll(allocator, doc.text.bytes, query, options);
     defer allocator.free(literal_matches);
 
     var matches = std.array_list.Managed(DocumentMatch).init(allocator);
@@ -3075,6 +3203,10 @@ fn findDocumentMatches(
     }
 
     return try matches.toOwnedSlice();
+}
+
+fn isDocumentSearchMode(mode: QuickPanelMode) bool {
+    return mode == .find_document or mode == .replace_document;
 }
 
 fn parseReplaceRequest(query: []const u8) ?ReplaceRequest {
@@ -3807,6 +3939,7 @@ const VK_DOWN: WPARAM = 0x28;
 const VK_DELETE: WPARAM = 0x2E;
 const VK_F1: WPARAM = 0x70;
 const VK_F6: WPARAM = 0x75;
+const VK_F7: WPARAM = 0x76;
 const VK_F8: WPARAM = 0x77;
 const VK_F12: WPARAM = 0x7B;
 

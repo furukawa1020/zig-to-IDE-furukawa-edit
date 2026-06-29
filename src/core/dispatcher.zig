@@ -23,6 +23,7 @@ const workspace_audit = @import("../security/workspace_audit.zig");
 const modes = @import("../language/modes.zig");
 const package_trust = @import("../security/package_trust.zig");
 const polyglot_scanner = @import("../security/polyglot_scanner.zig");
+const text_integrity = @import("../security/text_integrity.zig");
 const zig_scanner = @import("../security/zig_scanner.zig");
 
 pub const Result = union(enum) {
@@ -528,7 +529,6 @@ fn syncDiagnosticsFromConsole(app: *app_mod.App) !void {
 fn runSaveSafetyCheck(app: *app_mod.App) !?[]const u8 {
     const doc = app.documents.active() orelse return null;
     const path = doc.path orelse return null;
-    if (!modes.isZigFamily(doc.language) and !polyglot_scanner.isInterestingPath(path, doc.language)) return null;
 
     var scan = try scanDocumentSecurity(app.allocator, path, doc.language, doc.text.bytes);
     defer scan.deinit();
@@ -553,16 +553,34 @@ fn scanDocumentSecurity(
     language: modes.LanguageMode,
     source: []const u8,
 ) !security_findings.Collection {
+    var collection = try text_integrity.scan(allocator, source, .{ .path = path });
+    errdefer collection.deinit();
+
     if (language == .zon or std.mem.eql(u8, path, "build.zig.zon")) {
-        return try package_trust.scanZon(allocator, source, .{ .path = path });
+        var package_findings = try package_trust.scanZon(allocator, source, .{ .path = path });
+        defer package_findings.deinit();
+        try appendFindings(&collection, &package_findings);
+        return collection;
     }
     if (language == .zig) {
-        return try zig_scanner.scanSource(allocator, source, .{ .path = path });
+        var zig_findings = try zig_scanner.scanSource(allocator, source, .{ .path = path });
+        defer zig_findings.deinit();
+        try appendFindings(&collection, &zig_findings);
+        return collection;
     }
     if (polyglot_scanner.isInterestingPath(path, language)) {
-        return try polyglot_scanner.scanSource(allocator, source, .{ .path = path, .language = language });
+        var polyglot_findings = try polyglot_scanner.scanSource(allocator, source, .{ .path = path, .language = language });
+        defer polyglot_findings.deinit();
+        try appendFindings(&collection, &polyglot_findings);
+        return collection;
     }
-    return security_findings.Collection.init(allocator);
+    return collection;
+}
+
+fn appendFindings(target: *security_findings.Collection, source: *const security_findings.Collection) !void {
+    for (source.items.items) |item| {
+        try target.appendFinding(item);
+    }
 }
 
 fn renderSaveSafetyCheck(app: *app_mod.App, path: []const u8, scan: *const security_findings.Collection) !void {

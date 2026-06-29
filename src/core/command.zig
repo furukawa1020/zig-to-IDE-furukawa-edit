@@ -65,6 +65,8 @@ const definitions = [_]Definition{
     .{ .id = "editor.replace", .title = "Replace in File", .description = "Replace the selected current-document match.", .default_key = "ctrl-h", .scope = .editor, .capability = .safe },
     .{ .id = "editor.find_next", .title = "Find Next", .description = "Jump to the next current-document match.", .default_key = "f3", .scope = .editor, .capability = .safe },
     .{ .id = "editor.find_previous", .title = "Find Previous", .description = "Jump to the previous current-document match.", .default_key = "shift-f3", .scope = .editor, .capability = .safe },
+    .{ .id = "editor.normalize_newlines_lf", .title = "Normalize Line Endings: LF", .description = "Convert current buffer line endings to LF without saving automatically.", .default_key = "", .scope = .editor, .capability = .safe },
+    .{ .id = "editor.normalize_newlines_crlf", .title = "Normalize Line Endings: CRLF", .description = "Convert current buffer line endings to CRLF without saving automatically.", .default_key = "", .scope = .editor, .capability = .safe },
     .{ .id = "editor.delete_line", .title = "Delete Line", .description = "Delete the current editor line.", .default_key = "ctrl-shift-k", .scope = .editor, .capability = .safe },
     .{ .id = "editor.duplicate_line", .title = "Duplicate Line", .description = "Duplicate the current editor line below.", .default_key = "ctrl-shift-d", .scope = .editor, .capability = .safe },
     .{ .id = "editor.move_line_up", .title = "Move Line Up", .description = "Move the current editor line upward.", .default_key = "alt-up", .scope = .editor, .capability = .safe },

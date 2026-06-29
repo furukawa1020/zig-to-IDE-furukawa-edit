@@ -5,6 +5,8 @@ const modes = @import("../language/modes.zig");
 const types = @import("../core/types.zig");
 const undo_mod = @import("undo.zig");
 
+pub const Newline = buffer.Newline;
+
 pub const Document = struct {
     allocator: std.mem.Allocator,
     path: ?[]u8,
@@ -52,6 +54,75 @@ pub const Document = struct {
         try self.text.replaceRange(start, end, bytes);
         self.cursor.position = try self.positionFromOffset(start + bytes.len);
         self.dirty = true;
+    }
+
+    pub fn insertPreferredNewline(self: *Document, offset: usize) !void {
+        try self.insert(offset, self.preferredNewline());
+    }
+
+    pub fn normalizeNewlines(self: *Document, target: Newline) !bool {
+        const target_bytes = switch (target) {
+            .lf => "\n",
+            .crlf => "\r\n",
+            else => return error.UnsupportedNewlineStyle,
+        };
+
+        var rewritten: std.Io.Writer.Allocating = .init(self.allocator);
+        defer rewritten.deinit();
+
+        var changed = false;
+        var i: usize = 0;
+        while (i < self.text.bytes.len) {
+            const byte = self.text.bytes[i];
+            if (byte == '\r') {
+                if (i + 1 < self.text.bytes.len and self.text.bytes[i + 1] == '\n') {
+                    if (!std.mem.eql(u8, self.text.bytes[i .. i + 2], target_bytes)) changed = true;
+                    try rewritten.writer.writeAll(target_bytes);
+                    i += 2;
+                    continue;
+                }
+
+                changed = true;
+                try rewritten.writer.writeAll(target_bytes);
+                i += 1;
+                continue;
+            }
+
+            if (byte == '\n') {
+                if (!std.mem.eql(u8, self.text.bytes[i .. i + 1], target_bytes)) changed = true;
+                try rewritten.writer.writeAll(target_bytes);
+                i += 1;
+                continue;
+            }
+
+            try rewritten.writer.writeByte(byte);
+            i += 1;
+        }
+
+        if (!changed) return false;
+
+        const before_cursor = self.cursor.position;
+        try self.replaceRange(0, self.text.bytes.len, rewritten.written());
+        const target_line = @min(before_cursor.line, self.text.lineCount() - 1);
+        const target_column = @min(before_cursor.column, self.text.lineSlice(target_line).len);
+        const target_offset = try self.text.lineColumnToOffset(target_line, target_column);
+        self.cursor.position = try self.positionFromOffset(target_offset);
+        return true;
+    }
+
+    pub fn preferredNewline(self: *const Document) []const u8 {
+        return switch (self.text.newline) {
+            .crlf => "\r\n",
+            else => "\n",
+        };
+    }
+
+    pub fn newlineLabel(self: *const Document) []const u8 {
+        return newlineLabelFor(self.text.newline);
+    }
+
+    pub fn encodingLabel(self: *const Document) []const u8 {
+        return if (self.text.valid_utf8) "UTF-8" else "BYTES";
     }
 
     pub fn deleteLine(self: *Document, line: usize) !bool {
@@ -141,13 +212,6 @@ pub const Document = struct {
             self.text.bytes.len;
         return .{ .start = start, .content_end = content_end, .end = end };
     }
-
-    fn preferredNewline(self: *const Document) []const u8 {
-        return switch (self.text.newline) {
-            .crlf => "\r\n",
-            else => "\n",
-        };
-    }
 };
 
 const LineRange = struct {
@@ -155,6 +219,15 @@ const LineRange = struct {
     content_end: usize,
     end: usize,
 };
+
+pub fn newlineLabelFor(newline: Newline) []const u8 {
+    return switch (newline) {
+        .none => "NONE",
+        .lf => "LF",
+        .crlf => "CRLF",
+        .mixed => "MIXED",
+    };
+}
 
 test "document edit tracks dirty and undo" {
     var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "pub fn main() void {}\n");
@@ -196,4 +269,23 @@ test "document line duplicate handles final line without newline" {
 
     try std.testing.expect(try doc.duplicateLine(1));
     try std.testing.expectEqualStrings("a\nb\nb", doc.text.bytes);
+}
+
+test "document preserves preferred crlf on inserted newline" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "a\r\nb\r\n");
+    defer doc.deinit();
+
+    try doc.insertPreferredNewline(3);
+    try std.testing.expectEqualStrings("a\r\n\r\nb\r\n", doc.text.bytes);
+    try std.testing.expectEqual(buffer.Newline.crlf, doc.text.newline);
+}
+
+test "document normalizes mixed newlines explicitly" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "a\r\nb\nc\rd");
+    defer doc.deinit();
+
+    try std.testing.expectEqual(buffer.Newline.mixed, doc.text.newline);
+    try std.testing.expect(try doc.normalizeNewlines(.lf));
+    try std.testing.expectEqualStrings("a\nb\nc\nd", doc.text.bytes);
+    try std.testing.expectEqual(buffer.Newline.lf, doc.text.newline);
 }

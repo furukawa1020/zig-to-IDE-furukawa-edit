@@ -746,6 +746,14 @@ const GuiState = struct {
             self.findLastDocumentSearch(.backward);
             return;
         }
+        if (std.mem.eql(u8, id, "editor.normalize_newlines_lf")) {
+            self.normalizeActiveDocumentNewlines(.lf);
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.normalize_newlines_crlf")) {
+            self.normalizeActiveDocumentNewlines(.crlf);
+            return;
+        }
         if (std.mem.eql(u8, id, "workspace.search")) {
             self.openQuickPanel(.search_workspace);
             return;
@@ -1544,6 +1552,36 @@ const GuiState = struct {
         self.ensureCursorVisible();
     }
 
+    fn insertNewline(self: *GuiState) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("Open a file before typing") catch {};
+            return;
+        };
+        self.insertText(doc.preferredNewline());
+    }
+
+    fn normalizeActiveDocumentNewlines(self: *GuiState, newline: document_mod.Newline) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("No active document") catch {};
+            return;
+        };
+        const changed = doc.normalizeNewlines(newline) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.clearSelection();
+        self.ensureCursorVisible();
+        if (changed) {
+            self.setMessage(switch (newline) {
+                .lf => "Normalized line endings to LF",
+                .crlf => "Normalized line endings to CRLF",
+                else => "Normalized line endings",
+            }) catch {};
+        } else {
+            self.setMessage("Line endings already normalized") catch {};
+        }
+    }
+
     fn undo(self: *GuiState) void {
         const doc = self.app.documents.active() orelse return;
         const changed = doc.undo() catch |err| {
@@ -2272,7 +2310,7 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
             if (state.app.focus == .files) {
                 state.openSelected();
             } else if (state.app.mode == .insert) {
-                state.insertText("\n");
+                state.insertNewline();
             }
         },
         VK_TAB => {
@@ -2330,7 +2368,7 @@ fn handleChar(state: *GuiState, key: WPARAM) void {
 
     if (state.app.mode != .insert or state.app.focus != .editor) return;
     if (codepoint == '\r') {
-        state.insertText("\n");
+        state.insertNewline();
         return;
     }
     if (codepoint == '\t') {
@@ -3236,11 +3274,13 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
     const cursor = if (state.app.documents.active()) |doc| doc.cursor.position else null;
     const dirty = if (state.app.documents.active()) |doc| doc.dirty else false;
     const language = if (state.app.documents.active()) |doc| modes.label(doc.language) else "none";
+    const newline = if (state.app.documents.active()) |doc| doc.newlineLabel() else "NONE";
+    const encoding = if (state.app.documents.active()) |doc| doc.encodingLabel() else "UTF-8";
     const current_risk = currentDocumentRiskCounts(state);
     const git_changes = if (state.git_overview) |overview| overview.changes.len else 0;
     const text = std.fmt.bufPrint(
         &buffer,
-        " {s}/{s}  |  line:{d} col:{d} {s} lang:{s} risk:{d}/{d}/{d} git:{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
+        " {s}/{s}  |  line:{d} col:{d} {s} lang:{s} fmt:{s}/{s} risk:{d}/{d}/{d} git:{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
         .{
             mode,
             focus,
@@ -3248,6 +3288,8 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
             if (cursor) |position| position.column + 1 else 0,
             if (dirty) "dirty" else "clean",
             language,
+            encoding,
+            newline,
             current_risk.critical,
             current_risk.high,
             current_risk.medium,

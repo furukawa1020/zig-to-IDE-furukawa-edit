@@ -17,6 +17,7 @@ pub const Category = enum {
     secret_flow,
     output_sanitizer,
     ide_self_protection,
+    text_integrity,
     allocator_policy,
     git_trust,
     polyglot_trust,

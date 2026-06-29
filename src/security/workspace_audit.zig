@@ -2,8 +2,10 @@ const std = @import("std");
 const build_firewall = @import("build_firewall.zig");
 const findings = @import("findings.zig");
 const git_status = @import("../git/status.zig");
+const modes = @import("../language/modes.zig");
 const package_trust = @import("package_trust.zig");
 const polyglot_scanner = @import("polyglot_scanner.zig");
+const text_integrity = @import("text_integrity.zig");
 const workspace = @import("../workspace/workspace.zig");
 const zig_scanner = @import("zig_scanner.zig");
 
@@ -41,6 +43,10 @@ pub fn auditWorkspace(allocator: std.mem.Allocator, ws: *const workspace.Workspa
             continue;
         };
         defer allocator.free(bytes);
+
+        var text_findings = try text_integrity.scan(allocator, bytes, .{ .path = entry.path });
+        defer text_findings.deinit();
+        try appendAll(&collection, &text_findings);
 
         if (std.mem.eql(u8, entry.path, "build.zig")) {
             var build_findings = try build_firewall.scanBuildZig(allocator, bytes, .{ .path = entry.path });
@@ -80,8 +86,9 @@ fn appendAll(target: *findings.Collection, source: *const findings.Collection) !
     }
 }
 
-fn isInteresting(path: []const u8, language: @import("../language/modes.zig").LanguageMode) bool {
-    return std.mem.endsWith(u8, path, ".zig") or
+fn isInteresting(path: []const u8, language: modes.LanguageMode) bool {
+    return modes.isRecognized(language) or
+        std.mem.endsWith(u8, path, ".zig") or
         std.mem.eql(u8, path, "build.zig.zon") or
         polyglot_scanner.isInterestingPath(path, language);
 }

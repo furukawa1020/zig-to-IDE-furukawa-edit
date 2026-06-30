@@ -4,6 +4,7 @@ const findings = @import("findings.zig");
 const git_status = @import("../git/status.zig");
 const modes = @import("../language/modes.zig");
 const package_trust = @import("package_trust.zig");
+const path_audit = @import("path_audit.zig");
 const polyglot_scanner = @import("polyglot_scanner.zig");
 const text_integrity = @import("text_integrity.zig");
 const workspace = @import("../workspace/workspace.zig");
@@ -27,6 +28,7 @@ pub fn auditWorkspace(allocator: std.mem.Allocator, ws: *const workspace.Workspa
     var scanned: usize = 0;
     var truncated = false;
     for (ws.entries.items) |entry| {
+        try path_audit.scanPath(&collection, entry.path, entry.kind == .file);
         if (scanned >= options.max_files) {
             truncated = true;
             break;

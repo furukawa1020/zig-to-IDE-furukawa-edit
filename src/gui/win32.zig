@@ -56,6 +56,16 @@ const SecurityPanelAction = enum {
     clean,
 };
 
+const TutorialLanguage = enum {
+    ja,
+    en,
+};
+
+const TutorialPanelAction = enum {
+    ja,
+    en,
+};
+
 const SelectionRange = struct {
     start: usize,
     end: usize,
@@ -485,6 +495,7 @@ const GuiState = struct {
     last_document_search_options: literal_search.Options = .{},
     show_output: bool = true,
     bottom_panel: BottomPanel = .output,
+    tutorial_language: TutorialLanguage = .ja,
     quick_panel: QuickPanel,
     search_panel: SearchPanel,
     git_overview: ?git_repository.Overview = null,
@@ -832,6 +843,17 @@ const GuiState = struct {
             .crlf => self.normalizeActiveDocumentNewlines(.crlf),
             .clean => self.sanitizeActiveDocumentHiddenControls(),
         }
+    }
+
+    fn executeTutorialPanelAction(self: *GuiState, action: TutorialPanelAction) void {
+        self.tutorial_language = switch (action) {
+            .ja => .ja,
+            .en => .en,
+        };
+        self.tutorial_scroll_line = 0;
+        self.show_output = true;
+        self.bottom_panel = .tutorial;
+        self.setMessage(if (self.tutorial_language == .ja) "チュートリアル: 日本語" else "Tutorial: English") catch {};
     }
 
     fn runTaskByName(self: *GuiState, name: []const u8) void {
@@ -2194,7 +2216,7 @@ const GuiState = struct {
             },
             .tutorial => {
                 const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
-                scrollIndex(&self.tutorial_scroll_line, tutorialLineCount(), visible, delta);
+                scrollIndex(&self.tutorial_scroll_line, tutorialLineCount(self.tutorial_language), visible, delta);
             },
         }
     }
@@ -2386,6 +2408,13 @@ const GuiState = struct {
                 const content = bottomPanelContentRect(layout.output);
                 if (securityPanelActionAt(content, x, y)) |action| {
                     self.executeSecurityPanelAction(action);
+                    return;
+                }
+            }
+            if (self.bottom_panel == .tutorial) {
+                const content = bottomPanelContentRect(layout.output);
+                if (tutorialPanelActionAt(content, x, y)) |action| {
+                    self.executeTutorialPanelAction(action);
                     return;
                 }
             }
@@ -3472,10 +3501,15 @@ fn drawTutorialPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
 
     const counts = riskCounts(&state.app.security_findings);
     var header_buf: [260]u8 = undefined;
+    const language_label = switch (state.tutorial_language) {
+        .ja => "JA",
+        .en => "EN",
+    };
     const header = std.fmt.bufPrint(
         &header_buf,
-        "ZIDE TUTORIAL  trust:{s} findings:{d} critical:{d} high:{d} medium:{d}",
+        "ZIDE TUTORIAL  lang:{s} trust:{s} findings:{d} critical:{d} high:{d} medium:{d}",
         .{
+            language_label,
             @tagName(state.app.runtime.trust_state),
             state.app.security_findings.items.items.len,
             counts.critical,
@@ -3483,10 +3517,12 @@ fn drawTutorialPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
             counts.medium,
         },
     ) catch "ZIDE TUTORIAL";
-    drawTextClipped(hdc, rect.left + 16, rect.top + 10, rect.right - 16, rgb(79, 230, 226), header);
+    const header_right = if (tutorialPanelHasActionButtons(rect)) rect.right - 156 else rect.right - 16;
+    drawTextClipped(hdc, rect.left + 16, rect.top + 10, header_right, rgb(79, 230, 226), header);
+    drawTutorialPanelActions(hdc, rect, state.tutorial_language);
 
     const rows = @max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT, ROW_HEIGHT));
-    const lines = tutorialLines();
+    const lines = tutorialLines(state.tutorial_language);
     const start = @min(state.tutorial_scroll_line, if (lines.len > @as(usize, @intCast(rows))) lines.len - @as(usize, @intCast(rows)) else 0);
     var row: usize = 0;
     var y = rect.top + HEADER_HEIGHT;
@@ -3498,11 +3534,63 @@ fn drawTutorialPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     }
 }
 
+fn drawTutorialPanelActions(hdc: windows.HDC, rect: RECT, active_language: TutorialLanguage) void {
+    if (!tutorialPanelHasActionButtons(rect)) return;
+    const actions = [_]TutorialPanelAction{ .ja, .en };
+    for (actions) |action| {
+        const active = switch (action) {
+            .ja => active_language == .ja,
+            .en => active_language == .en,
+        };
+        const button = tutorialPanelActionButtonRect(rect, action);
+        fillRect(hdc, button, if (active) rgb(51, 153, 235) else rgb(32, 42, 50));
+        fillRect(hdc, RECT{ .left = button.left, .top = button.top, .right = button.right, .bottom = button.top + 1 }, rgb(79, 230, 226));
+        drawTextClipped(hdc, button.left + 10, button.top + 5, button.right - 6, if (active) rgb(16, 19, 22) else rgb(226, 234, 242), tutorialPanelActionLabel(action));
+    }
+}
+
+fn tutorialPanelActionAt(rect: RECT, x: c_int, y: c_int) ?TutorialPanelAction {
+    if (!tutorialPanelHasActionButtons(rect)) return null;
+    if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
+    const actions = [_]TutorialPanelAction{ .ja, .en };
+    for (actions) |action| {
+        if (pointIn(tutorialPanelActionButtonRect(rect, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn tutorialPanelHasActionButtons(rect: RECT) bool {
+    return rect.right - rect.left >= 360;
+}
+
+fn tutorialPanelActionButtonRect(rect: RECT, action: TutorialPanelAction) RECT {
+    const width: c_int = 58;
+    const gap: c_int = 8;
+    const slot: c_int = switch (action) {
+        .en => 0,
+        .ja => 1,
+    };
+    const right = rect.right - 12 - slot * (width + gap);
+    return .{
+        .left = right - width,
+        .top = rect.top + 8,
+        .right = right,
+        .bottom = rect.top + 32,
+    };
+}
+
+fn tutorialPanelActionLabel(action: TutorialPanelAction) []const u8 {
+    return switch (action) {
+        .ja => "JA",
+        .en => "EN",
+    };
+}
+
 fn tutorialLineColor(line: []const u8) windows.COLORREF {
     if (std.mem.startsWith(u8, line, "==")) return rgb(255, 207, 92);
-    if (std.mem.startsWith(u8, line, "SECURITY")) return rgb(255, 118, 118);
+    if (std.mem.startsWith(u8, line, "SECURITY") or std.mem.startsWith(u8, line, "セキュリティ")) return rgb(255, 118, 118);
     if (std.mem.startsWith(u8, line, "ZIG")) return rgb(79, 230, 226);
-    if (std.mem.startsWith(u8, line, "TRY")) return rgb(165, 214, 167);
+    if (std.mem.startsWith(u8, line, "TRY") or std.mem.startsWith(u8, line, "今すぐ")) return rgb(165, 214, 167);
     return rgb(210, 218, 226);
 }
 
@@ -4401,52 +4489,97 @@ fn currentDocumentRiskCounts(state: *GuiState) RiskCounts {
     return pathRiskCounts(state, path);
 }
 
-fn tutorialLines() []const []const u8 {
-    return &.{
-        "== QUICK START ==",
-        "F1 opens this tutorial. Ctrl+Shift+P opens commands. Ctrl+O opens a workspace folder.",
-        "Click files on the left. Edit in insert mode. Ctrl+S saves with atomic write.",
-        "Ctrl+F finds in the file. Ctrl+H replaces in the file. Ctrl+Shift+F searches the workspace.",
-        "F12 jumps to a local Zig definition. Shift+F12 finds references. F2 opens safe rename preview.",
-        "",
-        "== RUNNING CODE SAFELY ==",
-        "Build, test, run, and task execution go through consent and trust policy.",
-        "Opening a folder never executes hooks, build scripts, package scripts, or Git filters.",
-        "Output is captured into the panel and diagnostics are parsed from sanitized text.",
-        "",
-        "== SECURITY WORKFLOW ==",
-        "Open SEC. Press AUDIT for workspace static review. Press SCAN for the current file.",
-        "Use LF/CRLF to normalize line endings. Use CLEAN to remove NUL and bidi control markers.",
-        "Click a security finding to jump to the exact byte range when ZIDE can identify it.",
-        "Press LOCK when a workspace feels suspicious; writes and execution are blocked by policy.",
-        "",
-        "SECURITY DIFFERENCE: byte-first editor",
-        "ZIDE preserves raw bytes and shows UTF-8 validity plus LF/CRLF/MIXED state in the status bar.",
-        "Hidden text hazards are scanned without shelling out: NUL, invalid UTF-8, bidi controls, mixed endings.",
-        "",
-        "SECURITY DIFFERENCE: trust before execution",
-        "Commands are classified as safe, workspace_write, network_read, network_write, or external_command.",
-        "Untrusted workspaces can be read and edited, but external execution and network writes are blocked.",
-        "Critical findings force locked_down posture; high findings can push trusted workspaces into paranoid mode.",
-        "",
-        "SECURITY DIFFERENCE: Git without hook execution",
-        "The Git panel reads repository metadata directly instead of running git status.",
-        "This avoids hooks, filters, fsmonitor, aliases, and configured Git-side command execution.",
-        "",
-        "SECURITY DIFFERENCE: Zig-native scanner core",
-        "Build.zig, build.zig.zon, CI files, IaC, scripts, env files, and polyglot package edges are scanned in Zig.",
-        "No external parser is trusted for the security baseline. The IDE owns the first-pass audit.",
-        "",
-        "TRY THIS NOW",
-        "1. Press SEC then AUDIT.",
-        "2. Click a finding to jump to it.",
-        "3. Press CLEAN or LF/CRLF when text-integrity findings appear.",
-        "4. Press LOCK to see the workspace enter locked_down trust posture.",
+fn tutorialLines(language: TutorialLanguage) []const []const u8 {
+    return switch (language) {
+        .ja => &.{
+            "== はじめに ==",
+            "F1 でこのチュートリアルを開きます。Ctrl+Shift+P でコマンド、Ctrl+O でワークスペースを開きます。",
+            "左のファイルをクリックして開きます。編集はinsertモードで行い、Ctrl+Sでatomic saveします。",
+            "Ctrl+F はファイル内検索、Ctrl+H はファイル内置換、Ctrl+Shift+F はワークスペース検索です。",
+            "F12 はZigのローカル定義へ移動、Shift+F12 は参照検索、F2 は安全なリネームpreviewです。",
+            "",
+            "== 安全にコードを動かす ==",
+            "build/test/run/task は、trust policy と明示的なconsentを通ります。",
+            "フォルダを開くだけでは、hook、build script、package script、Git filterは実行されません。",
+            "出力はパネルに捕捉され、sanitized textからdiagnosticsが抽出されます。",
+            "",
+            "== セキュリティの流れ ==",
+            "SECを開いてAUDITを押すと、ワークスペース全体の静的監査を走らせます。",
+            "SCANは現在ファイルだけを監査します。LF/CRLFは改行正規化、CLEANはNUL/Bidi制御文字除去です。",
+            "security findingをクリックすると、ZIDEが特定できる場合は危険なbyte範囲を選択します。",
+            "怪しいワークスペースではLOCKを押します。writesとexecutionがpolicyでブロックされます。",
+            "",
+            "セキュリティ差分: byte-first editor",
+            "ZIDEはraw bytesを保持し、UTF-8妥当性とLF/CRLF/MIXED状態をstatus barへ出します。",
+            "NUL、invalid UTF-8、Bidi制御文字、mixed endingsを外部コマンドなしで検査します。",
+            "ファイル名も監査します: report.pdf.exe、.env、id_rsa、Windows予約名、hidden scriptを検出します。",
+            "",
+            "セキュリティ差分: trust before execution",
+            "commandはsafe/workspace_write/network_read/network_write/external_commandへ分類されます。",
+            "untrusted workspaceは読めて編集できますが、外部実行とnetwork writeは止めます。",
+            "critical findingはlocked_downへ、high findingはtrusted workspaceをparanoid寄りへ押し戻します。",
+            "",
+            "セキュリティ差分: Git without hook execution",
+            "Git panelはgit statusを実行せず、repository metadataをZigで直接読みます。",
+            "hook、filter、fsmonitor、alias、Git設定経由のcommand executionを避けるためです。",
+            "",
+            "セキュリティ差分: Zig-native scanner core",
+            "build.zig、build.zig.zon、CI、IaC、script、env、polyglot package edgeをZigで監査します。",
+            "最初の安全確認を外部parserに委ねず、IDE自身の小さな監査coreで持ちます。",
+            "",
+            "今すぐ試す",
+            "1. SECを押してAUDITを実行します。",
+            "2. findingをクリックして該当箇所へ移動します。",
+            "3. text-integrity findingがあればCLEANまたはLF/CRLFで修復します。",
+            "4. LOCKを押して、trust postureがlocked_downへ入る様子を見ます。",
+        },
+        .en => &.{
+            "== QUICK START ==",
+            "F1 opens this tutorial. Ctrl+Shift+P opens commands. Ctrl+O opens a workspace folder.",
+            "Click files on the left. Edit in insert mode. Ctrl+S saves with atomic write.",
+            "Ctrl+F finds in the file. Ctrl+H replaces in the file. Ctrl+Shift+F searches the workspace.",
+            "F12 jumps to a local Zig definition. Shift+F12 finds references. F2 opens safe rename preview.",
+            "",
+            "== RUNNING CODE SAFELY ==",
+            "Build, test, run, and task execution go through consent and trust policy.",
+            "Opening a folder never executes hooks, build scripts, package scripts, or Git filters.",
+            "Output is captured into the panel and diagnostics are parsed from sanitized text.",
+            "",
+            "== SECURITY WORKFLOW ==",
+            "Open SEC. Press AUDIT for workspace static review. Press SCAN for the current file.",
+            "Use LF/CRLF to normalize line endings. Use CLEAN to remove NUL and bidi control markers.",
+            "Click a security finding to jump to the exact byte range when ZIDE can identify it.",
+            "Press LOCK when a workspace feels suspicious; writes and execution are blocked by policy.",
+            "",
+            "SECURITY DIFFERENCE: byte-first editor",
+            "ZIDE preserves raw bytes and shows UTF-8 validity plus LF/CRLF/MIXED state in the status bar.",
+            "Hidden text hazards are scanned without shelling out: NUL, invalid UTF-8, bidi controls, mixed endings.",
+            "File names are audited too: report.pdf.exe, .env, id_rsa, Windows reserved names, hidden scripts.",
+            "",
+            "SECURITY DIFFERENCE: trust before execution",
+            "Commands are classified as safe, workspace_write, network_read, network_write, or external_command.",
+            "Untrusted workspaces can be read and edited, but external execution and network writes are blocked.",
+            "Critical findings force locked_down posture; high findings can push trusted workspaces into paranoid mode.",
+            "",
+            "SECURITY DIFFERENCE: Git without hook execution",
+            "The Git panel reads repository metadata directly instead of running git status.",
+            "This avoids hooks, filters, fsmonitor, aliases, and configured Git-side command execution.",
+            "",
+            "SECURITY DIFFERENCE: Zig-native scanner core",
+            "Build.zig, build.zig.zon, CI files, IaC, scripts, env files, and polyglot package edges are scanned in Zig.",
+            "No external parser is trusted for the security baseline. The IDE owns the first-pass audit.",
+            "",
+            "TRY THIS NOW",
+            "1. Press SEC then AUDIT.",
+            "2. Click a finding to jump to it.",
+            "3. Press CLEAN or LF/CRLF when text-integrity findings appear.",
+            "4. Press LOCK to see the workspace enter locked_down trust posture.",
+        },
     };
 }
 
-fn tutorialLineCount() usize {
-    return tutorialLines().len;
+fn tutorialLineCount(language: TutorialLanguage) usize {
+    return tutorialLines(language).len;
 }
 
 fn workflowRiskCounts(state: *GuiState, overview: git_repository.Overview) RiskCounts {

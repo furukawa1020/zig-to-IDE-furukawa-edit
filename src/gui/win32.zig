@@ -17,6 +17,7 @@ const literal_search = @import("../search/literal.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const build_consent = @import("../security/build_consent.zig");
 const findings_mod = @import("../security/findings.zig");
+const text_integrity = @import("../security/text_integrity.zig");
 const console_mod = @import("../tasks/console.zig");
 const task_registry = @import("../tasks/registry.zig");
 
@@ -42,6 +43,13 @@ const GitPanelAction = enum {
     issues,
     failures,
     draft_pr,
+};
+
+const SecurityPanelAction = enum {
+    scan,
+    lf,
+    crlf,
+    clean,
 };
 
 const SelectionRange = struct {
@@ -754,6 +762,10 @@ const GuiState = struct {
             self.normalizeActiveDocumentNewlines(.crlf);
             return;
         }
+        if (std.mem.eql(u8, id, "editor.sanitize_hidden_controls")) {
+            self.sanitizeActiveDocumentHiddenControls();
+            return;
+        }
         if (std.mem.eql(u8, id, "workspace.search")) {
             self.openQuickPanel(.search_workspace);
             return;
@@ -783,6 +795,17 @@ const GuiState = struct {
         self.executeCommand(gitPanelActionCommand(action));
         self.show_output = true;
         self.bottom_panel = .output;
+    }
+
+    fn executeSecurityPanelAction(self: *GuiState, action: SecurityPanelAction) void {
+        self.show_output = true;
+        self.bottom_panel = .security;
+        switch (action) {
+            .scan => self.refreshActiveSecurityFindings("Current file security scan"),
+            .lf => self.normalizeActiveDocumentNewlines(.lf),
+            .crlf => self.normalizeActiveDocumentNewlines(.crlf),
+            .clean => self.sanitizeActiveDocumentHiddenControls(),
+        }
     }
 
     fn runTaskByName(self: *GuiState, name: []const u8) void {
@@ -1577,8 +1600,77 @@ const GuiState = struct {
                 .crlf => "Normalized line endings to CRLF",
                 else => "Normalized line endings",
             }) catch {};
+            self.refreshActiveSecurityFindings(switch (newline) {
+                .lf => "Normalized line endings to LF",
+                .crlf => "Normalized line endings to CRLF",
+                else => "Normalized line endings",
+            });
         } else {
             self.setMessage("Line endings already normalized") catch {};
+        }
+    }
+
+    fn sanitizeActiveDocumentHiddenControls(self: *GuiState) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("No active document") catch {};
+            return;
+        };
+
+        var sanitized: std.Io.Writer.Allocating = .init(self.allocator);
+        defer sanitized.deinit();
+
+        const before_cursor = doc.cursor.position;
+        var removed: usize = 0;
+        var index: usize = 0;
+        while (index < doc.text.bytes.len) {
+            if (text_integrity.hiddenControlLengthAt(doc.text.bytes, index)) |len| {
+                removed += 1;
+                index += len;
+                continue;
+            }
+            sanitized.writer.writeByte(doc.text.bytes[index]) catch |err| {
+                self.setError(err) catch {};
+                return;
+            };
+            index += 1;
+        }
+
+        if (removed == 0) {
+            self.setMessage("No hidden controls to clean") catch {};
+            return;
+        }
+
+        doc.replaceRange(0, doc.text.bytes.len, sanitized.written()) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        const target_line = @min(before_cursor.line, doc.text.lineCount() - 1);
+        const target_column = @min(before_cursor.column, doc.text.lineSlice(target_line).len);
+        const target_offset = doc.text.lineColumnToOffset(target_line, target_column) catch @min(before_cursor.byte_offset, doc.text.bytes.len);
+        doc.cursor.position = doc.positionFromOffset(target_offset) catch doc.cursor.position;
+        self.clearSelection();
+        self.ensureCursorVisible();
+
+        var message_buf: [96]u8 = undefined;
+        const message = std.fmt.bufPrint(&message_buf, "Removed {d} hidden control marker{s}", .{ removed, if (removed == 1) "" else "s" }) catch "Removed hidden controls";
+        self.refreshActiveSecurityFindings(message);
+    }
+
+    fn refreshActiveSecurityFindings(self: *GuiState, message: []const u8) void {
+        self.show_output = true;
+        self.bottom_panel = .security;
+        self.security_scroll_line = 0;
+        const result = dispatcher.dispatch(&self.app, .{ .id = "security.scan_current", .source = .command_palette }) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        switch (result) {
+            .completed => self.setMessage(message) catch {},
+            .blocked => |reason| self.setMessage(reason) catch {},
+            .unknown_command => self.setMessage("Security scan command missing") catch {},
+            .no_active_document => self.setMessage("No active document") catch {},
+            .external_command => {},
+            .unsupported => |reason| self.setMessage(reason) catch {},
         }
     }
 
@@ -2052,6 +2144,13 @@ const GuiState = struct {
                 const content = bottomPanelContentRect(layout.output);
                 if (gitPanelActionAt(content, x, y)) |action| {
                     self.executeGitPanelAction(action);
+                    return;
+                }
+            }
+            if (self.bottom_panel == .security) {
+                const content = bottomPanelContentRect(layout.output);
+                if (securityPanelActionAt(content, x, y)) |action| {
+                    self.executeSecurityPanelAction(action);
                     return;
                 }
             }
@@ -3096,7 +3195,9 @@ fn drawSecurityPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
         "SECURITY  total:{d} critical:{d} high:{d} medium:{d} low:{d}",
         .{ state.app.security_findings.items.items.len, counts.critical, counts.high, counts.medium, counts.low },
     ) catch "SECURITY";
-    drawText(hdc, rect.left + 16, rect.top + 10, rgb(79, 230, 226), header);
+    const header_right = if (securityPanelHasActionButtons(rect)) rect.right - 330 else rect.right - 16;
+    drawTextClipped(hdc, rect.left + 16, rect.top + 10, header_right, rgb(79, 230, 226), header);
+    drawSecurityPanelActions(hdc, rect);
 
     const rows = @max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT, ROW_HEIGHT));
     const start = @min(state.security_scroll_line, if (state.app.security_findings.items.items.len > @as(usize, @intCast(rows))) state.app.security_findings.items.items.len - @as(usize, @intCast(rows)) else 0);
@@ -3121,6 +3222,55 @@ fn drawSecurityPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     if (state.app.security_findings.items.items.len == 0) {
         drawText(hdc, rect.left + 16, rect.top + HEADER_HEIGHT, rgb(116, 128, 140), "No security findings");
     }
+}
+
+fn drawSecurityPanelActions(hdc: windows.HDC, rect: RECT) void {
+    if (!securityPanelHasActionButtons(rect)) return;
+    const actions = [_]SecurityPanelAction{ .scan, .lf, .crlf, .clean };
+    for (actions) |action| {
+        drawButton(hdc, securityPanelActionButtonRect(rect, action), securityPanelActionLabel(action));
+    }
+}
+
+fn securityPanelActionAt(rect: RECT, x: c_int, y: c_int) ?SecurityPanelAction {
+    if (!securityPanelHasActionButtons(rect)) return null;
+    if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
+    const actions = [_]SecurityPanelAction{ .scan, .lf, .crlf, .clean };
+    for (actions) |action| {
+        if (pointIn(securityPanelActionButtonRect(rect, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn securityPanelHasActionButtons(rect: RECT) bool {
+    return rect.right - rect.left >= 540;
+}
+
+fn securityPanelActionButtonRect(rect: RECT, action: SecurityPanelAction) RECT {
+    const width: c_int = 72;
+    const gap: c_int = 8;
+    const slot: c_int = switch (action) {
+        .clean => 0,
+        .crlf => 1,
+        .lf => 2,
+        .scan => 3,
+    };
+    const right = rect.right - 12 - slot * (width + gap);
+    return .{
+        .left = right - width,
+        .top = rect.top + 8,
+        .right = right,
+        .bottom = rect.top + 32,
+    };
+}
+
+fn securityPanelActionLabel(action: SecurityPanelAction) []const u8 {
+    return switch (action) {
+        .scan => "SCAN",
+        .lf => "LF",
+        .crlf => "CRLF",
+        .clean => "CLEAN",
+    };
 }
 
 fn drawSearchResults(hdc: windows.HDC, state: *GuiState, rect: RECT) void {

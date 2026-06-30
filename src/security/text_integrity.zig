@@ -65,6 +65,16 @@ pub fn scan(allocator: std.mem.Allocator, bytes: []const u8, options: Options) !
     return collection;
 }
 
+pub fn hiddenControlLengthAt(bytes: []const u8, index: usize) ?usize {
+    if (index >= bytes.len) return null;
+    if (bytes[index] == 0) return 1;
+    if (index + 2 >= bytes.len) return null;
+    if (bytes[index] != 0xe2) return null;
+    if (bytes[index + 1] == 0x80 and bytes[index + 2] >= 0xaa and bytes[index + 2] <= 0xae) return 3;
+    if (bytes[index + 1] == 0x81 and bytes[index + 2] >= 0xa6 and bytes[index + 2] <= 0xa9) return 3;
+    return null;
+}
+
 const Location = struct {
     line: usize,
     column: usize,
@@ -134,9 +144,7 @@ fn hasContinuation(bytes: []const u8, start: usize, count: usize) bool {
 fn firstBidiControl(bytes: []const u8) ?usize {
     var index: usize = 0;
     while (index + 2 < bytes.len) : (index += 1) {
-        if (bytes[index] != 0xe2) continue;
-        if (bytes[index + 1] == 0x80 and bytes[index + 2] >= 0xaa and bytes[index + 2] <= 0xae) return index;
-        if (bytes[index + 1] == 0x81 and bytes[index + 2] >= 0xa6 and bytes[index + 2] <= 0xa9) return index;
+        if (bytes[index] != 0 and hiddenControlLengthAt(bytes, index) != null) return index;
     }
     return null;
 }
@@ -190,4 +198,10 @@ test "text integrity scan flags invalid utf8 and mixed newlines" {
 
     try std.testing.expect(scan_result.countRiskAtLeast(.medium) >= 1);
     try std.testing.expect(scan_result.items.items.len >= 2);
+}
+
+test "hidden control helper reports exact byte spans" {
+    try std.testing.expectEqual(@as(?usize, 1), hiddenControlLengthAt("a\x00b", 1));
+    try std.testing.expectEqual(@as(?usize, 3), hiddenControlLengthAt("x\xe2\x80\xaey", 1));
+    try std.testing.expectEqual(@as(?usize, null), hiddenControlLengthAt("plain", 1));
 }

@@ -25,6 +25,7 @@ const QuickPanelMode = enum {
     find_file,
     find_document,
     replace_document,
+    rename_symbol,
     search_workspace,
     run_task,
     new_file,
@@ -179,6 +180,7 @@ const QuickPanel = struct {
             .find_file => if (self.file_matches) |items| items.len else 0,
             .find_document => if (self.document_matches) |items| items.len else 0,
             .replace_document => if (self.document_matches) |items| items.len else 0,
+            .rename_symbol => if (renameRequest(self.query.items)) |_| 1 else 0,
             .search_workspace => if (self.search_results) |items| items.len else 0,
             .run_task => if (self.task_matches) |items| items.len else 0,
             .new_file => if (self.query.items.len > 0) 1 else 0,
@@ -237,6 +239,7 @@ const QuickPanel = struct {
                     self.document_matches = try findDocumentMatches(self.allocator, doc, request.find, self.search_options, 128);
                 }
             },
+            .rename_symbol => {},
             .search_workspace => {
                 if (self.query.items.len > 0) {
                     self.search_results = try workspace_search.search(self.allocator, &app.workspace, self.query.items, .{
@@ -358,6 +361,10 @@ const SearchPanel = struct {
     }
 
     fn refresh(self: *SearchPanel, app: *const app_mod.App, query: []const u8) !void {
+        try self.refreshWithOptions(app, query, .{});
+    }
+
+    fn refreshWithOptions(self: *SearchPanel, app: *const app_mod.App, query: []const u8, options: literal_search.Options) !void {
         self.clearResults();
         self.query.clearRetainingCapacity();
         try self.query.appendSlice(query);
@@ -369,6 +376,7 @@ const SearchPanel = struct {
         }
 
         self.results = try workspace_search.search(self.allocator, &app.workspace, query, .{
+            .literal_options = options,
             .max_file_bytes = 512 * 1024,
             .max_results = 512,
         });
@@ -734,6 +742,14 @@ const GuiState = struct {
             self.gotoLocalDefinitionAtCursor();
             return;
         }
+        if (std.mem.eql(u8, id, "symbol.find_references")) {
+            self.findReferencesAtCursor();
+            return;
+        }
+        if (std.mem.eql(u8, id, "symbol.rename")) {
+            self.openRenamePanel();
+            return;
+        }
         if (std.mem.eql(u8, id, "workspace.find_file")) {
             self.openQuickPanel(.find_file);
             return;
@@ -839,6 +855,32 @@ const GuiState = struct {
         self.openQuickPanel(.document_symbols);
     }
 
+    fn openRenamePanel(self: *GuiState) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("No active document") catch {};
+            return;
+        };
+        const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse {
+            self.setMessage("No identifier under cursor") catch {};
+            return;
+        };
+        self.openQuickPanel(.rename_symbol);
+        self.quick_panel.query.clearRetainingCapacity();
+        self.quick_panel.query.appendSlice(name) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.quick_panel.query.appendSlice("=>") catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.quick_panel.rebuild(&self.app) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.setMessage("Rename symbol: type new name after =>") catch {};
+    }
+
     fn openDiagnosticsPanel(self: *GuiState) void {
         self.show_output = true;
         self.bottom_panel = .diagnostics;
@@ -899,6 +941,7 @@ const GuiState = struct {
             .run_task => "Run task",
             .new_file => "New file",
             .document_symbols => "Document symbols",
+            .rename_symbol => "Rename symbol",
         }) catch {};
     }
 
@@ -1059,6 +1102,24 @@ const GuiState = struct {
                 defer self.allocator.free(replacement);
                 self.quick_panel.close();
                 self.replaceActiveDocumentRange(start, end, replacement);
+            },
+            .rename_symbol => {
+                const request = renameRequest(self.quick_panel.query.items) orelse {
+                    self.setMessage("Type old_name=>new_name") catch {};
+                    return;
+                };
+                const old_name = self.allocator.dupe(u8, request.find) catch |err| {
+                    self.setError(err) catch {};
+                    return;
+                };
+                defer self.allocator.free(old_name);
+                const new_name = self.allocator.dupe(u8, request.replace) catch |err| {
+                    self.setError(err) catch {};
+                    return;
+                };
+                defer self.allocator.free(new_name);
+                self.quick_panel.close();
+                self.renameWorkspaceSymbol(old_name, new_name);
             },
             .search_workspace => {
                 const item = self.quick_panel.selectedSearchResult() orelse {
@@ -1382,6 +1443,103 @@ const GuiState = struct {
         }
 
         self.setMessage("No local top-level definition") catch {};
+    }
+
+    fn findReferencesAtCursor(self: *GuiState) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("No active document") catch {};
+            return;
+        };
+        const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse {
+            self.setMessage("No identifier under cursor") catch {};
+            return;
+        };
+
+        self.search_panel.refreshWithOptions(&self.app, name, .{ .whole_word = true }) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.show_output = true;
+        self.bottom_panel = .output;
+        self.search_panel.selected_index = 0;
+        var message_buf: [120]u8 = undefined;
+        const message = std.fmt.bufPrint(&message_buf, "Found {d} reference{s}", .{
+            self.search_panel.itemCount(),
+            if (self.search_panel.itemCount() == 1) "" else "s",
+        }) catch "References found";
+        self.setMessage(message) catch {};
+    }
+
+    fn renameWorkspaceSymbol(self: *GuiState, old_name: []const u8, new_name: []const u8) void {
+        if (std.mem.eql(u8, old_name, new_name)) {
+            self.setMessage("Rename target is unchanged") catch {};
+            return;
+        }
+
+        const results = workspace_search.search(self.allocator, &self.app.workspace, old_name, .{
+            .literal_options = .{ .whole_word = true },
+            .max_file_bytes = 2 * 1024 * 1024,
+            .max_results = 2048,
+        }) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        defer {
+            for (results) |*item| item.deinit(self.allocator);
+            self.allocator.free(results);
+        }
+
+        if (results.len == 0) {
+            self.setMessage("No references to rename") catch {};
+            return;
+        }
+
+        var replaced: usize = 0;
+        var skipped: usize = 0;
+        var index = results.len;
+        while (index > 0) {
+            index -= 1;
+            const item = results[index];
+            const absolute = std.fs.path.join(self.allocator, &.{ self.app.workspace.root_path, item.path }) catch |err| {
+                self.setError(err) catch {};
+                return;
+            };
+            defer self.allocator.free(absolute);
+
+            const doc_index = self.app.documents.openFile(absolute) catch |err| {
+                skipped += 1;
+                self.appendOutput(.stderr, "rename skipped open failure: {s}: {s}\n", .{ item.path, @errorName(err) });
+                continue;
+            };
+            const doc = &self.app.documents.documents.items[doc_index];
+            const start = item.byte_offset;
+            const end = start + old_name.len;
+            if (end > doc.text.bytes.len or !std.mem.eql(u8, doc.text.bytes[start..end], old_name)) {
+                skipped += 1;
+                continue;
+            }
+            doc.replaceRange(start, end, new_name) catch |err| {
+                skipped += 1;
+                self.appendOutput(.stderr, "rename skipped edit failure: {s}: {s}\n", .{ item.path, @errorName(err) });
+                continue;
+            };
+            replaced += 1;
+        }
+
+        self.clearSelection();
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureCursorVisible();
+        self.show_output = true;
+        self.bottom_panel = .output;
+        self.appendOutput(.stdout, "rename preview: {s} -> {s}, changed {d}, skipped {d}. Save changed tabs to write files.\n", .{ old_name, new_name, replaced, skipped });
+
+        var message_buf: [160]u8 = undefined;
+        const message = std.fmt.bufPrint(&message_buf, "Rename preview changed {d} reference{s}", .{
+            replaced,
+            if (replaced == 1) "" else "s",
+        }) catch "Rename preview complete";
+        self.setMessage(message) catch {};
     }
 
     fn jumpToNextDiagnostic(self: *GuiState) void {
@@ -2413,8 +2571,12 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         state.jumpToNextDiagnostic();
         return;
     }
+    if (key == VK_F2) {
+        state.executeCommand("symbol.rename");
+        return;
+    }
     if (key == VK_F12) {
-        state.executeCommand("symbol.goto_definition");
+        state.executeCommand(if (shift) "symbol.find_references" else "symbol.goto_definition");
         return;
     }
     if (key == VK_F6) {
@@ -3367,6 +3529,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .find_file => "FIND FILE",
         .find_document => "FIND IN FILE",
         .replace_document => "REPLACE  search=>replacement",
+        .rename_symbol => "RENAME  old=>new",
         .search_workspace => "SEARCH",
         .run_task => "TASKS",
         .new_file => "NEW FILE",
@@ -3421,6 +3584,12 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 const location = std.fmt.bufPrint(&location_buf, "{d}:{d}", .{ item.line + 1, item.column + 1 }) catch "";
                 drawTextClipped(hdc, panel.left + 18, y, panel.left + 104, color, location);
                 drawTextClipped(hdc, panel.left + 116, y, panel.right - 16, color, item.preview);
+            },
+            .rename_symbol => {
+                const request = renameRequest(state.quick_panel.query.items) orelse break;
+                var rename_buf: [240]u8 = undefined;
+                const label = std.fmt.bufPrint(&rename_buf, "{s} -> {s}", .{ request.find, request.replace }) catch "Rename";
+                drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
             },
             .run_task => {
                 const items = state.quick_panel.task_matches orelse break;
@@ -3566,6 +3735,22 @@ fn parseReplaceRequest(query: []const u8) ?ReplaceRequest {
     const replace = query[delimiter + 2 ..];
     if (find.len == 0) return null;
     return .{ .find = find, .replace = replace };
+}
+
+fn renameRequest(query: []const u8) ?ReplaceRequest {
+    const request = parseReplaceRequest(query) orelse return null;
+    const replace = std.mem.trim(u8, request.replace, " \t\r\n");
+    if (!isValidIdentifierName(request.find) or !isValidIdentifierName(replace)) return null;
+    return .{ .find = request.find, .replace = replace };
+}
+
+fn isValidIdentifierName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
+    }
+    return true;
 }
 
 const Layout = struct {
@@ -4304,6 +4489,7 @@ const VK_RIGHT: WPARAM = 0x27;
 const VK_DOWN: WPARAM = 0x28;
 const VK_DELETE: WPARAM = 0x2E;
 const VK_F1: WPARAM = 0x70;
+const VK_F2: WPARAM = 0x71;
 const VK_F3: WPARAM = 0x72;
 const VK_F6: WPARAM = 0x75;
 const VK_F7: WPARAM = 0x76;

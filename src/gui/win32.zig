@@ -1397,12 +1397,45 @@ const GuiState = struct {
 
     fn jumpToSecurityFinding(self: *GuiState, index: usize) void {
         if (index >= self.app.security_findings.items.items.len) return;
-        const finding = self.app.security_findings.items.items[index];
+        const finding = &self.app.security_findings.items.items[index];
         if (finding.path.len == 0) {
             self.setMessage(finding.message) catch {};
             return;
         }
-        self.openRelativeLocation(finding.path, finding.line, finding.column);
+        self.openSecurityFindingLocation(finding);
+    }
+
+    fn openSecurityFindingLocation(self: *GuiState, finding: *const findings_mod.Finding) void {
+        const absolute = std.fs.path.join(self.allocator, &.{ self.app.workspace.root_path, finding.path }) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        defer self.allocator.free(absolute);
+
+        const index = self.app.documents.openFile(absolute) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "open failed: {s}: {s}\n", .{ finding.path, @errorName(err) });
+            return;
+        };
+        const doc = &self.app.documents.documents.items[index];
+        self.clearSelection();
+
+        const offset = doc.text.lineColumnToOffset(finding.line, finding.column) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        const end = securityFindingSelectionEnd(doc, finding, offset);
+        const target = if (end > offset) end else offset;
+        const position = doc.positionFromOffset(@min(target, doc.text.bytes.len)) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        if (end > offset) self.selection_anchor = offset;
+        navigation.setCursor(doc, position);
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureCursorVisible();
+        self.setMessage(if (end > offset) "Selected security finding" else "Opened security finding") catch {};
     }
 
     fn openConsoleLineAt(self: *GuiState, layout: Layout, y: c_int) void {
@@ -3801,6 +3834,21 @@ fn isEditorLineCommand(id: []const u8) bool {
         std.mem.eql(u8, id, "editor.duplicate_line") or
         std.mem.eql(u8, id, "editor.move_line_up") or
         std.mem.eql(u8, id, "editor.move_line_down");
+}
+
+fn securityFindingSelectionEnd(doc: *const document_mod.Document, finding: *const findings_mod.Finding, offset: usize) usize {
+    if (offset >= doc.text.bytes.len) return offset;
+    if (finding.category == .text_integrity) {
+        if (text_integrity.hiddenControlLengthAt(doc.text.bytes, offset)) |len| {
+            return @min(offset + len, doc.text.bytes.len);
+        }
+        if (doc.text.bytes[offset] == '\r') {
+            if (offset + 1 < doc.text.bytes.len and doc.text.bytes[offset + 1] == '\n') return offset + 2;
+            return offset + 1;
+        }
+        if (doc.text.bytes[offset] == '\n') return offset + 1;
+    }
+    return doc.text.nextByteOffset(offset) catch offset;
 }
 
 fn drawText(hdc: windows.HDC, x: c_int, y: c_int, color: windows.COLORREF, text: []const u8) void {

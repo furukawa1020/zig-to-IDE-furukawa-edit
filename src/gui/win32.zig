@@ -37,6 +37,7 @@ const BottomPanel = enum {
     git,
     diagnostics,
     security,
+    tutorial,
 };
 
 const GitPanelAction = enum {
@@ -47,6 +48,8 @@ const GitPanelAction = enum {
 };
 
 const SecurityPanelAction = enum {
+    audit,
+    lock,
     scan,
     lf,
     crlf,
@@ -474,6 +477,7 @@ const GuiState = struct {
     output_scroll_line: usize = 0,
     diagnostics_scroll_line: usize = 0,
     security_scroll_line: usize = 0,
+    tutorial_scroll_line: usize = 0,
     git_scroll_line: usize = 0,
     selection_anchor: ?usize = null,
     editor_dragging: bool = false,
@@ -794,6 +798,10 @@ const GuiState = struct {
             self.openDiagnosticsPanel();
             return;
         }
+        if (std.mem.eql(u8, id, "view.tutorial")) {
+            self.openTutorialPanel();
+            return;
+        }
 
         const result = dispatcher.dispatch(&self.app, .{ .id = id, .source = .command_palette }) catch |err| {
             self.setError(err) catch {};
@@ -817,6 +825,8 @@ const GuiState = struct {
         self.show_output = true;
         self.bottom_panel = .security;
         switch (action) {
+            .audit => self.runWorkspaceSecurityAudit("Security audit"),
+            .lock => self.lockWorkspaceFromGui(),
             .scan => self.refreshActiveSecurityFindings("Current file security scan"),
             .lf => self.normalizeActiveDocumentNewlines(.lf),
             .crlf => self.normalizeActiveDocumentNewlines(.crlf),
@@ -896,11 +906,41 @@ const GuiState = struct {
         self.setMessage("Security findings") catch {};
     }
 
+    fn openTutorialPanel(self: *GuiState) void {
+        self.show_output = true;
+        self.bottom_panel = .tutorial;
+        self.tutorial_scroll_line = 0;
+        self.setMessage("ZIDE tutorial") catch {};
+    }
+
     fn openGitPanel(self: *GuiState) void {
         self.show_output = true;
         self.bottom_panel = .git;
         self.git_scroll_line = 0;
         self.refreshGitOverview();
+    }
+
+    fn runWorkspaceSecurityAudit(self: *GuiState, message: []const u8) void {
+        self.show_output = true;
+        self.bottom_panel = .security;
+        self.security_scroll_line = 0;
+        const result = dispatcher.dispatch(&self.app, .{ .id = "security.audit_workspace", .source = .command_palette }) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.handleDispatchResult("security.audit_workspace", result);
+        self.setMessage(message) catch {};
+    }
+
+    fn lockWorkspaceFromGui(self: *GuiState) void {
+        const result = dispatcher.dispatch(&self.app, .{ .id = "security.lock_workspace", .source = .command_palette }) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.handleDispatchResult("security.lock_workspace", result);
+        self.show_output = true;
+        self.bottom_panel = .security;
+        self.setMessage("Workspace locked") catch {};
     }
 
     fn refreshGitOverview(self: *GuiState) void {
@@ -2152,6 +2192,10 @@ const GuiState = struct {
                 const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
                 scrollIndex(&self.security_scroll_line, self.app.security_findings.items.items.len, visible, delta);
             },
+            .tutorial => {
+                const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
+                scrollIndex(&self.tutorial_scroll_line, tutorialLineCount(), visible, delta);
+            },
         }
     }
 
@@ -2350,6 +2394,7 @@ const GuiState = struct {
                 .git => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.openGitPanelRow(self.git_scroll_line + row),
                 .diagnostics => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToDiagnostic(self.diagnostics_scroll_line + row),
                 .security => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToSecurityFinding(self.security_scroll_line + row),
+                .tutorial => {},
             }
             return;
         }
@@ -2488,7 +2533,7 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         return;
     }
     if (key == VK_F1) {
-        state.openPalette();
+        state.openTutorialPanel();
         return;
     }
     if (key == VK_F3) {
@@ -3055,6 +3100,7 @@ fn drawOutput(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
         .git => drawGitPanel(hdc, state, content),
         .diagnostics => drawDiagnosticsPanel(hdc, state, content),
         .security => drawSecurityPanel(hdc, state, content),
+        .tutorial => drawTutorialPanel(hdc, state, content),
     }
 }
 
@@ -3065,6 +3111,7 @@ fn drawBottomPanelTabs(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     drawBottomPanelTab(hdc, rect, .git, state.bottom_panel == .git, "GIT");
     drawBottomPanelTab(hdc, rect, .diagnostics, state.bottom_panel == .diagnostics, "DIAG");
     drawBottomPanelTab(hdc, rect, .security, state.bottom_panel == .security, "SEC");
+    drawBottomPanelTab(hdc, rect, .tutorial, state.bottom_panel == .tutorial, "HELP");
 }
 
 fn drawBottomPanelTab(hdc: windows.HDC, rect: RECT, panel: BottomPanel, active: bool, label: []const u8) void {
@@ -3390,7 +3437,7 @@ fn drawSecurityPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
         "SECURITY  total:{d} critical:{d} high:{d} medium:{d} low:{d}",
         .{ state.app.security_findings.items.items.len, counts.critical, counts.high, counts.medium, counts.low },
     ) catch "SECURITY";
-    const header_right = if (securityPanelHasActionButtons(rect)) rect.right - 330 else rect.right - 16;
+    const header_right = if (securityPanelHasActionButtons(rect)) rect.right - 460 else rect.right - 16;
     drawTextClipped(hdc, rect.left + 16, rect.top + 10, header_right, rgb(79, 230, 226), header);
     drawSecurityPanelActions(hdc, rect);
 
@@ -3419,9 +3466,49 @@ fn drawSecurityPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     }
 }
 
+fn drawTutorialPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
+    fillRect(hdc, rect, rgb(10, 12, 14));
+    fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
+
+    const counts = riskCounts(&state.app.security_findings);
+    var header_buf: [260]u8 = undefined;
+    const header = std.fmt.bufPrint(
+        &header_buf,
+        "ZIDE TUTORIAL  trust:{s} findings:{d} critical:{d} high:{d} medium:{d}",
+        .{
+            @tagName(state.app.runtime.trust_state),
+            state.app.security_findings.items.items.len,
+            counts.critical,
+            counts.high,
+            counts.medium,
+        },
+    ) catch "ZIDE TUTORIAL";
+    drawTextClipped(hdc, rect.left + 16, rect.top + 10, rect.right - 16, rgb(79, 230, 226), header);
+
+    const rows = @max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT, ROW_HEIGHT));
+    const lines = tutorialLines();
+    const start = @min(state.tutorial_scroll_line, if (lines.len > @as(usize, @intCast(rows))) lines.len - @as(usize, @intCast(rows)) else 0);
+    var row: usize = 0;
+    var y = rect.top + HEADER_HEIGHT;
+    while (row < @as(usize, @intCast(rows)) and start + row < lines.len) : (row += 1) {
+        const line = lines[start + row];
+        const color = tutorialLineColor(line);
+        drawTextClipped(hdc, rect.left + 16, y, rect.right - 16, color, line);
+        y += ROW_HEIGHT;
+    }
+}
+
+fn tutorialLineColor(line: []const u8) windows.COLORREF {
+    if (std.mem.startsWith(u8, line, "==")) return rgb(255, 207, 92);
+    if (std.mem.startsWith(u8, line, "SECURITY")) return rgb(255, 118, 118);
+    if (std.mem.startsWith(u8, line, "ZIG")) return rgb(79, 230, 226);
+    if (std.mem.startsWith(u8, line, "TRY")) return rgb(165, 214, 167);
+    return rgb(210, 218, 226);
+}
+
 fn drawSecurityPanelActions(hdc: windows.HDC, rect: RECT) void {
     if (!securityPanelHasActionButtons(rect)) return;
-    const actions = [_]SecurityPanelAction{ .scan, .lf, .crlf, .clean };
+    const actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean };
     for (actions) |action| {
         drawButton(hdc, securityPanelActionButtonRect(rect, action), securityPanelActionLabel(action));
     }
@@ -3430,7 +3517,7 @@ fn drawSecurityPanelActions(hdc: windows.HDC, rect: RECT) void {
 fn securityPanelActionAt(rect: RECT, x: c_int, y: c_int) ?SecurityPanelAction {
     if (!securityPanelHasActionButtons(rect)) return null;
     if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const actions = [_]SecurityPanelAction{ .scan, .lf, .crlf, .clean };
+    const actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean };
     for (actions) |action| {
         if (pointIn(securityPanelActionButtonRect(rect, action), x, y)) return action;
     }
@@ -3438,17 +3525,19 @@ fn securityPanelActionAt(rect: RECT, x: c_int, y: c_int) ?SecurityPanelAction {
 }
 
 fn securityPanelHasActionButtons(rect: RECT) bool {
-    return rect.right - rect.left >= 540;
+    return rect.right - rect.left >= 720;
 }
 
 fn securityPanelActionButtonRect(rect: RECT, action: SecurityPanelAction) RECT {
-    const width: c_int = 72;
+    const width: c_int = 64;
     const gap: c_int = 8;
     const slot: c_int = switch (action) {
         .clean => 0,
         .crlf => 1,
         .lf => 2,
         .scan => 3,
+        .lock => 4,
+        .audit => 5,
     };
     const right = rect.right - 12 - slot * (width + gap);
     return .{
@@ -3461,6 +3550,8 @@ fn securityPanelActionButtonRect(rect: RECT, action: SecurityPanelAction) RECT {
 
 fn securityPanelActionLabel(action: SecurityPanelAction) []const u8 {
     return switch (action) {
+        .audit => "AUDIT",
+        .lock => "LOCK",
         .scan => "SCAN",
         .lf => "LF",
         .crlf => "CRLF",
@@ -3632,7 +3723,7 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
     const git_changes = if (state.git_overview) |overview| overview.changes.len else 0;
     const text = std.fmt.bufPrint(
         &buffer,
-        " {s}/{s}  |  line:{d} col:{d} {s} lang:{s} fmt:{s}/{s} risk:{d}/{d}/{d} git:{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
+        " {s}/{s}  |  line:{d} col:{d} {s} lang:{s} fmt:{s}/{s} trust:{s} risk:{d}/{d}/{d} git:{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
         .{
             mode,
             focus,
@@ -3642,6 +3733,7 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
             language,
             encoding,
             newline,
+            @tagName(state.app.runtime.trust_state),
             current_risk.critical,
             current_risk.high,
             current_risk.medium,
@@ -3946,6 +4038,7 @@ fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
         .git => 1,
         .diagnostics => 2,
         .security => 3,
+        .tutorial => 4,
     };
     const left = rect.left + 12 + index * (width + gap);
     return .{ .left = left, .top = rect.top + 9, .right = left + width, .bottom = rect.top + 33 };
@@ -3953,7 +4046,7 @@ fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
 
 fn bottomPanelTabAt(rect: RECT, x: c_int, y: c_int) ?BottomPanel {
     if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const panels = [_]BottomPanel{ .output, .git, .diagnostics, .security };
+    const panels = [_]BottomPanel{ .output, .git, .diagnostics, .security, .tutorial };
     for (panels) |panel| {
         if (pointIn(bottomPanelTabRect(rect, panel), x, y)) return panel;
     }
@@ -4306,6 +4399,54 @@ fn currentDocumentRiskCounts(state: *GuiState) RiskCounts {
     const doc = state.app.documents.active() orelse return .{};
     const path = doc.path orelse return .{};
     return pathRiskCounts(state, path);
+}
+
+fn tutorialLines() []const []const u8 {
+    return &.{
+        "== QUICK START ==",
+        "F1 opens this tutorial. Ctrl+Shift+P opens commands. Ctrl+O opens a workspace folder.",
+        "Click files on the left. Edit in insert mode. Ctrl+S saves with atomic write.",
+        "Ctrl+F finds in the file. Ctrl+H replaces in the file. Ctrl+Shift+F searches the workspace.",
+        "F12 jumps to a local Zig definition. Shift+F12 finds references. F2 opens safe rename preview.",
+        "",
+        "== RUNNING CODE SAFELY ==",
+        "Build, test, run, and task execution go through consent and trust policy.",
+        "Opening a folder never executes hooks, build scripts, package scripts, or Git filters.",
+        "Output is captured into the panel and diagnostics are parsed from sanitized text.",
+        "",
+        "== SECURITY WORKFLOW ==",
+        "Open SEC. Press AUDIT for workspace static review. Press SCAN for the current file.",
+        "Use LF/CRLF to normalize line endings. Use CLEAN to remove NUL and bidi control markers.",
+        "Click a security finding to jump to the exact byte range when ZIDE can identify it.",
+        "Press LOCK when a workspace feels suspicious; writes and execution are blocked by policy.",
+        "",
+        "SECURITY DIFFERENCE: byte-first editor",
+        "ZIDE preserves raw bytes and shows UTF-8 validity plus LF/CRLF/MIXED state in the status bar.",
+        "Hidden text hazards are scanned without shelling out: NUL, invalid UTF-8, bidi controls, mixed endings.",
+        "",
+        "SECURITY DIFFERENCE: trust before execution",
+        "Commands are classified as safe, workspace_write, network_read, network_write, or external_command.",
+        "Untrusted workspaces can be read and edited, but external execution and network writes are blocked.",
+        "Critical findings force locked_down posture; high findings can push trusted workspaces into paranoid mode.",
+        "",
+        "SECURITY DIFFERENCE: Git without hook execution",
+        "The Git panel reads repository metadata directly instead of running git status.",
+        "This avoids hooks, filters, fsmonitor, aliases, and configured Git-side command execution.",
+        "",
+        "SECURITY DIFFERENCE: Zig-native scanner core",
+        "Build.zig, build.zig.zon, CI files, IaC, scripts, env files, and polyglot package edges are scanned in Zig.",
+        "No external parser is trusted for the security baseline. The IDE owns the first-pass audit.",
+        "",
+        "TRY THIS NOW",
+        "1. Press SEC then AUDIT.",
+        "2. Click a finding to jump to it.",
+        "3. Press CLEAN or LF/CRLF when text-integrity findings appear.",
+        "4. Press LOCK to see the workspace enter locked_down trust posture.",
+    };
+}
+
+fn tutorialLineCount() usize {
+    return tutorialLines().len;
 }
 
 fn workflowRiskCounts(state: *GuiState, overview: git_repository.Overview) RiskCounts {

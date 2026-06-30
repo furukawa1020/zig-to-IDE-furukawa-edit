@@ -87,6 +87,7 @@ const definitions = [_]Definition{
     .{ .id = "view.toggle_file_tree", .title = "Toggle File Tree", .description = "Show or hide the file tree.", .default_key = "ctrl-e", .scope = .view, .capability = .safe },
     .{ .id = "view.toggle_diagnostics", .title = "Toggle Diagnostics", .description = "Show or hide diagnostics.", .default_key = "ctrl-d", .scope = .view, .capability = .safe },
     .{ .id = "view.command_palette", .title = "Command Palette", .description = "Open the command palette.", .default_key = "ctrl-shift-p", .scope = .view, .capability = .safe },
+    .{ .id = "view.tutorial", .title = "Open Tutorial", .description = "Open the in-app ZIDE tutorial and security tour.", .default_key = "f1", .scope = .view, .capability = .safe },
     .{ .id = "symbol.goto_symbol", .title = "Go To Symbol", .description = "Open the current Zig document outline.", .default_key = "ctrl-shift-o", .scope = .zig, .capability = .safe },
     .{ .id = "symbol.goto_definition", .title = "Go To Definition", .description = "Jump to the selected symbol definition.", .default_key = "f12", .scope = .zig, .capability = .safe },
     .{ .id = "symbol.find_references", .title = "Find References", .description = "Find references for the selected symbol.", .default_key = "shift-f12", .scope = .zig, .capability = .safe },

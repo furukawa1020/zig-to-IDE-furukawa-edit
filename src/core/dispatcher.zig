@@ -13,6 +13,7 @@ const git_status = @import("../git/status.zig");
 const github_client = @import("../github/client.zig");
 const diagnostic_model = @import("../diagnostics/model.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
+const document_mod = @import("../editor/document.zig");
 const file_finder = @import("../search/file_finder.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const permissions = @import("../security/permissions.zig");
@@ -141,6 +142,29 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         if (try runSaveSafetyCheck(app)) |message| return .{ .blocked = message };
         try app.documents.saveActive(.{});
         return .{ .completed = "saved" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "file.save_all")) {
+        const dirty_count = app.documents.dirtyCount();
+        if (dirty_count == 0) return .{ .completed = "all files already saved" };
+
+        for (app.documents.documents.items) |*doc| {
+            if (!doc.dirty) continue;
+            _ = doc.path orelse return .{ .blocked = "dirty document has no file path" };
+            if (try runDocumentSaveSafetyCheck(app, doc)) |message| return .{ .blocked = message };
+        }
+
+        var saved_count: usize = 0;
+        for (app.documents.documents.items) |*doc| {
+            if (!doc.dirty) continue;
+            const path = doc.path orelse return .{ .blocked = "dirty document has no file path" };
+            try editor_save.saveBytes(app.allocator, path, doc.text.bytes, .{});
+            doc.dirty = false;
+            saved_count += 1;
+        }
+
+        try appendConsole(app, .stdout, "saved all: {d} file(s)\n", .{saved_count});
+        return .{ .completed = "saved all" };
     }
 
     if (std.mem.eql(u8, definition.id, "file.new")) {
@@ -528,8 +552,11 @@ fn syncDiagnosticsFromConsole(app: *app_mod.App) !void {
 
 fn runSaveSafetyCheck(app: *app_mod.App) !?[]const u8 {
     const doc = app.documents.active() orelse return null;
-    const path = doc.path orelse return null;
+    return runDocumentSaveSafetyCheck(app, doc);
+}
 
+fn runDocumentSaveSafetyCheck(app: *app_mod.App, doc: *const document_mod.Document) !?[]const u8 {
+    const path = doc.path orelse return null;
     var scan = try scanDocumentSecurity(app.allocator, path, doc.language, doc.text.bytes);
     defer scan.deinit();
 
@@ -1325,6 +1352,40 @@ test "save scans package manifest security findings" {
     const result = try dispatch(&app, .{ .id = "file.save" });
     try std.testing.expect(std.meta.activeTag(result) == .completed);
     try std.testing.expect(app.diagnostics.items.items.len > 0);
+}
+
+test "save all persists every dirty document" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const path_a = try std.fs.path.join(std.testing.allocator, &.{ root_path, "a.txt" });
+    defer std.testing.allocator.free(path_a);
+    const path_b = try std.fs.path.join(std.testing.allocator, &.{ root_path, "b.txt" });
+    defer std.testing.allocator.free(path_b);
+
+    _ = try app.documents.createScratch(path_a, "");
+    try app.documents.documents.items[0].insert(0, "alpha\n");
+    _ = try app.documents.createScratch(path_b, "");
+    try app.documents.documents.items[1].insert(0, "beta\n");
+    try std.testing.expectEqual(@as(usize, 2), app.documents.dirtyCount());
+
+    const result = try dispatch(&app, .{ .id = "file.save_all" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expectEqual(@as(usize, 0), app.documents.dirtyCount());
+
+    const bytes_a = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path_a, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(bytes_a);
+    const bytes_b = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path_b, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(bytes_b);
+    try std.testing.expectEqualStrings("alpha\n", bytes_a);
+    try std.testing.expectEqualStrings("beta\n", bytes_b);
 }
 
 test "diagnostics next jumps within active document" {

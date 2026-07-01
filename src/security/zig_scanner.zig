@@ -43,10 +43,27 @@ fn scanLine(collection: *findings.Collection, path: []const u8, line: []const u8
     try detect(collection, path, line, line_number, "GeneralPurposeAllocator", .allocator_policy, .info, "general purpose allocator boundary detected");
     try detect(collection, path, line, line_number, "std.process.run", .build_firewall, .high, "Zig source can spawn a child process");
     try detect(collection, path, line, line_number, "std.process.Child", .build_firewall, .high, "Zig source constructs a child process");
-    try detect(collection, path, line, line_number, "std.Io.Dir.delete", .allocator_policy, .high, "filesystem deletion boundary requires workspace policy");
-    try detect(collection, path, line, line_number, "deleteTree", .allocator_policy, .critical, "recursive deletion boundary requires explicit review");
-    try detect(collection, path, line, line_number, "threadlocal", .safety_profile, .medium, "threadlocal state can hide cross-thread invariants");
+    try detect(collection, path, line, line_number, "std.process.getEnv", .secret_flow, .medium, "environment read can expose ambient secrets");
+    try detect(collection, path, line, line_number, "std.process.args", .secret_flow, .low, "process arguments are an ambient input boundary");
+    try detect(collection, path, line, line_number, "std.Io.Dir.delete", .filesystem_boundary, .high, "filesystem deletion boundary requires workspace policy");
+    try detect(collection, path, line, line_number, "deleteFile", .filesystem_boundary, .high, "file deletion boundary requires workspace policy");
+    try detect(collection, path, line, line_number, "deleteTree", .filesystem_boundary, .critical, "recursive deletion boundary requires explicit review");
+    try detect(collection, path, line, line_number, "createFileAbsolute", .filesystem_boundary, .high, "absolute file creation crosses the workspace boundary");
+    try detect(collection, path, line, line_number, "openFileAbsolute", .filesystem_boundary, .medium, "absolute file open crosses the workspace boundary");
+    try detect(collection, path, line, line_number, "openDirAbsolute", .filesystem_boundary, .medium, "absolute directory open crosses the workspace boundary");
+    try detect(collection, path, line, line_number, "renameAbsolute", .filesystem_boundary, .medium, "absolute rename crosses the workspace boundary");
+    try detect(collection, path, line, line_number, "makePath", .filesystem_boundary, .medium, "directory creation should be constrained to workspace policy");
+    try detect(collection, path, line, line_number, "std.net", .network_boundary, .medium, "network boundary detected in Zig source");
+    try detect(collection, path, line, line_number, "std.http.Client", .network_boundary, .medium, "HTTP client boundary detected in Zig source");
+    try detect(collection, path, line, line_number, "resolveIp", .network_boundary, .medium, "DNS/IP resolution boundary detected");
+    try detect(collection, path, line, line_number, "tcpConnectTo", .network_boundary, .high, "outbound TCP connection boundary detected");
+    try detect(collection, path, line, line_number, "threadlocal", .concurrency_boundary, .medium, "threadlocal state can hide cross-thread invariants");
+    try detect(collection, path, line, line_number, "std.Thread.spawn", .concurrency_boundary, .medium, "thread spawn boundary requires lifetime and allocator review");
+    try detect(collection, path, line, line_number, "std.atomic", .concurrency_boundary, .medium, "atomic memory boundary requires ordering proof");
+    try detect(collection, path, line, line_number, "@atomic", .concurrency_boundary, .medium, "atomic builtin requires ordering proof");
     try detect(collection, path, line, line_number, "ReleaseFast", .safety_profile, .high, "ReleaseFast removes runtime safety checks unless explicitly overridden");
+    try detect(collection, path, line, line_number, "asm", .ffi_boundary, .high, "inline assembly escapes Zig's normal safety model");
+    try detect(collection, path, line, line_number, "std.DynLib.open", .ffi_boundary, .high, "dynamic library load expands the trusted computing boundary");
 
     if (std.mem.indexOf(u8, line, "catch unreachable")) |column| {
         try collection.append(.safety_profile, .medium, path, line_number, column, "catch unreachable turns recoverable failure into a safety boundary", line);
@@ -146,4 +163,22 @@ test "scanner detects allocator and C import boundaries" {
     defer collection.deinit();
 
     try std.testing.expect(collection.countRiskAtLeast(.high) >= 4);
+}
+
+test "scanner detects Zig filesystem network and concurrency boundaries" {
+    var collection = try scanSource(std.testing.allocator,
+        \\const client = std.http.Client{};
+        \\try std.net.tcpConnectToHost(allocator, "example.test", 443);
+        \\try std.Io.Dir.deleteFile(dir, "old");
+        \\try std.Io.Dir.deleteTree(dir, "cache");
+        \\_ = try std.Thread.spawn(.{}, worker, .{});
+        \\const value = @atomicLoad(u32, ptr, .seq_cst);
+        \\const secret = try std.process.getEnvVarOwned(allocator, "TOKEN");
+        \\
+    , .{ .path = "src/boundaries.zig" });
+    defer collection.deinit();
+
+    try std.testing.expect(collection.countRiskAtLeast(.critical) >= 1);
+    try std.testing.expect(collection.countRiskAtLeast(.high) >= 2);
+    try std.testing.expect(collection.countRiskAtLeast(.medium) >= 5);
 }

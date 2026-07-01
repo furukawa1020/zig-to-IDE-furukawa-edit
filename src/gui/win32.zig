@@ -1729,7 +1729,7 @@ const GuiState = struct {
             .completed => |message| {
                 self.setMessage(message) catch {};
                 self.appendOutput(.stdout, "{s}: {s}\n", .{ id, message });
-                if (self.git_overview != null and (std.mem.eql(u8, id, "file.save") or std.mem.eql(u8, id, "file.new"))) {
+                if (self.git_overview != null and (std.mem.eql(u8, id, "file.save") or std.mem.eql(u8, id, "file.save_all") or std.mem.eql(u8, id, "file.new"))) {
                     self.refreshGitOverview();
                     self.setMessage(message) catch {};
                 }
@@ -2341,6 +2341,10 @@ const GuiState = struct {
                 self.executeCommand("file.save");
                 return;
             }
+            if (pointIn(saveAllButtonRect(layout), x, y)) {
+                self.executeCommand("file.save_all");
+                return;
+            }
             if (pointIn(runButtonRect(layout), x, y)) {
                 self.runTaskByName("run");
                 return;
@@ -2567,6 +2571,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (key == VK_F3) {
         state.findLastDocumentSearch(if (shift) .backward else .forward);
+        return;
+    }
+    if (ctrl and shift and key == 'S') {
+        state.executeCommand("file.save_all");
         return;
     }
     if (ctrl and key == 'S') {
@@ -2934,7 +2942,7 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
         }
     } else {
         drawText(hdc, editor.left + 22, HEADER_HEIGHT + 10, rgb(199, 206, 214), "Click a file to open it.");
-        drawText(hdc, editor.left + 22, HEADER_HEIGHT + 38, rgb(126, 138, 150), "F1 opens commands. Ctrl+S saves. Ctrl+B prepares build.");
+        drawText(hdc, editor.left + 22, HEADER_HEIGHT + 38, rgb(126, 138, 150), "F1 opens commands. Ctrl+S saves. Ctrl+Shift+S saves all.");
     }
 }
 
@@ -2987,6 +2995,7 @@ fn drawSelectionForLine(
 
 fn drawEditorHeader(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
     drawButton(hdc, saveButtonRect(layout), "SAVE");
+    drawButton(hdc, saveAllButtonRect(layout), "ALL");
     drawButton(hdc, buildButtonRect(layout), "BUILD");
     drawButton(hdc, testButtonRect(layout), "TEST");
     drawButton(hdc, runButtonRect(layout), "RUN");
@@ -3830,6 +3839,7 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
     const message = state.last_error orelse "ready";
     const cursor = if (state.app.documents.active()) |doc| doc.cursor.position else null;
     const dirty = if (state.app.documents.active()) |doc| doc.dirty else false;
+    const dirty_count = state.app.documents.dirtyCount();
     const language = if (state.app.documents.active()) |doc| modes.label(doc.language) else "none";
     const newline = if (state.app.documents.active()) |doc| doc.newlineLabel() else "NONE";
     const encoding = if (state.app.documents.active()) |doc| doc.encodingLabel() else "UTF-8";
@@ -3837,13 +3847,14 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
     const git_changes = if (state.git_overview) |overview| overview.changes.len else 0;
     const text = std.fmt.bufPrint(
         &buffer,
-        " {s}/{s}  |  line:{d} col:{d} {s} lang:{s} fmt:{s}/{s} trust:{s} risk:{d}/{d}/{d} git:{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
+        " {s}/{s}  |  line:{d} col:{d} {s} dirty:{d} lang:{s} fmt:{s}/{s} trust:{s} risk:{d}/{d}/{d} git:{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
         .{
             mode,
             focus,
             if (cursor) |position| position.line + 1 else 0,
             if (cursor) |position| position.column + 1 else 0,
             if (dirty) "dirty" else "clean",
+            dirty_count,
             language,
             encoding,
             newline,
@@ -4045,32 +4056,36 @@ fn saveButtonRect(layout: Layout) RECT {
     return toolbarButtonRect(layout, 0);
 }
 
-fn runButtonRect(layout: Layout) RECT {
+fn saveAllButtonRect(layout: Layout) RECT {
     return toolbarButtonRect(layout, 1);
 }
 
-fn testButtonRect(layout: Layout) RECT {
+fn runButtonRect(layout: Layout) RECT {
     return toolbarButtonRect(layout, 2);
 }
 
-fn buildButtonRect(layout: Layout) RECT {
+fn testButtonRect(layout: Layout) RECT {
     return toolbarButtonRect(layout, 3);
 }
 
-fn taskButtonRect(layout: Layout) RECT {
+fn buildButtonRect(layout: Layout) RECT {
     return toolbarButtonRect(layout, 4);
 }
 
-fn diagButtonRect(layout: Layout) RECT {
+fn taskButtonRect(layout: Layout) RECT {
     return toolbarButtonRect(layout, 5);
 }
 
-fn secButtonRect(layout: Layout) RECT {
+fn diagButtonRect(layout: Layout) RECT {
     return toolbarButtonRect(layout, 6);
 }
 
-fn symbolButtonRect(layout: Layout) RECT {
+fn secButtonRect(layout: Layout) RECT {
     return toolbarButtonRect(layout, 7);
+}
+
+fn symbolButtonRect(layout: Layout) RECT {
+    return toolbarButtonRect(layout, 8);
 }
 
 fn documentTabMaxRight(layout: Layout) c_int {

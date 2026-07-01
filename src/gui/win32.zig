@@ -2211,7 +2211,7 @@ const GuiState = struct {
                 scrollIndex(&self.diagnostics_scroll_line, self.app.diagnostics.items.items.len, visible, delta);
             },
             .security => {
-                const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
+                const visible = securityPanelVisibleRows(bottomPanelContentRect(layout.output));
                 scrollIndex(&self.security_scroll_line, self.app.security_findings.items.items.len, visible, delta);
             },
             .tutorial => {
@@ -2422,7 +2422,7 @@ const GuiState = struct {
                 .output => self.openConsoleLineAt(layout, y),
                 .git => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.openGitPanelRow(self.git_scroll_line + row),
                 .diagnostics => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToDiagnostic(self.diagnostics_scroll_line + row),
-                .security => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToSecurityFinding(self.security_scroll_line + row),
+                .security => if (securityPanelFindingRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToSecurityFinding(self.security_scroll_line + row),
                 .tutorial => {},
             }
             return;
@@ -3470,29 +3470,55 @@ fn drawSecurityPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     drawTextClipped(hdc, rect.left + 16, rect.top + 10, header_right, rgb(79, 230, 226), header);
     drawSecurityPanelActions(hdc, rect);
 
-    const rows = @max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT, ROW_HEIGHT));
+    drawBoundaryStrip(hdc, state, RECT{ .left = rect.left, .top = rect.top + HEADER_HEIGHT, .right = rect.right, .bottom = rect.top + HEADER_HEIGHT + ROW_HEIGHT });
+
+    const rows = @max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT - ROW_HEIGHT, ROW_HEIGHT));
     const start = @min(state.security_scroll_line, if (state.app.security_findings.items.items.len > @as(usize, @intCast(rows))) state.app.security_findings.items.items.len - @as(usize, @intCast(rows)) else 0);
-    var y = rect.top + HEADER_HEIGHT;
+    var y = rect.top + HEADER_HEIGHT + ROW_HEIGHT;
     var row: usize = 0;
     while (row < @as(usize, @intCast(rows)) and start + row < state.app.security_findings.items.items.len) : (row += 1) {
         const item = state.app.security_findings.items.items[start + row];
         const color = riskColor(item.risk);
-        var location_buf: [360]u8 = undefined;
-        const location = std.fmt.bufPrint(&location_buf, "{s}:{d}:{d} [{s}/{s}]", .{
+        const boundary = findings_mod.boundaryFor(item.category);
+        var location_buf: [420]u8 = undefined;
+        const location = std.fmt.bufPrint(&location_buf, "{s}:{d}:{d} [{s}/{s}/{s}]", .{
             item.path,
             item.line + 1,
             item.column + 1,
             @tagName(item.risk),
+            findings_mod.boundaryLabel(boundary),
             @tagName(item.category),
         }) catch item.path;
-        drawTextClipped(hdc, rect.left + 16, y, rect.left + 390, color, location);
-        drawTextClipped(hdc, rect.left + 400, y, rect.right - 16, rgb(210, 218, 226), item.message);
+        drawTextClipped(hdc, rect.left + 16, y, rect.left + 470, color, location);
+        drawTextClipped(hdc, rect.left + 480, y, rect.right - 16, rgb(210, 218, 226), item.message);
         y += ROW_HEIGHT;
     }
 
     if (state.app.security_findings.items.items.len == 0) {
-        drawText(hdc, rect.left + 16, rect.top + HEADER_HEIGHT, rgb(116, 128, 140), "No security findings");
+        drawText(hdc, rect.left + 16, rect.top + HEADER_HEIGHT + ROW_HEIGHT, rgb(116, 128, 140), "No security findings");
     }
+}
+
+fn drawBoundaryStrip(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
+    fillRect(hdc, rect, rgb(13, 18, 22));
+    const counts = boundaryCounts(&state.app.security_findings);
+    var buffer: [320]u8 = undefined;
+    const text = std.fmt.bufPrint(
+        &buffer,
+        "BOUNDARY  mem:{d} exec:{d} fs:{d} net:{d} deps:{d} secret:{d} text:{d} path:{d} git:{d}",
+        .{
+            counts.memory,
+            counts.execution,
+            counts.filesystem,
+            counts.network,
+            counts.dependency,
+            counts.secret,
+            counts.text,
+            counts.path,
+            counts.git,
+        },
+    ) catch "BOUNDARY";
+    drawTextClipped(hdc, rect.left + 16, rect.top + 3, rect.right - 16, rgb(180, 190, 200), text);
 }
 
 fn drawTutorialPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
@@ -4118,6 +4144,16 @@ fn bottomPanelVisibleRows(rect: RECT) usize {
     return @as(usize, @intCast(@max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT, ROW_HEIGHT))));
 }
 
+fn securityPanelVisibleRows(rect: RECT) usize {
+    return @as(usize, @intCast(@max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT - ROW_HEIGHT, ROW_HEIGHT))));
+}
+
+fn securityPanelFindingRowAt(rect: RECT, y: c_int) ?usize {
+    const top = rect.top + HEADER_HEIGHT + ROW_HEIGHT;
+    if (y < top or y >= rect.bottom) return null;
+    return @as(usize, @intCast(@divTrunc(y - top, ROW_HEIGHT)));
+}
+
 fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
     const width: c_int = 82;
     const gap: c_int = 6;
@@ -4469,6 +4505,20 @@ const RiskCounts = struct {
     critical: usize = 0,
 };
 
+const BoundaryCounts = struct {
+    workspace: usize = 0,
+    memory: usize = 0,
+    execution: usize = 0,
+    filesystem: usize = 0,
+    network: usize = 0,
+    dependency: usize = 0,
+    secret: usize = 0,
+    text: usize = 0,
+    path: usize = 0,
+    git: usize = 0,
+    output: usize = 0,
+};
+
 fn riskCounts(collection: *const findings_mod.Collection) RiskCounts {
     var counts = RiskCounts{};
     for (collection.items.items) |item| {
@@ -4478,6 +4528,26 @@ fn riskCounts(collection: *const findings_mod.Collection) RiskCounts {
             .medium => counts.medium += 1,
             .high => counts.high += 1,
             .critical => counts.critical += 1,
+        }
+    }
+    return counts;
+}
+
+fn boundaryCounts(collection: *const findings_mod.Collection) BoundaryCounts {
+    var counts = BoundaryCounts{};
+    for (collection.items.items) |item| {
+        switch (findings_mod.boundaryFor(item.category)) {
+            .workspace => counts.workspace += 1,
+            .memory => counts.memory += 1,
+            .execution => counts.execution += 1,
+            .filesystem => counts.filesystem += 1,
+            .network => counts.network += 1,
+            .dependency => counts.dependency += 1,
+            .secret => counts.secret += 1,
+            .text => counts.text += 1,
+            .path => counts.path += 1,
+            .git => counts.git += 1,
+            .output => counts.output += 1,
         }
     }
     return counts;
@@ -4507,12 +4577,14 @@ fn tutorialLines(language: TutorialLanguage) []const []const u8 {
             "SECを開いてAUDITを押すと、ワークスペース全体の静的監査を走らせます。",
             "SCANは現在ファイルだけを監査します。LF/CRLFは改行正規化、CLEANはNUL/Bidi制御文字除去です。",
             "security findingをクリックすると、ZIDEが特定できる場合は危険なbyte範囲を選択します。",
+            "SEC上部のBOUNDARY行は、mem/exec/fs/net/deps/secret/text/path/gitのどの境界が濃いかを示します。",
             "怪しいワークスペースではLOCKを押します。writesとexecutionがpolicyでブロックされます。",
             "",
             "セキュリティ差分: byte-first editor",
             "ZIDEはraw bytesを保持し、UTF-8妥当性とLF/CRLF/MIXED状態をstatus barへ出します。",
             "NUL、invalid UTF-8、Bidi制御文字、mixed endingsを外部コマンドなしで検査します。",
             "ファイル名も監査します: report.pdf.exe、.env、id_rsa、Windows予約名、hidden scriptを検出します。",
+            "Zigの境界性をSECへ落とし込み、memory/execution/filesystem/networkの交差点としてfindingを読めます。",
             "",
             "セキュリティ差分: trust before execution",
             "commandはsafe/workspace_write/network_read/network_write/external_commandへ分類されます。",
@@ -4549,12 +4621,14 @@ fn tutorialLines(language: TutorialLanguage) []const []const u8 {
             "Open SEC. Press AUDIT for workspace static review. Press SCAN for the current file.",
             "Use LF/CRLF to normalize line endings. Use CLEAN to remove NUL and bidi control markers.",
             "Click a security finding to jump to the exact byte range when ZIDE can identify it.",
+            "The BOUNDARY line shows which lanes are hot: mem/exec/fs/net/deps/secret/text/path/git.",
             "Press LOCK when a workspace feels suspicious; writes and execution are blocked by policy.",
             "",
             "SECURITY DIFFERENCE: byte-first editor",
             "ZIDE preserves raw bytes and shows UTF-8 validity plus LF/CRLF/MIXED state in the status bar.",
             "Hidden text hazards are scanned without shelling out: NUL, invalid UTF-8, bidi controls, mixed endings.",
             "File names are audited too: report.pdf.exe, .env, id_rsa, Windows reserved names, hidden scripts.",
+            "Zig boundary thinking is surfaced as memory/execution/filesystem/network crossing points in SEC.",
             "",
             "SECURITY DIFFERENCE: trust before execution",
             "Commands are classified as safe, workspace_write, network_read, network_write, or external_command.",

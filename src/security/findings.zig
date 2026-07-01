@@ -14,6 +14,9 @@ pub const Category = enum {
     package_trust,
     safety_profile,
     ffi_boundary,
+    filesystem_boundary,
+    network_boundary,
+    concurrency_boundary,
     secret_flow,
     output_sanitizer,
     ide_self_protection,
@@ -22,6 +25,20 @@ pub const Category = enum {
     allocator_policy,
     git_trust,
     polyglot_trust,
+};
+
+pub const Boundary = enum {
+    workspace,
+    memory,
+    execution,
+    filesystem,
+    network,
+    dependency,
+    secret,
+    text,
+    path,
+    git,
+    output,
 };
 
 pub const Finding = struct {
@@ -40,6 +57,43 @@ pub const Finding = struct {
         self.* = undefined;
     }
 };
+
+pub fn boundaryFor(category: Category) Boundary {
+    return switch (category) {
+        .workspace_trust => .workspace,
+        .build_firewall => .execution,
+        .package_trust => .dependency,
+        .safety_profile => .memory,
+        .ffi_boundary => .memory,
+        .filesystem_boundary => .filesystem,
+        .network_boundary => .network,
+        .concurrency_boundary => .memory,
+        .secret_flow => .secret,
+        .output_sanitizer => .output,
+        .ide_self_protection => .memory,
+        .text_integrity => .text,
+        .path_trust => .path,
+        .allocator_policy => .memory,
+        .git_trust => .git,
+        .polyglot_trust => .execution,
+    };
+}
+
+pub fn boundaryLabel(boundary: Boundary) []const u8 {
+    return switch (boundary) {
+        .workspace => "workspace",
+        .memory => "memory",
+        .execution => "execution",
+        .filesystem => "filesystem",
+        .network => "network",
+        .dependency => "dependency",
+        .secret => "secret",
+        .text => "text",
+        .path => "path",
+        .git => "git",
+        .output => "output",
+    };
+}
 
 pub const Collection = struct {
     allocator: std.mem.Allocator,

@@ -115,6 +115,14 @@ pub const DocumentStore = struct {
         doc.dirty = false;
     }
 
+    pub fn dirtyCount(self: *const DocumentStore) usize {
+        var count: usize = 0;
+        for (self.documents.items) |doc| {
+            if (doc.dirty) count += 1;
+        }
+        return count;
+    }
+
     fn findByPath(self: *const DocumentStore, path: []const u8) ?usize {
         for (self.documents.items, 0..) |doc, index| {
             const doc_path = doc.path orelse continue;
@@ -161,4 +169,19 @@ test "document store closes active document" {
     try store.closeActive(.allow_dirty);
     try std.testing.expectEqual(@as(usize, 1), store.documents.items.len);
     try std.testing.expectEqual(@as(?usize, 0), store.activeIndex());
+}
+
+test "document store counts dirty documents" {
+    var store = DocumentStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    _ = try store.createScratch("one.zig", "const one = 1;\n");
+    _ = try store.createScratch("two.zig", "const two = 2;\n");
+
+    try std.testing.expectEqual(@as(usize, 0), store.dirtyCount());
+    store.documents.items[0].dirty = true;
+    store.documents.items[1].dirty = true;
+    try std.testing.expectEqual(@as(usize, 2), store.dirtyCount());
+    store.documents.items[1].dirty = false;
+    try std.testing.expectEqual(@as(usize, 1), store.dirtyCount());
 }

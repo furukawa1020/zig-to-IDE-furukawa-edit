@@ -14,6 +14,7 @@ const github_client = @import("../github/client.zig");
 const diagnostic_model = @import("../diagnostics/model.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
 const document_mod = @import("../editor/document.zig");
+const extension_registry = @import("../extensions/registry.zig");
 const file_finder = @import("../search/file_finder.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const permissions = @import("../security/permissions.zig");
@@ -398,6 +399,13 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return try createDraftGitHubPullRequest(app, request.argument);
     }
 
+    if (std.mem.eql(u8, definition.id, "view.extensions") or std.mem.eql(u8, definition.id, "extensions.scan")) {
+        var registry = try extension_registry.Registry.scan(app.allocator, &app.workspace, .{});
+        defer registry.deinit();
+        try renderExtensionRegistry(app, &registry);
+        return .{ .completed = "extension manifests scanned" };
+    }
+
     if (std.mem.eql(u8, definition.id, "git.status")) {
         var audit = try git_status.auditRepository(app.allocator, app.workspace.root_path, .{});
         defer audit.deinit();
@@ -778,6 +786,55 @@ fn renderGitAudit(app: *app_mod.App, audit: *const security_findings.Collection)
             item.message,
         });
     }
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn renderExtensionRegistry(app: *app_mod.App, registry: *const extension_registry.Registry) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("extensions/integrations (pure Zig manifest scan, no extension code executed)\n");
+    try writer.print("manifests: {d}, loaded={d}, invalid={d}, high={d}, medium={d}\n", .{
+        registry.items.items.len,
+        registry.countStatus(.loaded),
+        registry.countStatus(.invalid),
+        registry.countRisk(.high),
+        registry.countRisk(.medium),
+    });
+
+    if (registry.items.items.len == 0) {
+        try writer.writeAll("no zide-extension.json or zide.extension.json manifests found\n");
+    }
+
+    for (registry.items.items, 0..) |extension, index| {
+        if (index >= 40) {
+            try writer.print("... {d} more extension manifests\n", .{registry.items.items.len - index});
+            break;
+        }
+
+        try writer.print("- [{s}/{s}] {s} {s} ({s})\n", .{
+            @tagName(extension.status),
+            extension_registry.riskLabel(extension_registry.extensionRisk(extension)),
+            extension.name,
+            extension.version,
+            extension.manifest_path,
+        });
+        if (extension.capabilities.len > 0) {
+            try writer.writeAll("  capabilities:");
+            for (extension.capabilities) |capability| {
+                try writer.print(" {s}", .{extension_registry.capabilityLabel(capability)});
+            }
+            try writer.writeByte('\n');
+        }
+        if (extension.commands > 0 or extension.integrations > 0) {
+            try writer.print("  commands={d} integrations={d}\n", .{ extension.commands, extension.integrations });
+        }
+        if (extension.message.len > 0) {
+            try writer.print("  {s}\n", .{extension.message});
+        }
+    }
+
     try app.process_console.appendBytes(.stdout, text.written());
 }
 

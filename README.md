@@ -69,6 +69,7 @@ zig build run -- demo input
 zig build run -- demo loop
 zig build run -- demo screen
 zig build run -- demo security
+zig build run -- demo extensions
 zig build run -- demo buffer
 zig build run -- demo zig-tokens
 zig build test

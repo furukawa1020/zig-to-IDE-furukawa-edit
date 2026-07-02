@@ -7,6 +7,7 @@ const dispatcher = @import("../core/dispatcher.zig");
 const types = @import("../core/types.zig");
 const document_mod = @import("../editor/document.zig");
 const navigation = @import("../editor/navigation.zig");
+const extension_registry = @import("../extensions/registry.zig");
 const git_repository = @import("../git/repository.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
 const highlight = @import("../language/highlight.zig");
@@ -35,16 +36,23 @@ const QuickPanelMode = enum {
 const BottomPanel = enum {
     output,
     git,
+    extensions,
     diagnostics,
     security,
     tutorial,
 };
 
 const GitPanelAction = enum {
+    refresh,
+    status,
     live,
     issues,
     failures,
     draft_pr,
+};
+
+const ExtensionPanelAction = enum {
+    scan,
 };
 
 const SecurityPanelAction = enum {
@@ -489,6 +497,7 @@ const GuiState = struct {
     security_scroll_line: usize = 0,
     tutorial_scroll_line: usize = 0,
     git_scroll_line: usize = 0,
+    extensions_scroll_line: usize = 0,
     selection_anchor: ?usize = null,
     editor_dragging: bool = false,
     last_document_search_query: std.array_list.Managed(u8),
@@ -499,6 +508,7 @@ const GuiState = struct {
     quick_panel: QuickPanel,
     search_panel: SearchPanel,
     git_overview: ?git_repository.Overview = null,
+    extensions_registry: ?extension_registry.Registry = null,
 
     fn init(allocator: std.mem.Allocator, root_path: []const u8) !GuiState {
         var app = try app_mod.App.init(allocator, root_path);
@@ -541,10 +551,12 @@ const GuiState = struct {
         self.diagnostics_scroll_line = 0;
         self.security_scroll_line = 0;
         self.git_scroll_line = 0;
+        self.extensions_scroll_line = 0;
         self.clearSelection();
         self.show_output = true;
         self.bottom_panel = .output;
         self.clearGitOverview();
+        self.clearExtensionsRegistry();
         self.quick_panel.close();
         self.search_panel.clear();
         self.setMessage("Workspace opened") catch {};
@@ -630,6 +642,7 @@ const GuiState = struct {
         if (self.text_font) |font| _ = DeleteObject(@ptrCast(font));
         if (self.last_error) |message| self.allocator.free(message);
         self.clearGitOverview();
+        self.clearExtensionsRegistry();
         self.search_panel.deinit();
         self.quick_panel.deinit();
         self.last_document_search_query.deinit();
@@ -813,6 +826,10 @@ const GuiState = struct {
             self.openTutorialPanel();
             return;
         }
+        if (std.mem.eql(u8, id, "view.extensions") or std.mem.eql(u8, id, "extensions.scan")) {
+            self.openExtensionsPanel();
+            return;
+        }
 
         const result = dispatcher.dispatch(&self.app, .{ .id = id, .source = .command_palette }) catch |err| {
             self.setError(err) catch {};
@@ -827,9 +844,35 @@ const GuiState = struct {
     }
 
     fn executeGitPanelAction(self: *GuiState, action: GitPanelAction) void {
-        self.executeCommand(gitPanelActionCommand(action));
-        self.show_output = true;
-        self.bottom_panel = .output;
+        switch (action) {
+            .refresh => {
+                self.show_output = true;
+                self.bottom_panel = .git;
+                self.git_scroll_line = 0;
+                self.refreshGitOverview();
+            },
+            .status => {
+                self.executeCommand("git.status");
+                self.show_output = true;
+                self.bottom_panel = .output;
+            },
+            .live, .issues, .failures, .draft_pr => {
+                self.executeCommand(gitPanelActionCommand(action));
+                self.show_output = true;
+                self.bottom_panel = .output;
+            },
+        }
+    }
+
+    fn executeExtensionPanelAction(self: *GuiState, action: ExtensionPanelAction) void {
+        switch (action) {
+            .scan => {
+                self.show_output = true;
+                self.bottom_panel = .extensions;
+                self.extensions_scroll_line = 0;
+                self.refreshExtensionsRegistry();
+            },
+        }
     }
 
     fn executeSecurityPanelAction(self: *GuiState, action: SecurityPanelAction) void {
@@ -942,6 +985,13 @@ const GuiState = struct {
         self.refreshGitOverview();
     }
 
+    fn openExtensionsPanel(self: *GuiState) void {
+        self.show_output = true;
+        self.bottom_panel = .extensions;
+        self.extensions_scroll_line = 0;
+        self.refreshExtensionsRegistry();
+    }
+
     fn runWorkspaceSecurityAudit(self: *GuiState, message: []const u8) void {
         self.show_output = true;
         self.bottom_panel = .security;
@@ -980,6 +1030,25 @@ const GuiState = struct {
         if (self.git_overview) |*overview| {
             overview.deinit();
             self.git_overview = null;
+        }
+    }
+
+    fn refreshExtensionsRegistry(self: *GuiState) void {
+        self.clearExtensionsRegistry();
+        const registry = extension_registry.Registry.scan(self.allocator, &self.app.workspace, .{}) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "extension scan failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        const count = registry.items.items.len;
+        self.extensions_registry = registry;
+        self.setMessage(if (count == 0) "No extension manifests" else "Extension manifests") catch {};
+    }
+
+    fn clearExtensionsRegistry(self: *GuiState) void {
+        if (self.extensions_registry) |*registry| {
+            registry.deinit();
+            self.extensions_registry = null;
         }
     }
 
@@ -1708,6 +1777,13 @@ const GuiState = struct {
         self.openRelativeFile(change.path, null);
     }
 
+    fn openExtensionPanelRow(self: *GuiState, row: usize) void {
+        const registry = self.extensions_registry orelse return;
+        if (row >= registry.items.items.len) return;
+        const extension = registry.items.items[row];
+        self.openRelativeFile(extension.manifest_path, null);
+    }
+
     fn openExternalUrl(self: *GuiState, url: []const u8) void {
         const wide = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, url) catch |err| {
             self.setError(err) catch {};
@@ -2206,6 +2282,11 @@ const GuiState = struct {
                 const total = if (self.git_overview) |overview| gitPanelRowCount(overview) else 0;
                 scrollIndex(&self.git_scroll_line, total, visible, delta);
             },
+            .extensions => {
+                const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
+                const total = if (self.extensions_registry) |registry| registry.items.items.len else 0;
+                scrollIndex(&self.extensions_scroll_line, total, visible, delta);
+            },
             .diagnostics => {
                 const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
                 scrollIndex(&self.diagnostics_scroll_line, self.app.diagnostics.items.items.len, visible, delta);
@@ -2399,6 +2480,7 @@ const GuiState = struct {
                 self.bottom_panel = panel;
                 self.show_output = true;
                 if (panel == .git and self.git_overview == null) self.refreshGitOverview();
+                if (panel == .extensions and self.extensions_registry == null) self.refreshExtensionsRegistry();
                 return;
             }
             if (self.bottom_panel == .git) {
@@ -2415,6 +2497,13 @@ const GuiState = struct {
                     return;
                 }
             }
+            if (self.bottom_panel == .extensions) {
+                const content = bottomPanelContentRect(layout.output);
+                if (extensionPanelActionAt(content, x, y)) |action| {
+                    self.executeExtensionPanelAction(action);
+                    return;
+                }
+            }
             if (self.bottom_panel == .tutorial) {
                 const content = bottomPanelContentRect(layout.output);
                 if (tutorialPanelActionAt(content, x, y)) |action| {
@@ -2425,6 +2514,7 @@ const GuiState = struct {
             switch (self.bottom_panel) {
                 .output => self.openConsoleLineAt(layout, y),
                 .git => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.openGitPanelRow(self.git_scroll_line + row),
+                .extensions => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.openExtensionPanelRow(self.extensions_scroll_line + row),
                 .diagnostics => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToDiagnostic(self.diagnostics_scroll_line + row),
                 .security => if (securityPanelFindingRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToSecurityFinding(self.security_scroll_line + row),
                 .tutorial => {},
@@ -2547,6 +2637,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (ctrl and shift and key == 'O') {
         state.openSymbolPanel();
+        return;
+    }
+    if (ctrl and shift and key == 'X') {
+        state.openExtensionsPanel();
         return;
     }
     if (ctrl and key == 'P') {
@@ -3136,6 +3230,7 @@ fn drawOutput(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
             drawConsoleOutput(hdc, state, consoleOutputRect(layout, state));
         },
         .git => drawGitPanel(hdc, state, content),
+        .extensions => drawExtensionsPanel(hdc, state, content),
         .diagnostics => drawDiagnosticsPanel(hdc, state, content),
         .security => drawSecurityPanel(hdc, state, content),
         .tutorial => drawTutorialPanel(hdc, state, content),
@@ -3147,6 +3242,7 @@ fn drawBottomPanelTabs(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
     drawBottomPanelTab(hdc, rect, .output, state.bottom_panel == .output, "OUTPUT");
     drawBottomPanelTab(hdc, rect, .git, state.bottom_panel == .git, "GIT");
+    drawBottomPanelTab(hdc, rect, .extensions, state.bottom_panel == .extensions, "EXT");
     drawBottomPanelTab(hdc, rect, .diagnostics, state.bottom_panel == .diagnostics, "DIAG");
     drawBottomPanelTab(hdc, rect, .security, state.bottom_panel == .security, "SEC");
     drawBottomPanelTab(hdc, rect, .tutorial, state.bottom_panel == .tutorial, "HELP");
@@ -3216,7 +3312,7 @@ fn drawGitPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
             workflow_risk.medium,
         },
     ) catch "GIT";
-    const header_right = if (gitPanelHasActionButtons(rect)) gitPanelActionButtonRect(rect, .live).left - 12 else rect.right - 16;
+    const header_right = if (gitPanelHasActionButtons(rect)) gitPanelActionButtonRect(rect, .refresh).left - 12 else rect.right - 16;
     drawTextClipped(hdc, rect.left + 16, rect.top + 10, header_right, rgb(79, 230, 226), header);
     drawGitPanelActions(hdc, rect);
 
@@ -3359,7 +3455,7 @@ fn gitPanelUrlAtRow(overview: git_repository.Overview, row: usize) ?[]const u8 {
 
 fn drawGitPanelActions(hdc: windows.HDC, rect: RECT) void {
     if (!gitPanelHasActionButtons(rect)) return;
-    const actions = [_]GitPanelAction{ .live, .issues, .failures, .draft_pr };
+    const actions = [_]GitPanelAction{ .refresh, .status, .live, .issues, .failures, .draft_pr };
     for (actions) |action| {
         drawButton(hdc, gitPanelActionButtonRect(rect, action), gitPanelActionLabel(action));
     }
@@ -3368,7 +3464,7 @@ fn drawGitPanelActions(hdc: windows.HDC, rect: RECT) void {
 fn gitPanelActionAt(rect: RECT, x: c_int, y: c_int) ?GitPanelAction {
     if (!gitPanelHasActionButtons(rect)) return null;
     if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const actions = [_]GitPanelAction{ .live, .issues, .failures, .draft_pr };
+    const actions = [_]GitPanelAction{ .refresh, .status, .live, .issues, .failures, .draft_pr };
     for (actions) |action| {
         if (pointIn(gitPanelActionButtonRect(rect, action), x, y)) return action;
     }
@@ -3376,17 +3472,19 @@ fn gitPanelActionAt(rect: RECT, x: c_int, y: c_int) ?GitPanelAction {
 }
 
 fn gitPanelHasActionButtons(rect: RECT) bool {
-    return rect.right - rect.left >= 520;
+    return rect.right - rect.left >= 620;
 }
 
 fn gitPanelActionButtonRect(rect: RECT, action: GitPanelAction) RECT {
-    const width: c_int = 76;
+    const width: c_int = 62;
     const gap: c_int = 8;
     const slot: c_int = switch (action) {
         .draft_pr => 0,
         .failures => 1,
         .issues => 2,
         .live => 3,
+        .status => 4,
+        .refresh => 5,
     };
     const right = rect.right - 12 - slot * (width + gap);
     return .{
@@ -3399,8 +3497,10 @@ fn gitPanelActionButtonRect(rect: RECT, action: GitPanelAction) RECT {
 
 fn gitPanelActionLabel(action: GitPanelAction) []const u8 {
     return switch (action) {
+        .refresh => "REF",
+        .status => "STAT",
         .live => "LIVE",
-        .issues => "ISSUES",
+        .issues => "ISS",
         .failures => "FAIL",
         .draft_pr => "PR",
     };
@@ -3408,6 +3508,8 @@ fn gitPanelActionLabel(action: GitPanelAction) []const u8 {
 
 fn gitPanelActionCommand(action: GitPanelAction) []const u8 {
     return switch (action) {
+        .refresh => "git.overview",
+        .status => "git.status",
         .live => "github.fetch",
         .issues => "github.issues",
         .failures => "github.actions.failures",
@@ -3428,6 +3530,127 @@ fn gitChangeColor(status: git_repository.ChangeStatus) windows.COLORREF {
         .modified => rgb(255, 207, 92),
         .deleted => rgb(255, 118, 118),
         .untracked => rgb(127, 211, 255),
+    };
+}
+
+fn drawExtensionsPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
+    fillRect(hdc, rect, rgb(10, 12, 14));
+    fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
+
+    const registry = state.extensions_registry orelse {
+        drawText(hdc, rect.left + 16, rect.top + 10, rgb(79, 230, 226), "EXTENSIONS");
+        drawExtensionPanelActions(hdc, rect);
+        drawText(hdc, rect.left + 16, rect.top + HEADER_HEIGHT, rgb(116, 128, 140), "Click EXT or press Ctrl+Shift+X to scan extension manifests");
+        return;
+    };
+
+    var header_buf: [260]u8 = undefined;
+    const header = std.fmt.bufPrint(
+        &header_buf,
+        "EXTENSIONS  manifests:{d} loaded:{d} invalid:{d} high:{d} medium:{d}",
+        .{
+            registry.items.items.len,
+            registry.countStatus(.loaded),
+            registry.countStatus(.invalid),
+            registry.countRisk(.high),
+            registry.countRisk(.medium),
+        },
+    ) catch "EXTENSIONS";
+    const header_right = if (extensionPanelHasActionButtons(rect)) extensionPanelActionButtonRect(rect, .scan).left - 12 else rect.right - 16;
+    drawTextClipped(hdc, rect.left + 16, rect.top + 10, header_right, rgb(79, 230, 226), header);
+    drawExtensionPanelActions(hdc, rect);
+
+    const rows = @max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT, ROW_HEIGHT));
+    const total = registry.items.items.len;
+    const start = @min(state.extensions_scroll_line, if (total > @as(usize, @intCast(rows))) total - @as(usize, @intCast(rows)) else 0);
+    var y = rect.top + HEADER_HEIGHT;
+    var row: usize = 0;
+    while (row < @as(usize, @intCast(rows)) and start + row < total) : (row += 1) {
+        drawExtensionPanelRow(hdc, rect, registry.items.items[start + row], y);
+        y += ROW_HEIGHT;
+    }
+
+    if (total == 0) {
+        drawText(hdc, rect.left + 16, rect.top + HEADER_HEIGHT, rgb(116, 128, 140), "No zide-extension.json or zide.extension.json manifests found");
+    }
+}
+
+fn drawExtensionPanelRow(hdc: windows.HDC, rect: RECT, extension: extension_registry.Extension, y: c_int) void {
+    const risk = extension_registry.extensionRisk(extension);
+    const color = extensionRiskColor(risk);
+    var left_buf: [420]u8 = undefined;
+    const left = std.fmt.bufPrint(&left_buf, "[{s}/{s}] {s} {s}", .{
+        @tagName(extension.status),
+        extension_registry.riskLabel(risk),
+        extension.name,
+        extension.version,
+    }) catch extension.name;
+
+    var right_buf: [240]u8 = undefined;
+    const right = std.fmt.bufPrint(&right_buf, "cmd:{d} int:{d} {s}", .{ extension.commands, extension.integrations, extension.manifest_path }) catch extension.manifest_path;
+    var capability_buf: [240]u8 = undefined;
+    const capabilities = extensionCapabilitiesLabel(&capability_buf, extension);
+
+    drawTextClipped(hdc, rect.left + 16, y, rect.left + 430, color, left);
+    drawTextClipped(hdc, rect.left + 440, y, rect.right - 210, rgb(180, 190, 200), capabilities);
+    drawTextRight(hdc, rect.right - 204, y, rect.right - 16, rgb(127, 211, 255), right);
+}
+
+fn extensionCapabilitiesLabel(buffer: []u8, extension: extension_registry.Extension) []const u8 {
+    if (extension.capabilities.len == 0) return "cap:none";
+    var len: usize = 0;
+    appendBounded(buffer, &len, "cap:");
+    for (extension.capabilities, 0..) |capability, index| {
+        if (index >= 5) {
+            appendBounded(buffer, &len, " ...");
+            break;
+        }
+        if (index > 0) appendBounded(buffer, &len, ",");
+        appendBounded(buffer, &len, extension_registry.capabilityLabel(capability));
+    }
+    return buffer[0..len];
+}
+
+fn appendBounded(buffer: []u8, len: *usize, text: []const u8) void {
+    if (len.* >= buffer.len) return;
+    const available = buffer.len - len.*;
+    const copy_len = @min(available, text.len);
+    if (copy_len == 0) return;
+    @memcpy(buffer[len.* .. len.* + copy_len], text[0..copy_len]);
+    len.* += copy_len;
+}
+
+fn extensionRiskColor(risk: extension_registry.Risk) windows.COLORREF {
+    return switch (risk) {
+        .high => rgb(255, 118, 118),
+        .medium => rgb(255, 207, 92),
+        .low => rgb(165, 214, 167),
+    };
+}
+
+fn drawExtensionPanelActions(hdc: windows.HDC, rect: RECT) void {
+    if (!extensionPanelHasActionButtons(rect)) return;
+    drawButton(hdc, extensionPanelActionButtonRect(rect, .scan), "SCAN");
+}
+
+fn extensionPanelActionAt(rect: RECT, x: c_int, y: c_int) ?ExtensionPanelAction {
+    if (!extensionPanelHasActionButtons(rect)) return null;
+    if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
+    if (pointIn(extensionPanelActionButtonRect(rect, .scan), x, y)) return .scan;
+    return null;
+}
+
+fn extensionPanelHasActionButtons(rect: RECT) bool {
+    return rect.right - rect.left >= 220;
+}
+
+fn extensionPanelActionButtonRect(rect: RECT, action: ExtensionPanelAction) RECT {
+    _ = action;
+    return .{
+        .left = rect.right - 78,
+        .top = rect.top + 8,
+        .right = rect.right - 12,
+        .bottom = rect.top + 32,
     };
 }
 
@@ -4175,9 +4398,10 @@ fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
     const index: c_int = switch (panel) {
         .output => 0,
         .git => 1,
-        .diagnostics => 2,
-        .security => 3,
-        .tutorial => 4,
+        .extensions => 2,
+        .diagnostics => 3,
+        .security => 4,
+        .tutorial => 5,
     };
     const left = rect.left + 12 + index * (width + gap);
     return .{ .left = left, .top = rect.top + 9, .right = left + width, .bottom = rect.top + 33 };
@@ -4185,7 +4409,7 @@ fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
 
 fn bottomPanelTabAt(rect: RECT, x: c_int, y: c_int) ?BottomPanel {
     if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const panels = [_]BottomPanel{ .output, .git, .diagnostics, .security, .tutorial };
+    const panels = [_]BottomPanel{ .output, .git, .extensions, .diagnostics, .security, .tutorial };
     for (panels) |panel| {
         if (pointIn(bottomPanelTabRect(rect, panel), x, y)) return panel;
     }

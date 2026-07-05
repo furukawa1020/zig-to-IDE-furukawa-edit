@@ -56,6 +56,12 @@ pub const InspectOptions = struct {
     include_untracked: bool = true,
 };
 
+pub const DiffPreviewOptions = struct {
+    max_index_bytes: usize = 16 * 1024 * 1024,
+    max_file_bytes: usize = 8 * 1024 * 1024,
+    max_lines: usize = 160,
+};
+
 pub const Overview = struct {
     allocator: std.mem.Allocator,
     present: bool = false,
@@ -184,6 +190,85 @@ pub fn inspect(allocator: std.mem.Allocator, workspace: *const workspace_mod.Wor
     try collectChanges(allocator, workspace, &index, &ignore_rules, options, &overview);
 
     return overview;
+}
+
+pub fn previewFileDiff(allocator: std.mem.Allocator, workspace: *const workspace_mod.Workspace, path: []const u8, options: DiffPreviewOptions) ![]u8 {
+    const relative = try normalizeWorkspacePath(allocator, workspace.root_path, path);
+    defer allocator.free(relative);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("git diff preview (pure Zig, no git executable)\n");
+    try writer.print("path: {s}\n", .{relative});
+
+    const git_dir = try resolveGitDir(allocator, workspace.root_path);
+    defer if (git_dir) |value| allocator.free(value);
+    if (git_dir == null) {
+        try writer.writeAll("status: no .git metadata found\n");
+        return try out.toOwnedSlice();
+    }
+
+    var index = readIndex(allocator, git_dir.?, options.max_index_bytes) catch |err| switch (err) {
+        error.UnsupportedGitIndexVersion => {
+            try writer.writeAll("status: unsupported Git index version\n");
+            return try out.toOwnedSlice();
+        },
+        error.FileNotFound => {
+            try writer.writeAll("status: Git index not found\n");
+            return try out.toOwnedSlice();
+        },
+        else => return err,
+    };
+    defer index.deinit();
+
+    const entry = findTrackedEntry(index.entries, relative);
+    const absolute = try std.fs.path.join(allocator, &.{ workspace.root_path, relative });
+    defer allocator.free(absolute);
+
+    const new_bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, absolute, allocator, .limited(options.max_file_bytes)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (new_bytes) |bytes| allocator.free(bytes);
+
+    if (entry) |tracked| {
+        var old_blob = readLooseBlob(allocator, git_dir.?, tracked.object_id, options.max_file_bytes) catch null;
+        defer if (old_blob) |*blob| blob.deinit(allocator);
+
+        if (new_bytes) |new_body| {
+            const object_id = gitBlobSha1(new_body);
+            if (std.mem.eql(u8, object_id[0..], tracked.object_id[0..])) {
+                try writer.writeAll("status: clean against index\n");
+                return try out.toOwnedSlice();
+            }
+            try writer.writeAll("status: modified\n");
+            if (old_blob) |blob| {
+                try writeChangedPreview(writer, blob.body, new_body, options.max_lines);
+            } else {
+                try writer.writeAll("diff body unavailable: indexed blob is packed or too large\n");
+            }
+            return try out.toOwnedSlice();
+        }
+
+        try writer.writeAll("status: deleted\n");
+        if (old_blob) |blob| {
+            try writePrefixedLines(writer, '-', blob.body, options.max_lines);
+        } else {
+            try writer.writeAll("diff body unavailable: indexed blob is packed or too large\n");
+        }
+        return try out.toOwnedSlice();
+    }
+
+    if (new_bytes) |body| {
+        try writer.writeAll("status: untracked\n");
+        try writePrefixedLines(writer, '+', body, options.max_lines);
+        return try out.toOwnedSlice();
+    }
+
+    try writer.writeAll("status: file not found in workspace or index\n");
+    return try out.toOwnedSlice();
 }
 
 fn collectChanges(

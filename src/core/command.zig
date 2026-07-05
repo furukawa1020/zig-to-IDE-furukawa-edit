@@ -106,6 +106,7 @@ const definitions = [_]Definition{
     .{ .id = "debug.start", .title = "Start Debugging", .description = "Launch the configured debug session.", .default_key = "f5", .scope = .task, .capability = .external_command },
     .{ .id = "git.overview", .title = "Git and GitHub Overview", .description = "Read branch, remotes, GitHub links, and file changes without executing Git.", .default_key = "ctrl-g", .scope = .workspace, .capability = .safe },
     .{ .id = "git.status", .title = "Git Security Status", .description = "Read Git metadata without executing Git hooks, filters, or fsmonitor.", .default_key = "", .scope = .workspace, .capability = .safe },
+    .{ .id = "git.diff_current", .title = "Preview Current Git Diff", .description = "Render a compact diff for the active file without running git diff.", .default_key = "ctrl-shift-g", .scope = .workspace, .capability = .safe },
     .{ .id = "github.overview", .title = "GitHub Overview", .description = "Show GitHub repository and Actions links inferred from local Git remotes.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "github.fetch", .title = "Fetch GitHub Live Overview", .description = "Fetch read-only GitHub repo, PR, and Actions data with optional GITHUB_TOKEN.", .default_key = "", .scope = .workspace, .capability = .network_read },
     .{ .id = "github.issues", .title = "Fetch GitHub Issues", .description = "Fetch open GitHub issues and pull requests for the current repository.", .default_key = "", .scope = .workspace, .capability = .network_read },

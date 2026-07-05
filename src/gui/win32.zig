@@ -40,6 +40,7 @@ const BottomPanel = enum {
     diagnostics,
     security,
     tutorial,
+    publish,
 };
 
 const GitPanelAction = enum {
@@ -73,6 +74,11 @@ const TutorialLanguage = enum {
 const TutorialPanelAction = enum {
     ja,
     en,
+};
+
+const PublishPanelAction = enum {
+    checklist,
+    assets,
 };
 
 const SelectionRange = struct {
@@ -497,6 +503,7 @@ const GuiState = struct {
     diagnostics_scroll_line: usize = 0,
     security_scroll_line: usize = 0,
     tutorial_scroll_line: usize = 0,
+    publish_scroll_line: usize = 0,
     git_scroll_line: usize = 0,
     extensions_scroll_line: usize = 0,
     selection_anchor: ?usize = null,
@@ -553,6 +560,7 @@ const GuiState = struct {
         self.security_scroll_line = 0;
         self.git_scroll_line = 0;
         self.extensions_scroll_line = 0;
+        self.publish_scroll_line = 0;
         self.clearSelection();
         self.show_output = true;
         self.bottom_panel = .output;
@@ -831,6 +839,10 @@ const GuiState = struct {
             self.openExtensionsPanel();
             return;
         }
+        if (std.mem.eql(u8, id, "view.publish")) {
+            self.openPublishPanel();
+            return;
+        }
 
         const result = dispatcher.dispatch(&self.app, .{ .id = id, .source = .command_palette }) catch |err| {
             self.setError(err) catch {};
@@ -906,6 +918,21 @@ const GuiState = struct {
         self.show_output = true;
         self.bottom_panel = .tutorial;
         self.setMessage(if (self.tutorial_language == .ja) "チュートリアル: 日本語" else "Tutorial: English") catch {};
+    }
+
+    fn executePublishPanelAction(self: *GuiState, action: PublishPanelAction) void {
+        const id = switch (action) {
+            .checklist => "release.checklist",
+            .assets => "release.assets",
+        };
+        const result = dispatcher.dispatch(&self.app, .{ .id = id, .source = .command_palette }) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "publish action failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult(id, result);
+        self.show_output = true;
+        self.bottom_panel = .output;
     }
 
     fn runTaskByName(self: *GuiState, name: []const u8) void {
@@ -985,6 +1012,13 @@ const GuiState = struct {
         self.bottom_panel = .tutorial;
         self.tutorial_scroll_line = 0;
         self.setMessage("ZIDE tutorial") catch {};
+    }
+
+    fn openPublishPanel(self: *GuiState) void {
+        self.show_output = true;
+        self.bottom_panel = .publish;
+        self.publish_scroll_line = 0;
+        self.setMessage("Publish checklist") catch {};
     }
 
     fn openGitPanel(self: *GuiState) void {
@@ -2326,6 +2360,10 @@ const GuiState = struct {
                 const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
                 scrollIndex(&self.tutorial_scroll_line, tutorialLineCount(self.tutorial_language), visible, delta);
             },
+            .publish => {
+                const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
+                scrollIndex(&self.publish_scroll_line, publishLineCount(), visible, delta);
+            },
         }
     }
 
@@ -2538,6 +2576,13 @@ const GuiState = struct {
                     return;
                 }
             }
+            if (self.bottom_panel == .publish) {
+                const content = bottomPanelContentRect(layout.output);
+                if (publishPanelActionAt(content, x, y)) |action| {
+                    self.executePublishPanelAction(action);
+                    return;
+                }
+            }
             switch (self.bottom_panel) {
                 .output => self.openConsoleLineAt(layout, y),
                 .git => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.openGitPanelRow(self.git_scroll_line + row),
@@ -2545,6 +2590,7 @@ const GuiState = struct {
                 .diagnostics => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToDiagnostic(self.diagnostics_scroll_line + row),
                 .security => if (securityPanelFindingRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToSecurityFinding(self.security_scroll_line + row),
                 .tutorial => {},
+                .publish => {},
             }
             return;
         }
@@ -2668,6 +2714,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (ctrl and shift and key == 'X') {
         state.openExtensionsPanel();
+        return;
+    }
+    if (ctrl and shift and key == 'L') {
+        state.openPublishPanel();
         return;
     }
     if (ctrl and key == 'P') {
@@ -3366,6 +3416,7 @@ fn drawOutput(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
         .diagnostics => drawDiagnosticsPanel(hdc, state, content),
         .security => drawSecurityPanel(hdc, state, content),
         .tutorial => drawTutorialPanel(hdc, state, content),
+        .publish => drawPublishPanel(hdc, state, content),
     }
 }
 
@@ -3378,6 +3429,7 @@ fn drawBottomPanelTabs(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     drawBottomPanelTab(hdc, rect, .diagnostics, state.bottom_panel == .diagnostics, "DIAG");
     drawBottomPanelTab(hdc, rect, .security, state.bottom_panel == .security, "SEC");
     drawBottomPanelTab(hdc, rect, .tutorial, state.bottom_panel == .tutorial, "HELP");
+    drawBottomPanelTab(hdc, rect, .publish, state.bottom_panel == .publish, "SHIP");
 }
 
 fn drawBottomPanelTab(hdc: windows.HDC, rect: RECT, panel: BottomPanel, active: bool, label: []const u8) void {
@@ -3977,6 +4029,39 @@ fn tutorialPanelActionLabel(action: TutorialPanelAction) []const u8 {
         .ja => "JA",
         .en => "EN",
     };
+}
+
+fn drawPublishPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
+    fillRect(hdc, rect, rgb(10, 12, 14));
+    fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
+
+    var header_buf: [220]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "SHIP  release:{s} gui:{s} cli:{s} workflows:{s}", .{
+        if (workspaceHasAnyLicense(&state.app)) "licensed" else "no-license",
+        if (workspaceFileExistsGui(&state.app, "zig-out/bin/zide-gui.exe")) "built" else "missing",
+        if (workspaceFileExistsGui(&state.app, "zig-out/bin/zide.exe")) "built" else "missing",
+        if (workspaceHasPrefixGui(&state.app, ".github/workflows/")) "yes" else "none",
+    }) catch "SHIP";
+    drawTextClipped(hdc, rect.left + 16, rect.top + 10, rect.right - 16, rgb(79, 230, 226), header);
+
+    const lines = publishLines();
+    const rows = @max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT, ROW_HEIGHT));
+    const start = @min(state.publish_scroll_line, if (lines.len > @as(usize, @intCast(rows))) lines.len - @as(usize, @intCast(rows)) else 0);
+    var y = rect.top + HEADER_HEIGHT;
+    var row: usize = 0;
+    while (row < @as(usize, @intCast(rows)) and start + row < lines.len) : (row += 1) {
+        const line = lines[start + row];
+        drawTextClipped(hdc, rect.left + 16, y, rect.right - 16, publishLineColor(line), line);
+        y += ROW_HEIGHT;
+    }
+}
+
+fn publishLineColor(line: []const u8) windows.COLORREF {
+    if (std.mem.startsWith(u8, line, "==")) return rgb(255, 207, 92);
+    if (std.mem.startsWith(u8, line, "[ship]")) return rgb(165, 214, 167);
+    if (std.mem.startsWith(u8, line, "[later]")) return rgb(127, 211, 255);
+    if (std.mem.startsWith(u8, line, "[avoid]")) return rgb(255, 118, 118);
+    return rgb(210, 218, 226);
 }
 
 fn tutorialLineColor(line: []const u8) windows.COLORREF {
@@ -4618,6 +4703,7 @@ fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
         .diagnostics => 3,
         .security => 4,
         .tutorial => 5,
+        .publish => 6,
     };
     const left = rect.left + 12 + index * (width + gap);
     return .{ .left = left, .top = rect.top + 9, .right = left + width, .bottom = rect.top + 33 };
@@ -4625,7 +4711,7 @@ fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
 
 fn bottomPanelTabAt(rect: RECT, x: c_int, y: c_int) ?BottomPanel {
     if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const panels = [_]BottomPanel{ .output, .git, .extensions, .diagnostics, .security, .tutorial };
+    const panels = [_]BottomPanel{ .output, .git, .extensions, .diagnostics, .security, .tutorial, .publish };
     for (panels) |panel| {
         if (pointIn(bottomPanelTabRect(rect, panel), x, y)) return panel;
     }
@@ -5043,6 +5129,7 @@ fn tutorialLines(language: TutorialLanguage) []const []const u8 {
             "左のファイルをクリックして開きます。編集はinsertモードで行い、Ctrl+Sでatomic saveします。",
             "Ctrl+F はファイル内検索、Ctrl+H はファイル内置換、Ctrl+Shift+F はワークスペース検索です。",
             "F12 はZigのローカル定義へ移動、Shift+F12 は参照検索、F2 は安全なリネームpreviewです。",
+            "Ctrl+Shift+L はSHIPパネルです。公開前の配布、信頼、パッケージ化の抜けを確認します。",
             "",
             "== 安全にコードを動かす ==",
             "build/test/run/task は、trust policy と明示的なconsentを通ります。",
@@ -5080,6 +5167,7 @@ fn tutorialLines(language: TutorialLanguage) []const []const u8 {
             "2. findingをクリックして該当箇所へ移動します。",
             "3. text-integrity findingがあればCLEANまたはLF/CRLFで修復します。",
             "4. LOCKを押して、trust postureがlocked_downへ入る様子を見ます。",
+            "5. SHIPを押して、最初の公開に必要な成果物と信頼パッケージを確認します。",
         },
         .en => &.{
             "== QUICK START ==",
@@ -5087,6 +5175,7 @@ fn tutorialLines(language: TutorialLanguage) []const []const u8 {
             "Click files on the left. Edit in insert mode. Ctrl+S saves with atomic write.",
             "Ctrl+F finds in the file. Ctrl+H replaces in the file. Ctrl+Shift+F searches the workspace.",
             "F12 jumps to a local Zig definition. Shift+F12 finds references. F2 opens safe rename preview.",
+            "Ctrl+Shift+L opens SHIP, the release, trust, and packaging checklist.",
             "",
             "== RUNNING CODE SAFELY ==",
             "Build, test, run, and task execution go through consent and trust policy.",
@@ -5130,12 +5219,70 @@ fn tutorialLines(language: TutorialLanguage) []const []const u8 {
             "2. Click a finding to jump to it.",
             "3. Press CLEAN or LF/CRLF when text-integrity findings appear.",
             "4. Press LOCK to see the workspace enter locked_down trust posture.",
+            "5. Press SHIP to check first-release assets and the trust package.",
         },
     };
 }
 
 fn tutorialLineCount(language: TutorialLanguage) usize {
     return tutorialLines(language).len;
+}
+
+fn publishLines() []const []const u8 {
+    return &.{
+        "== FIRST PUBLIC RELEASE ==",
+        "[ship] GitHub Releases: publish a draft first, attach zide-gui.exe, zide.exe, checksum text, and a short demo clip.",
+        "[ship] Mark the first tag as prerelease until outside users exercise edit/save/git/security flows.",
+        "[ship] Make the promise obvious: secure Zig-native workbench, hook-free Git, visible capability boundaries.",
+        "[ship] Keep README human-written. Let this panel carry the mechanical checklist.",
+        "",
+        "== TRUST PACKAGE ==",
+        "[ship] Include docs/security.md in the release links.",
+        "[ship] Show checksums next to binaries.",
+        "[ship] Mention that EXT scans manifests but does not execute extension code.",
+        "[ship] Mention that GIT reads metadata without running git status, hooks, filters, or fsmonitor.",
+        "",
+        "== DISTRIBUTION LADDER ==",
+        "[ship] Phase 1: GitHub release zip for Windows x86_64.",
+        "[later] Phase 2: Scoop manifest for power users who want quick install/update.",
+        "[later] Phase 3: winget manifest once the installer/portable story and hashes are stable.",
+        "[later] Phase 4: signed binaries and update channel.",
+        "",
+        "== COMMUNITY LOOP ==",
+        "[ship] Ask for security false-positive reports as a first-class issue type.",
+        "[ship] Ask users for screenshots of their workflow; ZIDE is visual and trust-oriented.",
+        "[ship] Keep a 60-second demo focused on opening a scary repo, seeing boundaries, and safe Git diff.",
+        "[avoid] Do not lead with a giant feature matrix. Lead with the trust workflow.",
+    };
+}
+
+fn publishLineCount() usize {
+    return publishLines().len;
+}
+
+fn workspaceHasAnyLicense(app: *const app_mod.App) bool {
+    return workspaceHasPathGui(app, "LICENSE") or workspaceHasPathGui(app, "LICENSE.md") or workspaceHasPathGui(app, "COPYING");
+}
+
+fn workspaceHasPathGui(app: *const app_mod.App, relative: []const u8) bool {
+    for (app.workspace.entries.items) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.path, relative)) return true;
+    }
+    return false;
+}
+
+fn workspaceHasPrefixGui(app: *const app_mod.App, prefix: []const u8) bool {
+    for (app.workspace.entries.items) |entry| {
+        if (entry.path.len >= prefix.len and std.ascii.eqlIgnoreCase(entry.path[0..prefix.len], prefix)) return true;
+    }
+    return false;
+}
+
+fn workspaceFileExistsGui(app: *const app_mod.App, relative: []const u8) bool {
+    const path = std.fs.path.join(app.allocator, &.{ app.workspace.root_path, relative }) catch return false;
+    defer app.allocator.free(path);
+    _ = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch return false;
+    return true;
 }
 
 fn workflowRiskCounts(state: *GuiState, overview: git_repository.Overview) RiskCounts {

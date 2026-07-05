@@ -3050,6 +3050,7 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
                 drawSelectionForLine(hdc, editor, doc, line, range, y);
             }
             drawTextRight(hdc, editor.left + 10, y, editor.left + GUTTER_WIDTH - 12, rgb(105, 116, 128), number);
+            const line_text = doc.text.lineSlice(line);
             drawHighlightedLine(
                 hdc,
                 state,
@@ -3057,8 +3058,11 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
                 editor.left + GUTTER_WIDTH + EDITOR_TEXT_PADDING_X,
                 y,
                 editor.right - 20,
-                doc.text.lineSlice(line),
+                line_text,
             );
+            if (current_line) {
+                drawCurrentLineLens(hdc, state, editor, doc, line, line_text, y);
+            }
             if (current_line) {
                 const caret_x = editor.left + GUTTER_WIDTH + EDITOR_TEXT_PADDING_X + @as(c_int, @intCast(doc.cursor.position.column)) * CHAR_WIDTH;
                 fillRect(hdc, RECT{ .left = caret_x, .top = y - 2, .right = caret_x + 2, .bottom = y + ROW_HEIGHT - 4 }, rgb(255, 255, 255));
@@ -3116,6 +3120,66 @@ fn drawSelectionForLine(
     const right = @min(editor.right - 20, x + @as(c_int, @intCast(end_col - start_col)) * CHAR_WIDTH);
     if (right <= x) return;
     fillRect(hdc, .{ .left = x, .top = y - 2, .right = right, .bottom = y + ROW_HEIGHT - 4 }, rgb(37, 74, 105));
+}
+
+fn drawCurrentLineLens(
+    hdc: windows.HDC,
+    state: *GuiState,
+    editor: RECT,
+    doc: *const document_mod.Document,
+    line: usize,
+    line_text: []const u8,
+    y: c_int,
+) void {
+    const path = doc.path orelse return;
+    const line_cells = @min(displayCells(line_text), @as(usize, 220));
+    const x = editor.left + GUTTER_WIDTH + EDITOR_TEXT_PADDING_X + @as(c_int, @intCast(line_cells)) * CHAR_WIDTH + 28;
+    if (x > editor.right - 190) return;
+
+    var text_buf: [300]u8 = undefined;
+    var color = rgb(149, 163, 178);
+    const text = currentSecurityLensText(state, path, line, &text_buf, &color) orelse
+        currentDiagnosticLensText(state, path, line, &text_buf, &color) orelse
+        return;
+
+    fillRect(hdc, RECT{ .left = x - 8, .top = y - 3, .right = editor.right - 18, .bottom = y + ROW_HEIGHT - 3 }, rgb(13, 18, 23));
+    fillRect(hdc, RECT{ .left = x - 8, .top = y - 3, .right = x - 5, .bottom = y + ROW_HEIGHT - 3 }, color);
+    drawTextClipped(hdc, x, y, editor.right - 24, color, text);
+}
+
+fn currentSecurityLensText(state: *GuiState, path: []const u8, line: usize, buffer: []u8, color: *windows.COLORREF) ?[]const u8 {
+    var best: ?*const findings_mod.Finding = null;
+    for (state.app.security_findings.items.items) |*item| {
+        if (item.line != line) continue;
+        if (!pathMatches(path, item.path)) continue;
+        if (best == null or riskRank(item.risk) > riskRank(best.?.risk)) best = item;
+    }
+
+    const finding = best orelse return null;
+    color.* = riskColor(finding.risk);
+    const boundary = findings_mod.boundaryFor(finding.category);
+    return std.fmt.bufPrint(buffer, "SEC {s}/{s}: {s}", .{
+        @tagName(finding.risk),
+        findings_mod.boundaryLabel(boundary),
+        finding.message,
+    }) catch "SEC";
+}
+
+fn currentDiagnosticLensText(state: *GuiState, path: []const u8, line: usize, buffer: []u8, color: *windows.COLORREF) ?[]const u8 {
+    var best: ?types.Severity = null;
+    var message: []const u8 = "";
+    for (state.app.diagnostics.items.items) |item| {
+        if (item.range.start.line != line) continue;
+        if (!pathMatches(path, item.path)) continue;
+        if (best == null or severityRank(item.severity) > severityRank(best.?)) {
+            best = item.severity;
+            message = item.message;
+        }
+    }
+
+    const severity = best orelse return null;
+    color.* = severityColor(severity);
+    return std.fmt.bufPrint(buffer, "DIAG {s}: {s}", .{ @tagName(severity), message }) catch "DIAG";
 }
 
 fn drawEditorHeader(hdc: windows.HDC, state: *GuiState, layout: Layout) void {

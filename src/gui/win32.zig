@@ -3985,10 +3985,88 @@ fn drawCommandPalette(hdc: windows.HDC, state: *GuiState, client: RECT) void {
             fillRect(hdc, RECT{ .left = palette.left + 8, .top = y - 3, .right = palette.right - 8, .bottom = y + ROW_HEIGHT - 3 }, rgb(51, 153, 235));
         }
         const color = if (selected) rgb(16, 19, 22) else rgb(219, 225, 232);
-        drawTextClipped(hdc, palette.left + 18, y, palette.right - 130, color, match.definition.title);
-        drawTextClipped(hdc, palette.right - 124, y, palette.right - 16, color, match.definition.default_key);
+        const scope_rect = commandScopeRect(palette, y);
+        const capability_rect = commandCapabilityRect(palette, y);
+        const key_rect = commandKeyRect(palette, y);
+        drawTextClipped(hdc, palette.left + 18, y, scope_rect.left - 12, color, match.definition.title);
+        drawCommandScopeBadge(hdc, scope_rect, match.definition.scope, selected);
+        drawCommandCapabilityBadge(hdc, capability_rect, match.definition.capability, selected);
+        drawTextClipped(hdc, key_rect.left + 6, y, key_rect.right, color, match.definition.default_key);
         y += ROW_HEIGHT;
     }
+
+    if (state.app.palette.selected()) |definition| {
+        drawCommandPaletteDetail(hdc, palette, definition);
+    }
+}
+
+fn drawCommandPaletteDetail(hdc: windows.HDC, palette: RECT, definition: command_mod.Definition) void {
+    const top = palette.bottom - 58;
+    fillRect(hdc, RECT{ .left = palette.left + 8, .top = top - 8, .right = palette.right - 8, .bottom = palette.bottom - 8 }, rgb(16, 20, 25));
+    fillRect(hdc, RECT{ .left = palette.left + 8, .top = top - 8, .right = palette.left + 11, .bottom = palette.bottom - 8 }, commandCapabilityColor(definition.capability));
+
+    var meta_buf: [220]u8 = undefined;
+    const meta = std.fmt.bufPrint(&meta_buf, "id:{s}  scope:{s}  capability:{s}", .{
+        definition.id,
+        @tagName(definition.scope),
+        commandCapabilityLabel(definition.capability),
+    }) catch definition.id;
+    drawTextClipped(hdc, palette.left + 20, top, palette.right - 16, commandCapabilityColor(definition.capability), meta);
+    drawTextClipped(hdc, palette.left + 20, top + ROW_HEIGHT, palette.right - 16, rgb(205, 213, 222), definition.description);
+}
+
+fn commandScopeRect(palette: RECT, y: c_int) RECT {
+    return .{ .left = palette.right - 316, .top = y - 3, .right = palette.right - 230, .bottom = y + ROW_HEIGHT - 3 };
+}
+
+fn commandCapabilityRect(palette: RECT, y: c_int) RECT {
+    return .{ .left = palette.right - 222, .top = y - 3, .right = palette.right - 116, .bottom = y + ROW_HEIGHT - 3 };
+}
+
+fn commandKeyRect(palette: RECT, y: c_int) RECT {
+    return .{ .left = palette.right - 110, .top = y - 3, .right = palette.right - 16, .bottom = y + ROW_HEIGHT - 3 };
+}
+
+fn drawCommandScopeBadge(hdc: windows.HDC, rect: RECT, scope: command_mod.Scope, selected: bool) void {
+    const bg = if (selected) rgb(194, 223, 244) else rgb(31, 40, 49);
+    fillRect(hdc, rect, bg);
+    drawTextClipped(hdc, rect.left + 7, rect.top + 5, rect.right - 5, if (selected) rgb(16, 19, 22) else rgb(180, 190, 200), @tagName(scope));
+}
+
+fn drawCommandCapabilityBadge(hdc: windows.HDC, rect: RECT, capability: command_mod.Capability, selected: bool) void {
+    const color = commandCapabilityColor(capability);
+    fillRect(hdc, rect, if (selected) color else commandCapabilityBackground(capability));
+    drawTextClipped(hdc, rect.left + 7, rect.top + 5, rect.right - 5, if (selected) rgb(16, 19, 22) else color, commandCapabilityLabel(capability));
+}
+
+fn commandCapabilityLabel(capability: command_mod.Capability) []const u8 {
+    return switch (capability) {
+        .safe => "safe",
+        .workspace_write => "write",
+        .network_read => "net-read",
+        .network_write => "net-write",
+        .external_command => "exec",
+    };
+}
+
+fn commandCapabilityColor(capability: command_mod.Capability) windows.COLORREF {
+    return switch (capability) {
+        .safe => rgb(165, 214, 167),
+        .workspace_write => rgb(255, 207, 92),
+        .network_read => rgb(127, 211, 255),
+        .network_write => rgb(255, 148, 82),
+        .external_command => rgb(255, 118, 118),
+    };
+}
+
+fn commandCapabilityBackground(capability: command_mod.Capability) windows.COLORREF {
+    return switch (capability) {
+        .safe => rgb(22, 42, 32),
+        .workspace_write => rgb(52, 43, 22),
+        .network_read => rgb(20, 42, 52),
+        .network_write => rgb(58, 34, 24),
+        .external_command => rgb(58, 26, 31),
+    };
 }
 
 fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
@@ -4090,7 +4168,8 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
 }
 
 fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
-    var buffer: [512]u8 = undefined;
+    var buffer: [640]u8 = undefined;
+    var boundary_buffer: [64]u8 = undefined;
     const mode = @tagName(state.app.mode);
     const focus = @tagName(state.app.focus);
     const message = state.last_error orelse "ready";
@@ -4101,10 +4180,11 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
     const newline = if (state.app.documents.active()) |doc| doc.newlineLabel() else "NONE";
     const encoding = if (state.app.documents.active()) |doc| doc.encodingLabel() else "UTF-8";
     const current_risk = currentDocumentRiskCounts(state);
+    const current_boundary = currentLineBoundaryHint(state, &boundary_buffer);
     const git_changes = if (state.git_overview) |overview| overview.changes.len else 0;
     const text = std.fmt.bufPrint(
         &buffer,
-        " {s}/{s}  |  line:{d} col:{d} {s} dirty:{d} lang:{s} fmt:{s}/{s} trust:{s} risk:{d}/{d}/{d} git:{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
+        " {s}/{s}  |  line:{d} col:{d} {s} dirty:{d} lang:{s} fmt:{s}/{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
         .{
             mode,
             focus,
@@ -4119,6 +4199,7 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
             current_risk.critical,
             current_risk.high,
             current_risk.medium,
+            current_boundary,
             git_changes,
             state.app.workspace.entries.items.len,
             state.app.workspace.countCodeFiles(),
@@ -4830,6 +4911,27 @@ fn currentDocumentRiskCounts(state: *GuiState) RiskCounts {
     const doc = state.app.documents.active() orelse return .{};
     const path = doc.path orelse return .{};
     return pathRiskCounts(state, path);
+}
+
+fn currentLineBoundaryHint(state: *GuiState, buffer: []u8) []const u8 {
+    const doc = state.app.documents.active() orelse return "clear";
+    const path = doc.path orelse return "clear";
+    const line = doc.cursor.position.line;
+
+    var best_risk: ?findings_mod.Risk = null;
+    var best_boundary: ?findings_mod.Boundary = null;
+    for (state.app.security_findings.items.items) |item| {
+        if (item.line != line) continue;
+        if (!pathMatches(path, item.path)) continue;
+        if (best_risk == null or riskRank(item.risk) > riskRank(best_risk.?)) {
+            best_risk = item.risk;
+            best_boundary = findings_mod.boundaryFor(item.category);
+        }
+    }
+
+    const risk = best_risk orelse return "clear";
+    const boundary = best_boundary orelse return @tagName(risk);
+    return std.fmt.bufPrint(buffer, "{s}/{s}", .{ @tagName(risk), findings_mod.boundaryLabel(boundary) }) catch "hot";
 }
 
 fn tutorialLines(language: TutorialLanguage) []const []const u8 {

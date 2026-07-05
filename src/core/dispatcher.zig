@@ -420,6 +420,11 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "release checklist rendered" };
     }
 
+    if (std.mem.eql(u8, definition.id, "release.assets")) {
+        try renderReleaseAssets(app);
+        return .{ .completed = "release assets hashed" };
+    }
+
     if (std.mem.eql(u8, definition.id, "git.status")) {
         var audit = try git_status.auditRepository(app.allocator, app.workspace.root_path, .{});
         defer audit.deinit();
@@ -850,6 +855,132 @@ fn renderExtensionRegistry(app: *app_mod.App, registry: *const extension_registr
     }
 
     try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn renderReleaseChecklist(app: *app_mod.App) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("release/public launch checklist\n");
+    try writer.writeAll("goal: make the first public build easy to try, easy to trust, and easy to talk about\n\n");
+
+    try writer.print("{s} README.md present (human-written landing story)\n", .{checkMark(workspaceHasPath(app, "README.md"))});
+    try writer.print("{s} docs/security.md present (trust model explainer)\n", .{checkMark(workspaceHasPath(app, "docs/security.md"))});
+    try writer.print("{s} built GUI artifact zig-out/bin/zide-gui.exe\n", .{checkMark(workspaceFileExists(app, "zig-out/bin/zide-gui.exe"))});
+    try writer.print("{s} built CLI artifact zig-out/bin/zide.exe\n", .{checkMark(workspaceFileExists(app, "zig-out/bin/zide.exe"))});
+    try writer.print("{s} GitHub Actions workflow present\n", .{checkMark(workspaceHasPrefix(app, ".github/workflows/"))});
+    try writer.print("{s} LICENSE present\n", .{checkMark(workspaceHasPath(app, "LICENSE") or workspaceHasPath(app, "LICENSE.md") or workspaceHasPath(app, "COPYING"))});
+
+    try writer.writeAll("\nfirst public path\n");
+    try writer.writeAll("1. Ship a GitHub draft release with zide-gui.exe, zide.exe, checksum text, and a short screencast/GIF.\n");
+    try writer.writeAll("2. Mark it prerelease until save/edit/git/security flows are exercised by outside users.\n");
+    try writer.writeAll("3. Add issue templates for bug, security false-positive, and feature request once first testers appear.\n");
+    try writer.writeAll("4. After the first stable tag, publish install manifests: winget first for Windows, Scoop bucket next for power users.\n");
+    try writer.writeAll("5. Keep the hook-free Git/security story in every release note; that is the memorable difference.\n");
+    try writer.writeAll("6. Run release.assets and paste SHA-256 values into release notes, winget, and Scoop manifests.\n");
+
+    try writer.writeAll("\nasset naming suggestion\n");
+    try writer.writeAll("- zide-windows-x86_64.zip\n");
+    try writer.writeAll("- zide-windows-x86_64.sha256.txt\n");
+    try writer.writeAll("- zide-demo-60s.mp4 or zide-demo.gif\n");
+
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+const ReleaseAsset = struct {
+    label: []const u8,
+    relative_path: []const u8,
+    release_name: []const u8,
+};
+
+const release_assets = [_]ReleaseAsset{
+    .{ .label = "GUI", .relative_path = "zig-out/bin/zide-gui.exe", .release_name = "zide-gui.exe" },
+    .{ .label = "CLI", .relative_path = "zig-out/bin/zide.exe", .release_name = "zide.exe" },
+};
+
+fn renderReleaseAssets(app: *app_mod.App) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("release assets and checksums\n");
+    try writer.writeAll("mode: pure Zig file read + SHA-256; no shell, no git, no network\n\n");
+
+    var found: usize = 0;
+    for (release_assets) |asset| {
+        if (try renderReleaseAsset(app, writer, asset)) found += 1;
+    }
+
+    if (found == 0) {
+        try writer.writeAll("\nno release artifacts found yet; run zig build install and zig build install-gui first\n");
+    } else {
+        try writer.writeAll("\ncopy targets\n");
+        try writer.writeAll("- GitHub release notes: include each sha256 line below the attached file name.\n");
+        try writer.writeAll("- winget: use the matching SHA-256 as InstallerSha256.\n");
+        try writer.writeAll("- Scoop: use the matching SHA-256 as hash.\n");
+    }
+
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn renderReleaseAsset(app: *app_mod.App, writer: *std.Io.Writer, asset: ReleaseAsset) !bool {
+    const path = try std.fs.path.join(app.allocator, &.{ app.workspace.root_path, asset.relative_path });
+    defer app.allocator.free(path);
+
+    const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            try writer.print("- [{s}] missing: {s}\n", .{ asset.label, asset.relative_path });
+            return false;
+        },
+        else => return err,
+    };
+    if (stat.kind != .file) {
+        try writer.print("- [{s}] not a file: {s}\n", .{ asset.label, asset.relative_path });
+        return false;
+    }
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, app.allocator, .limited(512 * 1024 * 1024));
+    defer app.allocator.free(bytes);
+
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(bytes, &digest, .{});
+    var hex: [Sha256.digest_length * 2]u8 = undefined;
+    try std.crypto.codecs.hex.encode(hex[0..], digest[0..], .lower);
+
+    try writer.print("- [{s}] {s}\n", .{ asset.label, asset.release_name });
+    try writer.print("  path   : {s}\n", .{asset.relative_path});
+    try writer.print("  size   : {d} bytes\n", .{stat.size});
+    try writer.print("  sha256 : {s}\n", .{hex[0..]});
+    try writer.print("  winget : InstallerSha256: {s}\n", .{hex[0..]});
+    try writer.print("  scoop  : \"hash\": \"{s}\"\n", .{hex[0..]});
+    return true;
+}
+
+fn checkMark(ok: bool) []const u8 {
+    return if (ok) "[ok]" else "[missing]";
+}
+
+fn workspaceHasPath(app: *const app_mod.App, relative: []const u8) bool {
+    for (app.workspace.entries.items) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.path, relative)) return true;
+    }
+    return false;
+}
+
+fn workspaceHasPrefix(app: *const app_mod.App, prefix: []const u8) bool {
+    for (app.workspace.entries.items) |entry| {
+        if (entry.path.len >= prefix.len and std.ascii.eqlIgnoreCase(entry.path[0..prefix.len], prefix)) return true;
+    }
+    return false;
+}
+
+fn workspaceFileExists(app: *const app_mod.App, relative: []const u8) bool {
+    const path = std.fs.path.join(app.allocator, &.{ app.workspace.root_path, relative }) catch return false;
+    defer app.allocator.free(path);
+    _ = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch return false;
+    return true;
 }
 
 fn renderGitOverview(app: *app_mod.App, overview: *const git_repository.Overview) !void {
@@ -1362,6 +1493,40 @@ test "extension scan command renders manifest overview" {
     const result = try dispatch(&app, .{ .id = "extensions.scan" });
     try std.testing.expect(std.meta.activeTag(result) == .completed);
     try std.testing.expect(app.process_console.lines.items.len > 0);
+}
+
+test "release checklist command renders launch overview" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "release.checklist" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expect(app.process_console.lines.items.len > 0);
+}
+
+test "release assets command renders artifact hashes" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/bin");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide-gui.exe", .data = "gui-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide.exe", .data = "cli-bytes" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "release.assets" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+
+    var saw_hash = false;
+    for (app.process_console.lines.items) |line| {
+        if (std.mem.indexOf(u8, line.text, "sha256") != null) saw_hash = true;
+    }
+    try std.testing.expect(saw_hash);
 }
 
 test "file new creates a workspace file and opens it" {

@@ -2955,10 +2955,17 @@ fn drawFileList(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
             .other => rgb(121, 133, 145),
         };
 
+        const risk_marker = riskMarkerForEntry(state, entry.path, entry.kind == .directory);
+        const git_marker = gitMarkerForEntry(state, entry.path, entry.kind == .directory);
+        const path_right = if (risk_marker != null or git_marker != null) layout.sidebar.right - 66 else layout.sidebar.right - 12;
+
         drawText(hdc, 16 + indent, y + 3, color, marker);
-        drawTextClipped(hdc, 36 + indent, y + 3, layout.sidebar.right - 12, color, entry.path);
-        if (gitMarkerForEntry(state, entry.path, entry.kind == .directory)) |git_marker| {
-            drawTextRight(hdc, layout.sidebar.right - 34, y + 3, layout.sidebar.right - 12, gitChangeColor(git_marker.status), git_marker.label);
+        drawTextClipped(hdc, 36 + indent, y + 3, path_right, color, entry.path);
+        if (risk_marker) |security_marker| {
+            drawTextRight(hdc, layout.sidebar.right - 62, y + 3, layout.sidebar.right - 40, riskColor(security_marker.risk), security_marker.label);
+        }
+        if (git_marker) |git_marker_value| {
+            drawTextRight(hdc, layout.sidebar.right - 34, y + 3, layout.sidebar.right - 12, gitChangeColor(git_marker_value.status), git_marker_value.label);
         }
         y += ROW_HEIGHT;
     }
@@ -2972,6 +2979,36 @@ const GitMarker = struct {
     label: []const u8,
     status: git_repository.ChangeStatus,
 };
+
+const RiskMarker = struct {
+    label: []const u8,
+    risk: findings_mod.Risk,
+};
+
+fn riskMarkerForEntry(state: *const GuiState, entry_path: []const u8, is_directory: bool) ?RiskMarker {
+    var best: ?findings_mod.Risk = null;
+    for (state.app.security_findings.items.items) |item| {
+        const matches = if (is_directory)
+            pathIsInsideDirectory(item.path, entry_path)
+        else
+            pathMatches(entry_path, item.path);
+        if (!matches) continue;
+        if (best == null or riskRank(item.risk) > riskRank(best.?)) best = item.risk;
+    }
+
+    const risk = best orelse return null;
+    return .{ .label = riskMarkerLabel(risk), .risk = risk };
+}
+
+fn riskMarkerLabel(risk: findings_mod.Risk) []const u8 {
+    return switch (risk) {
+        .critical => "C!",
+        .high => "H!",
+        .medium => "M!",
+        .low => "L",
+        .info => "i",
+    };
+}
 
 fn gitMarkerForEntry(state: *const GuiState, entry_path: []const u8, is_directory: bool) ?GitMarker {
     const overview = state.git_overview orelse return null;

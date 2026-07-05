@@ -383,6 +383,15 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "git overview complete" };
     }
 
+    if (std.mem.eql(u8, definition.id, "git.diff_current")) {
+        const doc = app.documents.active() orelse return .no_active_document;
+        const path = doc.path orelse return .{ .blocked = "active document has no file path" };
+        const preview = try git_repository.previewFileDiff(app.allocator, &app.workspace, path, .{});
+        defer app.allocator.free(preview);
+        try app.process_console.appendBytes(.stdout, preview);
+        return .{ .completed = "git diff preview rendered" };
+    }
+
     if (std.mem.eql(u8, definition.id, "github.fetch")) {
         return try fetchGitHubLive(app);
     }

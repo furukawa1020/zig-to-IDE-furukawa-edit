@@ -90,8 +90,14 @@ fn scoreDefinition(query: []const u8, definition: command.Definition) ?u16 {
     if (query.len == 0) return 1;
     const id_score = command.fuzzyScore(query, definition.id);
     const title_score = command.fuzzyScore(query, definition.title);
-    if (id_score == null and title_score == null) return null;
-    return @max(id_score orelse 0, title_score orelse 0);
+    const description_score = command.fuzzyScore(query, definition.description);
+    const scope_score = command.fuzzyScore(query, @tagName(definition.scope));
+    const capability_score = command.fuzzyScore(query, @tagName(definition.capability));
+    if (id_score == null and title_score == null and description_score == null and scope_score == null and capability_score == null) return null;
+    return @max(
+        @max(id_score orelse 0, title_score orelse 0),
+        @max(@max(description_score orelse 0, scope_score orelse 0), capability_score orelse 0),
+    );
 }
 
 fn sortMatches(items: []Match) void {
@@ -124,4 +130,15 @@ test "command palette filters commands" {
 
     const selected = palette.selected() orelse return error.ExpectedSelection;
     try std.testing.expectEqualStrings("zig.build", selected.id);
+}
+
+test "command palette can search security capability" {
+    var palette = CommandPalette.init(std.testing.allocator);
+    defer palette.deinit();
+
+    try palette.open();
+    try palette.setQuery("network_write");
+
+    const selected = palette.selected() orelse return error.ExpectedSelection;
+    try std.testing.expectEqual(command.Capability.network_write, selected.capability);
 }

@@ -9,6 +9,7 @@ pub const Scope = enum {
     task,
     demo,
     extensions,
+    release,
 };
 
 pub const Capability = enum {
@@ -91,6 +92,7 @@ const definitions = [_]Definition{
     .{ .id = "view.command_palette", .title = "Command Palette", .description = "Open the command palette.", .default_key = "ctrl-shift-p", .scope = .view, .capability = .safe },
     .{ .id = "view.tutorial", .title = "Open Tutorial", .description = "Open the in-app ZIDE tutorial and security tour.", .default_key = "f1", .scope = .view, .capability = .safe },
     .{ .id = "view.extensions", .title = "Open Extensions", .description = "Open the extension and integration manifest panel.", .default_key = "ctrl-shift-x", .scope = .view, .capability = .safe },
+    .{ .id = "view.publish", .title = "Open Publish Checklist", .description = "Open the release and public launch checklist.", .default_key = "ctrl-shift-l", .scope = .view, .capability = .safe },
     .{ .id = "symbol.goto_symbol", .title = "Go To Symbol", .description = "Open the current Zig document outline.", .default_key = "ctrl-shift-o", .scope = .zig, .capability = .safe },
     .{ .id = "symbol.goto_definition", .title = "Go To Definition", .description = "Jump to the selected symbol definition.", .default_key = "f12", .scope = .zig, .capability = .safe },
     .{ .id = "symbol.find_references", .title = "Find References", .description = "Find references for the selected symbol.", .default_key = "shift-f12", .scope = .zig, .capability = .safe },
@@ -113,6 +115,7 @@ const definitions = [_]Definition{
     .{ .id = "github.actions.failures", .title = "Fetch Actions Failure Log", .description = "Fetch the latest failed GitHub Actions job log excerpt.", .default_key = "", .scope = .workspace, .capability = .network_read },
     .{ .id = "github.pr.create_draft", .title = "Create Draft GitHub PR", .description = "Create a draft PR from the current branch to the default branch using GITHUB_TOKEN.", .default_key = "", .scope = .workspace, .capability = .network_write },
     .{ .id = "extensions.scan", .title = "Scan Extensions", .description = "Scan ZIDE extension manifests without executing extension code.", .default_key = "", .scope = .extensions, .capability = .safe },
+    .{ .id = "release.checklist", .title = "Release Checklist", .description = "Render a public launch checklist for GitHub Releases, zip assets, winget, and Scoop.", .default_key = "", .scope = .release, .capability = .safe },
     .{ .id = "demo.run", .title = "Run Demo", .description = "Run an internal zide demo.", .default_key = "", .scope = .demo, .capability = .safe },
 };
 

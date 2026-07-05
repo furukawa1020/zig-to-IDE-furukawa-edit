@@ -45,6 +45,7 @@ const BottomPanel = enum {
 const GitPanelAction = enum {
     refresh,
     status,
+    diff,
     live,
     issues,
     failures,
@@ -838,6 +839,9 @@ const GuiState = struct {
         };
         self.handleDispatchResult(id, result);
         if (!std.mem.startsWith(u8, id, "editor.")) self.show_output = true;
+        if (std.mem.eql(u8, id, "git.diff_current")) {
+            self.bottom_panel = .output;
+        }
         if (std.mem.startsWith(u8, id, "github.") and !std.mem.eql(u8, id, "github.overview")) {
             self.bottom_panel = .output;
         }
@@ -853,6 +857,11 @@ const GuiState = struct {
             },
             .status => {
                 self.executeCommand("git.status");
+                self.show_output = true;
+                self.bottom_panel = .output;
+            },
+            .diff => {
+                self.executeCommand("git.diff_current");
                 self.show_output = true;
                 self.bottom_panel = .output;
             },
@@ -1771,10 +1780,12 @@ const GuiState = struct {
         if (change_index >= overview.changes.len) return;
         const change = overview.changes[change_index];
         if (change.status == .deleted) {
-            self.setMessage("Deleted file cannot be opened") catch {};
+            self.previewGitDiffForPath(change.path);
+            self.setMessage("Deleted file diff preview") catch {};
             return;
         }
         self.openRelativeFile(change.path, null);
+        self.previewGitDiffForPath(change.path);
     }
 
     fn openExtensionPanelRow(self: *GuiState, row: usize) void {
@@ -1782,6 +1793,22 @@ const GuiState = struct {
         if (row >= registry.items.items.len) return;
         const extension = registry.items.items[row];
         self.openRelativeFile(extension.manifest_path, null);
+    }
+
+    fn previewGitDiffForPath(self: *GuiState, path: []const u8) void {
+        const preview = git_repository.previewFileDiff(self.allocator, &self.app.workspace, path, .{}) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "git diff preview failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(preview);
+        self.app.process_console.appendBytes(.stdout, preview) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.show_output = true;
+        self.bottom_panel = .output;
+        self.setMessage("Git diff preview") catch {};
     }
 
     fn openExternalUrl(self: *GuiState, url: []const u8) void {
@@ -2699,6 +2726,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         state.runTaskByName("run");
         return;
     }
+    if (ctrl and shift and key == 'G') {
+        state.executeCommand("git.diff_current");
+        return;
+    }
     if (ctrl and key == 'G') {
         state.executeCommand("git.overview");
         return;
@@ -3455,7 +3486,7 @@ fn gitPanelUrlAtRow(overview: git_repository.Overview, row: usize) ?[]const u8 {
 
 fn drawGitPanelActions(hdc: windows.HDC, rect: RECT) void {
     if (!gitPanelHasActionButtons(rect)) return;
-    const actions = [_]GitPanelAction{ .refresh, .status, .live, .issues, .failures, .draft_pr };
+    const actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
     for (actions) |action| {
         drawButton(hdc, gitPanelActionButtonRect(rect, action), gitPanelActionLabel(action));
     }
@@ -3464,7 +3495,7 @@ fn drawGitPanelActions(hdc: windows.HDC, rect: RECT) void {
 fn gitPanelActionAt(rect: RECT, x: c_int, y: c_int) ?GitPanelAction {
     if (!gitPanelHasActionButtons(rect)) return null;
     if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const actions = [_]GitPanelAction{ .refresh, .status, .live, .issues, .failures, .draft_pr };
+    const actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
     for (actions) |action| {
         if (pointIn(gitPanelActionButtonRect(rect, action), x, y)) return action;
     }
@@ -3472,7 +3503,7 @@ fn gitPanelActionAt(rect: RECT, x: c_int, y: c_int) ?GitPanelAction {
 }
 
 fn gitPanelHasActionButtons(rect: RECT) bool {
-    return rect.right - rect.left >= 620;
+    return rect.right - rect.left >= 690;
 }
 
 fn gitPanelActionButtonRect(rect: RECT, action: GitPanelAction) RECT {
@@ -3483,8 +3514,9 @@ fn gitPanelActionButtonRect(rect: RECT, action: GitPanelAction) RECT {
         .failures => 1,
         .issues => 2,
         .live => 3,
-        .status => 4,
-        .refresh => 5,
+        .diff => 4,
+        .status => 5,
+        .refresh => 6,
     };
     const right = rect.right - 12 - slot * (width + gap);
     return .{
@@ -3499,6 +3531,7 @@ fn gitPanelActionLabel(action: GitPanelAction) []const u8 {
     return switch (action) {
         .refresh => "REF",
         .status => "STAT",
+        .diff => "DIFF",
         .live => "LIVE",
         .issues => "ISS",
         .failures => "FAIL",
@@ -3510,6 +3543,7 @@ fn gitPanelActionCommand(action: GitPanelAction) []const u8 {
     return switch (action) {
         .refresh => "git.overview",
         .status => "git.status",
+        .diff => "git.diff_current",
         .live => "github.fetch",
         .issues => "github.issues",
         .failures => "github.actions.failures",
@@ -4877,6 +4911,12 @@ fn tutorialLines(language: TutorialLanguage) []const []const u8 {
             "SECURITY DIFFERENCE: Git without hook execution",
             "The Git panel reads repository metadata directly instead of running git status.",
             "This avoids hooks, filters, fsmonitor, aliases, and configured Git-side command execution.",
+            "Press REF to refresh, STAT to audit Git metadata, and DIFF or Ctrl+Shift+G for a pure Zig diff preview.",
+            "Clicking a changed file in GIT opens it and renders a compact diff preview in OUTPUT.",
+            "",
+            "SECURITY DIFFERENCE: extensions without implicit execution",
+            "Open EXT or press Ctrl+Shift+X to scan zide-extension.json and zide.extension.json manifests.",
+            "ZIDE shows capabilities and risk before any extension code can run.",
             "",
             "SECURITY DIFFERENCE: Zig-native scanner core",
             "Build.zig, build.zig.zon, CI files, IaC, scripts, env files, and polyglot package edges are scanned in Zig.",

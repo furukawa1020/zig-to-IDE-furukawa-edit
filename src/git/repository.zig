@@ -789,6 +789,84 @@ fn removedStats(bytes: []const u8) DiffStats {
     return .{ .deletions = countLines(bytes), .available = true };
 }
 
+const ChangeSpan = struct {
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    new_end: usize,
+};
+
+fn changedSpan(old: []const u8, new: []const u8) ?ChangeSpan {
+    if (std.mem.eql(u8, old, new)) return null;
+
+    var prefix: usize = 0;
+    const min_len = @min(old.len, new.len);
+    while (prefix < min_len and old[prefix] == new[prefix]) : (prefix += 1) {}
+    while (prefix > 0 and old[prefix - 1] != '\n') : (prefix -= 1) {}
+
+    var old_end = old.len;
+    var new_end = new.len;
+    while (old_end > prefix and new_end > prefix and old[old_end - 1] == new[new_end - 1]) {
+        old_end -= 1;
+        new_end -= 1;
+    }
+    while (old_end < old.len and old_end > prefix and old[old_end - 1] != '\n') : (old_end += 1) {}
+    while (new_end < new.len and new_end > prefix and new_end - 1 < new.len and new[new_end - 1] != '\n') : (new_end += 1) {}
+
+    return .{
+        .old_start = prefix,
+        .old_end = old_end,
+        .new_start = prefix,
+        .new_end = new_end,
+    };
+}
+
+fn writeChangedPreview(writer: anytype, old: []const u8, new: []const u8, max_lines: usize) !void {
+    if (hasNul(old) or hasNul(new)) {
+        try writer.writeAll("diff body unavailable: binary-looking content\n");
+        return;
+    }
+
+    const span = changedSpan(old, new) orelse {
+        try writer.writeAll("no content changes\n");
+        return;
+    };
+
+    try writer.writeAll("@@ compact changed region @@\n");
+    var emitted: usize = 0;
+    try writePrefixedLinesCounted(writer, '-', old[span.old_start..span.old_end], max_lines, &emitted);
+    try writePrefixedLinesCounted(writer, '+', new[span.new_start..span.new_end], max_lines, &emitted);
+    if (emitted >= max_lines) {
+        try writer.writeAll("... diff preview truncated\n");
+    }
+}
+
+fn writePrefixedLines(writer: anytype, prefix: u8, bytes: []const u8, max_lines: usize) !void {
+    if (hasNul(bytes)) {
+        try writer.writeAll("diff body unavailable: binary-looking content\n");
+        return;
+    }
+    var emitted: usize = 0;
+    try writePrefixedLinesCounted(writer, prefix, bytes, max_lines, &emitted);
+    if (emitted >= max_lines) {
+        try writer.writeAll("... diff preview truncated\n");
+    }
+}
+
+fn writePrefixedLinesCounted(writer: anytype, prefix: u8, bytes: []const u8, max_lines: usize, emitted: *usize) !void {
+    var iter = std.mem.splitScalar(u8, bytes, '\n');
+    while (iter.next()) |raw_line| {
+        if (emitted.* >= max_lines) return;
+        const line = if (std.mem.endsWith(u8, raw_line, "\r")) raw_line[0 .. raw_line.len - 1] else raw_line;
+        try writer.print("{c}{s}\n", .{ prefix, line });
+        emitted.* += 1;
+    }
+}
+
+fn hasNul(bytes: []const u8) bool {
+    return std.mem.indexOfScalar(u8, bytes, 0) != null;
+}
+
 fn countLines(bytes: []const u8) usize {
     if (bytes.len == 0) return 0;
     var count: usize = 0;
@@ -825,6 +903,13 @@ fn isTracked(entries: []const IndexEntry, path: []const u8) bool {
     return false;
 }
 
+fn findTrackedEntry(entries: []const IndexEntry, path: []const u8) ?*const IndexEntry {
+    for (entries) |*entry| {
+        if (std.mem.eql(u8, entry.path, path)) return entry;
+    }
+    return null;
+}
+
 fn duplicateWithSlashes(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const copy = try allocator.dupe(u8, path);
     for (copy) |*byte| {
@@ -833,11 +918,44 @@ fn duplicateWithSlashes(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return copy;
 }
 
+fn normalizeWorkspacePath(allocator: std.mem.Allocator, workspace_root: []const u8, path: []const u8) ![]u8 {
+    const relative = if (std.fs.path.isAbsolute(path)) blk: {
+        if (!startsWithPath(path, workspace_root)) return error.PathOutsideWorkspace;
+        var start = workspace_root.len;
+        if (start < path.len and (path[start] == '/' or path[start] == '\\')) start += 1;
+        break :blk path[start..];
+    } else path;
+
+    if (hasParentTraversal(relative)) return error.PathOutsideWorkspace;
+    return duplicateWithSlashes(allocator, relative);
+}
+
 fn assignmentValue(line: []const u8, key: []const u8) ?[]const u8 {
     const equals = std.mem.indexOfScalar(u8, line, '=') orelse return null;
     const left = std.mem.trim(u8, line[0..equals], " \t");
     if (!std.ascii.eqlIgnoreCase(left, key)) return null;
     return std.mem.trim(u8, line[equals + 1 ..], " \t");
+}
+
+fn startsWithPath(path: []const u8, root: []const u8) bool {
+    if (root.len == 0) return false;
+    if (path.len < root.len) return false;
+    if (!std.ascii.eqlIgnoreCase(path[0..root.len], root)) return false;
+    if (path.len == root.len) return true;
+    const next = path[root.len];
+    return next == '/' or next == '\\';
+}
+
+fn hasParentTraversal(path: []const u8) bool {
+    var start: usize = 0;
+    while (start <= path.len) {
+        var end = start;
+        while (end < path.len and path[end] != '/' and path[end] != '\\') : (end += 1) {}
+        if (std.mem.eql(u8, path[start..end], "..")) return true;
+        if (end == path.len) break;
+        start = end + 1;
+    }
+    return false;
 }
 
 fn startsWith(haystack: []const u8, prefix: []const u8) bool {

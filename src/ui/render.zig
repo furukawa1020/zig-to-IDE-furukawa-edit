@@ -11,7 +11,7 @@ pub fn renderHelp(stdout: anytype) !void {
         \\Usage:
         \\  zide [workspace]
         \\  zide commands
-        \\  zide demo [overview|architecture|languages|commands|editor|palette|dispatch|diagnostics|input|loop|screen|security|buffer|zig-tokens]
+        \\  zide demo [overview|architecture|languages|commands|editor|palette|dispatch|diagnostics|input|loop|screen|security|extensions|buffer|zig-tokens]
         \\  zide --version
         \\
         \\The current slice has a virtual screen, input decoding, command dispatch,

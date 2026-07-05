@@ -1,12 +1,10 @@
 # zide
-
 ZigでIDEを作る。
 TUIで作る。
 単一バイナリで作る。
 外部ライブラリなしで作る。
-
 つまり、逃げ場はない。
-作るんじゃい。
+作るんじゃい！！！！
 
 `zide` は、Zigを書くための自己完結型TUI IDEです。
 でも「Zigファイルしか触れません」みたいな窮屈な道具にはしません。
@@ -16,7 +14,7 @@ READMEも設定もスクリプトもデモも、開発中に必要なものは�
 
 ## 何を作るのか
 
-小さいけど強いIDEを作ります。
+小さいけどセキュアなIDEを作ります！！
 
 - ターミナルで完結する
 - Zigで実装する
@@ -69,6 +67,7 @@ zig build run -- demo input
 zig build run -- demo loop
 zig build run -- demo screen
 zig build run -- demo security
+zig build run -- demo extensions
 zig build run -- demo buffer
 zig build run -- demo zig-tokens
 zig build test

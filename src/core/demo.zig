@@ -8,6 +8,7 @@ const command = @import("command.zig");
 const dispatcher = @import("dispatcher.zig");
 const event = @import("event.zig");
 const event_loop = @import("event_loop.zig");
+const extensions = @import("../extensions/registry.zig");
 const input_handler = @import("input_handler.zig");
 const loop_runner = @import("loop_runner.zig");
 const buffer = @import("../editor/buffer.zig");
@@ -41,6 +42,7 @@ pub fn run(allocator: std.mem.Allocator, kind: cli.DemoName, stdout: anytype) !v
         .loop => try loopDemo(allocator, stdout),
         .screen => try screenDemo(allocator, stdout),
         .security => try securityDemo(allocator, stdout),
+        .extensions => try extensionsDemo(allocator, stdout),
         .buffer => try bufferDemo(allocator, stdout),
         .zig_tokens => try zigTokens(stdout),
     }
@@ -69,6 +71,7 @@ fn overview(stdout: anytype) !void {
         \\  zide demo loop
         \\  zide demo screen
         \\  zide demo security
+        \\  zide demo extensions
         \\  zide demo buffer
         \\  zide demo zig-tokens
         \\
@@ -204,6 +207,72 @@ fn securityDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
         });
         try stdout.print("  {s}\n", .{item.evidence});
     }
+}
+
+
+fn extensionsDemo(allocator: std.mem.Allocator, stdout: anytype) !void {
+    const manifests = [_][]const u8{
+        \\
+        \\{
+        \\  "id": "zide.theme-preview",
+        \\  "name": "Theme Preview",
+        \\  "version": "0.1.0",
+        \\  "description": "Read-only UI helpers for theme iteration",
+        \\  "entry": "main.zig",
+        \\  "capabilities": ["ui", "workspace.read"],
+        \\  "commands": [{"id": "theme.preview"}],
+        \\  "integrations": []
+        \\}
+        ,
+        \\
+        \\{
+        \\  "id": "zide.github-issues",
+        \\  "name": "GitHub Issues",
+        \\  "version": "0.2.0",
+        \\  "description": "Issue search and task handoff",
+        \\  "entry": "issues.zig",
+        \\  "capabilities": ["ui", "github", "network.read"],
+        \\  "commands": [{"id": "github.issues.refresh"}, {"id": "github.issues.open"}],
+        \\  "integrations": [{"type": "github"}]
+        \\}
+        ,
+        \\
+        \\{
+        \\  "id": "zide.build-runner",
+        \\  "name": "Build Runner",
+        \\  "version": "0.3.0",
+        \\  "description": "Runs workspace build tasks after explicit consent",
+        \\  "entry": "build.zig",
+        \\  "capabilities": ["task", "process", "workspace.write"],
+        \\  "commands": [{"id": "build.runner.run"}],
+        \\  "integrations": [{"type": "task"}]
+        \\}
+        ,
+    };
+
+    try stdout.writeAll("extension registry demo\n-----------------------\n");
+    var risk_counts = [_]usize{ 0, 0, 0 };
+    for (manifests, 0..) |manifest, index| {
+        var extension = try extensions.parseManifest(allocator, "demo/zide-extension.json", manifest);
+        defer extension.deinit(allocator);
+        const risk = extensions.extensionRisk(extension);
+        risk_counts[@intFromEnum(risk)] += 1;
+        try stdout.print("{d}. {s} {s} risk={s} commands={d} integrations={d}\n", .{
+            index + 1,
+            extension.id,
+            extension.version,
+            extensions.riskLabel(risk),
+            extension.commands,
+            extension.integrations,
+        });
+        try stdout.writeAll("   caps: ");
+        for (extension.capabilities, 0..) |capability, cap_index| {
+            if (cap_index > 0) try stdout.writeAll(", ");
+            try stdout.writeAll(extensions.capabilityLabel(capability));
+        }
+        try stdout.print("\n   note: {s}\n", .{extension.message});
+    }
+    try stdout.print("\nsummary: low={d}, medium={d}, high={d}\n", .{ risk_counts[@intFromEnum(extensions.Risk.low)], risk_counts[@intFromEnum(extensions.Risk.medium)], risk_counts[@intFromEnum(extensions.Risk.high)] });
 }
 
 fn appendFindings(target: *security_findings.Collection, source: *const security_findings.Collection) !void {

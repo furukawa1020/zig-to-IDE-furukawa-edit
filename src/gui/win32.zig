@@ -857,6 +857,9 @@ const GuiState = struct {
         if (std.mem.startsWith(u8, id, "github.") and !std.mem.eql(u8, id, "github.overview")) {
             self.bottom_panel = .output;
         }
+        if (std.mem.startsWith(u8, id, "release.")) {
+            self.bottom_panel = .output;
+        }
     }
 
     fn executeGitPanelAction(self: *GuiState, action: GitPanelAction) void {
@@ -4042,7 +4045,9 @@ fn drawPublishPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
         if (workspaceFileExistsGui(&state.app, "zig-out/bin/zide.exe")) "built" else "missing",
         if (workspaceHasPrefixGui(&state.app, ".github/workflows/")) "yes" else "none",
     }) catch "SHIP";
-    drawTextClipped(hdc, rect.left + 16, rect.top + 10, rect.right - 16, rgb(79, 230, 226), header);
+    const header_right = if (publishPanelHasActionButtons(rect)) publishPanelActionButtonRect(rect, .checklist).left - 12 else rect.right - 16;
+    drawTextClipped(hdc, rect.left + 16, rect.top + 10, header_right, rgb(79, 230, 226), header);
+    drawPublishPanelActions(hdc, rect);
 
     const lines = publishLines();
     const rows = @max(0, @divTrunc(rect.bottom - rect.top - HEADER_HEIGHT, ROW_HEIGHT));
@@ -4056,9 +4061,55 @@ fn drawPublishPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     }
 }
 
+fn drawPublishPanelActions(hdc: windows.HDC, rect: RECT) void {
+    if (!publishPanelHasActionButtons(rect)) return;
+    const actions = [_]PublishPanelAction{ .checklist, .assets };
+    for (actions) |action| {
+        drawButton(hdc, publishPanelActionButtonRect(rect, action), publishPanelActionLabel(action));
+    }
+}
+
+fn publishPanelActionAt(rect: RECT, x: c_int, y: c_int) ?PublishPanelAction {
+    if (!publishPanelHasActionButtons(rect)) return null;
+    if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
+    const actions = [_]PublishPanelAction{ .checklist, .assets };
+    for (actions) |action| {
+        if (pointIn(publishPanelActionButtonRect(rect, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn publishPanelHasActionButtons(rect: RECT) bool {
+    return rect.right - rect.left >= 360;
+}
+
+fn publishPanelActionButtonRect(rect: RECT, action: PublishPanelAction) RECT {
+    const width: c_int = 72;
+    const gap: c_int = 8;
+    const slot: c_int = switch (action) {
+        .assets => 0,
+        .checklist => 1,
+    };
+    const right = rect.right - 12 - slot * (width + gap);
+    return .{
+        .left = right - width,
+        .top = rect.top + 8,
+        .right = right,
+        .bottom = rect.top + 32,
+    };
+}
+
+fn publishPanelActionLabel(action: PublishPanelAction) []const u8 {
+    return switch (action) {
+        .checklist => "CHECK",
+        .assets => "HASH",
+    };
+}
+
 fn publishLineColor(line: []const u8) windows.COLORREF {
     if (std.mem.startsWith(u8, line, "==")) return rgb(255, 207, 92);
     if (std.mem.startsWith(u8, line, "[ship]")) return rgb(165, 214, 167);
+    if (std.mem.startsWith(u8, line, "[hash]")) return rgb(79, 230, 226);
     if (std.mem.startsWith(u8, line, "[later]")) return rgb(127, 211, 255);
     if (std.mem.startsWith(u8, line, "[avoid]")) return rgb(255, 118, 118);
     return rgb(210, 218, 226);
@@ -5232,6 +5283,7 @@ fn publishLines() []const []const u8 {
     return &.{
         "== FIRST PUBLIC RELEASE ==",
         "[ship] GitHub Releases: publish a draft first, attach zide-gui.exe, zide.exe, checksum text, and a short demo clip.",
+        "[hash] Press HASH after builds to render size and SHA-256 for GitHub Releases, winget, and Scoop.",
         "[ship] Mark the first tag as prerelease until outside users exercise edit/save/git/security flows.",
         "[ship] Make the promise obvious: secure Zig-native workbench, hook-free Git, visible capability boundaries.",
         "[ship] Keep README human-written. Let this panel carry the mechanical checklist.",

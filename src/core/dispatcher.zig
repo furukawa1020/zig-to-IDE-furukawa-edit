@@ -1341,6 +1341,15 @@ test "git overview command renders repository output" {
     try std.testing.expect(app.process_console.lines.items.len > 0);
 }
 
+test "extension scan command renders manifest overview" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "extensions.scan" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expect(app.process_console.lines.items.len > 0);
+}
+
 test "file new creates a workspace file and opens it" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

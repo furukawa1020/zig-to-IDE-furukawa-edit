@@ -116,6 +116,7 @@ const definitions = [_]Definition{
     .{ .id = "github.pr.create_draft", .title = "Create Draft GitHub PR", .description = "Create a draft PR from the current branch to the default branch using GITHUB_TOKEN.", .default_key = "", .scope = .workspace, .capability = .network_write },
     .{ .id = "extensions.scan", .title = "Scan Extensions", .description = "Scan ZIDE extension manifests without executing extension code.", .default_key = "", .scope = .extensions, .capability = .safe },
     .{ .id = "release.checklist", .title = "Release Checklist", .description = "Render a public launch checklist for GitHub Releases, zip assets, winget, and Scoop.", .default_key = "", .scope = .release, .capability = .safe },
+    .{ .id = "release.assets", .title = "Release Assets and Checksums", .description = "Render artifact sizes and SHA-256 hashes without running shell tools.", .default_key = "", .scope = .release, .capability = .safe },
     .{ .id = "demo.run", .title = "Run Demo", .description = "Run an internal zide demo.", .default_key = "", .scope = .demo, .capability = .safe },
 };
 

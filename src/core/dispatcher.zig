@@ -894,7 +894,7 @@ fn renderReleaseChecklist(app: *app_mod.App) !void {
     try writer.writeAll("3. Add issue templates for bug, security false-positive, and feature request once first testers appear.\n");
     try writer.writeAll("4. After the first stable tag, publish install manifests: winget first for Windows, Scoop bucket next for power users.\n");
     try writer.writeAll("5. Keep the hook-free Git/security story in every release note; that is the memorable difference.\n");
-    try writer.writeAll("6. Run release.bundle, then release.assets, and paste ZIP SHA-256 into release notes, winget, and Scoop manifests.\n");
+    try writer.writeAll("6. Run release.bundle, release.verify, then release.assets; paste ZIP SHA-256 into release notes, winget, and Scoop manifests.\n");
 
     try writer.writeAll("\nasset naming suggestion\n");
     try writer.writeAll("- zide-windows-x86_64.zip\n");

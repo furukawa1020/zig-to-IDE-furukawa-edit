@@ -119,6 +119,7 @@ const definitions = [_]Definition{
     .{ .id = "release.assets", .title = "Release Assets and Checksums", .description = "Render artifact sizes and SHA-256 hashes without running shell tools.", .default_key = "", .scope = .release, .capability = .safe },
     .{ .id = "release.manifests", .title = "Release Manifest Drafts", .description = "Render GitHub Release, winget, and Scoop manifest drafts from local artifact hashes.", .default_key = "", .scope = .release, .capability = .safe },
     .{ .id = "release.bundle", .title = "Build Release Bundle", .description = "Create a Windows ZIP release bundle using pure Zig archive writing.", .default_key = "", .scope = .release, .capability = .workspace_write },
+    .{ .id = "release.verify", .title = "Verify Release Bundle", .description = "Verify the release ZIP structure, paths, CRC32, and embedded checksums using pure Zig.", .default_key = "", .scope = .release, .capability = .safe },
     .{ .id = "demo.run", .title = "Run Demo", .description = "Run an internal zide demo.", .default_key = "", .scope = .demo, .capability = .safe },
 };
 

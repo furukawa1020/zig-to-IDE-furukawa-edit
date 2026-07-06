@@ -79,6 +79,8 @@ const TutorialPanelAction = enum {
 const PublishPanelAction = enum {
     checklist,
     assets,
+    manifests,
+    bundle,
 };
 
 const SelectionRange = struct {
@@ -927,6 +929,8 @@ const GuiState = struct {
         const id = switch (action) {
             .checklist => "release.checklist",
             .assets => "release.assets",
+            .manifests => "release.manifests",
+            .bundle => "release.bundle",
         };
         const result = dispatcher.dispatch(&self.app, .{ .id = id, .source = .command_palette }) catch |err| {
             self.setError(err) catch {};
@@ -4063,7 +4067,7 @@ fn drawPublishPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
 
 fn drawPublishPanelActions(hdc: windows.HDC, rect: RECT) void {
     if (!publishPanelHasActionButtons(rect)) return;
-    const actions = [_]PublishPanelAction{ .checklist, .assets };
+    const actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle };
     for (actions) |action| {
         drawButton(hdc, publishPanelActionButtonRect(rect, action), publishPanelActionLabel(action));
     }
@@ -4072,7 +4076,7 @@ fn drawPublishPanelActions(hdc: windows.HDC, rect: RECT) void {
 fn publishPanelActionAt(rect: RECT, x: c_int, y: c_int) ?PublishPanelAction {
     if (!publishPanelHasActionButtons(rect)) return null;
     if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const actions = [_]PublishPanelAction{ .checklist, .assets };
+    const actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle };
     for (actions) |action| {
         if (pointIn(publishPanelActionButtonRect(rect, action), x, y)) return action;
     }
@@ -4080,15 +4084,17 @@ fn publishPanelActionAt(rect: RECT, x: c_int, y: c_int) ?PublishPanelAction {
 }
 
 fn publishPanelHasActionButtons(rect: RECT) bool {
-    return rect.right - rect.left >= 360;
+    return rect.right - rect.left >= 520;
 }
 
 fn publishPanelActionButtonRect(rect: RECT, action: PublishPanelAction) RECT {
     const width: c_int = 72;
     const gap: c_int = 8;
     const slot: c_int = switch (action) {
-        .assets => 0,
-        .checklist => 1,
+        .bundle => 0,
+        .manifests => 1,
+        .assets => 2,
+        .checklist => 3,
     };
     const right = rect.right - 12 - slot * (width + gap);
     return .{
@@ -4103,6 +4109,8 @@ fn publishPanelActionLabel(action: PublishPanelAction) []const u8 {
     return switch (action) {
         .checklist => "CHECK",
         .assets => "HASH",
+        .manifests => "MANI",
+        .bundle => "ZIP",
     };
 }
 
@@ -5282,8 +5290,10 @@ fn tutorialLineCount(language: TutorialLanguage) usize {
 fn publishLines() []const []const u8 {
     return &.{
         "== FIRST PUBLIC RELEASE ==",
-        "[ship] GitHub Releases: publish a draft first, attach zide-gui.exe, zide.exe, checksum text, and a short demo clip.",
+        "[ship] GitHub Releases: publish a draft first, attach zide-windows-x86_64.zip and a short demo clip.",
+        "[ship] Press ZIP after builds to create zide-windows-x86_64.zip with pure Zig archive writing.",
         "[hash] Press HASH after builds to render size and SHA-256 for GitHub Releases, winget, and Scoop.",
+        "[ship] Press MANI to render GitHub Release, winget, and Scoop draft manifests; ZIP is preferred when present.",
         "[ship] Mark the first tag as prerelease until outside users exercise edit/save/git/security flows.",
         "[ship] Make the promise obvious: secure Zig-native workbench, hook-free Git, visible capability boundaries.",
         "[ship] Keep README human-written. Let this panel carry the mechanical checklist.",

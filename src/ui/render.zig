@@ -11,6 +11,7 @@ pub fn renderHelp(stdout: anytype) !void {
         \\Usage:
         \\  zide [workspace]
         \\  zide commands
+        \\  zide command <command-id> [argument]
         \\  zide demo [overview|architecture|languages|commands|editor|palette|dispatch|diagnostics|input|loop|screen|security|extensions|buffer|zig-tokens]
         \\  zide --version
         \\

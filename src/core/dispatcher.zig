@@ -425,6 +425,16 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "release assets hashed" };
     }
 
+    if (std.mem.eql(u8, definition.id, "release.manifests")) {
+        try renderReleaseManifests(app, request.argument);
+        return .{ .completed = "release manifest drafts rendered" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "release.bundle")) {
+        const created = try renderReleaseBundle(app);
+        return .{ .completed = if (created) "release bundle created" else "release bundle waiting for build artifacts" };
+    }
+
     if (std.mem.eql(u8, definition.id, "git.status")) {
         var audit = try git_status.auditRepository(app.allocator, app.workspace.root_path, .{});
         defer audit.deinit();
@@ -869,6 +879,7 @@ fn renderReleaseChecklist(app: *app_mod.App) !void {
     try writer.print("{s} docs/security.md present (trust model explainer)\n", .{checkMark(workspaceHasPath(app, "docs/security.md"))});
     try writer.print("{s} built GUI artifact zig-out/bin/zide-gui.exe\n", .{checkMark(workspaceFileExists(app, "zig-out/bin/zide-gui.exe"))});
     try writer.print("{s} built CLI artifact zig-out/bin/zide.exe\n", .{checkMark(workspaceFileExists(app, "zig-out/bin/zide.exe"))});
+    try writer.print("{s} bundled ZIP zig-out/release/zide-windows-x86_64.zip\n", .{checkMark(workspaceFileExists(app, release_bundle_asset.relative_path))});
     try writer.print("{s} GitHub Actions workflow present\n", .{checkMark(workspaceHasPrefix(app, ".github/workflows/"))});
     try writer.print("{s} LICENSE present\n", .{checkMark(workspaceHasPath(app, "LICENSE") or workspaceHasPath(app, "LICENSE.md") or workspaceHasPath(app, "COPYING"))});
 
@@ -878,7 +889,7 @@ fn renderReleaseChecklist(app: *app_mod.App) !void {
     try writer.writeAll("3. Add issue templates for bug, security false-positive, and feature request once first testers appear.\n");
     try writer.writeAll("4. After the first stable tag, publish install manifests: winget first for Windows, Scoop bucket next for power users.\n");
     try writer.writeAll("5. Keep the hook-free Git/security story in every release note; that is the memorable difference.\n");
-    try writer.writeAll("6. Run release.assets and paste SHA-256 values into release notes, winget, and Scoop manifests.\n");
+    try writer.writeAll("6. Run release.bundle, then release.assets, and paste ZIP SHA-256 into release notes, winget, and Scoop manifests.\n");
 
     try writer.writeAll("\nasset naming suggestion\n");
     try writer.writeAll("- zide-windows-x86_64.zip\n");
@@ -894,9 +905,23 @@ const ReleaseAsset = struct {
     release_name: []const u8,
 };
 
+const Sha256Hex = [std.crypto.hash.sha2.Sha256.digest_length * 2]u8;
+
+const ReleaseAssetDigest = struct {
+    asset: ReleaseAsset,
+    size: u64,
+    sha256: Sha256Hex,
+};
+
+const release_bundle_root = "zide-windows-x86_64";
+const release_bundle_asset = ReleaseAsset{ .label = "ZIP", .relative_path = "zig-out/release/zide-windows-x86_64.zip", .release_name = "zide-windows-x86_64.zip" };
+const release_gui_asset = ReleaseAsset{ .label = "GUI", .relative_path = "zig-out/bin/zide-gui.exe", .release_name = "zide-gui.exe" };
+const release_cli_asset = ReleaseAsset{ .label = "CLI", .relative_path = "zig-out/bin/zide.exe", .release_name = "zide.exe" };
+
 const release_assets = [_]ReleaseAsset{
-    .{ .label = "GUI", .relative_path = "zig-out/bin/zide-gui.exe", .release_name = "zide-gui.exe" },
-    .{ .label = "CLI", .relative_path = "zig-out/bin/zide.exe", .release_name = "zide.exe" },
+    release_bundle_asset,
+    release_gui_asset,
+    release_cli_asset,
 };
 
 fn renderReleaseAssets(app: *app_mod.App) !void {
@@ -925,37 +950,419 @@ fn renderReleaseAssets(app: *app_mod.App) !void {
 }
 
 fn renderReleaseAsset(app: *app_mod.App, writer: *std.Io.Writer, asset: ReleaseAsset) !bool {
+    const digest = (try hashReleaseAsset(app, asset)) orelse {
+        try writer.print("- [{s}] missing: {s}\n", .{ asset.label, asset.relative_path });
+        return false;
+    };
+
+    try writer.print("- [{s}] {s}\n", .{ asset.label, asset.release_name });
+    try writer.print("  path   : {s}\n", .{asset.relative_path});
+    try writer.print("  size   : {d} bytes\n", .{digest.size});
+    try writer.print("  sha256 : {s}\n", .{digest.sha256[0..]});
+    try writer.print("  winget : InstallerSha256: {s}\n", .{digest.sha256[0..]});
+    try writer.print("  scoop  : \"hash\": \"{s}\"\n", .{digest.sha256[0..]});
+    return true;
+}
+
+fn hashReleaseAsset(app: *app_mod.App, asset: ReleaseAsset) !?ReleaseAssetDigest {
     const path = try std.fs.path.join(app.allocator, &.{ app.workspace.root_path, asset.relative_path });
     defer app.allocator.free(path);
 
     const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            try writer.print("- [{s}] missing: {s}\n", .{ asset.label, asset.relative_path });
-            return false;
-        },
+        error.FileNotFound => return null,
         else => return err,
     };
-    if (stat.kind != .file) {
-        try writer.print("- [{s}] not a file: {s}\n", .{ asset.label, asset.relative_path });
-        return false;
-    }
+    if (stat.kind != .file) return null;
 
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, app.allocator, .limited(512 * 1024 * 1024));
     defer app.allocator.free(bytes);
 
+    return .{ .asset = asset, .size = stat.size, .sha256 = try sha256Hex(bytes) };
+}
+
+fn readReleaseAssetBytes(app: *app_mod.App, asset: ReleaseAsset) !?[]u8 {
+    const path = try std.fs.path.join(app.allocator, &.{ app.workspace.root_path, asset.relative_path });
+    defer app.allocator.free(path);
+
+    const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    if (stat.kind != .file) return null;
+
+    return try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, app.allocator, .limited(512 * 1024 * 1024));
+}
+
+fn sha256Hex(bytes: []const u8) !Sha256Hex {
     const Sha256 = std.crypto.hash.sha2.Sha256;
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(bytes, &digest, .{});
-    var hex: [Sha256.digest_length * 2]u8 = undefined;
+    var hex: Sha256Hex = undefined;
     try std.crypto.codecs.hex.encode(hex[0..], digest[0..], .lower);
+    return hex;
+}
 
-    try writer.print("- [{s}] {s}\n", .{ asset.label, asset.release_name });
-    try writer.print("  path   : {s}\n", .{asset.relative_path});
-    try writer.print("  size   : {d} bytes\n", .{stat.size});
-    try writer.print("  sha256 : {s}\n", .{hex[0..]});
-    try writer.print("  winget : InstallerSha256: {s}\n", .{hex[0..]});
-    try writer.print("  scoop  : \"hash\": \"{s}\"\n", .{hex[0..]});
+const ZipInputEntry = struct {
+    name: []const u8,
+    bytes: []const u8,
+};
+
+const ZipCentralEntry = struct {
+    name: []const u8,
+    crc32: u32,
+    size: u32,
+    local_header_offset: u32,
+};
+
+fn renderReleaseBundle(app: *app_mod.App) !bool {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("release bundle\n");
+    try writer.writeAll("mode: pure Zig store ZIP writer; no shell, no zip executable, no network\n\n");
+
+    const gui_bytes_opt = try readReleaseAssetBytes(app, release_gui_asset);
+    defer {
+        if (gui_bytes_opt) |bytes| app.allocator.free(bytes);
+    }
+    const cli_bytes_opt = try readReleaseAssetBytes(app, release_cli_asset);
+    defer {
+        if (cli_bytes_opt) |bytes| app.allocator.free(bytes);
+    }
+
+    if (gui_bytes_opt == null or cli_bytes_opt == null) {
+        if (gui_bytes_opt == null) try writer.print("- missing: {s}\n", .{release_gui_asset.relative_path});
+        if (cli_bytes_opt == null) try writer.print("- missing: {s}\n", .{release_cli_asset.relative_path});
+        try writer.writeAll("\nrun zig build install and zig build install-gui before creating the release bundle\n");
+        try app.process_console.appendBytes(.stdout, text.written());
+        return false;
+    }
+
+    const gui_bytes = gui_bytes_opt.?;
+    const cli_bytes = cli_bytes_opt.?;
+    const gui_sha = try sha256Hex(gui_bytes);
+    const cli_sha = try sha256Hex(cli_bytes);
+
+    var checksums: std.Io.Writer.Allocating = .init(app.allocator);
+    defer checksums.deinit();
+    try checksums.writer.print("{s}  {s}/zide-gui.exe\n", .{ gui_sha[0..], release_bundle_root });
+    try checksums.writer.print("{s}  {s}/zide.exe\n", .{ cli_sha[0..], release_bundle_root });
+    const checksum_bytes = try checksums.toOwnedSlice();
+    defer app.allocator.free(checksum_bytes);
+
+    const release_note =
+        "ZIDE Windows x86_64 release bundle\n" ++
+        "\n" ++
+        "- zide-gui.exe: Windows GUI IDE/workbench\n" ++
+        "- zide.exe: CLI/TUI entry point\n" ++
+        "- CHECKSUMS.sha256: SHA-256 values for files inside this archive\n" ++
+        "\n" ++
+        "Built by release.bundle with pure Zig ZIP writing.\n";
+
+    const entries = [_]ZipInputEntry{
+        .{ .name = release_bundle_root ++ "/zide-gui.exe", .bytes = gui_bytes },
+        .{ .name = release_bundle_root ++ "/zide.exe", .bytes = cli_bytes },
+        .{ .name = release_bundle_root ++ "/CHECKSUMS.sha256", .bytes = checksum_bytes },
+        .{ .name = release_bundle_root ++ "/ZIDE-RELEASE.txt", .bytes = release_note },
+    };
+    const zip_bytes = try buildStoredZip(app.allocator, entries[0..]);
+    defer app.allocator.free(zip_bytes);
+
+    const release_dir = try std.fs.path.join(app.allocator, &.{ app.workspace.root_path, "zig-out/release" });
+    defer app.allocator.free(release_dir);
+    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, release_dir);
+
+    const out_path = try std.fs.path.join(app.allocator, &.{ app.workspace.root_path, release_bundle_asset.relative_path });
+    defer app.allocator.free(out_path);
+    try writeFileAbsolute(out_path, zip_bytes);
+
+    const digest = (try hashReleaseAsset(app, release_bundle_asset)).?;
+    try writer.print("- wrote : {s}\n", .{release_bundle_asset.relative_path});
+    try writer.print("- size  : {d} bytes\n", .{digest.size});
+    try writer.print("- sha256: {s}\n", .{digest.sha256[0..]});
+    try writer.writeAll("\nnext: run release.manifests to refresh GitHub Release, winget, and Scoop drafts\n");
+
+    try app.process_console.appendBytes(.stdout, text.written());
     return true;
+}
+
+fn buildStoredZip(allocator: std.mem.Allocator, entries: []const ZipInputEntry) ![]u8 {
+    if (entries.len > std.math.maxInt(u16)) return error.ZipTooManyEntries;
+
+    var zip: std.Io.Writer.Allocating = .init(allocator);
+    errdefer zip.deinit();
+    const writer = &zip.writer;
+
+    const central_entries = try allocator.alloc(ZipCentralEntry, entries.len);
+    defer allocator.free(central_entries);
+
+    for (entries, 0..) |entry, index| {
+        if (entry.name.len > std.math.maxInt(u16)) return error.ZipEntryNameTooLong;
+        if (entry.bytes.len > std.math.maxInt(u32)) return error.ZipEntryTooLarge;
+        if (zip.written().len > std.math.maxInt(u32)) return error.ZipTooLarge;
+
+        const size: u32 = @intCast(entry.bytes.len);
+        const offset: u32 = @intCast(zip.written().len);
+        const crc32 = std.hash.Crc32.hash(entry.bytes);
+
+        try writer.writeInt(u32, 0x04034b50, .little);
+        try writer.writeInt(u16, 20, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u32, crc32, .little);
+        try writer.writeInt(u32, size, .little);
+        try writer.writeInt(u32, size, .little);
+        try writer.writeInt(u16, @intCast(entry.name.len), .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeAll(entry.name);
+        try writer.writeAll(entry.bytes);
+
+        central_entries[index] = .{
+            .name = entry.name,
+            .crc32 = crc32,
+            .size = size,
+            .local_header_offset = offset,
+        };
+    }
+
+    if (zip.written().len > std.math.maxInt(u32)) return error.ZipTooLarge;
+    const central_directory_offset: u32 = @intCast(zip.written().len);
+
+    for (central_entries) |entry| {
+        try writer.writeInt(u32, 0x02014b50, .little);
+        try writer.writeInt(u16, 20, .little);
+        try writer.writeInt(u16, 20, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u32, entry.crc32, .little);
+        try writer.writeInt(u32, entry.size, .little);
+        try writer.writeInt(u32, entry.size, .little);
+        try writer.writeInt(u16, @intCast(entry.name.len), .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u16, 0, .little);
+        try writer.writeInt(u32, 0, .little);
+        try writer.writeInt(u32, entry.local_header_offset, .little);
+        try writer.writeAll(entry.name);
+    }
+
+    if (zip.written().len > std.math.maxInt(u32)) return error.ZipTooLarge;
+    const central_directory_size: u32 = @intCast(zip.written().len - central_directory_offset);
+    const entry_count: u16 = @intCast(entries.len);
+
+    try writer.writeInt(u32, 0x06054b50, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, entry_count, .little);
+    try writer.writeInt(u16, entry_count, .little);
+    try writer.writeInt(u32, central_directory_size, .little);
+    try writer.writeInt(u32, central_directory_offset, .little);
+    try writer.writeInt(u16, 0, .little);
+
+    return try zip.toOwnedSlice();
+}
+
+fn writeFileAbsolute(path: []const u8, bytes: []const u8) !void {
+    var file = try std.Io.Dir.createFileAbsolute(std.Options.debug_io, path, .{ .truncate = true });
+    defer file.close(std.Options.debug_io);
+    try file.writeStreamingAll(std.Options.debug_io, bytes);
+    try file.sync(std.Options.debug_io);
+}
+
+fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    var overview = try git_repository.inspect(app.allocator, &app.workspace, .{});
+    defer overview.deinit();
+    const remote = firstGitHubRemote(&overview);
+
+    const raw_version = std.mem.trim(u8, argument orelse "0.1.0", " \t\r\n");
+    const package_version = packageVersionFromTag(if (raw_version.len == 0) "0.1.0" else raw_version);
+    var allocated_tag: ?[]u8 = null;
+    const tag = if (std.mem.startsWith(u8, package_version, "v"))
+        package_version
+    else tag: {
+        allocated_tag = try std.fmt.allocPrint(app.allocator, "v{s}", .{package_version});
+        break :tag allocated_tag.?;
+    };
+    defer if (allocated_tag) |value| app.allocator.free(value);
+
+    const homepage = if (remote) |github| github.web_url else "https://github.com/OWNER/REPO";
+    const owner = if (remote) |github| github.owner else "Publisher";
+    const repo = if (remote) |github| github.repo else "zide";
+    const bundle = try hashReleaseAsset(app, release_bundle_asset);
+    const gui = try hashReleaseAsset(app, release_gui_asset);
+    const cli = try hashReleaseAsset(app, release_cli_asset);
+
+    try writer.writeAll("release manifest drafts\n");
+    try writer.writeAll("mode: pure Zig; hashes come from local artifacts; verify final schema before submitting upstream\n\n");
+    try writer.print("repo    : {s}\n", .{homepage});
+    try writer.print("tag     : {s}\n", .{tag});
+    try writer.print("version : {s}\n", .{package_version});
+    if (bundle == null) {
+        try writer.writeAll("missing : run release.bundle after zig build install and zig build install-gui for the preferred ZIP asset\n");
+    }
+
+    try writer.writeAll("\nGitHub Release assets\n");
+    if (bundle) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
+    if (gui) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
+    if (cli) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
+    if (bundle == null and gui == null and cli == null) try writer.writeAll("- no local artifacts found yet\n");
+
+    try writer.writeAll("\nwinget portable draft\n");
+    try writer.print(
+        \\PackageIdentifier: {s}.{s}
+        \\PackageVersion: {s}
+        \\PackageLocale: en-US
+        \\Publisher: {s}
+        \\PackageName: ZIDE
+        \\License: TODO
+        \\ShortDescription: Secure Zig-native IDE/workbench with visible trust boundaries.
+        \\Installers:
+        \\
+    , .{ owner, repo, package_version, owner });
+    if (bundle) |item| {
+        try renderWingetZipInstaller(writer, homepage, tag, item);
+    } else {
+        if (gui) |item| try renderWingetInstaller(writer, homepage, tag, item, "zide-gui");
+        if (cli) |item| try renderWingetInstaller(writer, homepage, tag, item, "zide");
+    }
+    try writer.writeAll(
+        \\ManifestType: singleton
+        \\ManifestVersion: 1.9.0
+        \\
+    );
+
+    try writer.writeAll("\nScoop bucket draft\n");
+    try writer.writeAll("{\n");
+    try writer.print(
+        \\  "version": "{s}",
+        \\  "description": "Secure Zig-native IDE/workbench with visible trust boundaries.",
+        \\  "homepage": "{s}",
+        \\  "license": "TODO",
+        \\  "architecture": {{
+        \\    "64bit": {{
+        \\
+    , .{ package_version, homepage });
+    try renderScoopUrlAndHash(writer, homepage, tag, bundle, gui, cli);
+    try writer.writeAll(
+        \\    }
+        \\  },
+        \\  "bin": "zide.exe",
+        \\  "shortcuts": [["zide-gui.exe", "ZIDE"]]
+        \\}
+        \\
+    );
+
+    try writer.writeAll("\nnext packaging move\n");
+    try writer.print("- Preferred asset: zig-out/release/{s}; keep the same tag {s}.\n", .{ release_bundle_asset.release_name, tag });
+    try writer.print("- GitHub CLI shape: gh release create {s} zig-out/release/{s} --draft --prerelease\n", .{ tag, release_bundle_asset.release_name });
+
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn packageVersionFromTag(value: []const u8) []const u8 {
+    if (value.len > 1 and (value[0] == 'v' or value[0] == 'V') and std.ascii.isDigit(value[1])) {
+        return value[1..];
+    }
+    return value;
+}
+
+fn renderReleaseAssetUrl(writer: *std.Io.Writer, homepage: []const u8, tag: []const u8, item: ReleaseAssetDigest) !void {
+    try writer.print("- {s}: {s}/releases/download/{s}/{s}\n", .{ item.asset.label, homepage, tag, item.asset.release_name });
+    try writer.print("  sha256: {s}\n", .{item.sha256[0..]});
+}
+
+fn renderWingetInstaller(writer: *std.Io.Writer, homepage: []const u8, tag: []const u8, item: ReleaseAssetDigest, command_name: []const u8) !void {
+    try writer.print(
+        \\- Architecture: x64
+        \\  InstallerType: portable
+        \\  InstallerUrl: {s}/releases/download/{s}/{s}
+        \\  InstallerSha256: {s}
+        \\  Commands:
+        \\  - {s}
+        \\
+    , .{ homepage, tag, item.asset.release_name, item.sha256[0..], command_name });
+}
+
+fn renderWingetZipInstaller(writer: *std.Io.Writer, homepage: []const u8, tag: []const u8, item: ReleaseAssetDigest) !void {
+    try writer.print(
+        \\- Architecture: x64
+        \\  InstallerType: zip
+        \\  NestedInstallerType: portable
+        \\  NestedInstallerFiles:
+        \\  - RelativeFilePath: {s}\zide-gui.exe
+        \\    PortableCommandAlias: zide-gui
+        \\  - RelativeFilePath: {s}\zide.exe
+        \\    PortableCommandAlias: zide
+        \\  InstallerUrl: {s}/releases/download/{s}/{s}
+        \\  InstallerSha256: {s}
+        \\
+    , .{ release_bundle_root, release_bundle_root, homepage, tag, item.asset.release_name, item.sha256[0..] });
+}
+
+fn renderScoopUrlAndHash(writer: *std.Io.Writer, homepage: []const u8, tag: []const u8, bundle: ?ReleaseAssetDigest, gui: ?ReleaseAssetDigest, cli: ?ReleaseAssetDigest) !void {
+    if (bundle) |item| {
+        try writer.print(
+            \\      "url": "{s}/releases/download/{s}/{s}",
+            \\      "hash": "{s}",
+            \\      "extract_dir": "{s}"
+            \\
+        , .{ homepage, tag, item.asset.release_name, item.sha256[0..], release_bundle_root });
+        return;
+    }
+    if (gui != null and cli != null) {
+        try writer.print(
+            \\      "url": [
+            \\        "{s}/releases/download/{s}/{s}",
+            \\        "{s}/releases/download/{s}/{s}"
+            \\      ],
+            \\      "hash": [
+            \\        "{s}",
+            \\        "{s}"
+            \\      ]
+            \\
+        , .{
+            homepage,
+            tag,
+            gui.?.asset.release_name,
+            homepage,
+            tag,
+            cli.?.asset.release_name,
+            gui.?.sha256[0..],
+            cli.?.sha256[0..],
+        });
+        return;
+    }
+    if (gui) |item| {
+        try writer.print(
+            \\      "url": "{s}/releases/download/{s}/{s}",
+            \\      "hash": "{s}"
+            \\
+        , .{ homepage, tag, item.asset.release_name, item.sha256[0..] });
+        return;
+    }
+    if (cli) |item| {
+        try writer.print(
+            \\      "url": "{s}/releases/download/{s}/{s}",
+            \\      "hash": "{s}"
+            \\
+        , .{ homepage, tag, item.asset.release_name, item.sha256[0..] });
+        return;
+    }
+    try writer.writeAll(
+        \\      "url": "https://github.com/OWNER/REPO/releases/download/v0.1.0/zide-windows-x86_64.zip",
+        \\      "hash": "TODO"
+        \\
+    );
 }
 
 fn checkMark(ok: bool) []const u8 {
@@ -1527,6 +1934,96 @@ test "release assets command renders artifact hashes" {
         if (std.mem.indexOf(u8, line.text, "sha256") != null) saw_hash = true;
     }
     try std.testing.expect(saw_hash);
+}
+
+test "release bundle command creates zip artifact" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/bin");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide-gui.exe", .data = "gui-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide.exe", .data = "cli-bytes" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "release.bundle" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+
+    const stat = try tmp.dir.statFile(std.Options.debug_io, release_bundle_asset.relative_path, .{});
+    try std.testing.expect(stat.size > 22);
+
+    const bytes = try tmp.dir.readFileAlloc(std.Options.debug_io, release_bundle_asset.relative_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(bytes.len >= 4);
+    try std.testing.expectEqualSlices(u8, "PK\x03\x04", bytes[0..4]);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, release_bundle_root ++ "/zide.exe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, release_bundle_root ++ "/CHECKSUMS.sha256") != null);
+}
+
+test "release manifests command renders package drafts" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/bin");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide-gui.exe", .data = "gui-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide.exe", .data = "cli-bytes" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "release.manifests", .argument = "v0.2.0" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+
+    var saw_winget = false;
+    var saw_scoop = false;
+    for (app.process_console.lines.items) |line| {
+        if (std.mem.indexOf(u8, line.text, "winget") != null) saw_winget = true;
+        if (std.mem.indexOf(u8, line.text, "Scoop") != null) saw_scoop = true;
+    }
+    try std.testing.expect(saw_winget);
+    try std.testing.expect(saw_scoop);
+}
+
+test "release manifests prefer bundled zip artifact" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/bin");
+    try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/release");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide-gui.exe", .data = "gui-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide.exe", .data = "cli-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = release_bundle_asset.relative_path, .data = "zip-bytes" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "release.manifests", .argument = "v0.2.0" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+
+    var saw_bundle = false;
+    var saw_winget_zip = false;
+    var saw_scoop_extract = false;
+    for (app.process_console.lines.items) |line| {
+        if (std.mem.indexOf(u8, line.text, release_bundle_asset.release_name) != null) saw_bundle = true;
+        if (std.mem.indexOf(u8, line.text, "InstallerType: zip") != null) saw_winget_zip = true;
+        if (std.mem.indexOf(u8, line.text, "\"extract_dir\"") != null) saw_scoop_extract = true;
+    }
+    try std.testing.expect(saw_bundle);
+    try std.testing.expect(saw_winget_zip);
+    try std.testing.expect(saw_scoop_extract);
 }
 
 test "file new creates a workspace file and opens it" {

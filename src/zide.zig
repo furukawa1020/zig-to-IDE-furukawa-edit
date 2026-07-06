@@ -194,8 +194,74 @@ pub fn runWithProcess(
             }
         },
         .demo => |kind| try demo.run(allocator, kind, stdout),
+        .command => |invocation| try runCommandAction(allocator, invocation, io, environ, stdout, stderr),
         .commands => try render.renderCommands(stdout),
         .version => try stdout.print("zide 0.1.0-dev\n", .{}),
         .help => try render.renderHelp(stdout),
     }
+}
+
+fn runCommandAction(
+    allocator: std.mem.Allocator,
+    invocation: cli.CommandInvocation,
+    io: std.Io,
+    environ: std.process.Environ,
+    stdout: anytype,
+    stderr: anytype,
+) !void {
+    var instance = app.App.initWithProcess(allocator, ".", io, environ) catch |err| {
+        try stderr.print("zide: workspace open failed for '.': {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer instance.deinit();
+
+    const result = try dispatcher.dispatch(&instance, .{
+        .id = invocation.id,
+        .argument = invocation.argument,
+        .source = .command_palette,
+    });
+    try writeCommandConsole(&instance, stdout, stderr);
+
+    switch (result) {
+        .completed => |message| try stdout.print("completed: {s}\n", .{message}),
+        .blocked => |message| try stderr.print("blocked: {s}\n", .{message}),
+        .unknown_command => try stderr.print("unknown command: {s}\n", .{invocation.id}),
+        .no_active_document => try stderr.print("no active document for command: {s}\n", .{invocation.id}),
+        .unsupported => |message| try stderr.print("unsupported: {s}\n", .{message}),
+        .external_command => |spec| {
+            const display = try platform.process.appendDisplay(allocator, spec.command);
+            defer allocator.free(display);
+            try stderr.print("external command not launched by zide command: {s}\n", .{display});
+        },
+    }
+}
+
+fn writeCommandConsole(instance: *const app.App, stdout: anytype, stderr: anytype) !void {
+    for (instance.process_console.lines.items) |line| {
+        const out = switch (line.stream) {
+            .stdout => stdout,
+            .stderr => stderr,
+        };
+        try out.writeAll(line.text);
+        try out.writeAll("\n");
+    }
+}
+
+test "command action dispatches an internal command" {
+    var stdout_buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout_buffer.deinit();
+    var stderr_buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr_buffer.deinit();
+
+    try runWithProcess(
+        std.testing.allocator,
+        .{ .action = .{ .command = .{ .id = "release.checklist" } } },
+        std.Options.debug_io,
+        std.process.Environ.empty,
+        &stdout_buffer.writer,
+        &stderr_buffer.writer,
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buffer.written(), "release/public launch checklist") != null);
+    try std.testing.expectEqual(@as(usize, 0), stderr_buffer.written().len);
 }

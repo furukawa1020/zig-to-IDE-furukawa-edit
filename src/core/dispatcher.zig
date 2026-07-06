@@ -435,6 +435,11 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = if (created) "release bundle created" else "release bundle waiting for build artifacts" };
     }
 
+    if (std.mem.eql(u8, definition.id, "release.verify")) {
+        const verified = try renderReleaseVerification(app);
+        return .{ .completed = if (verified) "release bundle verified" else "release bundle verification found issues" };
+    }
+
     if (std.mem.eql(u8, definition.id, "git.status")) {
         var audit = try git_status.auditRepository(app.allocator, app.workspace.root_path, .{});
         defer audit.deinit();
@@ -1173,6 +1178,289 @@ fn writeFileAbsolute(path: []const u8, bytes: []const u8) !void {
     defer file.close(std.Options.debug_io);
     try file.writeStreamingAll(std.Options.debug_io, bytes);
     try file.sync(std.Options.debug_io);
+}
+
+fn renderReleaseVerification(app: *app_mod.App) !bool {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("release bundle verification\n");
+    try writer.writeAll("mode: pure Zig ZIP parser + path boundary + CRC32 + embedded SHA-256 checks\n\n");
+
+    const zip_bytes_opt = try readReleaseAssetBytes(app, release_bundle_asset);
+    defer {
+        if (zip_bytes_opt) |bytes| app.allocator.free(bytes);
+    }
+
+    const zip_bytes = zip_bytes_opt orelse {
+        try writer.print("- missing: {s}\n", .{release_bundle_asset.relative_path});
+        try writer.writeAll("\nrun release.bundle first\n");
+        try app.process_console.appendBytes(.stdout, text.written());
+        return false;
+    };
+
+    const sha = try sha256Hex(zip_bytes);
+    try writer.print("- bundle: {s}\n", .{release_bundle_asset.relative_path});
+    try writer.print("- size  : {d} bytes\n", .{zip_bytes.len});
+    try writer.print("- sha256: {s}\n\n", .{sha[0..]});
+
+    const ok = try verifyStoredReleaseZip(writer, zip_bytes);
+    try app.process_console.appendBytes(.stdout, text.written());
+    return ok;
+}
+
+fn verifyStoredReleaseZip(writer: *std.Io.Writer, bytes: []const u8) !bool {
+    var ok = true;
+    var issues: usize = 0;
+
+    const eocd_offset = findZipEndOfCentralDirectory(bytes) orelse {
+        try reportZipIssue(writer, &ok, &issues, "end of central directory record not found", .{});
+        try renderZipVerificationSummary(writer, ok, issues);
+        return false;
+    };
+
+    if (bytes.len - eocd_offset < 22) {
+        try reportZipIssue(writer, &ok, &issues, "end of central directory record is truncated", .{});
+        try renderZipVerificationSummary(writer, ok, issues);
+        return false;
+    }
+
+    const disk_number = readU16Le(bytes, eocd_offset + 4).?;
+    const central_disk = readU16Le(bytes, eocd_offset + 6).?;
+    const entries_this_disk = readU16Le(bytes, eocd_offset + 8).?;
+    const entry_count = readU16Le(bytes, eocd_offset + 10).?;
+    const central_size: usize = readU32Le(bytes, eocd_offset + 12).?;
+    const central_offset: usize = readU32Le(bytes, eocd_offset + 16).?;
+    const comment_len: usize = readU16Le(bytes, eocd_offset + 20).?;
+
+    if (disk_number != 0 or central_disk != 0) {
+        try reportZipIssue(writer, &ok, &issues, "multi-disk ZIP is not allowed", .{});
+    }
+    if (entries_this_disk != entry_count) {
+        try reportZipIssue(writer, &ok, &issues, "central directory entry counts disagree", .{});
+    }
+    if (eocd_offset + 22 + comment_len != bytes.len) {
+        try reportZipIssue(writer, &ok, &issues, "ZIP comment length does not match archive tail", .{});
+    }
+    if (central_offset > bytes.len or central_size > bytes.len - central_offset or central_offset + central_size > eocd_offset) {
+        try reportZipIssue(writer, &ok, &issues, "central directory points outside the archive", .{});
+        try renderZipVerificationSummary(writer, ok, issues);
+        return false;
+    }
+
+    const central_end = central_offset + central_size;
+    try writer.print("- entries: {d}\n", .{entry_count});
+    try writer.print("- central directory: offset={d} size={d}\n", .{ central_offset, central_size });
+
+    var pos = central_offset;
+    var index: usize = 0;
+    var gui_data: ?[]const u8 = null;
+    var cli_data: ?[]const u8 = null;
+    var checksum_data: ?[]const u8 = null;
+    var note_seen = false;
+
+    while (index < entry_count) : (index += 1) {
+        if (central_end - pos < 46) {
+            try reportZipIssue(writer, &ok, &issues, "central directory entry {d} is truncated", .{index});
+            break;
+        }
+        if (readU32Le(bytes, pos).? != 0x02014b50) {
+            try reportZipIssue(writer, &ok, &issues, "central directory entry {d} has a bad signature", .{index});
+            break;
+        }
+
+        const method = readU16Le(bytes, pos + 10).?;
+        const crc32 = readU32Le(bytes, pos + 16).?;
+        const compressed_size: usize = readU32Le(bytes, pos + 20).?;
+        const uncompressed_size: usize = readU32Le(bytes, pos + 24).?;
+        const name_len: usize = readU16Le(bytes, pos + 28).?;
+        const extra_len: usize = readU16Le(bytes, pos + 30).?;
+        const comment_length: usize = readU16Le(bytes, pos + 32).?;
+        const local_offset: usize = readU32Le(bytes, pos + 42).?;
+
+        const name_start = pos + 46;
+        const entry_end = name_start + name_len + extra_len + comment_length;
+        if (entry_end > central_end) {
+            try reportZipIssue(writer, &ok, &issues, "central directory entry {d} length points outside the central directory", .{index});
+            break;
+        }
+        const name = bytes[name_start..][0..name_len];
+
+        if (!isSafeZipEntryName(name)) {
+            try reportZipIssue(writer, &ok, &issues, "unsafe entry path: {s}", .{name});
+        }
+        if (method != 0) {
+            try reportZipIssue(writer, &ok, &issues, "entry {s} uses unsupported compression method {d}", .{ name, method });
+        }
+        if (compressed_size != uncompressed_size) {
+            try reportZipIssue(writer, &ok, &issues, "entry {s} has mismatched stored sizes", .{name});
+        }
+
+        const data = verifyZipLocalEntry(writer, bytes, central_offset, name, method, crc32, compressed_size, local_offset, &ok, &issues);
+        if (data) |entry_bytes| {
+            if (std.mem.eql(u8, name, release_bundle_root ++ "/zide-gui.exe")) {
+                if (gui_data != null) try reportZipIssue(writer, &ok, &issues, "duplicate GUI entry", .{});
+                gui_data = entry_bytes;
+            } else if (std.mem.eql(u8, name, release_bundle_root ++ "/zide.exe")) {
+                if (cli_data != null) try reportZipIssue(writer, &ok, &issues, "duplicate CLI entry", .{});
+                cli_data = entry_bytes;
+            } else if (std.mem.eql(u8, name, release_bundle_root ++ "/CHECKSUMS.sha256")) {
+                if (checksum_data != null) try reportZipIssue(writer, &ok, &issues, "duplicate checksum entry", .{});
+                checksum_data = entry_bytes;
+            } else if (std.mem.eql(u8, name, release_bundle_root ++ "/ZIDE-RELEASE.txt")) {
+                if (note_seen) try reportZipIssue(writer, &ok, &issues, "duplicate release note entry", .{});
+                note_seen = true;
+            } else {
+                try reportZipIssue(writer, &ok, &issues, "unexpected release entry: {s}", .{name});
+            }
+        }
+
+        pos = entry_end;
+    }
+
+    if (pos != central_end) {
+        try reportZipIssue(writer, &ok, &issues, "central directory was not consumed exactly", .{});
+    }
+    if (gui_data == null) try reportZipIssue(writer, &ok, &issues, "missing zide-gui.exe entry", .{});
+    if (cli_data == null) try reportZipIssue(writer, &ok, &issues, "missing zide.exe entry", .{});
+    if (checksum_data == null) try reportZipIssue(writer, &ok, &issues, "missing CHECKSUMS.sha256 entry", .{});
+    if (!note_seen) try reportZipIssue(writer, &ok, &issues, "missing ZIDE-RELEASE.txt entry", .{});
+
+    if (checksum_data) |checksums| {
+        if (gui_data) |gui| {
+            const gui_sha = try sha256Hex(gui);
+            if (std.mem.indexOf(u8, checksums, gui_sha[0..]) == null) {
+                try reportZipIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the GUI SHA-256", .{});
+            }
+        }
+        if (cli_data) |cli_bytes| {
+            const cli_sha = try sha256Hex(cli_bytes);
+            if (std.mem.indexOf(u8, checksums, cli_sha[0..]) == null) {
+                try reportZipIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the CLI SHA-256", .{});
+            }
+        }
+    }
+
+    try renderZipVerificationSummary(writer, ok, issues);
+    return ok;
+}
+
+fn verifyZipLocalEntry(
+    writer: *std.Io.Writer,
+    bytes: []const u8,
+    central_offset: usize,
+    name: []const u8,
+    method: u16,
+    expected_crc32: u32,
+    compressed_size: usize,
+    local_offset: usize,
+    ok: *bool,
+    issues: *usize,
+) ?[]const u8 {
+    _ = method;
+    if (local_offset > bytes.len or bytes.len - local_offset < 30) {
+        reportZipIssue(writer, ok, issues, "local header for {s} points outside the archive", .{name}) catch {};
+        return null;
+    }
+    if (readU32Le(bytes, local_offset).? != 0x04034b50) {
+        reportZipIssue(writer, ok, issues, "local header for {s} has a bad signature", .{name}) catch {};
+        return null;
+    }
+
+    const local_method = readU16Le(bytes, local_offset + 8).?;
+    const local_crc32 = readU32Le(bytes, local_offset + 14).?;
+    const local_compressed_size: usize = readU32Le(bytes, local_offset + 18).?;
+    const local_uncompressed_size: usize = readU32Le(bytes, local_offset + 22).?;
+    const local_name_len: usize = readU16Le(bytes, local_offset + 26).?;
+    const local_extra_len: usize = readU16Le(bytes, local_offset + 28).?;
+    const local_name_start = local_offset + 30;
+    const data_start = local_name_start + local_name_len + local_extra_len;
+
+    if (data_start > bytes.len or data_start > central_offset or compressed_size > central_offset - data_start) {
+        reportZipIssue(writer, ok, issues, "entry data for {s} overlaps archive metadata or escapes the file", .{name}) catch {};
+        return null;
+    }
+
+    const local_name = bytes[local_name_start..][0..local_name_len];
+    if (!std.mem.eql(u8, local_name, name)) {
+        reportZipIssue(writer, ok, issues, "central/local name mismatch for {s}", .{name}) catch {};
+    }
+    if (local_method != 0) {
+        reportZipIssue(writer, ok, issues, "local header for {s} uses unsupported method {d}", .{ name, local_method }) catch {};
+    }
+    if (local_compressed_size != compressed_size or local_uncompressed_size != compressed_size) {
+        reportZipIssue(writer, ok, issues, "local size fields do not match central directory for {s}", .{name}) catch {};
+    }
+    if (local_crc32 != expected_crc32) {
+        reportZipIssue(writer, ok, issues, "local CRC32 does not match central directory for {s}", .{name}) catch {};
+    }
+
+    const data = bytes[data_start..][0..compressed_size];
+    const actual_crc32 = std.hash.Crc32.hash(data);
+    if (actual_crc32 != expected_crc32) {
+        reportZipIssue(writer, ok, issues, "CRC32 mismatch for {s}", .{name}) catch {};
+    } else {
+        writer.print("- [ok] {s} ({d} bytes)\n", .{ name, compressed_size }) catch {};
+    }
+
+    return data;
+}
+
+fn reportZipIssue(writer: *std.Io.Writer, ok: *bool, issues: *usize, comptime fmt: []const u8, args: anytype) !void {
+    ok.* = false;
+    issues.* += 1;
+    try writer.writeAll("- [issue] ");
+    try writer.print(fmt, args);
+    try writer.writeByte('\n');
+}
+
+fn renderZipVerificationSummary(writer: *std.Io.Writer, ok: bool, issues: usize) !void {
+    if (ok) {
+        try writer.writeAll("\nverification: OK\n");
+    } else {
+        try writer.print("\nverification: FAILED ({d} issue(s))\n", .{issues});
+    }
+}
+
+fn findZipEndOfCentralDirectory(bytes: []const u8) ?usize {
+    if (bytes.len < 22) return null;
+    const earliest = if (bytes.len > 22 + 65535) bytes.len - (22 + 65535) else 0;
+    var index = bytes.len - 22;
+    while (true) {
+        if (std.mem.eql(u8, bytes[index..][0..4], "PK\x05\x06")) return index;
+        if (index == earliest) break;
+        index -= 1;
+    }
+    return null;
+}
+
+fn isSafeZipEntryName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (std.mem.startsWith(u8, name, "/") or std.mem.startsWith(u8, name, "\\")) return false;
+    if (name.len >= 2 and std.ascii.isAlphabetic(name[0]) and name[1] == ':') return false;
+    if (std.mem.indexOfScalar(u8, name, '\\') != null) return false;
+
+    var parts = std.mem.splitScalar(u8, name, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0) return false;
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    }
+    return true;
+}
+
+fn readU16Le(bytes: []const u8, offset: usize) ?u16 {
+    if (offset > bytes.len or bytes.len - offset < 2) return null;
+    return @as(u16, bytes[offset]) |
+        (@as(u16, bytes[offset + 1]) << 8);
+}
+
+fn readU32Le(bytes: []const u8, offset: usize) ?u32 {
+    if (offset > bytes.len or bytes.len - offset < 4) return null;
+    return @as(u32, bytes[offset]) |
+        (@as(u32, bytes[offset + 1]) << 8) |
+        (@as(u32, bytes[offset + 2]) << 16) |
+        (@as(u32, bytes[offset + 3]) << 24);
 }
 
 fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
@@ -1963,6 +2251,65 @@ test "release bundle command creates zip artifact" {
     try std.testing.expectEqualSlices(u8, "PK\x03\x04", bytes[0..4]);
     try std.testing.expect(std.mem.indexOf(u8, bytes, release_bundle_root ++ "/zide.exe") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, release_bundle_root ++ "/CHECKSUMS.sha256") != null);
+}
+
+test "release verify validates bundled zip artifact" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/bin");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide-gui.exe", .data = "gui-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide.exe", .data = "cli-bytes" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    _ = try dispatch(&app, .{ .id = "release.bundle" });
+    app.process_console.clear();
+    const result = try dispatch(&app, .{ .id = "release.verify" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+
+    var saw_ok = false;
+    for (app.process_console.lines.items) |line| {
+        if (std.mem.indexOf(u8, line.text, "verification: OK") != null) saw_ok = true;
+    }
+    try std.testing.expect(saw_ok);
+}
+
+test "release verify rejects unsafe zip paths" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/release");
+    const entries = [_]ZipInputEntry{
+        .{ .name = "../evil.exe", .bytes = "nope" },
+    };
+    const zip_bytes = try buildStoredZip(std.testing.allocator, entries[0..]);
+    defer std.testing.allocator.free(zip_bytes);
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = release_bundle_asset.relative_path, .data = zip_bytes });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "release.verify" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+
+    var saw_failed = false;
+    var saw_unsafe = false;
+    for (app.process_console.lines.items) |line| {
+        if (std.mem.indexOf(u8, line.text, "verification: FAILED") != null) saw_failed = true;
+        if (std.mem.indexOf(u8, line.text, "unsafe entry path") != null) saw_unsafe = true;
+    }
+    try std.testing.expect(saw_failed);
+    try std.testing.expect(saw_unsafe);
 }
 
 test "release manifests command renders package drafts" {

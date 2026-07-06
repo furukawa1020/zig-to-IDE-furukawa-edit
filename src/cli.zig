@@ -21,9 +21,15 @@ pub const DemoName = enum {
 pub const Action = union(enum) {
     open: []const u8,
     demo: DemoName,
+    command: CommandInvocation,
     commands,
     version,
     help,
+};
+
+pub const CommandInvocation = struct {
+    id: []const u8,
+    argument: ?[]const u8 = null,
 };
 
 pub const Options = struct {
@@ -44,6 +50,13 @@ pub fn parse(args: anytype) Options {
     }
     if (std.mem.eql(u8, first, "commands")) {
         return .{ .action = .commands };
+    }
+    if (std.mem.eql(u8, first, "command") or std.mem.eql(u8, first, "cmd")) {
+        if (args.len <= 2) return .{ .action = .help };
+        return .{ .action = .{ .command = .{
+            .id = args[2],
+            .argument = if (args.len > 3) args[3] else null,
+        } } };
     }
     if (std.mem.eql(u8, first, "demo")) {
         if (args.len <= 2) {
@@ -78,7 +91,7 @@ fn parseDemoName(raw: []const u8) ?DemoName {
 }
 
 test "parse defaults to current workspace" {
-    const options = parse(&.{ "zide" });
+    const options = parse(&.{"zide"});
     switch (options.action) {
         .open => |path| try std.testing.expectEqualStrings(".", path),
         else => return error.ExpectedOpenAction,
@@ -90,5 +103,17 @@ test "parse demo names" {
     switch (options.action) {
         .demo => |name| try std.testing.expect(name == .buffer),
         else => return error.ExpectedDemoAction,
+    }
+}
+
+test "parse command invocation" {
+    const options = parse(&.{ "zide", "command", "release.manifests", "v0.2.0" });
+    switch (options.action) {
+        .command => |invocation| {
+            try std.testing.expectEqualStrings("release.manifests", invocation.id);
+            try std.testing.expect(invocation.argument != null);
+            try std.testing.expectEqualStrings("v0.2.0", invocation.argument.?);
+        },
+        else => return error.ExpectedCommandAction,
     }
 }

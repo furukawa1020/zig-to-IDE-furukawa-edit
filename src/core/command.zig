@@ -120,6 +120,7 @@ const definitions = [_]Definition{
     .{ .id = "release.manifests", .title = "Release Manifest Drafts", .description = "Render GitHub Release, winget, and Scoop manifest drafts from local artifact hashes.", .default_key = "", .scope = .release, .capability = .safe },
     .{ .id = "release.bundle", .title = "Build Release Bundle", .description = "Create a Windows ZIP release bundle using pure Zig archive writing.", .default_key = "", .scope = .release, .capability = .workspace_write },
     .{ .id = "release.verify", .title = "Verify Release Bundle", .description = "Verify the release ZIP structure, paths, CRC32, and embedded checksums using pure Zig.", .default_key = "", .scope = .release, .capability = .safe },
+    .{ .id = "release.preflight", .title = "Final Release Preflight", .description = "Run the final publish gate for docs, Git state, artifacts, ZIP verification, and release hashes.", .default_key = "", .scope = .release, .capability = .safe },
     .{ .id = "demo.run", .title = "Run Demo", .description = "Run an internal zide demo.", .default_key = "", .scope = .demo, .capability = .safe },
 };
 

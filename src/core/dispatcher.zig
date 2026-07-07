@@ -440,6 +440,11 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = if (verified) "release bundle verified" else "release bundle verification found issues" };
     }
 
+    if (std.mem.eql(u8, definition.id, "release.preflight")) {
+        const passed = try renderReleasePreflight(app, request.argument);
+        return .{ .completed = if (passed) "release preflight passed" else "release preflight found blockers" };
+    }
+
     if (std.mem.eql(u8, definition.id, "git.status")) {
         var audit = try git_status.auditRepository(app.allocator, app.workspace.root_path, .{});
         defer audit.deinit();
@@ -1210,6 +1215,113 @@ fn renderReleaseVerification(app: *app_mod.App) !bool {
     return ok;
 }
 
+fn renderReleasePreflight(app: *app_mod.App, argument: ?[]const u8) !bool {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    var blockers: usize = 0;
+    var warnings: usize = 0;
+
+    var overview = try git_repository.inspect(app.allocator, &app.workspace, .{});
+    defer overview.deinit();
+
+    const remote = firstGitHubRemote(&overview);
+    const raw_version = std.mem.trim(u8, argument orelse "0.1.0", " \t\r\n");
+    const package_version = packageVersionFromTag(if (raw_version.len == 0) "0.1.0" else raw_version);
+    var allocated_tag: ?[]u8 = null;
+    const tag = if (std.mem.startsWith(u8, package_version, "v"))
+        package_version
+    else tag: {
+        allocated_tag = try std.fmt.allocPrint(app.allocator, "v{s}", .{package_version});
+        break :tag allocated_tag.?;
+    };
+    defer if (allocated_tag) |value| app.allocator.free(value);
+
+    try writer.writeAll("final release preflight\n");
+    try writer.writeAll("mode: pure Zig local gate; no shell, no network, no upload\n\n");
+    try writer.print("tag     : {s}\n", .{tag});
+    try writer.print("version : {s}\n", .{package_version});
+    try writer.print("trust   : {s}\n\n", .{@tagName(app.runtime.trust_state)});
+
+    try writer.writeAll("project surface\n");
+    try preflightRequired(writer, &blockers, workspaceHasPath(app, "README.md"), "README.md is present and remains human-written", .{});
+    try preflightRequired(writer, &blockers, workspaceHasPath(app, "docs/security.md"), "docs/security.md explains the trust/security model", .{});
+    try preflightRequired(writer, &blockers, workspaceHasPath(app, "LICENSE") or workspaceHasPath(app, "LICENSE.md") or workspaceHasPath(app, "COPYING"), "license file is present", .{});
+    try preflightRequired(writer, &blockers, workspaceHasPrefix(app, ".github/workflows/"), "GitHub Actions workflow is present", .{});
+
+    try writer.writeAll("\ngit state\n");
+    try preflightRequired(writer, &blockers, overview.present, ".git metadata is readable without executing git", .{});
+    try preflightRequired(writer, &blockers, remote != null, "GitHub remote is detected", .{});
+    try preflightRequired(writer, &blockers, overview.branch != null, "current branch is known", .{});
+    try preflightRequired(writer, &blockers, overview.commit != null, "current commit is known", .{});
+    try preflightRequired(writer, &blockers, overview.changes.len == 0, "working tree has no local changes", .{});
+    if (overview.branch) |branch| try writer.print("  branch : {s}\n", .{branch});
+    if (overview.commit) |commit| try writer.print("  commit : {s}\n", .{commit});
+    if (remote) |github| try writer.print("  remote : {s}\n", .{github.web_url});
+    if (overview.changes.len > 0) try writer.print("  changes: {d}\n", .{overview.changes.len});
+
+    try writer.writeAll("\nartifacts\n");
+    const bundle = try hashReleaseAsset(app, release_bundle_asset);
+    const gui = try hashReleaseAsset(app, release_gui_asset);
+    const cli = try hashReleaseAsset(app, release_cli_asset);
+    try preflightRequired(writer, &blockers, gui != null, "GUI artifact exists: {s}", .{release_gui_asset.relative_path});
+    try preflightRequired(writer, &blockers, cli != null, "CLI artifact exists: {s}", .{release_cli_asset.relative_path});
+    try preflightRequired(writer, &blockers, bundle != null, "release ZIP exists: {s}", .{release_bundle_asset.relative_path});
+    if (bundle) |item| {
+        try writer.print("  zip sha256: {s}\n", .{item.sha256[0..]});
+        try writer.print("  zip size  : {d} bytes\n", .{item.size});
+    }
+
+    try writer.writeAll("\nbundle verification\n");
+    const zip_bytes_opt = try readReleaseAssetBytes(app, release_bundle_asset);
+    defer {
+        if (zip_bytes_opt) |bytes| app.allocator.free(bytes);
+    }
+    if (zip_bytes_opt) |zip_bytes| {
+        const verified = try verifyStoredReleaseZip(writer, zip_bytes);
+        try preflightRequired(writer, &blockers, verified, "release ZIP passes structural and checksum verification", .{});
+    } else {
+        try preflightRequired(writer, &blockers, false, "release ZIP can be read for verification", .{});
+    }
+
+    try writer.writeAll("\nrelease manifest readiness\n");
+    try preflightRequired(writer, &blockers, bundle != null, "GitHub/winget/Scoop drafts can use the ZIP hash", .{});
+    try preflightWarning(writer, &warnings, package_version.len > 0 and !std.mem.eql(u8, package_version, "0.1.0"), "default version 0.1.0 is still in use; confirm this is intentional", .{});
+    try preflightWarning(writer, &warnings, overview.changes.len == 0, "preflight should be rerun after committing these release changes", .{});
+
+    try writer.writeAll("\nfinal verdict\n");
+    if (blockers == 0) {
+        try writer.print("READY: {d} blocker(s), {d} warning(s)\n", .{ blockers, warnings });
+        if (bundle) |item| try writer.print("publish asset: {s}  sha256={s}\n", .{ release_bundle_asset.release_name, item.sha256[0..] });
+    } else {
+        try writer.print("BLOCKED: {d} blocker(s), {d} warning(s)\n", .{ blockers, warnings });
+        try writer.writeAll("fix blockers, rebuild with release.bundle, verify with release.verify, then rerun release.preflight\n");
+    }
+
+    try app.process_console.appendBytes(.stdout, text.written());
+    return blockers == 0;
+}
+
+fn preflightRequired(writer: *std.Io.Writer, blockers: *usize, ok: bool, comptime fmt: []const u8, args: anytype) !void {
+    if (ok) {
+        try writer.writeAll("- [ok] ");
+    } else {
+        blockers.* += 1;
+        try writer.writeAll("- [block] ");
+    }
+    try writer.print(fmt, args);
+    try writer.writeByte('\n');
+}
+
+fn preflightWarning(writer: *std.Io.Writer, warnings: *usize, ok: bool, comptime fmt: []const u8, args: anytype) !void {
+    if (ok) return;
+    warnings.* += 1;
+    try writer.writeAll("- [warn] ");
+    try writer.print(fmt, args);
+    try writer.writeByte('\n');
+}
+
 fn verifyStoredReleaseZip(writer: *std.Io.Writer, bytes: []const u8) !bool {
     var ok = true;
     var issues: usize = 0;
@@ -1659,16 +1771,33 @@ fn checkMark(ok: bool) []const u8 {
 
 fn workspaceHasPath(app: *const app_mod.App, relative: []const u8) bool {
     for (app.workspace.entries.items) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.path, relative)) return true;
+        if (pathEqualIgnoreCaseAndSlash(entry.path, relative)) return true;
     }
     return false;
 }
 
 fn workspaceHasPrefix(app: *const app_mod.App, prefix: []const u8) bool {
     for (app.workspace.entries.items) |entry| {
-        if (entry.path.len >= prefix.len and std.ascii.eqlIgnoreCase(entry.path[0..prefix.len], prefix)) return true;
+        if (pathStartsWithIgnoreCaseAndSlash(entry.path, prefix)) return true;
     }
     return false;
+}
+
+fn pathEqualIgnoreCaseAndSlash(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (normalizePathByte(left) != normalizePathByte(right)) return false;
+    }
+    return true;
+}
+
+fn pathStartsWithIgnoreCaseAndSlash(value: []const u8, prefix: []const u8) bool {
+    if (value.len < prefix.len) return false;
+    return pathEqualIgnoreCaseAndSlash(value[0..prefix.len], prefix);
+}
+
+fn normalizePathByte(byte: u8) u8 {
+    return if (byte == '\\') '/' else std.ascii.toLower(byte);
 }
 
 fn workspaceFileExists(app: *const app_mod.App, relative: []const u8) bool {
@@ -2310,6 +2439,36 @@ test "release verify rejects unsafe zip paths" {
     }
     try std.testing.expect(saw_failed);
     try std.testing.expect(saw_unsafe);
+}
+
+test "release preflight reports final gate blockers" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const result = try dispatch(&app, .{ .id = "release.preflight" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+
+    var saw_header = false;
+    var saw_blocked = false;
+    for (app.process_console.lines.items) |line| {
+        if (std.mem.indexOf(u8, line.text, "final release preflight") != null) saw_header = true;
+        if (std.mem.indexOf(u8, line.text, "BLOCKED") != null) saw_blocked = true;
+    }
+    try std.testing.expect(saw_header);
+    try std.testing.expect(saw_blocked);
+}
+
+test "workspace path checks treat slash styles equally" {
+    try std.testing.expect(pathEqualIgnoreCaseAndSlash("docs\\security.md", "docs/security.md"));
+    try std.testing.expect(pathEqualIgnoreCaseAndSlash(".GITHUB\\workflows\\ci.yml", ".github/workflows/ci.yml"));
+    try std.testing.expect(pathStartsWithIgnoreCaseAndSlash(".github\\workflows\\ci.yml", ".github/workflows/"));
 }
 
 test "release manifests command renders package drafts" {

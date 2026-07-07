@@ -9,6 +9,16 @@ const site_url = "https://furukawa1020.github.io/zig-to-IDE-furukawa-edit/";
 const og_image_path = "ogp.png";
 const og_image_source_path = "tools/site/ogp.png";
 const og_image_url = site_url ++ og_image_path;
+const share_url_encoded = "https%3A%2F%2Ffurukawa1020.github.io%2Fzig-to-IDE-furukawa-edit%2F";
+const share_title_encoded = "ZIDE%20-%20Zig-native%20secure%20IDE";
+const share_text_encoded = "ZIDE%20-%20Zig-native%20secure%20IDE%20with%20visible%20trust%20boundaries.%20https%3A%2F%2Ffurukawa1020.github.io%2Fzig-to-IDE-furukawa-edit%2F";
+const share_text_multiline_encoded = "ZIDE%20-%20Zig-native%20secure%20IDE%20with%20visible%20trust%20boundaries.%0Ahttps%3A%2F%2Ffurukawa1020.github.io%2Fzig-to-IDE-furukawa-edit%2F";
+const share_x_url = "https://x.com/intent/post?text=" ++ share_text_encoded;
+const share_bluesky_url = "https://bsky.app/intent/compose?text=" ++ share_text_multiline_encoded;
+const share_linkedin_url = "https://www.linkedin.com/sharing/share-offsite/?url=" ++ share_url_encoded;
+const share_facebook_url = "https://www.facebook.com/sharer/sharer.php?u=" ++ share_url_encoded;
+const share_email_url = "mailto:?subject=" ++ share_title_encoded ++ "&body=" ++ share_text_multiline_encoded;
+const share_email_href = "mailto:?subject=" ++ share_title_encoded ++ "&amp;body=" ++ share_text_multiline_encoded;
 
 const DownloadInfo = struct {
     href: []const u8,
@@ -123,6 +133,7 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         \\      <a href="#download">Download</a>
         \\      <a href="#security">Security</a>
         \\      <a href="#languages">Languages</a>
+        \\      <a href="#share">Share</a>
         \\      <a href="#deploy">Deploy</a>
         \\    </nav>
         \\  </header>
@@ -144,6 +155,21 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         \\          <div><dt>SHA-256</dt><dd>{s}</dd></div>
         \\        </dl>
         \\      </div>
+        \\    </section>
+        \\
+        \\    <section class="band share-band" id="share" aria-labelledby="share-title">
+        \\      <div class="section-head">
+        \\        <p class="eyebrow">Share</p>
+        \\        <h2 id="share-title">Spread it without tracking scripts.</h2>
+        \\      </div>
+        \\      <div class="share-grid" aria-label="Share ZIDE">
+        \\        <a class="share-link" href="{s}" target="_blank" rel="noopener noreferrer" aria-label="Share ZIDE on X"><span>X</span><strong>X</strong><em>Open a prepared post.</em></a>
+        \\        <a class="share-link" href="{s}" target="_blank" rel="noopener noreferrer" aria-label="Share ZIDE on Bluesky"><span>BS</span><strong>Bluesky</strong><em>Compose with the page URL.</em></a>
+        \\        <a class="share-link" href="{s}" target="_blank" rel="noopener noreferrer" aria-label="Share ZIDE on LinkedIn"><span>in</span><strong>LinkedIn</strong><em>Share to a professional feed.</em></a>
+        \\        <a class="share-link" href="{s}" target="_blank" rel="noopener noreferrer" aria-label="Share ZIDE on Facebook"><span>f</span><strong>Facebook</strong><em>Open the share dialog.</em></a>
+        \\        <a class="share-link" href="{s}" aria-label="Share ZIDE by email"><span>@</span><strong>Email</strong><em>Send the verified page link.</em></a>
+        \\      </div>
+        \\      <div class="share-url" aria-label="Canonical share URL"><code>{s}</code></div>
         \\    </section>
         \\
         \\    <section class="band download-band" id="download" aria-labelledby="download-title">
@@ -228,6 +254,12 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         release_zip_name,
         info.source,
         sha_text,
+        share_x_url,
+        share_bluesky_url,
+        share_linkedin_url,
+        share_facebook_url,
+        share_email_href,
+        site_url,
         info.href,
         size_text,
         sha_text,
@@ -353,6 +385,7 @@ const siteCss =
     \\.band { padding: clamp(64px, 10vw, 132px) clamp(20px, 6vw, 78px); border-top: 1px solid var(--line); }
     \\.section-head { margin-bottom: 34px; }
     \\.download-band { background: #091011; }
+    \\.share-band { background: #0d1112; }
     \\.security-band { background: #101517; }
     \\.languages-band { background: #080c0e; }
     \\.deploy-band { background: #131512; }
@@ -385,6 +418,51 @@ const siteCss =
     \\.terminal-bar span:nth-child(2) { background: var(--amber); }
     \\.terminal-bar span:nth-child(3) { background: var(--green); }
     \\pre { margin: 0; padding: 22px; overflow-x: auto; color: #d8e8ea; line-height: 1.7; }
+    \\.share-grid {
+    \\  display: grid;
+    \\  grid-template-columns: repeat(5, minmax(0, 1fr));
+    \\  gap: 12px;
+    \\}
+    \\.share-link {
+    \\  display: grid;
+    \\  grid-template-columns: 42px minmax(0, 1fr);
+    \\  gap: 12px;
+    \\  align-items: center;
+    \\  min-height: 108px;
+    \\  padding: 16px;
+    \\  border: 1px solid var(--line);
+    \\  border-radius: 8px;
+    \\  background: var(--panel);
+    \\}
+    \\.share-link:hover { border-color: rgba(66, 217, 213, .62); background: #152126; }
+    \\.share-link span {
+    \\  display: grid;
+    \\  place-items: center;
+    \\  width: 42px;
+    \\  height: 42px;
+    \\  border-radius: 8px;
+    \\  background: var(--cyan);
+    \\  color: #061012;
+    \\  font-weight: 880;
+    \\}
+    \\.share-link strong { display: block; min-width: 0; font-size: 17px; }
+    \\.share-link em {
+    \\  display: block;
+    \\  min-width: 0;
+    \\  margin-top: 5px;
+    \\  color: var(--muted);
+    \\  font-size: 13px;
+    \\  font-style: normal;
+    \\  line-height: 1.35;
+    \\}
+    \\.share-url {
+    \\  margin-top: 14px;
+    \\  padding: 14px;
+    \\  border: 1px solid var(--line);
+    \\  border-radius: 8px;
+    \\  background: #071012;
+    \\}
+    \\.share-url code { color: var(--green); word-break: break-all; font-size: 13px; }
     \\.feature-grid {
     \\  display: grid;
     \\  grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -424,11 +502,13 @@ const siteCss =
     \\@media (max-width: 980px) {
     \\  nav { display: none; }
     \\  .release-strip, .download-grid, .deploy-grid, .feature-grid { grid-template-columns: 1fr; }
+    \\  .share-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     \\  .language-list { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     \\}
     \\@media (max-width: 620px) {
     \\  .hero { min-height: 84svh; padding-top: 96px; }
     \\  .release-strip { grid-template-columns: 1fr; }
+    \\  .share-grid { grid-template-columns: 1fr; }
     \\  .language-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     \\  footer { flex-direction: column; }
     \\}
@@ -446,13 +526,20 @@ fn writeManifest(allocator: std.mem.Allocator, out_dir: []const u8, info: Downlo
         \\  "generated_by": "tools/site_gen.zig",
         \\  "site_url": "{s}",
         \\  "og_image": "{s}",
+        \\  "share": {{
+        \\    "x": "{s}",
+        \\    "bluesky": "{s}",
+        \\    "linkedin": "{s}",
+        \\    "facebook": "{s}",
+        \\    "email": "{s}"
+        \\  }},
         \\  "download": "{s}",
         \\  "download_source": "{s}",
         \\  "size_bytes": {d},
         \\  "sha256": "{s}"
         \\}}
         \\
-    , .{ site_url, og_image_url, info.href, info.source, size, sha_text });
+    , .{ site_url, og_image_url, share_x_url, share_bluesky_url, share_linkedin_url, share_facebook_url, share_email_url, info.href, info.source, size, sha_text });
     try writeAssetBytes(allocator, out_dir, "site-manifest.json", json.written());
 }
 

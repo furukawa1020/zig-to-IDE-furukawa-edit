@@ -369,7 +369,10 @@ const GitPanelAction = enum {
     refresh,
     status,
     diff,
+    live,
     issues,
+    failures,
+    draft_pr,
 };
 
 const SecurityPanelAction = enum {
@@ -779,8 +782,8 @@ const LinuxGuiState = struct {
     message_buf: [240]u8 = [_]u8{0} ** 240,
     message_len: usize = 0,
 
-    fn init(allocator: std.mem.Allocator, root_path: []const u8) !LinuxGuiState {
-        var app = try app_mod.App.init(allocator, root_path);
+    fn init(allocator: std.mem.Allocator, root_path: []const u8, environ: std.process.Environ) !LinuxGuiState {
+        var app = try app_mod.App.initWithProcess(allocator, root_path, std.Options.debug_io, environ);
         errdefer app.deinit();
         const collapsed_dirs = try allocator.alloc(bool, app.workspace.entries.items.len);
         errdefer allocator.free(collapsed_dirs);
@@ -1299,6 +1302,7 @@ const LinuxGuiState = struct {
         }
 
         if (std.mem.eql(u8, id, "git.overview") or std.mem.eql(u8, id, "github.overview")) self.bottom_panel = .git;
+        if (std.mem.startsWith(u8, id, "github.") and !std.mem.eql(u8, id, "github.overview")) self.bottom_panel = .output;
         if (std.mem.startsWith(u8, id, "task.")) {
             self.refreshLinuxSelfProtection();
             self.bottom_panel = .tasks;
@@ -1379,8 +1383,8 @@ const LinuxGuiState = struct {
                 self.execute("git.diff_current", .command_palette);
                 self.bottom_panel = .output;
             },
-            .issues => {
-                self.execute("github.issues", .command_palette);
+            .live, .issues, .failures, .draft_pr => {
+                self.execute(gitPanelActionCommand(action), .command_palette);
                 self.bottom_panel = .output;
             },
         }
@@ -1971,7 +1975,7 @@ const LinuxGuiState = struct {
     }
 
     fn openWorkspace(self: *LinuxGuiState, root_path: []const u8) void {
-        var next = app_mod.App.init(self.allocator, root_path) catch |err| {
+        var next = app_mod.App.initWithProcess(self.allocator, root_path, std.Options.debug_io, self.app.environ) catch |err| {
             self.message("workspace open failed: {s}", .{@errorName(err)});
             self.appendOutput(.stderr, "workspace open failed: {s}\n", .{@errorName(err)});
             return;
@@ -2503,15 +2507,20 @@ const LinuxGuiState = struct {
     }
 };
 
-pub fn run(allocator: std.mem.Allocator, root_path: []const u8, environ: *const std.process.Environ.Map) !void {
-    var state = try LinuxGuiState.init(allocator, root_path);
+pub fn run(
+    allocator: std.mem.Allocator,
+    root_path: []const u8,
+    environ: std.process.Environ,
+    environ_map: *const std.process.Environ.Map,
+) !void {
+    var state = try LinuxGuiState.init(allocator, root_path, environ);
     defer state.deinit();
 
     state.enableLinuxSelfProtection();
     state.refreshGitOverview();
     state.execute("security.audit_workspace", .startup);
 
-    var x11 = try X11.connect(allocator, environ);
+    var x11 = try X11.connect(allocator, environ_map);
     defer x11.close();
 
     try draw(&x11, &state);
@@ -3037,7 +3046,7 @@ fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
 fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
     const bottom = state.bottomTop();
     try drawGitPanelActions(x11, state);
-    try x11.text(x11.gc.green, 18, bottom + 58, "GIT / hook-free repository view");
+    try x11.text(x11.gc.green, 18, bottom + 58, "GIT / hook-free repository view / GitHub live actions");
 
     const overview = state.git_overview orelse {
         try x11.text(x11.gc.muted, 18, bottom + 86, "Press REFRESH. ZIDE reads .git directly without running hooks, filters, fsmonitor, or git status.");
@@ -3067,7 +3076,18 @@ fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
     var meta_ascii: [720]u8 = undefined;
     try x11.text(x11.gc.muted, 18, bottom + 82, asciiInto(meta_ascii[0..], meta));
 
-    var y: i16 = bottom + 108;
+    const has_github_remote = overviewHasGitHubRemote(overview);
+    const token_label = githubTokenPresenceLabel(state.app.environ);
+    var lane_buf: [420]u8 = undefined;
+    const lane = std.fmt.bufPrint(lane_buf[0..], "GITHUB lanes remote:{s} token:{s} read:LIVE/ISS/FAIL write:PR(draft)", .{
+        if (has_github_remote) "yes" else "no",
+        token_label,
+    }) catch "GITHUB lanes";
+    var lane_ascii: [420]u8 = undefined;
+    const lane_gc = if (!has_github_remote) x11.gc.amber else if (std.mem.eql(u8, token_label, "none")) x11.gc.muted else x11.gc.cyan;
+    try x11.text(lane_gc, 18, bottom + 106, asciiInto(lane_ascii[0..], lane));
+
+    var y: i16 = bottom + 130;
     if (overview.remotes.len > 0) {
         for (overview.remotes[0..@min(overview.remotes.len, @as(usize, 2))]) |remote| {
             var remote_buf: [720]u8 = undefined;
@@ -3735,6 +3755,19 @@ fn workspaceHasAnyLicense(app: *const app_mod.App) bool {
             std.ascii.eqlIgnoreCase(base, "COPYING")) return true;
     }
     return false;
+}
+
+fn overviewHasGitHubRemote(overview: git_repository.Overview) bool {
+    for (overview.remotes) |remote| {
+        if (remote.github != null) return true;
+    }
+    return false;
+}
+
+fn githubTokenPresenceLabel(environ: std.process.Environ) []const u8 {
+    if (environ.containsUnemptyConstant("GITHUB_TOKEN")) return "GITHUB_TOKEN";
+    if (environ.containsUnemptyConstant("GH_TOKEN")) return "GH_TOKEN";
+    return "none";
 }
 
 fn workspaceHasPrefixGui(app: *const app_mod.App, prefix: []const u8) bool {
@@ -4409,7 +4442,7 @@ fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
     return null;
 }
 
-const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .issues };
+const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
 const task_panel_actions = [_]TaskPanelAction{ .tasks, .preview, .seal, .run_next, .history };
 const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .linux };
 const extension_panel_actions = [_]ExtensionPanelAction{.scan};
@@ -4499,11 +4532,14 @@ fn gitPanelActionRect(state: *const LinuxGuiState, action: GitPanelAction) HitRe
         .refresh => 0,
         .status => 1,
         .diff => 2,
-        .issues => 3,
+        .live => 3,
+        .issues => 4,
+        .failures => 5,
+        .draft_pr => 6,
     };
-    const width: i16 = 74;
+    const width: i16 = 62;
     const gap: i16 = 8;
-    const right = state.window_width - 18 - (3 - index) * (width + gap);
+    const right = state.window_width - 18 - (6 - index) * (width + gap);
     const bottom = state.bottomTop();
     return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
@@ -4576,10 +4612,25 @@ fn publishPanelActionRect(state: *const LinuxGuiState, action: PublishPanelActio
 
 fn gitPanelActionLabel(action: GitPanelAction) []const u8 {
     return switch (action) {
-        .refresh => "REFRESH",
-        .status => "STATUS",
+        .refresh => "REF",
+        .status => "STAT",
         .diff => "DIFF",
-        .issues => "ISSUES",
+        .live => "LIVE",
+        .issues => "ISS",
+        .failures => "FAIL",
+        .draft_pr => "PR",
+    };
+}
+
+fn gitPanelActionCommand(action: GitPanelAction) []const u8 {
+    return switch (action) {
+        .refresh => "git.overview",
+        .status => "git.status",
+        .diff => "git.diff_current",
+        .live => "github.fetch",
+        .issues => "github.issues",
+        .failures => "github.actions.failures",
+        .draft_pr => "github.pr.create_draft",
     };
 }
 
@@ -4632,7 +4683,7 @@ fn publishPanelActionLabel(action: PublishPanelAction) []const u8 {
 fn gitChangesTop(state: *const LinuxGuiState) i16 {
     const bottom = state.bottomTop();
     const remote_rows: usize = if (state.git_overview) |overview| @max(@min(overview.remotes.len, @as(usize, 2)), 1) else 1;
-    return bottom + 108 + @as(i16, @intCast(remote_rows)) * LINE_HEIGHT;
+    return bottom + 132 + @as(i16, @intCast(remote_rows)) * LINE_HEIGHT;
 }
 
 fn gitChangeRowAt(state: *const LinuxGuiState, y: i16) ?usize {

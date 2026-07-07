@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
     const root_path = if (args.len > 1) args[1] else ".";
     switch (builtin.os.tag) {
         .windows => try gui.run(allocator, root_path),
-        .linux => try gui.run(allocator, root_path, init.environ_map),
+        .linux => try gui.run(allocator, root_path, init.minimal.environ, init.environ_map),
         else => unreachable,
     }
 }

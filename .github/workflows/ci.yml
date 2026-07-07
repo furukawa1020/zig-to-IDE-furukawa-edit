@@ -43,3 +43,6 @@ jobs:
 
       - name: GUI type check
         run: zig build-exe src\gui_main.zig -fno-emit-bin -luser32 -lgdi32 -lkernel32 -lshell32 -lole32 --cache-dir .zig-cache --global-cache-dir .zig-global-cache
+
+      - name: Linux CLI/TUI cross build
+        run: zig build install-linux --cache-dir .zig-cache --global-cache-dir .zig-global-cache

@@ -54,6 +54,7 @@ jobs:
         run: |
           zig build install --cache-dir .zig-cache --global-cache-dir .zig-global-cache
           zig build install-gui --cache-dir .zig-cache --global-cache-dir .zig-global-cache
+          zig build install-linux --cache-dir .zig-cache --global-cache-dir .zig-global-cache
 
       - name: Bundle and verify release
         run: |

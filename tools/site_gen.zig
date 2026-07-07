@@ -1,10 +1,14 @@
 const std = @import("std");
 
-const release_zip_path = "zig-out/release/zide-windows-x86_64.zip";
-const release_zip_name = "zide-windows-x86_64.zip";
-const download_zip_path = "download/zide-windows-x86_64.zip";
+const windows_release_path = "zig-out/release/zide-windows-x86_64.zip";
+const windows_release_name = "zide-windows-x86_64.zip";
+const windows_download_path = "download/zide-windows-x86_64.zip";
+const linux_release_path = "zig-out/release/zide-linux-x86_64.tar";
+const linux_release_name = "zide-linux-x86_64.tar";
+const linux_download_path = "download/zide-linux-x86_64.tar";
 const checksum_path = "download/CHECKSUMS.sha256";
-const latest_release_url = "https://github.com/furukawa1020/zig-to-IDE-furukawa-edit/releases/latest/download/zide-windows-x86_64.zip";
+const latest_windows_release_url = "https://github.com/furukawa1020/zig-to-IDE-furukawa-edit/releases/latest/download/zide-windows-x86_64.zip";
+const latest_linux_release_url = "https://github.com/furukawa1020/zig-to-IDE-furukawa-edit/releases/latest/download/zide-linux-x86_64.tar";
 const site_url = "https://furukawa1020.github.io/zig-to-IDE-furukawa-edit/";
 const og_image_path = "ogp.png";
 const og_image_source_path = "tools/site/ogp.png";
@@ -23,8 +27,14 @@ const share_email_href = "mailto:?subject=" ++ share_title_encoded ++ "&amp;body
 const DownloadInfo = struct {
     href: []const u8,
     source: []const u8,
+    file_name: []const u8,
     size: ?u64,
     sha256: ?[64]u8,
+};
+
+const DownloadSet = struct {
+    windows: DownloadInfo,
+    linux: DownloadInfo,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -39,13 +49,13 @@ fn generateSite(allocator: std.mem.Allocator, out_dir: []const u8) !void {
     try createSubdir(allocator, out_dir, "assets");
     try createSubdir(allocator, out_dir, "download");
 
-    const info = try copyReleaseZipIfPresent(allocator, out_dir);
+    const downloads = try copyReleaseAssetsIfPresent(allocator, out_dir);
     try writeAsset(allocator, out_dir, "assets/site.css", siteCss);
     try writeHeroBitmap(allocator, out_dir);
     try copyOpenGraphImage(allocator, out_dir);
-    try writeHtml(allocator, out_dir, "index.html", info);
-    try writeHtml(allocator, out_dir, "404.html", info);
-    try writeManifest(allocator, out_dir, info);
+    try writeHtml(allocator, out_dir, "index.html", downloads);
+    try writeHtml(allocator, out_dir, "404.html", downloads);
+    try writeManifest(allocator, out_dir, downloads);
 }
 
 fn createSubdir(allocator: std.mem.Allocator, out_dir: []const u8, sub_path: []const u8) !void {
@@ -54,11 +64,32 @@ fn createSubdir(allocator: std.mem.Allocator, out_dir: []const u8, sub_path: []c
     try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, path);
 }
 
-fn copyReleaseZipIfPresent(allocator: std.mem.Allocator, out_dir: []const u8) !DownloadInfo {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, release_zip_path, allocator, .limited(512 * 1024 * 1024)) catch |err| switch (err) {
+fn copyReleaseAssetsIfPresent(allocator: std.mem.Allocator, out_dir: []const u8) !DownloadSet {
+    const windows = try copyReleaseAssetIfPresent(allocator, out_dir, windows_release_path, windows_download_path, windows_release_name, latest_windows_release_url);
+    const linux = try copyReleaseAssetIfPresent(allocator, out_dir, linux_release_path, linux_download_path, linux_release_name, latest_linux_release_url);
+
+    var checksum: std.Io.Writer.Allocating = .init(allocator);
+    defer checksum.deinit();
+    if (windows.sha256) |sha| try checksum.writer.print("{s}  {s}\n", .{ sha[0..], windows_release_name });
+    if (linux.sha256) |sha| try checksum.writer.print("{s}  {s}\n", .{ sha[0..], linux_release_name });
+    if (checksum.written().len > 0) try writeAssetBytes(allocator, out_dir, checksum_path, checksum.written());
+
+    return .{ .windows = windows, .linux = linux };
+}
+
+fn copyReleaseAssetIfPresent(
+    allocator: std.mem.Allocator,
+    out_dir: []const u8,
+    source_path: []const u8,
+    download_path: []const u8,
+    file_name: []const u8,
+    fallback_url: []const u8,
+) !DownloadInfo {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, source_path, allocator, .limited(512 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return .{
-            .href = latest_release_url,
+            .href = fallback_url,
             .source = "GitHub Releases",
+            .file_name = file_name,
             .size = null,
             .sha256 = null,
         },
@@ -66,16 +97,13 @@ fn copyReleaseZipIfPresent(allocator: std.mem.Allocator, out_dir: []const u8) !D
     };
     defer allocator.free(bytes);
 
-    try writeAssetBytes(allocator, out_dir, download_zip_path, bytes);
+    try writeAssetBytes(allocator, out_dir, download_path, bytes);
     const sha = try sha256Hex(bytes);
-    var checksum: std.Io.Writer.Allocating = .init(allocator);
-    defer checksum.deinit();
-    try checksum.writer.print("{s}  {s}\n", .{ sha[0..], release_zip_name });
-    try writeAssetBytes(allocator, out_dir, checksum_path, checksum.written());
 
     return .{
-        .href = download_zip_path,
+        .href = download_path,
         .source = "bundled static download",
+        .file_name = file_name,
         .size = bytes.len,
         .sha256 = sha,
     };
@@ -106,14 +134,17 @@ fn readBe32(bytes: []const u8) u32 {
         @as(u32, bytes[3]);
 }
 
-fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []const u8, info: DownloadInfo) !void {
+fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []const u8, downloads: DownloadSet) !void {
     var html: std.Io.Writer.Allocating = .init(allocator);
     defer html.deinit();
     const writer = &html.writer;
 
-    const size_text = if (info.size) |size| try std.fmt.allocPrint(allocator, "{d}.{d} MB", .{ size / (1024 * 1024), (size % (1024 * 1024)) * 10 / (1024 * 1024) }) else "release asset";
-    defer if (info.size != null) allocator.free(size_text);
-    const sha_text = if (info.sha256) |sha| sha[0..] else "available after the first bundled release";
+    const windows_size_text = if (downloads.windows.size) |size| try formatSizeMb(allocator, size) else "release asset";
+    defer if (downloads.windows.size != null) allocator.free(windows_size_text);
+    const linux_size_text = if (downloads.linux.size) |size| try formatSizeMb(allocator, size) else "release asset";
+    defer if (downloads.linux.size != null) allocator.free(linux_size_text);
+    const windows_sha_text = if (downloads.windows.sha256) |sha| sha[0..] else "available after the first bundled release";
+    const linux_sha_text = if (downloads.linux.sha256) |sha| sha[0..] else "available after the first bundled release";
 
     try writer.print(
         \\<!doctype html>
@@ -162,6 +193,7 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         \\        <p class="lede">A secure multi-language IDE that treats every boundary as something you can see, review, and verify before it runs.</p>
         \\        <div class="hero-actions">
         \\          <a class="button primary" href="{s}" download>Download for Windows</a>
+        \\          <a class="button" href="{s}" download>Download for Linux</a>
         \\          <a class="button" href="#security">See the trust model</a>
         \\        </div>
         \\        <dl class="release-strip" aria-label="Current release">
@@ -195,8 +227,15 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         \\      <div class="download-grid">
         \\        <article class="download-card">
         \\          <div class="platform">Windows x86_64</div>
-        \\          <h3>ZIDE bundle</h3>
+        \\          <h3>ZIDE Windows bundle</h3>
         \\          <p>Includes the GUI workbench and CLI/TUI entry point in one ZIP.</p>
+        \\          <a class="button primary wide" href="{s}" download>Download {s}</a>
+        \\          <code>{s}</code>
+        \\        </article>
+        \\        <article class="download-card">
+        \\          <div class="platform">Linux x86_64</div>
+        \\          <h3>ZIDE CLI/TUI bundle</h3>
+        \\          <p>Ships a musl-targeted CLI/TUI binary with executable permissions preserved in a TAR archive.</p>
         \\          <a class="button primary wide" href="{s}" download>Download {s}</a>
         \\          <code>{s}</code>
         \\        </article>
@@ -204,7 +243,9 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         \\          <div class="terminal-bar"><span></span><span></span><span></span></div>
         \\          <pre><code>Expand-Archive .\zide-windows-x86_64.zip
         \\.\\zide-windows-x86_64\\zide-gui.exe
-        \\.\\zide-windows-x86_64\\zide.exe command release.verify</code></pre>
+        \\
+        \\tar -xf zide-linux-x86_64.tar
+        \\./zide-linux-x86_64/zide</code></pre>
         \\        </article>
         \\      </div>
         \\    </section>
@@ -217,7 +258,7 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         \\      <div class="feature-grid">
         \\        <article><strong>Hook-free Git</strong><span>Reads repository metadata without running git hooks, filters, fsmonitor, or shell commands.</span></article>
         \\        <article><strong>Capability labels</strong><span>Commands are classified as safe, workspace_write, network_read, network_write, or external_command.</span></article>
-        \\        <article><strong>Release Gate</strong><span>ZIP structure, paths, CRC32, and embedded SHA-256 values are verified before publish.</span></article>
+        \\        <article><strong>Release Gate</strong><span>Archive structure, paths, permissions, CRC32, and embedded SHA-256 values are verified before publish.</span></article>
         \\        <article><strong>Text integrity</strong><span>Hidden controls, newline policy, and suspicious language-specific boundaries are surfaced inside the editor.</span></article>
         \\      </div>
         \\    </section>
@@ -244,8 +285,8 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         \\        </div>
         \\        <ol>
         \\          <li>Build ZIDE GUI and CLI.</li>
-        \\          <li>Create the release ZIP with <code>release.bundle</code>.</li>
-        \\          <li>Verify the ZIP with <code>release.verify</code>.</li>
+        \\          <li>Create Windows and Linux archives with <code>release.bundle</code>.</li>
+        \\          <li>Verify archives with <code>release.verify</code>.</li>
         \\          <li>Generate and deploy this site with Zig.</li>
         \\        </ol>
         \\      </div>
@@ -265,22 +306,30 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         og_image_url,
         og_image_url,
         og_image_url,
-        info.href,
-        release_zip_name,
-        info.source,
-        sha_text,
+        downloads.windows.href,
+        downloads.linux.href,
+        downloads.windows.file_name,
+        downloads.windows.source,
+        windows_sha_text,
         share_x_url,
         share_bluesky_url,
         share_linkedin_url,
         share_facebook_url,
         share_email_href,
         site_url,
-        info.href,
-        size_text,
-        sha_text,
+        downloads.windows.href,
+        windows_size_text,
+        windows_sha_text,
+        downloads.linux.href,
+        linux_size_text,
+        linux_sha_text,
     });
 
     try writeAssetBytes(allocator, out_dir, file_name, html.written());
+}
+
+fn formatSizeMb(allocator: std.mem.Allocator, size: u64) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "{d}.{d} MB", .{ size / (1024 * 1024), (size % (1024 * 1024)) * 10 / (1024 * 1024) });
 }
 
 const siteCss =
@@ -404,7 +453,12 @@ const siteCss =
     \\.security-band { background: #101517; }
     \\.languages-band { background: #080c0e; }
     \\.deploy-band { background: #131512; }
-    \\.download-grid, .deploy-grid {
+    \\.download-grid {
+    \\  display: grid;
+    \\  grid-template-columns: repeat(3, minmax(0, 1fr));
+    \\  gap: 18px;
+    \\}
+    \\.deploy-grid {
     \\  display: grid;
     \\  grid-template-columns: minmax(0, .86fr) minmax(0, 1.14fr);
     \\  gap: 18px;
@@ -530,11 +584,13 @@ const siteCss =
     \\
 ;
 
-fn writeManifest(allocator: std.mem.Allocator, out_dir: []const u8, info: DownloadInfo) !void {
+fn writeManifest(allocator: std.mem.Allocator, out_dir: []const u8, downloads: DownloadSet) !void {
     var json: std.Io.Writer.Allocating = .init(allocator);
     defer json.deinit();
-    const sha_text = if (info.sha256) |sha| sha[0..] else "";
-    const size = info.size orelse 0;
+    const windows_sha_text = if (downloads.windows.sha256) |sha| sha[0..] else "";
+    const linux_sha_text = if (downloads.linux.sha256) |sha| sha[0..] else "";
+    const windows_size = downloads.windows.size orelse 0;
+    const linux_size = downloads.linux.size orelse 0;
     try json.writer.print(
         \\{{
         \\  "name": "ZIDE",
@@ -548,13 +604,43 @@ fn writeManifest(allocator: std.mem.Allocator, out_dir: []const u8, info: Downlo
         \\    "facebook": "{s}",
         \\    "email": "{s}"
         \\  }},
-        \\  "download": "{s}",
-        \\  "download_source": "{s}",
-        \\  "size_bytes": {d},
-        \\  "sha256": "{s}"
+        \\  "downloads": {{
+        \\    "windows_x86_64": {{
+        \\      "file": "{s}",
+        \\      "url": "{s}",
+        \\      "source": "{s}",
+        \\      "size_bytes": {d},
+        \\      "sha256": "{s}"
+        \\    }},
+        \\    "linux_x86_64": {{
+        \\      "file": "{s}",
+        \\      "url": "{s}",
+        \\      "source": "{s}",
+        \\      "size_bytes": {d},
+        \\      "sha256": "{s}"
+        \\    }}
+        \\  }}
         \\}}
         \\
-    , .{ site_url, og_image_url, share_x_url, share_bluesky_url, share_linkedin_url, share_facebook_url, share_email_url, info.href, info.source, size, sha_text });
+    , .{
+        site_url,
+        og_image_url,
+        share_x_url,
+        share_bluesky_url,
+        share_linkedin_url,
+        share_facebook_url,
+        share_email_url,
+        downloads.windows.file_name,
+        downloads.windows.href,
+        downloads.windows.source,
+        windows_size,
+        windows_sha_text,
+        downloads.linux.file_name,
+        downloads.linux.href,
+        downloads.linux.source,
+        linux_size,
+        linux_sha_text,
+    });
     try writeAssetBytes(allocator, out_dir, "site-manifest.json", json.written());
 }
 

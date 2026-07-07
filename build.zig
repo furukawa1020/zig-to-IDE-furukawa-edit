@@ -17,6 +17,26 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const linux_target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .linux,
+        .abi = .musl,
+    });
+    const linux_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = linux_target,
+        .optimize = optimize,
+    });
+    const linux_exe = b.addExecutable(.{
+        .name = "zide",
+        .root_module = linux_module,
+    });
+    const install_linux_cmd = b.addInstallArtifact(linux_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "linux-x86_64/bin" } },
+    });
+    const install_linux_step = b.step("install-linux", "Install Linux x86_64 CLI/TUI zide");
+    install_linux_step.dependOn(&install_linux_cmd.step);
+
     const gui_module = b.createModule(.{
         .root_source_file = b.path("src/gui_main.zig"),
         .target = target,

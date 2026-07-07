@@ -19,6 +19,8 @@ const file_finder = @import("../search/file_finder.zig");
 const literal_search = @import("../search/literal.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const task_registry = @import("../tasks/registry.zig");
+const execution_queue = @import("../tasks/execution_queue.zig");
+const permissions = @import("../security/permissions.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("linux_x11.zig is Linux-only");
@@ -336,6 +338,7 @@ const XAuth = struct {
 
 const BottomPanel = enum {
     output,
+    tasks,
     git,
     extensions,
     diagnostics,
@@ -350,6 +353,7 @@ const HeaderAction = enum {
     save_all,
     build,
     test_run,
+    task,
     git,
     audit,
     scan,
@@ -373,6 +377,14 @@ const SecurityPanelAction = enum {
     crlf,
     clean,
     linux,
+};
+
+const TaskPanelAction = enum {
+    tasks,
+    preview,
+    seal,
+    run_next,
+    history,
 };
 
 const ExtensionPanelAction = enum {
@@ -697,6 +709,11 @@ const LinuxFlag = enum {
     on,
 };
 
+const FdSealResult = struct {
+    sealed: usize = 0,
+    failed: usize = 0,
+};
+
 const LinuxSecuritySnapshot = struct {
     no_new_privs: LinuxFlag = .unknown,
     no_new_privs_set: LinuxFlag = .unknown,
@@ -727,6 +744,8 @@ const LinuxSecuritySnapshot = struct {
     fd_anon: usize = 0,
     fd_files: usize = 0,
     fd_unknown: usize = 0,
+    fd_cloexec_sealed: usize = 0,
+    fd_cloexec_seal_failed: usize = 0,
 };
 
 const LinuxGuiState = struct {
@@ -746,6 +765,7 @@ const LinuxGuiState = struct {
     file_scroll_line: usize = 0,
     editor_scroll_line: usize = 0,
     output_scroll_line: usize = 0,
+    task_scroll_line: usize = 0,
     git_scroll_line: usize = 0,
     extensions_scroll_line: usize = 0,
     diagnostics_scroll_line: usize = 0,
@@ -792,8 +812,11 @@ const LinuxGuiState = struct {
         const drops = tryDropDangerousBoundingCapabilities();
         self.linux_security.bounding_caps_dropped = drops.dropped;
         self.linux_security.bounding_caps_drop_failed = drops.failed;
+        const seals = trySealExecFileDescriptors();
+        self.linux_security.fd_cloexec_sealed = seals.sealed;
+        self.linux_security.fd_cloexec_seal_failed = seals.failed;
         self.refreshLinuxSelfProtection();
-        self.appendOutput(.stdout, "linux self-protection: no_new_privs_set={s} no_new_privs={s} dumpable={s} dumpable_set={s} ambient_clear={s} seccomp={s} cap_eff={s} dangerous_bound={d} dropped={d} drop_failed={d}\n", .{
+        self.appendOutput(.stdout, "linux self-protection: no_new_privs_set={s} no_new_privs={s} dumpable={s} dumpable_set={s} ambient_clear={s} seccomp={s} cap_eff={s} dangerous_bound={d} dropped={d} drop_failed={d} fd_sealed={d} fd_seal_failed={d}\n", .{
             flagLabel(self.linux_security.no_new_privs_set),
             flagLabel(self.linux_security.no_new_privs),
             flagLabel(self.linux_security.dumpable),
@@ -804,6 +827,8 @@ const LinuxGuiState = struct {
             self.linux_security.dangerous_bounding_caps,
             self.linux_security.bounding_caps_dropped,
             self.linux_security.bounding_caps_drop_failed,
+            self.linux_security.fd_cloexec_sealed,
+            self.linux_security.fd_cloexec_seal_failed,
         });
     }
 
@@ -813,6 +838,37 @@ const LinuxGuiState = struct {
         self.linux_security.ambient_clear = previous.ambient_clear;
         self.linux_security.bounding_caps_dropped = previous.bounding_caps_dropped;
         self.linux_security.bounding_caps_drop_failed = previous.bounding_caps_drop_failed;
+        self.linux_security.fd_cloexec_sealed = previous.fd_cloexec_sealed;
+        self.linux_security.fd_cloexec_seal_failed = previous.fd_cloexec_seal_failed;
+    }
+
+    fn sealLinuxExecBoundary(self: *LinuxGuiState) void {
+        const seals = trySealExecFileDescriptors();
+        self.linux_security.fd_cloexec_sealed += seals.sealed;
+        self.linux_security.fd_cloexec_seal_failed += seals.failed;
+        self.refreshLinuxSelfProtection();
+        self.message("linux fd seal: +{d} failed:{d}", .{ seals.sealed, seals.failed });
+    }
+
+    fn prepareLinuxLaunchBoundary(self: *LinuxGuiState) bool {
+        self.linux_security.no_new_privs_set = if (trySetNoNewPrivs()) .on else .off;
+        self.linux_security.dumpable_set = if (trySetDumpable(false)) .on else .off;
+        self.linux_security.ambient_clear = if (tryClearAmbientCapabilities()) .on else .off;
+        self.sealLinuxExecBoundary();
+        self.appendOutput(.stdout, "linux launch boundary: nnp={s} dumpable={s} fd_no_cloexec={d} sealed_total={d} seal_failed={d}\n", .{
+            flagLabel(self.linux_security.no_new_privs),
+            flagLabel(self.linux_security.dumpable),
+            self.linux_security.fd_cloexec_missing,
+            self.linux_security.fd_cloexec_sealed,
+            self.linux_security.fd_cloexec_seal_failed,
+        });
+        if (self.linux_security.no_new_privs != .on) {
+            self.appendOutput(.stderr, "blocked: linux no_new_privs is not active\n", .{});
+            self.message("linux launch blocked: no_new_privs inactive", .{});
+            self.bottom_panel = .tasks;
+            return false;
+        }
+        return true;
     }
 
     fn linuxSecurityCapEffLabel(self: *const LinuxGuiState) []const u8 {
@@ -1011,6 +1067,7 @@ const LinuxGuiState = struct {
                 };
                 self.appendOutput(.stdout, "queued external command: {s}\n", .{preview.command});
 
+                if (!self.prepareLinuxLaunchBoundary()) return;
                 const run_result = dispatcher.dispatch(&self.app, .{ .id = "task.run_next", .source = .task }) catch |err| {
                     self.message("run failed: {s}", .{@errorName(err)});
                     self.appendOutput(.stderr, "run failed: {s}\n", .{@errorName(err)});
@@ -1025,6 +1082,10 @@ const LinuxGuiState = struct {
         }
 
         if (std.mem.eql(u8, id, "git.overview") or std.mem.eql(u8, id, "github.overview")) self.bottom_panel = .git;
+        if (std.mem.startsWith(u8, id, "task.")) {
+            self.refreshLinuxSelfProtection();
+            self.bottom_panel = .tasks;
+        }
         if (std.mem.eql(u8, id, "view.extensions") or std.mem.eql(u8, id, "extensions.scan")) self.bottom_panel = .extensions;
         if (std.mem.eql(u8, id, "view.publish") or std.mem.eql(u8, id, "release.checklist")) self.bottom_panel = .publish;
         if (std.mem.eql(u8, id, "security.audit_workspace") or std.mem.eql(u8, id, "security.scan_current")) {
@@ -1040,6 +1101,7 @@ const LinuxGuiState = struct {
             .save_all => self.execute("file.save_all", .keybinding),
             .build => self.execute("zig.build", .keybinding),
             .test_run => self.execute("zig.test", .keybinding),
+            .task => self.openTasksPanel(),
             .git => self.openGitPanel(),
             .audit => self.execute("security.audit_workspace", .keybinding),
             .scan => self.execute("security.scan_current", .keybinding),
@@ -1055,6 +1117,12 @@ const LinuxGuiState = struct {
     fn openGitPanel(self: *LinuxGuiState) void {
         self.bottom_panel = .git;
         self.refreshGitOverview();
+    }
+
+    fn openTasksPanel(self: *LinuxGuiState) void {
+        self.bottom_panel = .tasks;
+        self.refreshLinuxSelfProtection();
+        self.openQuickPanel(.run_task);
     }
 
     fn refreshGitOverview(self: *LinuxGuiState) void {
@@ -1098,6 +1166,21 @@ const LinuxGuiState = struct {
                 self.execute("github.issues", .command_palette);
                 self.bottom_panel = .output;
             },
+        }
+    }
+
+    fn executeTaskPanelAction(self: *LinuxGuiState, action: TaskPanelAction) void {
+        self.bottom_panel = .tasks;
+        switch (action) {
+            .tasks => self.openQuickPanel(.run_task),
+            .preview => self.execute("task.preview_next", .command_palette),
+            .seal => self.sealLinuxExecBoundary(),
+            .run_next => {
+                if (!self.prepareLinuxLaunchBoundary()) return;
+                self.execute("task.run_next", .command_palette);
+                self.refreshLinuxSelfProtection();
+            },
+            .history => self.execute("task.history", .command_palette),
         }
     }
 
@@ -1404,13 +1487,15 @@ const LinuxGuiState = struct {
         self.handleDispatchResult("task.run", queued);
         if (std.meta.activeTag(queued) != .completed) return;
 
-        const run_result = dispatcher.dispatch(&self.app, .{ .id = "task.run_next", .source = .task }) catch |err| {
-            self.message("task run failed: {s}", .{@errorName(err)});
-            self.appendOutput(.stderr, "task run failed: {s}\n", .{@errorName(err)});
+        const preview = dispatcher.dispatch(&self.app, .{ .id = "task.preview_next", .source = .task }) catch |err| {
+            self.message("task preview failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "task preview failed: {s}\n", .{@errorName(err)});
             return;
         };
-        self.handleDispatchResult("task.run_next", run_result);
-        self.bottom_panel = .output;
+        self.refreshLinuxSelfProtection();
+        self.bottom_panel = .tasks;
+        self.handleDispatchResult("task.preview_next", preview);
+        self.message("task queued; review RUN panel, then click RUN", .{});
     }
 
     fn normalizeActiveDocumentNewlines(self: *LinuxGuiState, newline: document_mod.Newline) void {
@@ -1680,6 +1765,7 @@ const LinuxGuiState = struct {
         self.file_scroll_line = 0;
         self.editor_scroll_line = 0;
         self.output_scroll_line = 0;
+        self.task_scroll_line = 0;
         self.git_scroll_line = 0;
         self.extensions_scroll_line = 0;
         self.diagnostics_scroll_line = 0;
@@ -1968,6 +2054,13 @@ const LinuxGuiState = struct {
                 self.openRelativeLocation(item.path, item.range.start.line, item.range.start.column);
                 return true;
             },
+            .tasks => {
+                if (taskPanelActionAt(self, x, y)) |action| {
+                    self.executeTaskPanelAction(action);
+                    return true;
+                }
+                return true;
+            },
             .git => {
                 if (gitPanelActionAt(self, x, y)) |action| {
                     self.executeGitPanelAction(action);
@@ -2125,6 +2218,12 @@ const LinuxGuiState = struct {
                 const visible = self.bottomRowsFrom(self.bottomTop() + 86);
                 const max_start = if (total > visible) total - visible else 0;
                 self.diagnostics_scroll_line = scrollValue(self.diagnostics_scroll_line, max_start, delta);
+            },
+            .tasks => {
+                const total = self.app.execution_queue.history.items.len;
+                const visible = self.bottomRowsFrom(taskHistoryTop(self));
+                const max_start = if (total > visible) total - visible else 0;
+                self.task_scroll_line = scrollValue(self.task_scroll_line, max_start, delta);
             },
             .security => {
                 const total = self.app.security_findings.items.items.len;
@@ -2381,15 +2480,17 @@ fn drawBottomPanel(x11: *X11, state: *LinuxGuiState) !void {
     const bottom = state.bottomTop();
     try x11.fillRect(x11.gc.line, 0, bottom, toU16(state.window_width), 1);
     try drawPanelTab(x11, bottom, state.bottom_panel == .output, 18, "OUTPUT");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .git, 122, "GIT");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .extensions, 226, "EXT");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .diagnostics, 330, "DIAG");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .security, 434, "SEC");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .tutorial, 538, "HELP");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .publish, 642, "SHIP");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .tasks, 122, "RUN");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .git, 226, "GIT");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .extensions, 330, "EXT");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .diagnostics, 434, "DIAG");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .security, 538, "SEC");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .tutorial, 642, "HELP");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .publish, 746, "SHIP");
 
     switch (state.bottom_panel) {
         .output => try drawOutputPanel(x11, state),
+        .tasks => try drawTaskPanel(x11, state),
         .git => try drawGitPanel(x11, state),
         .extensions => try drawExtensionsPanel(x11, state),
         .diagnostics => try drawDiagnosticsPanel(x11, state),
@@ -2438,6 +2539,112 @@ fn drawOutputPanel(x11: *X11, state: *LinuxGuiState) !void {
     }
     if (app.process_console.lines.items.len == 0) {
         try x11.text(x11.gc.muted, 18, y, "No output yet.");
+    }
+}
+
+fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
+    const bottom = state.bottomTop();
+    const queue = &state.app.execution_queue;
+    try drawTaskPanelActions(x11, state);
+
+    var header_buf: [260]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "RUN / Linux launch boundary queued:{d} history:{d} console:{s}", .{
+        queue.queuedCount(),
+        queue.history.items.len,
+        if (state.app.process_console.running) "running" else "idle",
+    }) catch "RUN / Linux launch boundary";
+    try x11.text(x11.gc.green, 18, bottom + 58, header);
+
+    var linux_buf: [420]u8 = undefined;
+    const linux_line = std.fmt.bufPrint(linux_buf[0..], "INHERITED nnp:{s} dump:{s} ambient_clear:{s} seccomp:{s} cap_eff:{s} fd:{d} no-cloexec:{d} sealed:{d}/{d} wx:{d}", .{
+        flagLabel(state.linux_security.no_new_privs),
+        flagLabel(state.linux_security.dumpable),
+        flagLabel(state.linux_security.ambient_clear),
+        seccompLabel(state.linux_security.seccomp_mode),
+        state.linuxSecurityCapEffLabel(),
+        state.linux_security.fd_total,
+        state.linux_security.fd_cloexec_missing,
+        state.linux_security.fd_cloexec_sealed,
+        state.linux_security.fd_cloexec_seal_failed,
+        state.linux_security.maps_writable_executable,
+    }) catch "INHERITED";
+    const linux_gc = if (state.linux_security.no_new_privs == .on and state.linux_security.maps_writable_executable == 0) x11.gc.cyan else x11.gc.amber;
+    try x11.text(linux_gc, 18, bottom + 82, linux_line);
+
+    if (queue.latest()) |ticket| {
+        var command_ascii: [900]u8 = undefined;
+        var command_buf: [900]u8 = undefined;
+        const command_line = std.fmt.bufPrint(command_buf[0..], "QUEUED {s} state:{s} argv:{d}  {s}", .{
+            ticket.source_command_id,
+            @tagName(ticket.state),
+            ticket.args.items.len + 1,
+            ticket.display_command,
+        }) catch ticket.display_command;
+        try x11.text(x11.gc.text, 18, bottom + 108, asciiInto(command_ascii[0..], command_line));
+
+        var policy_buf: [520]u8 = undefined;
+        const policy_line = std.fmt.bufPrint(policy_buf[0..], "policy env:{s} fs:{s} net:{s} sanitized:{s} timeout:{s} output:{d}", .{
+            @tagName(ticket.env_policy),
+            @tagName(ticket.fs_policy),
+            @tagName(ticket.network_policy),
+            boolLabel(ticket.output_sanitized),
+            timeoutLabel(ticket.timeout_ms),
+            ticket.output_limit_bytes,
+        }) catch "policy";
+        try x11.text(x11.gc.muted, 18, bottom + 132, policy_line);
+
+        var gate_buf: [720]u8 = undefined;
+        const cwd_ok = permissions.allowsWorkspacePath(ticket.fs_policy, state.app.workspace.root_path, ticket.cwd);
+        const network_ok = !ticketLooksNetworked(ticket.executable, ticket.args.items) or permissions.allowsNetwork(ticket.network_policy);
+        const gate_line = std.fmt.bufPrint(gate_buf[0..], "gate cwd:{s} net:{s} cwd_path:{s}", .{
+            if (cwd_ok) "ok" else "blocked",
+            if (network_ok) "ok" else "blocked",
+            ticket.cwd,
+        }) catch "gate";
+        var gate_ascii: [720]u8 = undefined;
+        try x11.text(if (cwd_ok and network_ok) x11.gc.muted else x11.gc.red, 18, bottom + 156, asciiInto(gate_ascii[0..], gate_line));
+    } else {
+        try x11.text(x11.gc.muted, 18, bottom + 108, "No queued task. Press TASKS or Ctrl+R, then review PREVIEW/SEAL before RUN.");
+        if (queue.latestHistory()) |entry| {
+            var last_buf: [720]u8 = undefined;
+            const last_line = std.fmt.bufPrint(last_buf[0..], "LAST {s} {s} lines:{d} sanitized:{d}  {s}", .{
+                @tagName(entry.state),
+                exitCodeLabel(entry.exit_code),
+                entry.output_lines,
+                entry.sanitized_controls,
+                entry.display_command,
+            }) catch entry.display_command;
+            var last_ascii: [720]u8 = undefined;
+            try x11.text(x11.gc.cyan, 18, bottom + 132, asciiInto(last_ascii[0..], last_line));
+        }
+    }
+
+    const history_top = taskHistoryTop(state);
+    try x11.text(x11.gc.amber, 18, history_top - 12, "HISTORY");
+    const visible = state.bottomRowsFrom(history_top);
+    const start = @min(state.task_scroll_line, queue.history.items.len);
+    const limit = @min(queue.history.items.len, start + visible);
+    try drawScrollHint(x11, state, queue.history.items.len, visible, start, history_top);
+    var y: i16 = history_top;
+    for (queue.history.items[start..limit], start..) |entry, index| {
+        var row_buf: [900]u8 = undefined;
+        const row = std.fmt.bufPrint(row_buf[0..], "{d}. {s} {s} lines:{d} clean:{d} env:{s} fs:{s} net:{s}  {s}", .{
+            index + 1,
+            @tagName(entry.state),
+            exitCodeLabel(entry.exit_code),
+            entry.output_lines,
+            entry.sanitized_controls,
+            @tagName(entry.env_policy),
+            @tagName(entry.fs_policy),
+            @tagName(entry.network_policy),
+            entry.display_command,
+        }) catch entry.display_command;
+        var ascii_buf: [900]u8 = undefined;
+        try x11.text(taskStateGc(x11, entry.state), 18, y, asciiInto(ascii_buf[0..], row));
+        y += LINE_HEIGHT;
+    }
+    if (queue.history.items.len == 0) {
+        try x11.text(x11.gc.muted, 18, y, "No task history yet. RUN will record exit, output cap, and sanitizer counts.");
     }
 }
 
@@ -2494,11 +2701,13 @@ fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
         state.linux_security.maps_anonymous_executable,
     }) catch "PROC MAPS";
     try x11.text(if (state.linux_security.maps_writable_executable > 0) x11.gc.red else x11.gc.muted, 18, bottom + 154, maps_line);
-    var fd_buf: [300]u8 = undefined;
-    const fd_line = std.fmt.bufPrint(fd_buf[0..], "PROC FD read:{s} total:{d} no-cloexec:{d} unknown:{d} socket:{d} pipe:{d} memfd:{d} anon:{d} files:{d}", .{
+    var fd_buf: [360]u8 = undefined;
+    const fd_line = std.fmt.bufPrint(fd_buf[0..], "PROC FD read:{s} total:{d} no-cloexec:{d} sealed:{d}/{d} unknown:{d} socket:{d} pipe:{d} memfd:{d} anon:{d} files:{d}", .{
         if (state.linux_security.proc_fd_read) "yes" else "no",
         state.linux_security.fd_total,
         state.linux_security.fd_cloexec_missing,
+        state.linux_security.fd_cloexec_sealed,
+        state.linux_security.fd_cloexec_seal_failed,
         state.linux_security.fd_cloexec_unknown,
         state.linux_security.fd_sockets,
         state.linux_security.fd_pipes,
@@ -3056,6 +3265,38 @@ fn countDangerousBoundingCapabilities() usize {
     return count;
 }
 
+fn trySealExecFileDescriptors() FdSealResult {
+    var result: FdSealResult = .{};
+    var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, "/proc/self/fd", .{ .iterate = true }) catch return result;
+    defer dir.close(std.Options.debug_io);
+
+    var iter = dir.iterate();
+    while (true) {
+        const maybe_entry = iter.next(std.Options.debug_io) catch {
+            result.failed += 1;
+            break;
+        };
+        const entry = maybe_entry orelse break;
+        const fd = std.fmt.parseInt(i32, entry.name, 10) catch continue;
+        if (fd <= 2) continue;
+
+        const flags_rc = linux.fcntl(fd, linux.F.GETFD, 0);
+        if (linux.errno(flags_rc) != .SUCCESS) {
+            result.failed += 1;
+            continue;
+        }
+        if ((flags_rc & linux.FD_CLOEXEC) != 0) continue;
+
+        const set_rc = linux.fcntl(fd, linux.F.SETFD, flags_rc | linux.FD_CLOEXEC);
+        if (linux.errno(set_rc) == .SUCCESS) {
+            result.sealed += 1;
+        } else {
+            result.failed += 1;
+        }
+    }
+    return result;
+}
+
 fn readLinuxSecuritySnapshot(allocator: std.mem.Allocator, no_new_privs_set: LinuxFlag, dumpable_set: LinuxFlag) LinuxSecuritySnapshot {
     var snapshot = LinuxSecuritySnapshot{
         .no_new_privs_set = no_new_privs_set,
@@ -3204,6 +3445,63 @@ fn flagLabel(flag: LinuxFlag) []const u8 {
         .off => "off",
         .on => "on",
     };
+}
+
+fn boolLabel(value: bool) []const u8 {
+    return if (value) "yes" else "no";
+}
+
+fn timeoutLabel(timeout_ms: ?u32) []const u8 {
+    return if (timeout_ms == null) "none" else "set";
+}
+
+fn exitCodeLabel(exit_code: ?i32) []const u8 {
+    const code = exit_code orelse return "exit:none";
+    return switch (code) {
+        0 => "exit:0",
+        -1 => "exit:-1",
+        else => "exit:nonzero",
+    };
+}
+
+fn taskStateGc(x11: *const X11, state: execution_queue.State) u32 {
+    return switch (state) {
+        .finished => x11.gc.muted,
+        .queued, .running => x11.gc.cyan,
+        .blocked, .failed, .timed_out, .output_limited => x11.gc.red,
+        .cancelled => x11.gc.amber,
+    };
+}
+
+fn ticketLooksNetworked(executable: []const u8, args: []const []u8) bool {
+    if (looksNetworkExecutable(executable)) return true;
+    for (args) |arg| {
+        if (std.mem.indexOf(u8, arg, "://") != null) return true;
+        if (std.mem.startsWith(u8, arg, "git@")) return true;
+    }
+    return false;
+}
+
+fn looksNetworkExecutable(executable: []const u8) bool {
+    const basename = std.fs.path.basename(executable);
+    const known = [_][]const u8{
+        "curl",
+        "curl.exe",
+        "wget",
+        "wget.exe",
+        "git",
+        "git.exe",
+        "ssh",
+        "ssh.exe",
+        "scp",
+        "scp.exe",
+        "sftp",
+        "sftp.exe",
+    };
+    for (known) |candidate| {
+        if (std.ascii.eqlIgnoreCase(basename, candidate)) return true;
+    }
+    return false;
 }
 
 fn seccompLabel(mode: ?u8) []const u8 {
@@ -3474,7 +3772,7 @@ const HitRect = struct {
     bottom: i16,
 };
 
-const header_actions = [_]HeaderAction{ .open_workspace, .save, .save_all, .build, .test_run, .git, .audit, .scan, .extensions, .tutorial, .publish };
+const header_actions = [_]HeaderAction{ .open_workspace, .save, .save_all, .build, .test_run, .task, .git, .audit, .scan, .extensions, .tutorial, .publish };
 
 fn headerActionRect(action: HeaderAction) HitRect {
     const top: i16 = 15;
@@ -3485,12 +3783,13 @@ fn headerActionRect(action: HeaderAction) HitRect {
         .save_all => .{ .left = 548, .top = top, .right = 606, .bottom = top + height },
         .build => .{ .left = 614, .top = top, .right = 684, .bottom = top + height },
         .test_run => .{ .left = 692, .top = top, .right = 750, .bottom = top + height },
-        .git => .{ .left = 758, .top = top, .right = 814, .bottom = top + height },
-        .audit => .{ .left = 822, .top = top, .right = 896, .bottom = top + height },
-        .scan => .{ .left = 904, .top = top, .right = 970, .bottom = top + height },
-        .extensions => .{ .left = 978, .top = top, .right = 1036, .bottom = top + height },
-        .tutorial => .{ .left = 1044, .top = top, .right = 1110, .bottom = top + height },
-        .publish => .{ .left = 1118, .top = top, .right = 1184, .bottom = top + height },
+        .task => .{ .left = 758, .top = top, .right = 824, .bottom = top + height },
+        .git => .{ .left = 832, .top = top, .right = 888, .bottom = top + height },
+        .audit => .{ .left = 896, .top = top, .right = 970, .bottom = top + height },
+        .scan => .{ .left = 978, .top = top, .right = 1044, .bottom = top + height },
+        .extensions => .{ .left = 1052, .top = top, .right = 1110, .bottom = top + height },
+        .tutorial => .{ .left = 1118, .top = top, .right = 1184, .bottom = top + height },
+        .publish => .{ .left = 1192, .top = top, .right = 1258, .bottom = top + height },
     };
 }
 
@@ -3501,6 +3800,7 @@ fn headerActionLabel(action: HeaderAction) []const u8 {
         .save_all => "ALL",
         .build => "BUILD",
         .test_run => "TEST",
+        .task => "TASK",
         .git => "GIT",
         .audit => "AUDIT",
         .scan => "SCAN",
@@ -3520,7 +3820,7 @@ fn headerActionAt(x: i16, y: i16) ?HeaderAction {
 fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
     const bottom = state.bottomTop();
     if (y < bottom or y >= bottom + 34) return null;
-    const panels = [_]BottomPanel{ .output, .git, .extensions, .diagnostics, .security, .tutorial, .publish };
+    const panels = [_]BottomPanel{ .output, .tasks, .git, .extensions, .diagnostics, .security, .tutorial, .publish };
     for (panels, 0..) |panel, index| {
         const left: i16 = 10 + @as(i16, @intCast(index)) * 104;
         const rect = HitRect{ .left = left, .top = bottom + 8, .right = left + 96, .bottom = bottom + 32 };
@@ -3530,6 +3830,7 @@ fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
 }
 
 const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .issues };
+const task_panel_actions = [_]TaskPanelAction{ .tasks, .preview, .seal, .run_next, .history };
 const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .linux };
 const extension_panel_actions = [_]ExtensionPanelAction{.scan};
 const tutorial_panel_actions = [_]TutorialPanelAction{ .ja, .en };
@@ -3538,6 +3839,12 @@ const publish_panel_actions = [_]PublishPanelAction{ .checklist, .assets, .manif
 fn drawGitPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
     inline for (git_panel_actions) |action| {
         try drawActionButton(x11, gitPanelActionRect(state, action), gitPanelActionLabel(action));
+    }
+}
+
+fn drawTaskPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
+    inline for (task_panel_actions) |action| {
+        try drawActionButton(x11, taskPanelActionRect(state, action), taskPanelActionLabel(action));
     }
 }
 
@@ -3568,6 +3875,13 @@ fn drawPublishPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
 fn gitPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?GitPanelAction {
     inline for (git_panel_actions) |action| {
         if (pointIn(gitPanelActionRect(state, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn taskPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?TaskPanelAction {
+    inline for (task_panel_actions) |action| {
+        if (pointIn(taskPanelActionRect(state, action), x, y)) return action;
     }
     return null;
 }
@@ -3610,6 +3924,21 @@ fn gitPanelActionRect(state: *const LinuxGuiState, action: GitPanelAction) HitRe
     const width: i16 = 74;
     const gap: i16 = 8;
     const right = state.window_width - 18 - (3 - index) * (width + gap);
+    const bottom = state.bottomTop();
+    return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
+}
+
+fn taskPanelActionRect(state: *const LinuxGuiState, action: TaskPanelAction) HitRect {
+    const index: i16 = switch (action) {
+        .tasks => 0,
+        .preview => 1,
+        .seal => 2,
+        .run_next => 3,
+        .history => 4,
+    };
+    const width: i16 = 70;
+    const gap: i16 = 8;
+    const right = state.window_width - 18 - (4 - index) * (width + gap);
     const bottom = state.bottomTop();
     return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
@@ -3674,6 +4003,16 @@ fn gitPanelActionLabel(action: GitPanelAction) []const u8 {
     };
 }
 
+fn taskPanelActionLabel(action: TaskPanelAction) []const u8 {
+    return switch (action) {
+        .tasks => "TASKS",
+        .preview => "PLAN",
+        .seal => "SEAL",
+        .run_next => "RUN",
+        .history => "HIST",
+    };
+}
+
 fn securityPanelActionLabel(action: SecurityPanelAction) []const u8 {
     return switch (action) {
         .audit => "AUDIT",
@@ -3734,6 +4073,10 @@ fn extensionRowAt(state: *const LinuxGuiState, y: i16) ?usize {
 
 fn securityFindingsTop(state: *const LinuxGuiState) i16 {
     return state.bottomTop() + 206;
+}
+
+fn taskHistoryTop(state: *const LinuxGuiState) i16 {
+    return state.bottomTop() + 190;
 }
 
 fn documentTabAt(state: *const LinuxGuiState, x: i16, y: i16) ?usize {

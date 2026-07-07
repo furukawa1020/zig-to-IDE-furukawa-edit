@@ -8,6 +8,7 @@ const dispatcher = @import("../core/dispatcher.zig");
 const event_mod = @import("../core/event.zig");
 const input_handler = @import("../core/input_handler.zig");
 const document_mod = @import("../editor/document.zig");
+const extension_registry = @import("../extensions/registry.zig");
 const navigation = @import("../editor/navigation.zig");
 const git_repository = @import("../git/repository.zig");
 const modes = @import("../language/modes.zig");
@@ -374,6 +375,29 @@ const SecurityPanelAction = enum {
     linux,
 };
 
+const ExtensionPanelAction = enum {
+    scan,
+};
+
+const TutorialLanguage = enum {
+    ja,
+    en,
+};
+
+const TutorialPanelAction = enum {
+    ja,
+    en,
+};
+
+const PublishPanelAction = enum {
+    checklist,
+    assets,
+    manifests,
+    bundle,
+    verify,
+    preflight,
+};
+
 const QuickPanelMode = enum {
     open_workspace,
     find_file,
@@ -687,6 +711,12 @@ const LinuxSecuritySnapshot = struct {
     cap_eff_len: usize = 0,
     cap_eff_zero: LinuxFlag = .unknown,
     proc_status_read: bool = false,
+    proc_maps_read: bool = false,
+    maps_total: usize = 0,
+    maps_executable: usize = 0,
+    maps_writable_executable: usize = 0,
+    maps_shared_objects: usize = 0,
+    maps_anonymous_executable: usize = 0,
 };
 
 const LinuxGuiState = struct {
@@ -694,6 +724,8 @@ const LinuxGuiState = struct {
     app: app_mod.App,
     quick_panel: QuickPanel,
     git_overview: ?git_repository.Overview = null,
+    extensions_registry: ?extension_registry.Registry = null,
+    tutorial_language: TutorialLanguage = .ja,
     linux_security: LinuxSecuritySnapshot = .{},
     last_document_search_query: std.array_list.Managed(u8),
     last_document_search_options: literal_search.Options = .{},
@@ -716,6 +748,7 @@ const LinuxGuiState = struct {
     }
 
     fn deinit(self: *LinuxGuiState) void {
+        self.clearExtensionsRegistry();
         self.clearGitOverview();
         self.last_document_search_query.deinit();
         self.quick_panel.deinit();
@@ -1064,6 +1097,54 @@ const LinuxGuiState = struct {
                 self.message("linux self-protection refreshed", .{});
             },
         }
+    }
+
+    fn executeExtensionPanelAction(self: *LinuxGuiState, action: ExtensionPanelAction) void {
+        self.bottom_panel = .extensions;
+        switch (action) {
+            .scan => self.refreshExtensionsRegistry(),
+        }
+    }
+
+    fn refreshExtensionsRegistry(self: *LinuxGuiState) void {
+        self.clearExtensionsRegistry();
+        const registry = extension_registry.Registry.scan(self.allocator, &self.app.workspace, .{}) catch |err| {
+            self.message("extension scan failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "extension scan failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        const count = registry.items.items.len;
+        self.extensions_registry = registry;
+        self.message("extension manifest scan: {d}", .{count});
+    }
+
+    fn clearExtensionsRegistry(self: *LinuxGuiState) void {
+        if (self.extensions_registry) |*registry| {
+            registry.deinit();
+            self.extensions_registry = null;
+        }
+    }
+
+    fn executeTutorialPanelAction(self: *LinuxGuiState, action: TutorialPanelAction) void {
+        self.tutorial_language = switch (action) {
+            .ja => .ja,
+            .en => .en,
+        };
+        self.bottom_panel = .tutorial;
+        self.message("tutorial language: {s}", .{@tagName(self.tutorial_language)});
+    }
+
+    fn executePublishPanelAction(self: *LinuxGuiState, action: PublishPanelAction) void {
+        const id = switch (action) {
+            .checklist => "release.checklist",
+            .assets => "release.assets",
+            .manifests => "release.manifests",
+            .bundle => "release.bundle",
+            .verify => "release.verify",
+            .preflight => "release.preflight",
+        };
+        self.execute(id, .command_palette);
+        self.bottom_panel = .output;
     }
 
     fn openQuickPanel(self: *LinuxGuiState, mode: QuickPanelMode) void {
@@ -1841,7 +1922,7 @@ const LinuxGuiState = struct {
                     self.executeSecurityPanelAction(action);
                     return true;
                 }
-                const row = @divTrunc(@as(isize, y - (bottom + 144)), LINE_HEIGHT);
+                const row = @divTrunc(@as(isize, y - (bottom + 168)), LINE_HEIGHT);
                 if (row < 0) return true;
                 const index: usize = @intCast(row);
                 if (index >= self.app.security_findings.items.items.len) return true;
@@ -1872,6 +1953,34 @@ const LinuxGuiState = struct {
                     }
                 } else {
                     self.executeGitPanelAction(.diff);
+                }
+                return true;
+            },
+            .extensions => {
+                if (extensionPanelActionAt(self, x, y)) |action| {
+                    self.executeExtensionPanelAction(action);
+                    return true;
+                }
+                if (extensionRowAt(self, y)) |index| {
+                    if (self.extensions_registry) |registry| {
+                        if (index < registry.items.items.len) {
+                            self.openRelativeLocation(registry.items.items[index].manifest_path, 0, 0);
+                        }
+                    }
+                }
+                return true;
+            },
+            .tutorial => {
+                if (tutorialPanelActionAt(self, x, y)) |action| {
+                    self.executeTutorialPanelAction(action);
+                    return true;
+                }
+                return true;
+            },
+            .publish => {
+                if (publishPanelActionAt(self, x, y)) |action| {
+                    self.executePublishPanelAction(action);
+                    return true;
                 }
                 return true;
             },
@@ -2279,7 +2388,17 @@ fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
         if (state.linux_security.proc_status_read) "read" else "blocked",
     }) catch "linux cap boundary";
     try x11.text(x11.gc.muted, 18, bottom + 130, cap_line);
-    var y: i16 = bottom + 158;
+    var maps_buf: [260]u8 = undefined;
+    const maps_line = std.fmt.bufPrint(maps_buf[0..], "PROC MAPS read:{s} total:{d} exec:{d} wx:{d} so:{d} anon-x:{d}", .{
+        if (state.linux_security.proc_maps_read) "yes" else "no",
+        state.linux_security.maps_total,
+        state.linux_security.maps_executable,
+        state.linux_security.maps_writable_executable,
+        state.linux_security.maps_shared_objects,
+        state.linux_security.maps_anonymous_executable,
+    }) catch "PROC MAPS";
+    try x11.text(if (state.linux_security.maps_writable_executable > 0) x11.gc.red else x11.gc.muted, 18, bottom + 154, maps_line);
+    var y: i16 = bottom + 182;
     const limit = @min(app.security_findings.items.items.len, @as(usize, 6));
     for (app.security_findings.items.items[0..limit]) |finding| {
         var row_buf: [900]u8 = undefined;
@@ -2367,8 +2486,50 @@ fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
 
 fn drawExtensionsPanel(x11: *X11, state: *LinuxGuiState) !void {
     const bottom = state.bottomTop();
-    try x11.text(x11.gc.green, 18, bottom + 58, "Extensions and integrations are manifest-scanned; extension code is not executed.");
-    try drawFilteredConsole(x11, state, bottom + 86, &.{ "extension", "Extension", "manifest", "capabilities", "integrations" });
+    try drawExtensionPanelActions(x11, state);
+    const registry = state.extensions_registry orelse {
+        try x11.text(x11.gc.green, 18, bottom + 58, "EXTENSIONS / manifest-only scan");
+        try x11.text(x11.gc.muted, 18, bottom + 86, "Press SCAN. ZIDE reads zide-extension.json manifests but does not execute extension code.");
+        return;
+    };
+
+    var header_buf: [220]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "EXTENSIONS manifests:{d} loaded:{d} invalid:{d} high:{d} medium:{d}", .{
+        registry.items.items.len,
+        registry.countStatus(.loaded),
+        registry.countStatus(.invalid),
+        registry.countRisk(.high),
+        registry.countRisk(.medium),
+    }) catch "EXTENSIONS";
+    try x11.text(x11.gc.green, 18, bottom + 58, header);
+
+    var y: i16 = bottom + 86;
+    const max_rows: usize = @intCast(@max(@divTrunc(state.window_height - y - STATUS_HEIGHT - 8, LINE_HEIGHT), 1));
+    const limit = @min(registry.items.items.len, max_rows);
+    var row: usize = 0;
+    while (row < limit) : (row += 1) {
+        const extension = registry.items.items[row];
+        const risk = extension_registry.extensionRisk(extension);
+        var cap_buf: [220]u8 = undefined;
+        const caps = extensionCapabilitiesLabel(cap_buf[0..], extension);
+        var row_buf: [900]u8 = undefined;
+        const text = std.fmt.bufPrint(row_buf[0..], "[{s}/{s}] {s} {s}  cmd:{d} int:{d}  {s}  {s}", .{
+            @tagName(extension.status),
+            extension_registry.riskLabel(risk),
+            extension.name,
+            extension.version,
+            extension.commands,
+            extension.integrations,
+            caps,
+            extension.manifest_path,
+        }) catch extension.manifest_path;
+        var ascii_buf: [900]u8 = undefined;
+        try x11.text(extensionRiskGc(x11, risk), 18, y, asciiInto(ascii_buf[0..], text));
+        y += LINE_HEIGHT;
+    }
+    if (registry.items.items.len == 0) {
+        try x11.text(x11.gc.muted, 18, y, "No zide-extension.json or zide.extension.json manifests found.");
+    }
 }
 
 fn drawDiagnosticsPanel(x11: *X11, state: *LinuxGuiState) !void {
@@ -2400,31 +2561,42 @@ fn drawDiagnosticsPanel(x11: *X11, state: *LinuxGuiState) !void {
 fn drawTutorialPanel(x11: *X11, state: *LinuxGuiState) !void {
     const app = &state.app;
     const bottom = state.bottomTop();
+    try drawTutorialPanelActions(x11, state);
     var header_buf: [220]u8 = undefined;
-    const header = std.fmt.bufPrint(header_buf[0..], "HELP / ZIDE security tour   trust={s} risk={d}", .{
+    const header = std.fmt.bufPrint(header_buf[0..], "HELP / ZIDE tour lang:{s} trust:{s} risk:{d}", .{
+        @tagName(state.tutorial_language),
         @tagName(app.runtime.trust_state),
         app.security_findings.items.items.len,
     }) catch "HELP / ZIDE security tour";
     try x11.text(x11.gc.green, 18, bottom + 58, header);
 
-    const lines = [_][]const u8{
-        "F1 opens help. Ctrl+P opens commands. Ctrl+S saves with atomic write and save-time security scan.",
-        "Click files to open. Insert mode edits the same DocumentStore used by Windows and the TUI.",
-        "SEC shows Zig-owned boundary findings: memory, exec, filesystem, network, dependency, secret, text, path, git.",
-        "GIT reads repository metadata directly; hooks, filters, fsmonitor, and git status are not executed for overview.",
-        "EXT scans extension manifests only. SHIP verifies archives, paths, executable bits, and SHA-256 before release.",
-    };
+    const lines = tutorialLines(state.tutorial_language);
     var y: i16 = bottom + 86;
     for (lines) |line| {
         try x11.text(x11.gc.muted, 18, y, line);
         y += LINE_HEIGHT;
+        if (y > state.window_height - STATUS_HEIGHT - 12) break;
     }
 }
 
 fn drawPublishPanel(x11: *X11, state: *LinuxGuiState) !void {
     const bottom = state.bottomTop();
-    try x11.text(x11.gc.green, 18, bottom + 58, "SHIP / release gate");
-    try drawFilteredConsole(x11, state, bottom + 86, &.{ "release", "bundle", "Linux", "Windows", "sha256", "publish", "GitHub" });
+    try drawPublishPanelActions(x11, state);
+    var header_buf: [260]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "SHIP release:{s} win:{s} linux:{s} workflows:{s}", .{
+        if (workspaceHasAnyLicense(&state.app)) "licensed" else "no-license",
+        if (workspaceFileExistsGui(&state.app, "zig-out/release/zide-windows-x86_64.zip")) "zip" else "missing",
+        if (workspaceFileExistsGui(&state.app, "zig-out/release/zide-linux-x86_64.tar")) "tar" else "missing",
+        if (workspaceHasPrefixGui(&state.app, ".github/workflows/")) "yes" else "none",
+    }) catch "SHIP";
+    try x11.text(x11.gc.green, 18, bottom + 58, header);
+
+    var y: i16 = bottom + 86;
+    for (publishLines()) |line| {
+        try x11.text(publishLineGc(x11, line), 18, y, line);
+        y += LINE_HEIGHT;
+        if (y > state.window_height - STATUS_HEIGHT - 12) break;
+    }
 }
 
 fn drawFilteredConsole(x11: *X11, state: *LinuxGuiState, start_y: i16, needles: []const []const u8) !void {
@@ -2597,6 +2769,106 @@ fn riskGc(x11: *X11, risk: findings_mod.Risk) u32 {
     };
 }
 
+fn extensionRiskGc(x11: *X11, risk: extension_registry.Risk) u32 {
+    return switch (risk) {
+        .high => x11.gc.red,
+        .medium => x11.gc.amber,
+        .low => x11.gc.muted,
+    };
+}
+
+fn extensionCapabilitiesLabel(buffer: []u8, extension: extension_registry.Extension) []const u8 {
+    if (extension.capabilities.len == 0) return "cap:none";
+    var len: usize = 0;
+    appendBounded(buffer, &len, "cap:");
+    for (extension.capabilities, 0..) |capability, index| {
+        if (index >= 5) {
+            appendBounded(buffer, &len, "...");
+            break;
+        }
+        if (index > 0) appendBounded(buffer, &len, ",");
+        appendBounded(buffer, &len, extension_registry.capabilityLabel(capability));
+    }
+    return buffer[0..len];
+}
+
+fn appendBounded(buffer: []u8, len: *usize, text: []const u8) void {
+    if (len.* >= buffer.len) return;
+    const available = buffer.len - len.*;
+    const copy_len = @min(available, text.len);
+    if (copy_len == 0) return;
+    @memcpy(buffer[len.* .. len.* + copy_len], text[0..copy_len]);
+    len.* += copy_len;
+}
+
+fn tutorialLines(language: TutorialLanguage) []const []const u8 {
+    return switch (language) {
+        .ja => &.{
+            "== ZIDE JA TOUR ==",
+            "F1: help. Ctrl+P: file. Ctrl+Shift+P: command. Ctrl+S: save with security gate.",
+            "SEC: memory/exec/fs/net/deps/secret/text/path/git boundary wo miru panel.",
+            "GIT: .git wo Zig de yomu. hooks/filters/fsmonitor/git status ha ugokasanai.",
+            "EXT: manifest dake scan. extension code ha jikko shinai.",
+            "SHIP: bundle/verify/preflight wo Zig dake de hash to path boundary made kakunin.",
+            "LINUX: no_new_privs, dumpable off, caps, /proc maps wo SEC ni dasu.",
+        },
+        .en => &.{
+            "== ZIDE EN TOUR ==",
+            "F1 opens help. Ctrl+P opens files. Ctrl+Shift+P opens commands. Ctrl+S saves through security gates.",
+            "SEC shows Zig-owned boundary findings: memory, execution, filesystem, network, dependency, secret, text, path, git.",
+            "GIT reads repository metadata directly; hooks, filters, fsmonitor, and git status are not executed for overview.",
+            "EXT scans extension manifests only. Extension code is never executed during the baseline scan.",
+            "SHIP verifies archives, paths, executable bits, and SHA-256 before release.",
+            "LINUX exposes no_new_privs, dumpable, capabilities, and /proc maps as first-class IDE state.",
+        },
+    };
+}
+
+fn publishLines() []const []const u8 {
+    return &.{
+        "== RELEASE GATE ==",
+        "[ship] Build Windows GUI/CLI and Linux GUI/CLI before bundling.",
+        "[ship] Run ZIP/TAR bundle with pure Zig archive writers.",
+        "[hash] Verify SHA-256 and archive paths before publishing.",
+        "[ship] Keep GitHub Pages downloads and CHECKSUMS.sha256 in sync.",
+        "[ship] Lead with the trust workflow: secure Zig-native workbench, hook-free Git, visible Linux boundaries.",
+        "[avoid] Do not publish artifacts whose release.verify has not passed.",
+    };
+}
+
+fn publishLineGc(x11: *X11, line: []const u8) u32 {
+    if (std.mem.startsWith(u8, line, "==")) return x11.gc.amber;
+    if (std.mem.startsWith(u8, line, "[hash]")) return x11.gc.cyan;
+    if (std.mem.startsWith(u8, line, "[avoid]")) return x11.gc.red;
+    return x11.gc.muted;
+}
+
+fn workspaceHasAnyLicense(app: *const app_mod.App) bool {
+    for (app.workspace.entries.items) |entry| {
+        if (entry.kind != .file) continue;
+        const base = std.fs.path.basename(entry.path);
+        if (std.ascii.eqlIgnoreCase(base, "LICENSE") or
+            std.ascii.eqlIgnoreCase(base, "LICENSE.md") or
+            std.ascii.eqlIgnoreCase(base, "COPYING")) return true;
+    }
+    return false;
+}
+
+fn workspaceHasPrefixGui(app: *const app_mod.App, prefix: []const u8) bool {
+    for (app.workspace.entries.items) |entry| {
+        if (std.mem.startsWith(u8, entry.path, prefix)) return true;
+    }
+    return false;
+}
+
+fn workspaceFileExistsGui(app: *const app_mod.App, relative: []const u8) bool {
+    for (app.workspace.entries.items) |entry| {
+        if (entry.kind == .file and std.mem.eql(u8, entry.path, relative)) return true;
+    }
+    _ = std.Io.Dir.cwd().statFile(std.Options.debug_io, relative, .{}) catch return false;
+    return true;
+}
+
 fn trySetNoNewPrivs() bool {
     const rc = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
     return linux.errno(rc) == .SUCCESS;
@@ -2681,6 +2953,7 @@ fn readLinuxSecuritySnapshot(allocator: std.mem.Allocator, no_new_privs_set: Lin
 
     snapshot.dangerous_bounding_caps = countDangerousBoundingCapabilities();
     readLinuxProcStatus(allocator, &snapshot);
+    readLinuxProcMaps(allocator, &snapshot);
     return snapshot;
 }
 
@@ -2704,6 +2977,35 @@ fn readLinuxProcStatus(allocator: std.mem.Allocator, snapshot: *LinuxSecuritySna
             @memcpy(snapshot.cap_eff[0..len], value[0..len]);
             snapshot.cap_eff_len = len;
             snapshot.cap_eff_zero = if (hexIsZero(value)) .on else .off;
+        }
+    }
+}
+
+fn readLinuxProcMaps(allocator: std.mem.Allocator, snapshot: *LinuxSecuritySnapshot) void {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, "/proc/self/maps", allocator, .limited(256 * 1024)) catch return;
+    defer allocator.free(bytes);
+    snapshot.proc_maps_read = true;
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        snapshot.maps_total += 1;
+
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        _ = fields.next() orelse continue;
+        const perms = fields.next() orelse continue;
+        const executable = perms.len >= 3 and perms[2] == 'x';
+        const writable = perms.len >= 2 and perms[1] == 'w';
+        if (executable) snapshot.maps_executable += 1;
+        if (executable and writable) snapshot.maps_writable_executable += 1;
+
+        _ = fields.next();
+        _ = fields.next();
+        _ = fields.next();
+        const path = fields.next() orelse "";
+        if (std.mem.indexOf(u8, path, ".so") != null) snapshot.maps_shared_objects += 1;
+        if (executable and (path.len == 0 or std.mem.startsWith(u8, path, "["))) {
+            snapshot.maps_anonymous_executable += 1;
         }
     }
 }
@@ -3050,6 +3352,9 @@ fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
 
 const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .issues };
 const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .linux };
+const extension_panel_actions = [_]ExtensionPanelAction{.scan};
+const tutorial_panel_actions = [_]TutorialPanelAction{ .ja, .en };
+const publish_panel_actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle, .verify, .preflight };
 
 fn drawGitPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
     inline for (git_panel_actions) |action| {
@@ -3063,6 +3368,24 @@ fn drawSecurityPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
     }
 }
 
+fn drawExtensionPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
+    inline for (extension_panel_actions) |action| {
+        try drawActionButton(x11, extensionPanelActionRect(state, action), extensionPanelActionLabel(action));
+    }
+}
+
+fn drawTutorialPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
+    inline for (tutorial_panel_actions) |action| {
+        try drawActionButton(x11, tutorialPanelActionRect(state, action), tutorialPanelActionLabel(action));
+    }
+}
+
+fn drawPublishPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
+    inline for (publish_panel_actions) |action| {
+        try drawActionButton(x11, publishPanelActionRect(state, action), publishPanelActionLabel(action));
+    }
+}
+
 fn gitPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?GitPanelAction {
     inline for (git_panel_actions) |action| {
         if (pointIn(gitPanelActionRect(state, action), x, y)) return action;
@@ -3073,6 +3396,27 @@ fn gitPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?GitPanelAction
 fn securityPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?SecurityPanelAction {
     inline for (security_panel_actions) |action| {
         if (pointIn(securityPanelActionRect(state, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn extensionPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?ExtensionPanelAction {
+    inline for (extension_panel_actions) |action| {
+        if (pointIn(extensionPanelActionRect(state, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn tutorialPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?TutorialPanelAction {
+    inline for (tutorial_panel_actions) |action| {
+        if (pointIn(tutorialPanelActionRect(state, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn publishPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?PublishPanelAction {
+    inline for (publish_panel_actions) |action| {
+        if (pointIn(publishPanelActionRect(state, action), x, y)) return action;
     }
     return null;
 }
@@ -3108,6 +3452,40 @@ fn securityPanelActionRect(state: *const LinuxGuiState, action: SecurityPanelAct
     return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
 
+fn extensionPanelActionRect(state: *const LinuxGuiState, action: ExtensionPanelAction) HitRect {
+    _ = action;
+    const bottom = state.bottomTop();
+    return .{ .left = state.window_width - 88, .top = bottom + 42, .right = state.window_width - 18, .bottom = bottom + 66 };
+}
+
+fn tutorialPanelActionRect(state: *const LinuxGuiState, action: TutorialPanelAction) HitRect {
+    const index: i16 = switch (action) {
+        .ja => 0,
+        .en => 1,
+    };
+    const width: i16 = 58;
+    const gap: i16 = 8;
+    const right = state.window_width - 18 - (1 - index) * (width + gap);
+    const bottom = state.bottomTop();
+    return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
+}
+
+fn publishPanelActionRect(state: *const LinuxGuiState, action: PublishPanelAction) HitRect {
+    const index: i16 = switch (action) {
+        .checklist => 0,
+        .assets => 1,
+        .manifests => 2,
+        .bundle => 3,
+        .verify => 4,
+        .preflight => 5,
+    };
+    const width: i16 = 70;
+    const gap: i16 = 8;
+    const right = state.window_width - 18 - (5 - index) * (width + gap);
+    const bottom = state.bottomTop();
+    return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
+}
+
 fn gitPanelActionLabel(action: GitPanelAction) []const u8 {
     return switch (action) {
         .refresh => "REFRESH",
@@ -3129,6 +3507,30 @@ fn securityPanelActionLabel(action: SecurityPanelAction) []const u8 {
     };
 }
 
+fn extensionPanelActionLabel(action: ExtensionPanelAction) []const u8 {
+    return switch (action) {
+        .scan => "SCAN",
+    };
+}
+
+fn tutorialPanelActionLabel(action: TutorialPanelAction) []const u8 {
+    return switch (action) {
+        .ja => "JA",
+        .en => "EN",
+    };
+}
+
+fn publishPanelActionLabel(action: PublishPanelAction) []const u8 {
+    return switch (action) {
+        .checklist => "CHECK",
+        .assets => "HASH",
+        .manifests => "MANI",
+        .bundle => "ZIP",
+        .verify => "VFY",
+        .preflight => "GATE",
+    };
+}
+
 fn gitChangesTop(state: *const LinuxGuiState) i16 {
     const bottom = state.bottomTop();
     const remote_rows: usize = if (state.git_overview) |overview| @max(@min(overview.remotes.len, @as(usize, 2)), 1) else 1;
@@ -3137,6 +3539,14 @@ fn gitChangesTop(state: *const LinuxGuiState) i16 {
 
 fn gitChangeRowAt(state: *const LinuxGuiState, y: i16) ?usize {
     const top = gitChangesTop(state);
+    if (y < top) return null;
+    const row = @divTrunc(@as(isize, y - top), LINE_HEIGHT);
+    if (row < 0) return null;
+    return @intCast(row);
+}
+
+fn extensionRowAt(state: *const LinuxGuiState, y: i16) ?usize {
+    const top = state.bottomTop() + 86;
     if (y < top) return null;
     const row = @divTrunc(@as(isize, y - top), LINE_HEIGHT);
     if (row < 0) return null;

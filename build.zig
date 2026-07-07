@@ -61,4 +61,19 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    const site_module = b.createModule(.{
+        .root_source_file = b.path("tools/site_gen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const site_gen = b.addExecutable(.{
+        .name = "zide-site-gen",
+        .root_module = site_module,
+    });
+    const run_site = b.addRunArtifact(site_gen);
+    run_site.addArg("zig-out/site");
+
+    const site_step = b.step("site", "Generate the ZIDE website with Zig only");
+    site_step.dependOn(&run_site.step);
 }

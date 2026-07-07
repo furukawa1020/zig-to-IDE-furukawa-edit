@@ -42,7 +42,7 @@ fn generateSite(allocator: std.mem.Allocator, out_dir: []const u8) !void {
     const info = try copyReleaseZipIfPresent(allocator, out_dir);
     try writeAsset(allocator, out_dir, "assets/site.css", siteCss);
     try writeHeroBitmap(allocator, out_dir);
-    try copyOpenGraphImageIfPresent(allocator, out_dir);
+    try copyOpenGraphImage(allocator, out_dir);
     try writeHtml(allocator, out_dir, "index.html", info);
     try writeHtml(allocator, out_dir, "404.html", info);
     try writeManifest(allocator, out_dir, info);
@@ -81,13 +81,29 @@ fn copyReleaseZipIfPresent(allocator: std.mem.Allocator, out_dir: []const u8) !D
     };
 }
 
-fn copyOpenGraphImageIfPresent(allocator: std.mem.Allocator, out_dir: []const u8) !void {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, og_image_source_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
+fn copyOpenGraphImage(allocator: std.mem.Allocator, out_dir: []const u8) !void {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, og_image_source_path, allocator, .limited(8 * 1024 * 1024));
     defer allocator.free(bytes);
+    try validateOpenGraphPng(bytes);
     try writeAssetBytes(allocator, out_dir, og_image_path, bytes);
+}
+
+fn validateOpenGraphPng(bytes: []const u8) !void {
+    const png_signature = [_]u8{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+    if (bytes.len < 33) return error.InvalidOpenGraphImage;
+    if (!std.mem.eql(u8, bytes[0..8], png_signature[0..])) return error.InvalidOpenGraphImage;
+    if (!std.mem.eql(u8, bytes[12..16], "IHDR")) return error.InvalidOpenGraphImage;
+
+    const width = readBe32(bytes[16..20]);
+    const height = readBe32(bytes[20..24]);
+    if (width != 1200 or height != 630) return error.InvalidOpenGraphImage;
+}
+
+fn readBe32(bytes: []const u8) u32 {
+    return (@as(u32, bytes[0]) << 24) |
+        (@as(u32, bytes[1]) << 16) |
+        (@as(u32, bytes[2]) << 8) |
+        @as(u32, bytes[3]);
 }
 
 fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []const u8, info: DownloadInfo) !void {
@@ -133,7 +149,6 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         \\      <a href="#download">Download</a>
         \\      <a href="#security">Security</a>
         \\      <a href="#languages">Languages</a>
-        \\      <a href="#share">Share</a>
         \\      <a href="#deploy">Deploy</a>
         \\    </nav>
         \\  </header>

@@ -717,6 +717,16 @@ const LinuxSecuritySnapshot = struct {
     maps_writable_executable: usize = 0,
     maps_shared_objects: usize = 0,
     maps_anonymous_executable: usize = 0,
+    proc_fd_read: bool = false,
+    fd_total: usize = 0,
+    fd_cloexec_missing: usize = 0,
+    fd_cloexec_unknown: usize = 0,
+    fd_sockets: usize = 0,
+    fd_pipes: usize = 0,
+    fd_memfd: usize = 0,
+    fd_anon: usize = 0,
+    fd_files: usize = 0,
+    fd_unknown: usize = 0,
 };
 
 const LinuxGuiState = struct {
@@ -735,6 +745,13 @@ const LinuxGuiState = struct {
     window_height: i16 = HEIGHT,
     file_scroll_line: usize = 0,
     editor_scroll_line: usize = 0,
+    output_scroll_line: usize = 0,
+    git_scroll_line: usize = 0,
+    extensions_scroll_line: usize = 0,
+    diagnostics_scroll_line: usize = 0,
+    security_scroll_line: usize = 0,
+    tutorial_scroll_line: usize = 0,
+    publish_scroll_line: usize = 0,
     message_buf: [240]u8 = [_]u8{0} ** 240,
     message_len: usize = 0,
 
@@ -1050,6 +1067,7 @@ const LinuxGuiState = struct {
         const present = overview.present;
         const changes = overview.changes.len;
         self.git_overview = overview;
+        self.git_scroll_line = 0;
         if (present) {
             self.message("git overview refreshed: {d} change(s)", .{changes});
         } else {
@@ -1115,6 +1133,7 @@ const LinuxGuiState = struct {
         };
         const count = registry.items.items.len;
         self.extensions_registry = registry;
+        self.extensions_scroll_line = 0;
         self.message("extension manifest scan: {d}", .{count});
     }
 
@@ -1660,6 +1679,13 @@ const LinuxGuiState = struct {
         self.quick_panel.close();
         self.file_scroll_line = 0;
         self.editor_scroll_line = 0;
+        self.output_scroll_line = 0;
+        self.git_scroll_line = 0;
+        self.extensions_scroll_line = 0;
+        self.diagnostics_scroll_line = 0;
+        self.security_scroll_line = 0;
+        self.tutorial_scroll_line = 0;
+        self.publish_scroll_line = 0;
         self.bottom_panel = .output;
         self.message("workspace opened", .{});
         self.appendOutput(.stdout, "opened workspace: {s}\n", .{self.app.workspace.root_path});
@@ -1843,6 +1869,8 @@ const LinuxGuiState = struct {
                 self.scrollFileTree(delta);
             } else if (y < self.bottomTop()) {
                 self.scrollEditor(delta);
+            } else if (y < self.window_height - STATUS_HEIGHT) {
+                self.scrollBottomPanel(delta);
             }
             return;
         }
@@ -1922,9 +1950,9 @@ const LinuxGuiState = struct {
                     self.executeSecurityPanelAction(action);
                     return true;
                 }
-                const row = @divTrunc(@as(isize, y - (bottom + 168)), LINE_HEIGHT);
+                const row = @divTrunc(@as(isize, y - securityFindingsTop(self)), LINE_HEIGHT);
                 if (row < 0) return true;
-                const index: usize = @intCast(row);
+                const index = self.security_scroll_line + @as(usize, @intCast(row));
                 if (index >= self.app.security_findings.items.items.len) return true;
                 const finding = self.app.security_findings.items.items[index];
                 const line = if (finding.line > 0) finding.line - 1 else 0;
@@ -1934,7 +1962,7 @@ const LinuxGuiState = struct {
             .diagnostics => {
                 const row = @divTrunc(@as(isize, y - (bottom + 72)), LINE_HEIGHT);
                 if (row < 0) return true;
-                const index: usize = @intCast(row);
+                const index = self.diagnostics_scroll_line + @as(usize, @intCast(row));
                 if (index >= self.app.diagnostics.items.items.len) return true;
                 const item = self.app.diagnostics.items.items[index];
                 self.openRelativeLocation(item.path, item.range.start.line, item.range.start.column);
@@ -2064,6 +2092,59 @@ const LinuxGuiState = struct {
         const offset = doc.text.lineColumnToOffset(line, column) catch return;
         navigation.setCursor(doc, doc.positionFromOffset(offset) catch return);
         self.message("cursor: {d}:{d}", .{ line + 1, column + 1 });
+    }
+
+    fn bottomRowsFrom(self: *const LinuxGuiState, top: i16) usize {
+        return @intCast(@max(@divTrunc(self.window_height - top - STATUS_HEIGHT - 8, LINE_HEIGHT), 1));
+    }
+
+    fn scrollBottomPanel(self: *LinuxGuiState, delta: isize) void {
+        switch (self.bottom_panel) {
+            .output => {
+                const visible = self.bottomRowsFrom(self.bottomTop() + 58);
+                const total = self.app.process_console.lines.items.len;
+                const max_start = if (total > visible) total - visible else 0;
+                var start = if (self.output_scroll_line == 0) max_start else @min(self.output_scroll_line - 1, max_start);
+                start = scrollValue(start, max_start, delta);
+                self.output_scroll_line = if (start == max_start) 0 else start + 1;
+            },
+            .git => {
+                const total = if (self.git_overview) |overview| overview.changes.len else 0;
+                const visible = self.bottomRowsFrom(gitChangesTop(self));
+                const max_start = if (total > visible) total - visible else 0;
+                self.git_scroll_line = scrollValue(self.git_scroll_line, max_start, delta);
+            },
+            .extensions => {
+                const total = if (self.extensions_registry) |registry| registry.items.items.len else 0;
+                const visible = self.bottomRowsFrom(self.bottomTop() + 86);
+                const max_start = if (total > visible) total - visible else 0;
+                self.extensions_scroll_line = scrollValue(self.extensions_scroll_line, max_start, delta);
+            },
+            .diagnostics => {
+                const total = self.app.diagnostics.items.items.len;
+                const visible = self.bottomRowsFrom(self.bottomTop() + 86);
+                const max_start = if (total > visible) total - visible else 0;
+                self.diagnostics_scroll_line = scrollValue(self.diagnostics_scroll_line, max_start, delta);
+            },
+            .security => {
+                const total = self.app.security_findings.items.items.len;
+                const visible = self.bottomRowsFrom(securityFindingsTop(self));
+                const max_start = if (total > visible) total - visible else 0;
+                self.security_scroll_line = scrollValue(self.security_scroll_line, max_start, delta);
+            },
+            .tutorial => {
+                const total = tutorialLines(self.tutorial_language).len;
+                const visible = self.bottomRowsFrom(self.bottomTop() + 86);
+                const max_start = if (total > visible) total - visible else 0;
+                self.tutorial_scroll_line = scrollValue(self.tutorial_scroll_line, max_start, delta);
+            },
+            .publish => {
+                const total = publishLines().len;
+                const visible = self.bottomRowsFrom(self.bottomTop() + 86);
+                const max_start = if (total > visible) total - visible else 0;
+                self.publish_scroll_line = scrollValue(self.publish_scroll_line, max_start, delta);
+            },
+        }
     }
 };
 
@@ -2328,13 +2409,28 @@ fn drawActionButton(x11: *X11, rect: HitRect, label: []const u8) !void {
     try x11.text(x11.gc.cyan, rect.left + 7, rect.top + 16, label);
 }
 
+fn drawScrollHint(x11: *X11, state: *const LinuxGuiState, total: usize, visible: usize, start: usize, y: i16) !void {
+    if (total <= visible or visible == 0) return;
+    var buf: [96]u8 = undefined;
+    const text = std.fmt.bufPrint(buf[0..], "rows {d}-{d}/{d}", .{
+        start + 1,
+        @min(total, start + visible),
+        total,
+    }) catch return;
+    const x = @max(@as(i16, 18), state.window_width - 170);
+    try x11.text(x11.gc.cyan, x, y, text);
+}
+
 fn drawOutputPanel(x11: *X11, state: *LinuxGuiState) !void {
     const app = &state.app;
     const bottom = state.bottomTop();
     var y: i16 = bottom + 58;
     const max_lines: usize = @intCast(@max(@divTrunc(state.window_height - bottom - STATUS_HEIGHT - 64, LINE_HEIGHT), 1));
-    const start = if (app.process_console.lines.items.len > max_lines) app.process_console.lines.items.len - max_lines else 0;
-    for (app.process_console.lines.items[start..]) |line| {
+    const max_start = if (app.process_console.lines.items.len > max_lines) app.process_console.lines.items.len - max_lines else 0;
+    const start = if (state.output_scroll_line == 0) max_start else @min(state.output_scroll_line - 1, max_start);
+    const limit = @min(app.process_console.lines.items.len, start + max_lines);
+    try drawScrollHint(x11, state, app.process_console.lines.items.len, max_lines, start, bottom + 58);
+    for (app.process_console.lines.items[start..limit]) |line| {
         var text_buf: [900]u8 = undefined;
         const color = if (line.stream == .stderr) x11.gc.red else x11.gc.muted;
         try x11.text(color, 18, y, asciiInto(text_buf[0..], line.text));
@@ -2398,9 +2494,25 @@ fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
         state.linux_security.maps_anonymous_executable,
     }) catch "PROC MAPS";
     try x11.text(if (state.linux_security.maps_writable_executable > 0) x11.gc.red else x11.gc.muted, 18, bottom + 154, maps_line);
-    var y: i16 = bottom + 182;
-    const limit = @min(app.security_findings.items.items.len, @as(usize, 6));
-    for (app.security_findings.items.items[0..limit]) |finding| {
+    var fd_buf: [300]u8 = undefined;
+    const fd_line = std.fmt.bufPrint(fd_buf[0..], "PROC FD read:{s} total:{d} no-cloexec:{d} unknown:{d} socket:{d} pipe:{d} memfd:{d} anon:{d} files:{d}", .{
+        if (state.linux_security.proc_fd_read) "yes" else "no",
+        state.linux_security.fd_total,
+        state.linux_security.fd_cloexec_missing,
+        state.linux_security.fd_cloexec_unknown,
+        state.linux_security.fd_sockets,
+        state.linux_security.fd_pipes,
+        state.linux_security.fd_memfd,
+        state.linux_security.fd_anon,
+        state.linux_security.fd_files,
+    }) catch "PROC FD";
+    try x11.text(if (state.linux_security.fd_cloexec_missing > 3) x11.gc.amber else x11.gc.muted, 18, bottom + 178, fd_line);
+    var y: i16 = securityFindingsTop(state);
+    const visible = state.bottomRowsFrom(y);
+    const start = @min(state.security_scroll_line, app.security_findings.items.items.len);
+    const limit = @min(app.security_findings.items.items.len, start + visible);
+    try drawScrollHint(x11, state, app.security_findings.items.items.len, visible, start, y);
+    for (app.security_findings.items.items[start..limit]) |finding| {
         var row_buf: [900]u8 = undefined;
         const row = std.fmt.bufPrint(row_buf[0..], "{s}:{d} [{s}] {s}", .{
             finding.path,
@@ -2462,11 +2574,13 @@ fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
         y += LINE_HEIGHT;
     }
 
-    const max_rows: usize = @intCast(@max(@divTrunc(state.window_height - y - STATUS_HEIGHT - 8, LINE_HEIGHT), 1));
-    const limit = @min(overview.changes.len, max_rows);
+    const max_rows = state.bottomRowsFrom(y);
+    const start = @min(state.git_scroll_line, overview.changes.len);
+    const limit = @min(overview.changes.len, start + max_rows);
+    try drawScrollHint(x11, state, overview.changes.len, max_rows, start, y);
     var row: usize = 0;
-    while (row < limit) : (row += 1) {
-        const change = overview.changes[row];
+    while (start + row < limit) : (row += 1) {
+        const change = overview.changes[start + row];
         var row_buf: [720]u8 = undefined;
         const line = std.fmt.bufPrint(row_buf[0..], "{s}  {s}  +{d}/-{d}{s}", .{
             @tagName(change.status),
@@ -2504,11 +2618,13 @@ fn drawExtensionsPanel(x11: *X11, state: *LinuxGuiState) !void {
     try x11.text(x11.gc.green, 18, bottom + 58, header);
 
     var y: i16 = bottom + 86;
-    const max_rows: usize = @intCast(@max(@divTrunc(state.window_height - y - STATUS_HEIGHT - 8, LINE_HEIGHT), 1));
-    const limit = @min(registry.items.items.len, max_rows);
+    const max_rows = state.bottomRowsFrom(y);
+    const start = @min(state.extensions_scroll_line, registry.items.items.len);
+    const limit = @min(registry.items.items.len, start + max_rows);
+    try drawScrollHint(x11, state, registry.items.items.len, max_rows, start, y);
     var row: usize = 0;
-    while (row < limit) : (row += 1) {
-        const extension = registry.items.items[row];
+    while (start + row < limit) : (row += 1) {
+        const extension = registry.items.items[start + row];
         const risk = extension_registry.extensionRisk(extension);
         var cap_buf: [220]u8 = undefined;
         const caps = extensionCapabilitiesLabel(cap_buf[0..], extension);
@@ -2539,8 +2655,11 @@ fn drawDiagnosticsPanel(x11: *X11, state: *LinuxGuiState) !void {
     const header = std.fmt.bufPrint(header_buf[0..], "DIAGNOSTICS total:{d}", .{app.diagnostics.items.items.len}) catch "DIAGNOSTICS";
     try x11.text(x11.gc.green, 18, bottom + 58, header);
     var y: i16 = bottom + 86;
-    const limit = @min(app.diagnostics.items.items.len, @as(usize, 6));
-    for (app.diagnostics.items.items[0..limit]) |item| {
+    const visible = state.bottomRowsFrom(y);
+    const start = @min(state.diagnostics_scroll_line, app.diagnostics.items.items.len);
+    const limit = @min(app.diagnostics.items.items.len, start + visible);
+    try drawScrollHint(x11, state, app.diagnostics.items.items.len, visible, start, y);
+    for (app.diagnostics.items.items[start..limit]) |item| {
         var row_buf: [900]u8 = undefined;
         const row = std.fmt.bufPrint(row_buf[0..], "{s}:{d}:{d} [{s}] {s}", .{
             item.path,
@@ -2572,10 +2691,13 @@ fn drawTutorialPanel(x11: *X11, state: *LinuxGuiState) !void {
 
     const lines = tutorialLines(state.tutorial_language);
     var y: i16 = bottom + 86;
-    for (lines) |line| {
+    const visible = state.bottomRowsFrom(y);
+    const start = @min(state.tutorial_scroll_line, lines.len);
+    const limit = @min(lines.len, start + visible);
+    try drawScrollHint(x11, state, lines.len, visible, start, y);
+    for (lines[start..limit]) |line| {
         try x11.text(x11.gc.muted, 18, y, line);
         y += LINE_HEIGHT;
-        if (y > state.window_height - STATUS_HEIGHT - 12) break;
     }
 }
 
@@ -2592,10 +2714,14 @@ fn drawPublishPanel(x11: *X11, state: *LinuxGuiState) !void {
     try x11.text(x11.gc.green, 18, bottom + 58, header);
 
     var y: i16 = bottom + 86;
-    for (publishLines()) |line| {
+    const lines = publishLines();
+    const visible = state.bottomRowsFrom(y);
+    const start = @min(state.publish_scroll_line, lines.len);
+    const limit = @min(lines.len, start + visible);
+    try drawScrollHint(x11, state, lines.len, visible, start, y);
+    for (lines[start..limit]) |line| {
         try x11.text(publishLineGc(x11, line), 18, y, line);
         y += LINE_HEIGHT;
-        if (y > state.window_height - STATUS_HEIGHT - 12) break;
     }
 }
 
@@ -2954,6 +3080,7 @@ fn readLinuxSecuritySnapshot(allocator: std.mem.Allocator, no_new_privs_set: Lin
     snapshot.dangerous_bounding_caps = countDangerousBoundingCapabilities();
     readLinuxProcStatus(allocator, &snapshot);
     readLinuxProcMaps(allocator, &snapshot);
+    readLinuxProcFd(&snapshot);
     return snapshot;
 }
 
@@ -3007,6 +3134,58 @@ fn readLinuxProcMaps(allocator: std.mem.Allocator, snapshot: *LinuxSecuritySnaps
         if (executable and (path.len == 0 or std.mem.startsWith(u8, path, "["))) {
             snapshot.maps_anonymous_executable += 1;
         }
+    }
+}
+
+fn readLinuxProcFd(snapshot: *LinuxSecuritySnapshot) void {
+    var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, "/proc/self/fd", .{ .iterate = true }) catch return;
+    defer dir.close(std.Options.debug_io);
+    snapshot.proc_fd_read = true;
+
+    var iter = dir.iterate();
+    var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    while (true) {
+        const maybe_entry = iter.next(std.Options.debug_io) catch {
+            snapshot.fd_unknown += 1;
+            break;
+        };
+        const entry = maybe_entry orelse break;
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+
+        const fd = std.fmt.parseInt(i32, entry.name, 10) catch {
+            snapshot.fd_unknown += 1;
+            continue;
+        };
+        snapshot.fd_total += 1;
+
+        const flags_rc = linux.fcntl(fd, linux.F.GETFD, 0);
+        if (linux.errno(flags_rc) == .SUCCESS) {
+            if ((flags_rc & linux.FD_CLOEXEC) == 0) snapshot.fd_cloexec_missing += 1;
+        } else {
+            snapshot.fd_cloexec_unknown += 1;
+        }
+
+        const target_len = dir.readLink(std.Options.debug_io, entry.name, target_buf[0..]) catch {
+            snapshot.fd_unknown += 1;
+            continue;
+        };
+        classifyLinuxFdTarget(snapshot, target_buf[0..target_len]);
+    }
+}
+
+fn classifyLinuxFdTarget(snapshot: *LinuxSecuritySnapshot, target: []const u8) void {
+    if (std.mem.startsWith(u8, target, "socket:")) {
+        snapshot.fd_sockets += 1;
+    } else if (std.mem.startsWith(u8, target, "pipe:")) {
+        snapshot.fd_pipes += 1;
+    } else if (std.mem.indexOf(u8, target, "memfd:") != null) {
+        snapshot.fd_memfd += 1;
+    } else if (std.mem.startsWith(u8, target, "anon_inode:")) {
+        snapshot.fd_anon += 1;
+    } else if (std.mem.startsWith(u8, target, "/")) {
+        snapshot.fd_files += 1;
+    } else {
+        snapshot.fd_unknown += 1;
     }
 }
 
@@ -3542,7 +3721,7 @@ fn gitChangeRowAt(state: *const LinuxGuiState, y: i16) ?usize {
     if (y < top) return null;
     const row = @divTrunc(@as(isize, y - top), LINE_HEIGHT);
     if (row < 0) return null;
-    return @intCast(row);
+    return state.git_scroll_line + @as(usize, @intCast(row));
 }
 
 fn extensionRowAt(state: *const LinuxGuiState, y: i16) ?usize {
@@ -3550,7 +3729,11 @@ fn extensionRowAt(state: *const LinuxGuiState, y: i16) ?usize {
     if (y < top) return null;
     const row = @divTrunc(@as(isize, y - top), LINE_HEIGHT);
     if (row < 0) return null;
-    return @intCast(row);
+    return state.extensions_scroll_line + @as(usize, @intCast(row));
+}
+
+fn securityFindingsTop(state: *const LinuxGuiState) i16 {
+    return state.bottomTop() + 206;
 }
 
 fn documentTabAt(state: *const LinuxGuiState, x: i16, y: i16) ?usize {

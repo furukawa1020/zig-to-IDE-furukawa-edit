@@ -9,9 +9,11 @@ const event_mod = @import("../core/event.zig");
 const input_handler = @import("../core/input_handler.zig");
 const document_mod = @import("../editor/document.zig");
 const navigation = @import("../editor/navigation.zig");
+const git_repository = @import("../git/repository.zig");
 const modes = @import("../language/modes.zig");
 const symbols_mod = @import("../language/symbols.zig");
 const findings_mod = @import("../security/findings.zig");
+const text_integrity = @import("../security/text_integrity.zig");
 const file_finder = @import("../search/file_finder.zig");
 const literal_search = @import("../search/literal.zig");
 const workspace_search = @import("../search/workspace_search.zig");
@@ -355,6 +357,23 @@ const HeaderAction = enum {
     publish,
 };
 
+const GitPanelAction = enum {
+    refresh,
+    status,
+    diff,
+    issues,
+};
+
+const SecurityPanelAction = enum {
+    audit,
+    lock,
+    scan,
+    lf,
+    crlf,
+    clean,
+    linux,
+};
+
 const QuickPanelMode = enum {
     open_workspace,
     find_file,
@@ -659,7 +678,11 @@ const LinuxSecuritySnapshot = struct {
     no_new_privs_set: LinuxFlag = .unknown,
     dumpable: LinuxFlag = .unknown,
     dumpable_set: LinuxFlag = .unknown,
+    ambient_clear: LinuxFlag = .unknown,
     seccomp_mode: ?u8 = null,
+    dangerous_bounding_caps: usize = 0,
+    bounding_caps_dropped: usize = 0,
+    bounding_caps_drop_failed: usize = 0,
     cap_eff: [32]u8 = [_]u8{0} ** 32,
     cap_eff_len: usize = 0,
     cap_eff_zero: LinuxFlag = .unknown,
@@ -670,6 +693,7 @@ const LinuxGuiState = struct {
     allocator: std.mem.Allocator,
     app: app_mod.App,
     quick_panel: QuickPanel,
+    git_overview: ?git_repository.Overview = null,
     linux_security: LinuxSecuritySnapshot = .{},
     last_document_search_query: std.array_list.Managed(u8),
     last_document_search_options: literal_search.Options = .{},
@@ -692,6 +716,7 @@ const LinuxGuiState = struct {
     }
 
     fn deinit(self: *LinuxGuiState) void {
+        self.clearGitOverview();
         self.last_document_search_query.deinit();
         self.quick_panel.deinit();
         self.app.deinit();
@@ -713,19 +738,31 @@ const LinuxGuiState = struct {
     fn enableLinuxSelfProtection(self: *LinuxGuiState) void {
         self.linux_security.no_new_privs_set = if (trySetNoNewPrivs()) .on else .off;
         self.linux_security.dumpable_set = if (trySetDumpable(false)) .on else .off;
+        self.linux_security.ambient_clear = if (tryClearAmbientCapabilities()) .on else .off;
+        const drops = tryDropDangerousBoundingCapabilities();
+        self.linux_security.bounding_caps_dropped = drops.dropped;
+        self.linux_security.bounding_caps_drop_failed = drops.failed;
         self.refreshLinuxSelfProtection();
-        self.appendOutput(.stdout, "linux self-protection: no_new_privs_set={s} no_new_privs={s} dumpable={s} dumpable_set={s} seccomp={s} cap_eff={s}\n", .{
+        self.appendOutput(.stdout, "linux self-protection: no_new_privs_set={s} no_new_privs={s} dumpable={s} dumpable_set={s} ambient_clear={s} seccomp={s} cap_eff={s} dangerous_bound={d} dropped={d} drop_failed={d}\n", .{
             flagLabel(self.linux_security.no_new_privs_set),
             flagLabel(self.linux_security.no_new_privs),
             flagLabel(self.linux_security.dumpable),
             flagLabel(self.linux_security.dumpable_set),
+            flagLabel(self.linux_security.ambient_clear),
             seccompLabel(self.linux_security.seccomp_mode),
             self.linuxSecurityCapEffLabel(),
+            self.linux_security.dangerous_bounding_caps,
+            self.linux_security.bounding_caps_dropped,
+            self.linux_security.bounding_caps_drop_failed,
         });
     }
 
     fn refreshLinuxSelfProtection(self: *LinuxGuiState) void {
-        self.linux_security = readLinuxSecuritySnapshot(self.allocator, self.linux_security.no_new_privs_set, self.linux_security.dumpable_set);
+        const previous = self.linux_security;
+        self.linux_security = readLinuxSecuritySnapshot(self.allocator, previous.no_new_privs_set, previous.dumpable_set);
+        self.linux_security.ambient_clear = previous.ambient_clear;
+        self.linux_security.bounding_caps_dropped = previous.bounding_caps_dropped;
+        self.linux_security.bounding_caps_drop_failed = previous.bounding_caps_drop_failed;
     }
 
     fn linuxSecurityCapEffLabel(self: *const LinuxGuiState) []const u8 {
@@ -819,6 +856,18 @@ const LinuxGuiState = struct {
             self.openQuickPanel(.replace_document);
             return;
         }
+        if (std.mem.eql(u8, id, "editor.normalize_newlines_lf")) {
+            self.normalizeActiveDocumentNewlines(.lf);
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.normalize_newlines_crlf")) {
+            self.normalizeActiveDocumentNewlines(.crlf);
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.sanitize_hidden_controls")) {
+            self.sanitizeActiveDocumentHiddenControls();
+            return;
+        }
         if (std.mem.eql(u8, id, "editor.find_next")) {
             self.findLastDocumentSearch(.forward);
             return;
@@ -831,6 +880,10 @@ const LinuxGuiState = struct {
             self.openQuickPanel(.search_workspace);
             return;
         }
+        if (std.mem.eql(u8, id, "git.overview") or std.mem.eql(u8, id, "github.overview")) {
+            self.openGitPanel();
+            return;
+        }
         if (std.mem.eql(u8, id, "file.new")) {
             self.openQuickPanel(.new_file);
             return;
@@ -841,6 +894,14 @@ const LinuxGuiState = struct {
         }
         if (std.mem.eql(u8, id, "symbol.goto_symbol")) {
             self.openQuickPanel(.document_symbols);
+            return;
+        }
+        if (std.mem.eql(u8, id, "symbol.goto_definition")) {
+            self.gotoLocalDefinitionAtCursor();
+            return;
+        }
+        if (std.mem.eql(u8, id, "symbol.find_references")) {
+            self.findReferencesAtCursor();
             return;
         }
         if (std.mem.eql(u8, id, "symbol.rename")) {
@@ -929,7 +990,7 @@ const LinuxGuiState = struct {
             .save_all => self.execute("file.save_all", .keybinding),
             .build => self.execute("zig.build", .keybinding),
             .test_run => self.execute("zig.test", .keybinding),
-            .git => self.execute("git.overview", .keybinding),
+            .git => self.openGitPanel(),
             .audit => self.execute("security.audit_workspace", .keybinding),
             .scan => self.execute("security.scan_current", .keybinding),
             .extensions => self.execute("extensions.scan", .keybinding),
@@ -938,6 +999,70 @@ const LinuxGuiState = struct {
                 self.message("help: tutorial opened", .{});
             },
             .publish => self.execute("release.checklist", .keybinding),
+        }
+    }
+
+    fn openGitPanel(self: *LinuxGuiState) void {
+        self.bottom_panel = .git;
+        self.refreshGitOverview();
+    }
+
+    fn refreshGitOverview(self: *LinuxGuiState) void {
+        self.clearGitOverview();
+        const overview = git_repository.inspect(self.allocator, &self.app.workspace, .{}) catch |err| {
+            self.message("git overview failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "git overview failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        const present = overview.present;
+        const changes = overview.changes.len;
+        self.git_overview = overview;
+        if (present) {
+            self.message("git overview refreshed: {d} change(s)", .{changes});
+        } else {
+            self.message("no git repository", .{});
+        }
+    }
+
+    fn clearGitOverview(self: *LinuxGuiState) void {
+        if (self.git_overview) |*overview| {
+            overview.deinit();
+            self.git_overview = null;
+        }
+    }
+
+    fn executeGitPanelAction(self: *LinuxGuiState, action: GitPanelAction) void {
+        self.bottom_panel = .git;
+        switch (action) {
+            .refresh => self.refreshGitOverview(),
+            .status => {
+                self.execute("git.status", .command_palette);
+                self.bottom_panel = .output;
+            },
+            .diff => {
+                self.execute("git.diff_current", .command_palette);
+                self.bottom_panel = .output;
+            },
+            .issues => {
+                self.execute("github.issues", .command_palette);
+                self.bottom_panel = .output;
+            },
+        }
+    }
+
+    fn executeSecurityPanelAction(self: *LinuxGuiState, action: SecurityPanelAction) void {
+        self.bottom_panel = .security;
+        switch (action) {
+            .audit => self.execute("security.audit_workspace", .command_palette),
+            .lock => self.execute("security.lock_workspace", .command_palette),
+            .scan => self.refreshActiveSecurityFindings("current file security scan"),
+            .lf => self.normalizeActiveDocumentNewlines(.lf),
+            .crlf => self.normalizeActiveDocumentNewlines(.crlf),
+            .clean => self.sanitizeActiveDocumentHiddenControls(),
+            .linux => {
+                self.refreshLinuxSelfProtection();
+                self.message("linux self-protection refreshed", .{});
+            },
         }
     }
 
@@ -1159,11 +1284,7 @@ const LinuxGuiState = struct {
                 const name = self.allocator.dupe(u8, item.name) catch |err| return self.message("task failed: {s}", .{@errorName(err)});
                 defer self.allocator.free(name);
                 self.quick_panel.close();
-                const result = dispatcher.dispatch(&self.app, .{ .id = "task.run", .argument = name, .source = .command_palette }) catch |err| {
-                    self.message("task failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                self.handleDispatchResult("task.run", result);
+                self.runTaskByName(name);
             },
             .document_symbols => {
                 const item = self.quick_panel.selectedSymbol() orelse return self.message("no symbol selected", .{});
@@ -1171,6 +1292,89 @@ const LinuxGuiState = struct {
                 self.quick_panel.close();
                 self.jumpToActiveDocumentOffset(offset, "opened symbol");
             },
+        }
+    }
+
+    fn runTaskByName(self: *LinuxGuiState, name: []const u8) void {
+        const queued = dispatcher.dispatch(&self.app, .{ .id = "task.run", .argument = name, .source = .command_palette }) catch |err| {
+            self.message("task failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "task queue failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult("task.run", queued);
+        if (std.meta.activeTag(queued) != .completed) return;
+
+        const run_result = dispatcher.dispatch(&self.app, .{ .id = "task.run_next", .source = .task }) catch |err| {
+            self.message("task run failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "task run failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult("task.run_next", run_result);
+        self.bottom_panel = .output;
+    }
+
+    fn normalizeActiveDocumentNewlines(self: *LinuxGuiState, newline: document_mod.Newline) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        const changed = doc.normalizeNewlines(newline) catch |err| return self.message("newline normalize failed: {s}", .{@errorName(err)});
+        self.selection_anchor = null;
+        self.ensureEditorCursorVisible();
+        if (changed) {
+            const result_message = switch (newline) {
+                .lf => "normalized line endings to LF",
+                .crlf => "normalized line endings to CRLF",
+                else => "normalized line endings",
+            };
+            self.refreshActiveSecurityFindings(result_message);
+        } else {
+            self.message("line endings already normalized", .{});
+        }
+    }
+
+    fn sanitizeActiveDocumentHiddenControls(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        var sanitized: std.Io.Writer.Allocating = .init(self.allocator);
+        defer sanitized.deinit();
+
+        const before_cursor = doc.cursor.position;
+        var removed: usize = 0;
+        var index: usize = 0;
+        while (index < doc.text.bytes.len) {
+            if (text_integrity.hiddenControlLengthAt(doc.text.bytes, index)) |len| {
+                removed += 1;
+                index += len;
+                continue;
+            }
+            sanitized.writer.writeByte(doc.text.bytes[index]) catch |err| return self.message("sanitize failed: {s}", .{@errorName(err)});
+            index += 1;
+        }
+
+        if (removed == 0) return self.message("no hidden controls to clean", .{});
+
+        doc.replaceRange(0, doc.text.bytes.len, sanitized.written()) catch |err| return self.message("sanitize failed: {s}", .{@errorName(err)});
+        const target_line = @min(before_cursor.line, doc.text.lineCount() - 1);
+        const target_column = @min(before_cursor.column, doc.text.lineSlice(target_line).len);
+        const target_offset = doc.text.lineColumnToOffset(target_line, target_column) catch @min(before_cursor.byte_offset, doc.text.bytes.len);
+        doc.cursor.position = doc.positionFromOffset(target_offset) catch doc.cursor.position;
+        self.selection_anchor = null;
+        self.ensureEditorCursorVisible();
+        self.refreshActiveSecurityFindings("removed hidden control markers");
+    }
+
+    fn refreshActiveSecurityFindings(self: *LinuxGuiState, text: []const u8) void {
+        const result = dispatcher.dispatch(&self.app, .{ .id = "security.scan_current", .source = .command_palette }) catch |err| {
+            self.message("security scan failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult("security.scan_current", result);
+        self.refreshLinuxSelfProtection();
+        self.bottom_panel = .security;
+        switch (result) {
+            .completed => self.message("{s}", .{text}),
+            .blocked => |reason| self.message("{s}", .{reason}),
+            .unknown_command => self.message("security scan command missing", .{}),
+            .no_active_document => self.message("no active document", .{}),
+            .external_command => {},
+            .unsupported => |reason| self.message("{s}", .{reason}),
         }
     }
 
@@ -1268,6 +1472,51 @@ const LinuxGuiState = struct {
         self.selectActiveDocumentRange(match.start, match.end, "found match");
     }
 
+    fn gotoLocalDefinitionAtCursor(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse return self.message("no identifier under cursor", .{});
+        const path = doc.path orelse "(scratch)";
+        var index = symbols_mod.collectTopLevel(self.allocator, doc.text.bytes, path) catch |err| return self.message("symbol scan failed: {s}", .{@errorName(err)});
+        defer index.deinit();
+
+        for (index.symbols) |symbol| {
+            if (!std.mem.eql(u8, symbol.name, name)) continue;
+            self.selection_anchor = null;
+            navigation.setCursor(doc, symbol.range.start);
+            self.app.focus = .editor;
+            self.app.mode = .insert;
+            self.ensureEditorCursorVisible();
+            self.message("jumped to definition", .{});
+            return;
+        }
+        self.message("no local top-level definition", .{});
+    }
+
+    fn findReferencesAtCursor(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse return self.message("no identifier under cursor", .{});
+        const owned_name = self.allocator.dupe(u8, name) catch |err| return self.message("reference search failed: {s}", .{@errorName(err)});
+        defer self.allocator.free(owned_name);
+
+        const results = workspace_search.search(self.allocator, &self.app.workspace, owned_name, .{
+            .literal_options = .{ .whole_word = true },
+            .max_file_bytes = 2 * 1024 * 1024,
+            .max_results = 1024,
+        }) catch |err| return self.message("reference search failed: {s}", .{@errorName(err)});
+        defer {
+            for (results) |*item| item.deinit(self.allocator);
+            self.allocator.free(results);
+        }
+
+        self.bottom_panel = .output;
+        self.appendOutput(.stdout, "references for {s}: {d}\n", .{ owned_name, results.len });
+        for (results[0..@min(results.len, @as(usize, 80))]) |item| {
+            self.appendOutput(.stdout, "{s}:{d}:{d}: {s}\n", .{ item.path, item.line + 1, item.column + 1, item.preview });
+        }
+        if (results.len > 80) self.appendOutput(.stdout, "... {d} more references\n", .{results.len - 80});
+        self.message("found {d} reference(s)", .{results.len});
+    }
+
     fn renameWorkspaceSymbol(self: *LinuxGuiState, old_name: []const u8, new_name: []const u8) void {
         if (std.mem.eql(u8, old_name, new_name)) return self.message("rename target unchanged", .{});
         const results = workspace_search.search(self.allocator, &self.app.workspace, old_name, .{
@@ -1333,7 +1582,7 @@ const LinuxGuiState = struct {
         self.bottom_panel = .output;
         self.message("workspace opened", .{});
         self.appendOutput(.stdout, "opened workspace: {s}\n", .{self.app.workspace.root_path});
-        self.execute("git.overview", .startup);
+        self.refreshGitOverview();
         self.execute("security.audit_workspace", .startup);
     }
 
@@ -1372,6 +1621,14 @@ const LinuxGuiState = struct {
                 8 => {
                     self.bottom_panel = .diagnostics;
                     self.execute("diagnostics.next", .keybinding);
+                    return;
+                },
+                12 => {
+                    if (key.modifiers.shift) {
+                        self.findReferencesAtCursor();
+                    } else {
+                        self.gotoLocalDefinitionAtCursor();
+                    }
                     return;
                 },
                 else => {},
@@ -1577,10 +1834,13 @@ const LinuxGuiState = struct {
     }
 
     fn handleBottomPanelContentClick(self: *LinuxGuiState, x: i16, y: i16) bool {
-        _ = x;
         const bottom = self.bottomTop();
         switch (self.bottom_panel) {
             .security => {
+                if (securityPanelActionAt(self, x, y)) |action| {
+                    self.executeSecurityPanelAction(action);
+                    return true;
+                }
                 const row = @divTrunc(@as(isize, y - (bottom + 144)), LINE_HEIGHT);
                 if (row < 0) return true;
                 const index: usize = @intCast(row);
@@ -1600,7 +1860,19 @@ const LinuxGuiState = struct {
                 return true;
             },
             .git => {
-                self.execute("git.diff_current", .keybinding);
+                if (gitPanelActionAt(self, x, y)) |action| {
+                    self.executeGitPanelAction(action);
+                    return true;
+                }
+                if (gitChangeRowAt(self, y)) |index| {
+                    if (self.git_overview) |overview| {
+                        if (index < overview.changes.len) {
+                            self.openRelativeLocation(overview.changes[index].path, 0, 0);
+                        }
+                    }
+                } else {
+                    self.executeGitPanelAction(.diff);
+                }
                 return true;
             },
             else => return true,
@@ -1691,7 +1963,7 @@ pub fn run(allocator: std.mem.Allocator, root_path: []const u8, environ: *const 
     defer state.deinit();
 
     state.enableLinuxSelfProtection();
-    state.execute("git.overview", .startup);
+    state.refreshGitOverview();
     state.execute("security.audit_workspace", .startup);
 
     var x11 = try X11.connect(allocator, environ);
@@ -1942,6 +2214,11 @@ fn drawPanelTab(x11: *X11, bottom: i16, active: bool, x: i16, label: []const u8)
     try x11.text(if (active) x11.gc.bg else x11.gc.cyan, x, bottom + 27, label);
 }
 
+fn drawActionButton(x11: *X11, rect: HitRect, label: []const u8) !void {
+    try x11.fillRect(x11.gc.panel_2, rect.left, rect.top, @intCast(rect.right - rect.left), @intCast(rect.bottom - rect.top));
+    try x11.text(x11.gc.cyan, rect.left + 7, rect.top + 16, label);
+}
+
 fn drawOutputPanel(x11: *X11, state: *LinuxGuiState) !void {
     const app = &state.app;
     const bottom = state.bottomTop();
@@ -1962,6 +2239,7 @@ fn drawOutputPanel(x11: *X11, state: *LinuxGuiState) !void {
 fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
     const app = &state.app;
     const bottom = state.bottomTop();
+    try drawSecurityPanelActions(x11, state);
     var header_buf: [180]u8 = undefined;
     const header = std.fmt.bufPrint(header_buf[0..], "{d} finding(s) / trust={s}", .{
         app.security_findings.items.items.len,
@@ -1983,17 +2261,24 @@ fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
     }) catch "BOUNDARY";
     try x11.text(x11.gc.amber, 18, bottom + 82, boundary);
     var linux_buf: [260]u8 = undefined;
-    const linux_line = std.fmt.bufPrint(linux_buf[0..], "LINUX SELF nnp:{s}/{s} dump:{s}/{s} seccomp:{s} cap_eff:{s} proc:{s}", .{
+    const linux_line = std.fmt.bufPrint(linux_buf[0..], "LINUX SELF nnp:{s}/{s} dump:{s}/{s} ambient:{s} seccomp:{s} cap_eff:{s} bound:{d}", .{
         flagLabel(state.linux_security.no_new_privs),
         flagLabel(state.linux_security.no_new_privs_set),
         flagLabel(state.linux_security.dumpable),
         flagLabel(state.linux_security.dumpable_set),
+        flagLabel(state.linux_security.ambient_clear),
         seccompLabel(state.linux_security.seccomp_mode),
         state.linuxSecurityCapEffLabel(),
-        if (state.linux_security.proc_status_read) "read" else "blocked",
+        state.linux_security.dangerous_bounding_caps,
     }) catch "LINUX SELF";
     try x11.text(x11.gc.cyan, 18, bottom + 106, linux_line);
-    try x11.text(x11.gc.muted, 18, bottom + 130, "direct X11 socket / no toolkit plugin host / no_new_privs children / dumpable off when supported");
+    var cap_buf: [220]u8 = undefined;
+    const cap_line = std.fmt.bufPrint(cap_buf[0..], "direct X11 / no toolkit host / dangerous bounding caps dropped:{d} failed:{d} / proc:{s}", .{
+        state.linux_security.bounding_caps_dropped,
+        state.linux_security.bounding_caps_drop_failed,
+        if (state.linux_security.proc_status_read) "read" else "blocked",
+    }) catch "linux cap boundary";
+    try x11.text(x11.gc.muted, 18, bottom + 130, cap_line);
     var y: i16 = bottom + 158;
     const limit = @min(app.security_findings.items.items.len, @as(usize, 6));
     for (app.security_findings.items.items[0..limit]) |finding| {
@@ -2015,17 +2300,68 @@ fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
 
 fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
     const bottom = state.bottomTop();
-    try x11.text(x11.gc.green, 18, bottom + 58, "Git/GitHub overview is read by ZIDE without running git hooks or filters.");
-    var y: i16 = bottom + 86;
-    const app = &state.app;
-    const max_lines: usize = @intCast(@max(@divTrunc(state.window_height - bottom - STATUS_HEIGHT - 92, LINE_HEIGHT), 1));
-    const start = if (app.process_console.lines.items.len > max_lines) app.process_console.lines.items.len - max_lines else 0;
-    for (app.process_console.lines.items[start..]) |line| {
-        if (std.mem.indexOf(u8, line.text, "git") == null and std.mem.indexOf(u8, line.text, "Git") == null and std.mem.indexOf(u8, line.text, "branch") == null and std.mem.indexOf(u8, line.text, "remote") == null) continue;
-        var ascii_buf: [900]u8 = undefined;
-        try x11.text(x11.gc.muted, 18, y, asciiInto(ascii_buf[0..], line.text));
+    try drawGitPanelActions(x11, state);
+    try x11.text(x11.gc.green, 18, bottom + 58, "GIT / hook-free repository view");
+
+    const overview = state.git_overview orelse {
+        try x11.text(x11.gc.muted, 18, bottom + 86, "Press REFRESH. ZIDE reads .git directly without running hooks, filters, fsmonitor, or git status.");
+        return;
+    };
+
+    if (!overview.present) {
+        try x11.text(x11.gc.muted, 18, bottom + 86, "No Git repository detected in this workspace.");
+        return;
+    }
+
+    var meta_buf: [720]u8 = undefined;
+    const meta = std.fmt.bufPrint(meta_buf[0..], "branch:{s} commit:{s} index:v{d} entries:{d} tracked-clean:{d} changes:{d} workflows:{d}", .{
+        overview.branch orelse "(detached)",
+        if (overview.commit) |commit| commit[0..@min(commit.len, 12)] else "unknown",
+        overview.index_version orelse 0,
+        overview.index_entries,
+        overview.clean_tracked,
+        overview.changes.len,
+        overview.workflow_files,
+    }) catch "git overview";
+    var meta_ascii: [720]u8 = undefined;
+    try x11.text(x11.gc.muted, 18, bottom + 82, asciiInto(meta_ascii[0..], meta));
+
+    var y: i16 = bottom + 108;
+    if (overview.remotes.len > 0) {
+        for (overview.remotes[0..@min(overview.remotes.len, @as(usize, 2))]) |remote| {
+            var remote_buf: [720]u8 = undefined;
+            const remote_line = if (remote.github) |github|
+                std.fmt.bufPrint(remote_buf[0..], "remote:{s} github:{s}/{s} actions:{s}", .{ remote.name, github.owner, github.repo, github.actions_url }) catch remote.name
+            else
+                std.fmt.bufPrint(remote_buf[0..], "remote:{s} {s}", .{ remote.name, remote.url }) catch remote.name;
+            var remote_ascii: [720]u8 = undefined;
+            try x11.text(x11.gc.cyan, 18, y, asciiInto(remote_ascii[0..], remote_line));
+            y += LINE_HEIGHT;
+        }
+    } else {
+        try x11.text(x11.gc.muted, 18, y, "No remotes configured.");
         y += LINE_HEIGHT;
-        if (y > state.window_height - STATUS_HEIGHT - 12) break;
+    }
+
+    const max_rows: usize = @intCast(@max(@divTrunc(state.window_height - y - STATUS_HEIGHT - 8, LINE_HEIGHT), 1));
+    const limit = @min(overview.changes.len, max_rows);
+    var row: usize = 0;
+    while (row < limit) : (row += 1) {
+        const change = overview.changes[row];
+        var row_buf: [720]u8 = undefined;
+        const line = std.fmt.bufPrint(row_buf[0..], "{s}  {s}  +{d}/-{d}{s}", .{
+            @tagName(change.status),
+            change.path,
+            change.additions,
+            change.deletions,
+            if (change.diff_available) " diff" else "",
+        }) catch change.path;
+        var row_ascii: [720]u8 = undefined;
+        try x11.text(if (change.status == .deleted) x11.gc.red else x11.gc.muted, 18, y, asciiInto(row_ascii[0..], line));
+        y += LINE_HEIGHT;
+    }
+    if (overview.changes.len == 0) {
+        try x11.text(x11.gc.muted, 18, y, "No tracked or untracked changes found by the safe .git reader.");
     }
 }
 
@@ -2271,6 +2607,57 @@ fn trySetDumpable(enabled: bool) bool {
     return linux.errno(rc) == .SUCCESS;
 }
 
+const PR_CAP_AMBIENT_CLEAR_ALL: usize = 4;
+
+const dangerous_caps = [_]usize{
+    1, // CAP_DAC_OVERRIDE
+    2, // CAP_DAC_READ_SEARCH
+    12, // CAP_NET_ADMIN
+    13, // CAP_NET_RAW
+    16, // CAP_SYS_MODULE
+    17, // CAP_SYS_RAWIO
+    19, // CAP_SYS_PTRACE
+    21, // CAP_SYS_ADMIN
+    24, // CAP_SYS_RESOURCE
+    25, // CAP_SYS_TIME
+    27, // CAP_MKNOD
+};
+
+const CapabilityDropResult = struct {
+    dropped: usize = 0,
+    failed: usize = 0,
+};
+
+fn tryClearAmbientCapabilities() bool {
+    const rc = linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    return linux.errno(rc) == .SUCCESS;
+}
+
+fn tryDropDangerousBoundingCapabilities() CapabilityDropResult {
+    var result: CapabilityDropResult = .{};
+    for (dangerous_caps) |cap| {
+        const read_rc = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
+        if (linux.errno(read_rc) != .SUCCESS or read_rc == 0) continue;
+
+        const drop_rc = linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), cap, 0, 0, 0);
+        if (linux.errno(drop_rc) == .SUCCESS) {
+            result.dropped += 1;
+        } else {
+            result.failed += 1;
+        }
+    }
+    return result;
+}
+
+fn countDangerousBoundingCapabilities() usize {
+    var count: usize = 0;
+    for (dangerous_caps) |cap| {
+        const rc = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
+        if (linux.errno(rc) == .SUCCESS and rc != 0) count += 1;
+    }
+    return count;
+}
+
 fn readLinuxSecuritySnapshot(allocator: std.mem.Allocator, no_new_privs_set: LinuxFlag, dumpable_set: LinuxFlag) LinuxSecuritySnapshot {
     var snapshot = LinuxSecuritySnapshot{
         .no_new_privs_set = no_new_privs_set,
@@ -2292,6 +2679,7 @@ fn readLinuxSecuritySnapshot(allocator: std.mem.Allocator, no_new_privs_set: Lin
         snapshot.seccomp_mode = @intCast(@min(seccomp_rc, 255));
     }
 
+    snapshot.dangerous_bounding_caps = countDangerousBoundingCapabilities();
     readLinuxProcStatus(allocator, &snapshot);
     return snapshot;
 }
@@ -2527,6 +2915,8 @@ fn keyEventFromX(bytes: []const u8) ?event_mod.KeyEvent {
         69 => .{ .function = 3 },
         72 => .{ .function = 6 },
         73 => .{ .function = 7 },
+        95 => .{ .function = 11 },
+        96 => .{ .function = 12 },
         111 => .arrow_up,
         113 => .arrow_left,
         114 => .arrow_right,
@@ -2656,6 +3046,101 @@ fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
         if (pointIn(rect, x, y)) return panel;
     }
     return null;
+}
+
+const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .issues };
+const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .linux };
+
+fn drawGitPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
+    inline for (git_panel_actions) |action| {
+        try drawActionButton(x11, gitPanelActionRect(state, action), gitPanelActionLabel(action));
+    }
+}
+
+fn drawSecurityPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
+    inline for (security_panel_actions) |action| {
+        try drawActionButton(x11, securityPanelActionRect(state, action), securityPanelActionLabel(action));
+    }
+}
+
+fn gitPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?GitPanelAction {
+    inline for (git_panel_actions) |action| {
+        if (pointIn(gitPanelActionRect(state, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn securityPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?SecurityPanelAction {
+    inline for (security_panel_actions) |action| {
+        if (pointIn(securityPanelActionRect(state, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn gitPanelActionRect(state: *const LinuxGuiState, action: GitPanelAction) HitRect {
+    const index: i16 = switch (action) {
+        .refresh => 0,
+        .status => 1,
+        .diff => 2,
+        .issues => 3,
+    };
+    const width: i16 = 74;
+    const gap: i16 = 8;
+    const right = state.window_width - 18 - (3 - index) * (width + gap);
+    const bottom = state.bottomTop();
+    return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
+}
+
+fn securityPanelActionRect(state: *const LinuxGuiState, action: SecurityPanelAction) HitRect {
+    const index: i16 = switch (action) {
+        .audit => 0,
+        .lock => 1,
+        .scan => 2,
+        .lf => 3,
+        .crlf => 4,
+        .clean => 5,
+        .linux => 6,
+    };
+    const width: i16 = 64;
+    const gap: i16 = 7;
+    const right = state.window_width - 18 - (6 - index) * (width + gap);
+    const bottom = state.bottomTop();
+    return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
+}
+
+fn gitPanelActionLabel(action: GitPanelAction) []const u8 {
+    return switch (action) {
+        .refresh => "REFRESH",
+        .status => "STATUS",
+        .diff => "DIFF",
+        .issues => "ISSUES",
+    };
+}
+
+fn securityPanelActionLabel(action: SecurityPanelAction) []const u8 {
+    return switch (action) {
+        .audit => "AUDIT",
+        .lock => "LOCK",
+        .scan => "SCAN",
+        .lf => "LF",
+        .crlf => "CRLF",
+        .clean => "CLEAN",
+        .linux => "LINUX",
+    };
+}
+
+fn gitChangesTop(state: *const LinuxGuiState) i16 {
+    const bottom = state.bottomTop();
+    const remote_rows: usize = if (state.git_overview) |overview| @max(@min(overview.remotes.len, @as(usize, 2)), 1) else 1;
+    return bottom + 108 + @as(i16, @intCast(remote_rows)) * LINE_HEIGHT;
+}
+
+fn gitChangeRowAt(state: *const LinuxGuiState, y: i16) ?usize {
+    const top = gitChangesTop(state);
+    if (y < top) return null;
+    const row = @divTrunc(@as(isize, y - top), LINE_HEIGHT);
+    if (row < 0) return null;
+    return @intCast(row);
 }
 
 fn documentTabAt(state: *const LinuxGuiState, x: i16, y: i16) ?usize {

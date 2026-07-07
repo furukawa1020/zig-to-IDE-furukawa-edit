@@ -3,6 +3,9 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const app_mod = @import("../core/app.zig");
 const dispatcher = @import("../core/dispatcher.zig");
+const event_mod = @import("../core/event.zig");
+const input_handler = @import("../core/input_handler.zig");
+const modes = @import("../language/modes.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("linux_x11.zig is Linux-only");
@@ -15,6 +18,10 @@ const HEADER_HEIGHT = 58;
 const STATUS_HEIGHT = 28;
 const OUTPUT_HEIGHT = 210;
 const LINE_HEIGHT = 19;
+const EDITOR_LEFT = FILE_WIDTH + 24;
+const EDITOR_TOP = HEADER_HEIGHT + 58;
+const EDITOR_TEXT_TOP = EDITOR_TOP + 44;
+const BOTTOM_TOP = HEIGHT - OUTPUT_HEIGHT - STATUS_HEIGHT;
 
 const X = struct {
     const EventMask = struct {
@@ -315,27 +322,159 @@ const XAuth = struct {
     data: []u8,
 };
 
-pub fn run(allocator: std.mem.Allocator, root_path: []const u8, environ: *const std.process.Environ.Map) !void {
-    var app = try app_mod.App.init(allocator, root_path);
-    defer app.deinit();
+const BottomPanel = enum {
+    output,
+    security,
+    git,
+};
 
-    _ = dispatcher.dispatch(&app, .{ .id = "git.overview", .source = .startup }) catch {};
-    _ = dispatcher.dispatch(&app, .{ .id = "security.audit_workspace", .source = .startup }) catch {};
+const LinuxGuiState = struct {
+    allocator: std.mem.Allocator,
+    app: app_mod.App,
+    bottom_panel: BottomPanel = .output,
+    editor_scroll_line: usize = 0,
+    message_buf: [240]u8 = [_]u8{0} ** 240,
+    message_len: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, root_path: []const u8) !LinuxGuiState {
+        return .{
+            .allocator = allocator,
+            .app = try app_mod.App.init(allocator, root_path),
+        };
+    }
+
+    fn deinit(self: *LinuxGuiState) void {
+        self.app.deinit();
+        self.* = undefined;
+    }
+
+    fn message(self: *LinuxGuiState, comptime fmt: []const u8, args: anytype) void {
+        const written = std.fmt.bufPrint(self.message_buf[0..], fmt, args) catch self.message_buf[0..0];
+        self.message_len = written.len;
+    }
+
+    fn execute(self: *LinuxGuiState, id: []const u8, source: @import("../core/command.zig").Source) void {
+        const result = dispatcher.dispatch(&self.app, .{ .id = id, .source = source }) catch |err| {
+            self.message("{s} failed: {s}", .{ id, @errorName(err) });
+            self.app.process_console.appendBytes(.stderr, "command failed\n") catch {};
+            return;
+        };
+        self.handleDispatchResult(id, result);
+    }
+
+    fn handleOutcome(self: *LinuxGuiState, outcome: input_handler.Outcome) void {
+        switch (outcome) {
+            .ignored => {},
+            .redraw => {},
+            .command_result => |result| self.handleDispatchResult("input", result),
+        }
+    }
+
+    fn handleDispatchResult(self: *LinuxGuiState, id: []const u8, result: dispatcher.Result) void {
+        switch (result) {
+            .completed => |message_text| self.message("{s}: {s}", .{ id, message_text }),
+            .blocked => |message_text| {
+                self.message("{s}: blocked", .{id});
+                self.app.process_console.appendBytes(.stderr, message_text) catch {};
+            },
+            .unknown_command => self.message("{s}: unknown command", .{id}),
+            .no_active_document => self.message("{s}: no active document", .{id}),
+            .external_command => self.message("{s}: external command requires consent", .{id}),
+            .unsupported => |message_text| self.message("{s}: {s}", .{ id, message_text }),
+        }
+
+        if (std.mem.eql(u8, id, "git.overview") or std.mem.eql(u8, id, "github.overview")) self.bottom_panel = .git;
+        if (std.mem.eql(u8, id, "security.audit_workspace") or std.mem.eql(u8, id, "security.scan_current")) self.bottom_panel = .security;
+    }
+
+    fn handleKey(self: *LinuxGuiState, key: event_mod.KeyEvent) void {
+        if (key.modifiers.ctrl) {
+            switch (key.code) {
+                .char => |char| {
+                    if (char == 's' or char == 'S') {
+                        self.execute(if (key.modifiers.shift) "file.save_all" else "file.save", .keybinding);
+                        return;
+                    }
+                    if (char == 'g' or char == 'G') {
+                        self.execute("git.overview", .keybinding);
+                        return;
+                    }
+                    if (char == 'a' or char == 'A') {
+                        self.execute("security.audit_workspace", .keybinding);
+                        return;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        const outcome = input_handler.handle(&self.app, .{ .key = key }) catch |err| {
+            self.message("input failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.handleOutcome(outcome);
+    }
+
+    fn handleClick(self: *LinuxGuiState, x: i16, y: i16) void {
+        if (y >= 78 and y < BOTTOM_TOP and x < FILE_WIDTH) {
+            const row = @divTrunc(@as(isize, y - 98), LINE_HEIGHT);
+            if (row >= 0) {
+                const index: usize = @intCast(row);
+                if (index < self.app.workspace.entries.items.len) {
+                    self.app.file_cursor = index;
+                    self.app.focus = .files;
+                    _ = self.app.openSelectedWorkspaceEntry() catch |err| {
+                        self.message("open failed: {s}", .{@errorName(err)});
+                        return;
+                    };
+                    if (self.app.documents.active() != null) self.app.mode = .insert;
+                    self.message("opened selected workspace entry", .{});
+                }
+            }
+            return;
+        }
+
+        if (y >= HEADER_HEIGHT and y < BOTTOM_TOP and x >= FILE_WIDTH) {
+            self.app.focus = .editor;
+            if (self.app.documents.active() != null) self.app.mode = .insert;
+            return;
+        }
+
+        if (y >= BOTTOM_TOP and y < BOTTOM_TOP + 34) {
+            if (x < 135) self.bottom_panel = .output else if (x < 265) self.bottom_panel = .security else if (x < 380) self.bottom_panel = .git;
+            return;
+        }
+    }
+};
+
+pub fn run(allocator: std.mem.Allocator, root_path: []const u8, environ: *const std.process.Environ.Map) !void {
+    var state = try LinuxGuiState.init(allocator, root_path);
+    defer state.deinit();
+
+    state.execute("git.overview", .startup);
+    state.execute("security.audit_workspace", .startup);
 
     var x11 = try X11.connect(allocator, environ);
     defer x11.close();
 
-    try draw(&x11, &app);
+    try draw(&x11, &state);
     while (true) {
         var event: [32]u8 = undefined;
         try readExact(x11.fd, event[0..]);
         const event_type = event[0] & 0x7f;
         switch (event_type) {
             2 => {
-                const keycode = event[1];
-                if (keycode == 9 or keycode == 24) break;
+                if (keyEventFromX(event[0..])) |key| {
+                    if (std.meta.activeTag(key.code) == .escape and state.app.mode == .normal and !state.app.palette.visible) break;
+                    state.handleKey(key);
+                    try draw(&x11, &state);
+                }
             },
-            12 => try draw(&x11, &app),
+            4 => {
+                state.handleClick(@bitCast(readLe16(event[24..26])), @bitCast(readLe16(event[26..28])));
+                try draw(&x11, &state);
+            },
+            12 => try draw(&x11, &state),
             33 => {
                 const message_type = readLe32(event[8..12]);
                 const data0 = readLe32(event[12..16]);
@@ -346,61 +485,242 @@ pub fn run(allocator: std.mem.Allocator, root_path: []const u8, environ: *const 
     }
 }
 
-fn draw(x11: *X11, app: *const app_mod.App) !void {
+fn draw(x11: *X11, state: *LinuxGuiState) !void {
+    const app = &state.app;
     try x11.fillRect(x11.gc.bg, 0, 0, WIDTH, HEIGHT);
     try x11.fillRect(x11.gc.panel, 0, 0, WIDTH, HEADER_HEIGHT);
     try x11.fillRect(x11.gc.line, 0, HEADER_HEIGHT - 1, WIDTH, 1);
     try x11.fillRect(x11.gc.panel, 0, HEADER_HEIGHT, FILE_WIDTH, HEIGHT - HEADER_HEIGHT - STATUS_HEIGHT);
     try x11.fillRect(x11.gc.line, FILE_WIDTH, HEADER_HEIGHT, 1, HEIGHT - HEADER_HEIGHT - STATUS_HEIGHT);
-    try x11.fillRect(x11.gc.panel_2, 0, HEIGHT - OUTPUT_HEIGHT - STATUS_HEIGHT, WIDTH, OUTPUT_HEIGHT);
+    try x11.fillRect(x11.gc.panel_2, 0, BOTTOM_TOP, WIDTH, OUTPUT_HEIGHT);
     try x11.fillRect(x11.gc.cyan, 16, 14, 30, 30);
 
     try x11.text(x11.gc.bg, 26, 35, "Z");
     try x11.text(x11.gc.text, 58, 34, "ZIDE");
-    try x11.text(x11.gc.muted, 1060, 34, "Linux GUI / X11 / Zig-only backend");
+    try x11.text(x11.gc.muted, 900, 34, "Linux GUI / direct X11 / shared ZIDE core");
 
     try x11.text(x11.gc.cyan, 18, 86, "FILES");
+    try x11.text(x11.gc.muted, 112, 86, "click opens / Enter opens / j,k move");
     var y: i16 = 112;
-    const max_files = @min(app.workspace.entries.items.len, 28);
+    const max_files = @min(app.workspace.entries.items.len, @as(usize, @intCast((BOTTOM_TOP - 104) / LINE_HEIGHT)));
     for (app.workspace.entries.items[0..max_files], 0..) |entry, index| {
         const gc = if (index == app.file_cursor) x11.gc.cyan else if (entry.kind == .directory) x11.gc.green else x11.gc.text;
         if (index == app.file_cursor) try x11.fillRect(x11.gc.panel_2, 8, y - 14, FILE_WIDTH - 16, LINE_HEIGHT);
         var line_buf: [280]u8 = undefined;
         const prefix: []const u8 = if (entry.kind == .directory) "+ " else "  ";
         const label = std.fmt.bufPrint(line_buf[0..], "{s}{s}", .{ prefix, entry.path }) catch entry.path;
-        try x11.text(gc, 18, y, ascii(label));
+        var ascii_buf: [260]u8 = undefined;
+        try x11.text(gc, 18, y, asciiInto(ascii_buf[0..], label));
         y += LINE_HEIGHT;
     }
 
-    const editor_left: i16 = FILE_WIDTH + 24;
-    try x11.text(x11.gc.cyan, editor_left, 86, "ZIDE Linux GUI parity backend");
-    try x11.text(x11.gc.text, editor_left, 118, "This is the real zide-gui Linux target, not a separate demo binary.");
-    try x11.text(x11.gc.muted, editor_left, 146, "Next parity work: move Windows GuiState/rendering into a shared retained UI core.");
-    try x11.text(x11.gc.green, editor_left, 184, "workspace:");
-    try x11.text(x11.gc.text, editor_left + 95, 184, ascii(app.workspace.root_path));
+    try drawEditor(x11, state);
+    try drawBottomPanel(x11, state);
+    if (app.palette.visible) try drawPalette(x11, state);
 
-    try x11.text(x11.gc.green, editor_left, 222, "security:");
-    var stat_buf: [160]u8 = undefined;
-    const stat = std.fmt.bufPrint(stat_buf[0..], "{d} finding(s), trust={s}", .{
+    try x11.fillRect(x11.gc.cyan, 0, HEIGHT - STATUS_HEIGHT, WIDTH, STATUS_HEIGHT);
+    var status_buf: [520]u8 = undefined;
+    const active = app.documents.active();
+    const dirty_count = app.documents.dirtyCount();
+    const language = if (active) |doc| modes.label(doc.language) else "none";
+    const cursor = if (active) |doc| doc.cursor.position else null;
+    const status = std.fmt.bufPrint(status_buf[0..],
+        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} trust:{s} risk:{d} files:{d} docs:{d} | Ctrl+P palette Ctrl+S save Ctrl+G git Ctrl+A audit | {s}",
+        .{
+            @tagName(app.mode),
+            @tagName(app.focus),
+            if (cursor) |pos| pos.line + 1 else 0,
+            if (cursor) |pos| pos.column + 1 else 0,
+            dirty_count,
+            language,
+            @tagName(app.runtime.trust_state),
+            app.security_findings.items.items.len,
+            app.workspace.entries.items.len,
+            app.documents.documents.items.len,
+            state.message_buf[0..state.message_len],
+        },
+    ) catch "status unavailable";
+    try x11.text(x11.gc.bg, 14, HEIGHT - 9, status);
+}
+
+fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
+    const app = &state.app;
+    try x11.text(x11.gc.cyan, EDITOR_LEFT, 86, "EDITOR");
+    try x11.text(x11.gc.muted, EDITOR_LEFT + 88, 86, "shared buffer/save/security core");
+
+    const tab_y: i16 = 112;
+    var tab_x: i16 = EDITOR_LEFT;
+    for (app.documents.documents.items, 0..) |doc, index| {
+        const selected = if (app.documents.activeIndex()) |active_index| active_index == index else false;
+        const tab_w: u16 = 178;
+        if (selected) try x11.fillRect(x11.gc.panel_2, tab_x - 4, tab_y - 16, tab_w, 24);
+        const label = if (doc.path) |path| std.fs.path.basename(path) else "(scratch)";
+        var tab_buf: [160]u8 = undefined;
+        var text_buf: [180]u8 = undefined;
+        const dirty = if (doc.dirty) "*" else "";
+        const text = std.fmt.bufPrint(tab_buf[0..], "{s}{s}", .{ label, dirty }) catch label;
+        try x11.text(if (selected) x11.gc.cyan else x11.gc.muted, tab_x, tab_y, asciiInto(text_buf[0..], text));
+        tab_x += 188;
+        if (tab_x > WIDTH - 220) break;
+    }
+
+    const doc = app.documents.active() orelse {
+        try x11.text(x11.gc.text, EDITOR_LEFT, EDITOR_TEXT_TOP, "No file open. Click a file on the left, or press Enter from FILES.");
+        try x11.text(x11.gc.muted, EDITOR_LEFT, EDITOR_TEXT_TOP + 30, "Linux zide-gui is using the same App/document/dispatcher core as the Windows workbench.");
+        return;
+    };
+
+    const path = doc.path orelse "(scratch)";
+    var path_buf: [520]u8 = undefined;
+    const header = std.fmt.bufPrint(path_buf[0..], "{s}  lang={s}  newline={s}  encoding={s}", .{
+        path,
+        modes.label(doc.language),
+        doc.newlineLabel(),
+        doc.encodingLabel(),
+    }) catch path;
+    var header_ascii: [520]u8 = undefined;
+    try x11.text(x11.gc.green, EDITOR_LEFT, EDITOR_TOP, asciiInto(header_ascii[0..], header));
+
+    const visible_rows: usize = @intCast((BOTTOM_TOP - EDITOR_TEXT_TOP - 16) / LINE_HEIGHT);
+    const cursor_line = doc.cursor.position.line;
+    if (cursor_line < state.editor_scroll_line) state.editor_scroll_line = cursor_line;
+    if (visible_rows > 0 and cursor_line >= state.editor_scroll_line + visible_rows) {
+        state.editor_scroll_line = cursor_line - visible_rows + 1;
+    }
+
+    var line_y: i16 = EDITOR_TEXT_TOP;
+    var row: usize = 0;
+    while (row < visible_rows and state.editor_scroll_line + row < doc.text.lineCount()) : (row += 1) {
+        const line_index = state.editor_scroll_line + row;
+        const line = doc.text.lineSlice(line_index);
+        const selected = line_index == cursor_line;
+        if (selected) try x11.fillRect(x11.gc.panel_2, EDITOR_LEFT - 8, line_y - 14, WIDTH - EDITOR_LEFT - 20, LINE_HEIGHT);
+
+        var number_buf: [24]u8 = undefined;
+        const number = std.fmt.bufPrint(number_buf[0..], "{d: >4}", .{line_index + 1}) catch "   ?";
+        try x11.text(x11.gc.muted, EDITOR_LEFT, line_y, number);
+
+        var line_buf: [720]u8 = undefined;
+        try x11.text(if (selected) x11.gc.text else x11.gc.muted, EDITOR_LEFT + 56, line_y, asciiInto(line_buf[0..], line));
+
+        if (selected and app.mode == .insert and app.focus == .editor) {
+            const cursor_x: i16 = EDITOR_LEFT + 56 + @as(i16, @intCast(@min(doc.cursor.position.column, 120))) * 8;
+            try x11.fillRect(x11.gc.cyan, cursor_x, line_y - 14, 2, LINE_HEIGHT);
+        }
+        line_y += LINE_HEIGHT;
+    }
+}
+
+fn drawBottomPanel(x11: *X11, state: *LinuxGuiState) !void {
+    try x11.fillRect(x11.gc.line, 0, BOTTOM_TOP, WIDTH, 1);
+    try drawPanelTab(x11, state.bottom_panel == .output, 18, "OUTPUT");
+    try drawPanelTab(x11, state.bottom_panel == .security, 142, "SECURITY");
+    try drawPanelTab(x11, state.bottom_panel == .git, 282, "GIT");
+
+    switch (state.bottom_panel) {
+        .output => try drawOutputPanel(x11, state),
+        .security => try drawSecurityPanel(x11, state),
+        .git => try drawGitPanel(x11, state),
+    }
+}
+
+fn drawPanelTab(x11: *X11, active: bool, x: i16, label: []const u8) !void {
+    if (active) try x11.fillRect(x11.gc.cyan, x - 8, BOTTOM_TOP + 8, 104, 24);
+    try x11.text(if (active) x11.gc.bg else x11.gc.cyan, x, BOTTOM_TOP + 27, label);
+}
+
+fn drawOutputPanel(x11: *X11, state: *LinuxGuiState) !void {
+    const app = &state.app;
+    var y: i16 = BOTTOM_TOP + 58;
+    const max_lines: usize = @intCast((OUTPUT_HEIGHT - 64) / LINE_HEIGHT);
+    const start = if (app.process_console.lines.items.len > max_lines) app.process_console.lines.items.len - max_lines else 0;
+    for (app.process_console.lines.items[start..]) |line| {
+        var text_buf: [900]u8 = undefined;
+        const color = if (line.stream == .stderr) x11.gc.red else x11.gc.muted;
+        try x11.text(color, 18, y, asciiInto(text_buf[0..], line.text));
+        y += LINE_HEIGHT;
+    }
+    if (app.process_console.lines.items.len == 0) {
+        try x11.text(x11.gc.muted, 18, y, "No output yet.");
+    }
+}
+
+fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
+    const app = &state.app;
+    var header_buf: [180]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "{d} finding(s) / trust={s}", .{
         app.security_findings.items.items.len,
         @tagName(app.runtime.trust_state),
     }) catch "security status unavailable";
-    try x11.text(x11.gc.text, editor_left + 95, 222, stat);
-
-    try x11.text(x11.gc.amber, editor_left, 260, "release:");
-    try x11.text(x11.gc.text, editor_left + 95, 260, "Linux GUI is now a first-class artifact target.");
-
-    const out_y: i16 = HEIGHT - OUTPUT_HEIGHT - STATUS_HEIGHT + 34;
-    try x11.text(x11.gc.cyan, 18, out_y, "OUTPUT / SECURITY / GIT / SHIP");
-    var line_y = out_y + 28;
-    const start = if (app.process_console.lines.items.len > 7) app.process_console.lines.items.len - 7 else 0;
-    for (app.process_console.lines.items[start..]) |line| {
-        try x11.text(x11.gc.muted, 18, line_y, ascii(line.text));
-        line_y += LINE_HEIGHT;
+    try x11.text(x11.gc.green, 18, BOTTOM_TOP + 58, header);
+    var y: i16 = BOTTOM_TOP + 86;
+    const limit = @min(app.security_findings.items.items.len, @as(usize, 6));
+    for (app.security_findings.items.items[0..limit]) |finding| {
+        var row_buf: [900]u8 = undefined;
+        const row = std.fmt.bufPrint(row_buf[0..], "{s}:{d} [{s}] {s}", .{
+            finding.path,
+            finding.line,
+            @tagName(finding.risk),
+            finding.message,
+        }) catch finding.message;
+        var ascii_buf: [900]u8 = undefined;
+        try x11.text(riskGc(x11, finding.risk), 18, y, asciiInto(ascii_buf[0..], row));
+        y += LINE_HEIGHT;
     }
+    if (app.security_findings.items.items.len == 0) {
+        try x11.text(x11.gc.muted, 18, y, "No security findings. Ctrl+A reruns the workspace audit.");
+    }
+}
 
-    try x11.fillRect(x11.gc.cyan, 0, HEIGHT - STATUS_HEIGHT, WIDTH, STATUS_HEIGHT);
-    try x11.text(x11.gc.bg, 14, HEIGHT - 9, "normal/editor | backend:linux-x11 | Esc or Q closes | parity target: Windows GUI feature set");
+fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
+    try x11.text(x11.gc.green, 18, BOTTOM_TOP + 58, "Git/GitHub overview is read by ZIDE without running git hooks or filters.");
+    var y: i16 = BOTTOM_TOP + 86;
+    const app = &state.app;
+    const max_lines: usize = @intCast((OUTPUT_HEIGHT - 92) / LINE_HEIGHT);
+    const start = if (app.process_console.lines.items.len > max_lines) app.process_console.lines.items.len - max_lines else 0;
+    for (app.process_console.lines.items[start..]) |line| {
+        if (std.mem.indexOf(u8, line.text, "git") == null and std.mem.indexOf(u8, line.text, "Git") == null and std.mem.indexOf(u8, line.text, "branch") == null and std.mem.indexOf(u8, line.text, "remote") == null) continue;
+        var ascii_buf: [900]u8 = undefined;
+        try x11.text(x11.gc.muted, 18, y, asciiInto(ascii_buf[0..], line.text));
+        y += LINE_HEIGHT;
+        if (y > HEIGHT - STATUS_HEIGHT - 12) break;
+    }
+}
+
+fn drawPalette(x11: *X11, state: *LinuxGuiState) !void {
+    const left: i16 = 245;
+    const top: i16 = 92;
+    const width: u16 = 790;
+    const height: u16 = 420;
+    try x11.fillRect(x11.gc.panel, left, top, width, height);
+    try x11.fillRect(x11.gc.cyan, left, top, width, 3);
+    try x11.text(x11.gc.cyan, left + 18, top + 34, "COMMAND");
+    var query_buf: [260]u8 = undefined;
+    try x11.text(x11.gc.text, left + 18, top + 66, asciiInto(query_buf[0..], state.app.palette.query.items));
+
+    var y: i16 = top + 104;
+    const limit = @min(state.app.palette.matches.items.len, @as(usize, 12));
+    for (state.app.palette.matches.items[0..limit], 0..) |item, index| {
+        const selected = index == state.app.palette.selected_index;
+        if (selected) try x11.fillRect(x11.gc.panel_2, left + 10, y - 15, width - 20, LINE_HEIGHT + 2);
+        var row_buf: [520]u8 = undefined;
+        const row = std.fmt.bufPrint(row_buf[0..], "{s}  [{s}]  {s}", .{
+            item.definition.title,
+            @tagName(item.definition.capability),
+            item.definition.id,
+        }) catch item.definition.id;
+        var ascii_buf: [520]u8 = undefined;
+        try x11.text(if (selected) x11.gc.cyan else x11.gc.text, left + 18, y, asciiInto(ascii_buf[0..], row));
+        y += LINE_HEIGHT + 4;
+    }
+}
+
+fn riskGc(x11: *X11, risk: @import("../security/findings.zig").Risk) u32 {
+    return switch (risk) {
+        .critical, .high => x11.gc.red,
+        .medium => x11.gc.amber,
+        .low, .info => x11.gc.muted,
+    };
 }
 
 fn ascii(bytes: []const u8) []const u8 {
@@ -408,6 +728,105 @@ fn ascii(bytes: []const u8) []const u8 {
         if (byte >= 0x80) return bytes[0..index];
     }
     return bytes;
+}
+
+fn asciiInto(buffer: []u8, bytes: []const u8) []const u8 {
+    const limit = @min(buffer.len, bytes.len);
+    var index: usize = 0;
+    while (index < limit) : (index += 1) {
+        const byte = bytes[index];
+        buffer[index] = switch (byte) {
+            0x20...0x7e => byte,
+            '\t' => ' ',
+            else => '?',
+        };
+    }
+    return buffer[0..limit];
+}
+
+fn keyEventFromX(bytes: []const u8) ?event_mod.KeyEvent {
+    const keycode = bytes[1];
+    const state = readLe16(bytes[28..30]);
+    const modifiers = event_mod.Modifiers{
+        .shift = (state & 1) != 0,
+        .ctrl = (state & 4) != 0,
+        .alt = (state & 8) != 0,
+        .super = (state & 64) != 0,
+    };
+
+    const code: event_mod.KeyCode = switch (keycode) {
+        9 => .escape,
+        22 => .backspace,
+        23 => .tab,
+        36 => .enter,
+        67 => .{ .function = 1 },
+        111 => .arrow_up,
+        113 => .arrow_left,
+        114 => .arrow_right,
+        116 => .arrow_down,
+        119 => .delete,
+        else => if (keycodeToAscii(keycode, modifiers.shift)) |char| .{ .char = char } else return null,
+    };
+
+    return .{ .code = code, .modifiers = modifiers };
+}
+
+fn keycodeToAscii(keycode: u8, shift: bool) ?u21 {
+    return switch (keycode) {
+        10 => if (shift) '!' else '1',
+        11 => if (shift) '@' else '2',
+        12 => if (shift) '#' else '3',
+        13 => if (shift) '$' else '4',
+        14 => if (shift) '%' else '5',
+        15 => if (shift) '^' else '6',
+        16 => if (shift) '&' else '7',
+        17 => if (shift) '*' else '8',
+        18 => if (shift) '(' else '9',
+        19 => if (shift) ')' else '0',
+        20 => if (shift) '_' else '-',
+        21 => if (shift) '+' else '=',
+        24 => shifted('q', shift),
+        25 => shifted('w', shift),
+        26 => shifted('e', shift),
+        27 => shifted('r', shift),
+        28 => shifted('t', shift),
+        29 => shifted('y', shift),
+        30 => shifted('u', shift),
+        31 => shifted('i', shift),
+        32 => shifted('o', shift),
+        33 => shifted('p', shift),
+        34 => if (shift) '{' else '[',
+        35 => if (shift) '}' else ']',
+        38 => shifted('a', shift),
+        39 => shifted('s', shift),
+        40 => shifted('d', shift),
+        41 => shifted('f', shift),
+        42 => shifted('g', shift),
+        43 => shifted('h', shift),
+        44 => shifted('j', shift),
+        45 => shifted('k', shift),
+        46 => shifted('l', shift),
+        47 => if (shift) ':' else ';',
+        48 => if (shift) '"' else '\'',
+        49 => if (shift) '~' else '`',
+        51 => if (shift) '|' else '\\',
+        52 => shifted('z', shift),
+        53 => shifted('x', shift),
+        54 => shifted('c', shift),
+        55 => shifted('v', shift),
+        56 => shifted('b', shift),
+        57 => shifted('n', shift),
+        58 => shifted('m', shift),
+        59 => if (shift) '<' else ',',
+        60 => if (shift) '>' else '.',
+        61 => if (shift) '?' else '/',
+        65 => ' ',
+        else => null,
+    };
+}
+
+fn shifted(lower: u8, shift: bool) u21 {
+    return if (shift) lower - ('a' - 'A') else lower;
 }
 
 fn connectUnix(path: []const u8) !i32 {

@@ -5,6 +5,10 @@ const release_zip_name = "zide-windows-x86_64.zip";
 const download_zip_path = "download/zide-windows-x86_64.zip";
 const checksum_path = "download/CHECKSUMS.sha256";
 const latest_release_url = "https://github.com/furukawa1020/zig-to-IDE-furukawa-edit/releases/latest/download/zide-windows-x86_64.zip";
+const site_url = "https://furukawa1020.github.io/zig-to-IDE-furukawa-edit/";
+const og_image_path = "ogp.png";
+const og_image_source_path = "tools/site/ogp.png";
+const og_image_url = site_url ++ og_image_path;
 
 const DownloadInfo = struct {
     href: []const u8,
@@ -28,6 +32,7 @@ fn generateSite(allocator: std.mem.Allocator, out_dir: []const u8) !void {
     const info = try copyReleaseZipIfPresent(allocator, out_dir);
     try writeAsset(allocator, out_dir, "assets/site.css", siteCss);
     try writeHeroBitmap(allocator, out_dir);
+    try copyOpenGraphImageIfPresent(allocator, out_dir);
     try writeHtml(allocator, out_dir, "index.html", info);
     try writeHtml(allocator, out_dir, "404.html", info);
     try writeManifest(allocator, out_dir, info);
@@ -66,6 +71,15 @@ fn copyReleaseZipIfPresent(allocator: std.mem.Allocator, out_dir: []const u8) !D
     };
 }
 
+fn copyOpenGraphImageIfPresent(allocator: std.mem.Allocator, out_dir: []const u8) !void {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, og_image_source_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    try writeAssetBytes(allocator, out_dir, og_image_path, bytes);
+}
+
 fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []const u8, info: DownloadInfo) !void {
     var html: std.Io.Writer.Allocating = .init(allocator);
     defer html.deinit();
@@ -84,9 +98,22 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         \\  <meta name="color-scheme" content="dark light">
         \\  <title>ZIDE - Zig-native secure IDE</title>
         \\  <meta name="description" content="ZIDE is a Zig-native IDE/workbench for multi-language editing, visible trust boundaries, safe Git inspection, and release artifact verification.">
+        \\  <link rel="canonical" href="{s}">
+        \\  <meta property="og:type" content="website">
+        \\  <meta property="og:url" content="{s}">
         \\  <meta property="og:title" content="ZIDE">
         \\  <meta property="og:description" content="A Zig-native secure IDE/workbench with multi-language editing and local release verification.">
-        \\  <meta property="og:image" content="assets/hero.bmp">
+        \\  <meta property="og:image" content="{s}">
+        \\  <meta property="og:image:secure_url" content="{s}">
+        \\  <meta property="og:image:type" content="image/png">
+        \\  <meta property="og:image:width" content="1200">
+        \\  <meta property="og:image:height" content="630">
+        \\  <meta property="og:image:alt" content="ZIDE secure IDE website screenshot">
+        \\  <meta name="twitter:card" content="summary_large_image">
+        \\  <meta name="twitter:title" content="ZIDE">
+        \\  <meta name="twitter:description" content="A Zig-native secure IDE/workbench with multi-language editing and local release verification.">
+        \\  <meta name="twitter:image" content="{s}">
+        \\  <meta name="twitter:image:alt" content="ZIDE secure IDE website screenshot">
         \\  <link rel="stylesheet" href="assets/site.css">
         \\</head>
         \\<body>
@@ -192,6 +219,11 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         \\</html>
         \\
     , .{
+        site_url,
+        site_url,
+        og_image_url,
+        og_image_url,
+        og_image_url,
         info.href,
         release_zip_name,
         info.source,
@@ -412,13 +444,15 @@ fn writeManifest(allocator: std.mem.Allocator, out_dir: []const u8, info: Downlo
         \\{{
         \\  "name": "ZIDE",
         \\  "generated_by": "tools/site_gen.zig",
+        \\  "site_url": "{s}",
+        \\  "og_image": "{s}",
         \\  "download": "{s}",
         \\  "download_source": "{s}",
         \\  "size_bytes": {d},
         \\  "sha256": "{s}"
         \\}}
         \\
-    , .{ info.href, info.source, size, sha_text });
+    , .{ site_url, og_image_url, info.href, info.source, size, sha_text });
     try writeAssetBytes(allocator, out_dir, "site-manifest.json", json.written());
 }
 

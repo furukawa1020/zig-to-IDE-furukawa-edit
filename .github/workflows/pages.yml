@@ -63,6 +63,34 @@ jobs:
       - name: Generate site
         run: zig build site --cache-dir .zig-cache --global-cache-dir .zig-global-cache
 
+      - name: Capture Open Graph screenshot
+        shell: pwsh
+        run: |
+          $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+          $browserCandidates = @(
+            (Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"),
+            (Join-Path $env:ProgramFiles "Microsoft\Edge\Application\msedge.exe")
+          )
+          if ($programFilesX86) {
+            $browserCandidates += Join-Path $programFilesX86 "Microsoft\Edge\Application\msedge.exe"
+          }
+          $browser = $browserCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $browser) {
+            throw "Chrome or Edge is required to capture the Open Graph screenshot."
+          }
+          $indexPath = (Resolve-Path ".\zig-out\site\index.html").Path
+          $indexUri = [System.Uri]::new($indexPath).AbsoluteUri
+          $siteDir = (Resolve-Path ".\zig-out\site").Path
+          $screenshotPath = Join-Path $siteDir "ogp.png"
+          & $browser --headless=new --disable-gpu --hide-scrollbars --window-size=1200,630 "--screenshot=$screenshotPath" $indexUri
+          $captureExitCode = $LASTEXITCODE
+          if (($null -ne $captureExitCode) -and ($captureExitCode -ne 0)) {
+            throw "Open Graph screenshot capture failed with exit code $captureExitCode."
+          }
+          if (-not (Test-Path $screenshotPath)) {
+            throw "Open Graph screenshot was not created."
+          }
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:

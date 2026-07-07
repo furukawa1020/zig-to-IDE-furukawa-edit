@@ -22,6 +22,9 @@ const task_registry = @import("../tasks/registry.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
 const permissions = @import("../security/permissions.zig");
 
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const LaunchFingerprint = [Sha256.digest_length * 2]u8;
+
 comptime {
     if (builtin.os.tag != .linux) @compileError("linux_x11.zig is Linux-only");
 }
@@ -763,6 +766,7 @@ const LinuxGuiState = struct {
     window_width: i16 = WIDTH,
     window_height: i16 = HEIGHT,
     file_scroll_line: usize = 0,
+    collapsed_dirs: []bool,
     editor_scroll_line: usize = 0,
     output_scroll_line: usize = 0,
     task_scroll_line: usize = 0,
@@ -776,10 +780,16 @@ const LinuxGuiState = struct {
     message_len: usize = 0,
 
     fn init(allocator: std.mem.Allocator, root_path: []const u8) !LinuxGuiState {
+        var app = try app_mod.App.init(allocator, root_path);
+        errdefer app.deinit();
+        const collapsed_dirs = try allocator.alloc(bool, app.workspace.entries.items.len);
+        errdefer allocator.free(collapsed_dirs);
+        @memset(collapsed_dirs, false);
         return .{
             .allocator = allocator,
-            .app = try app_mod.App.init(allocator, root_path),
+            .app = app,
             .quick_panel = QuickPanel.init(allocator),
+            .collapsed_dirs = collapsed_dirs,
             .last_document_search_query = std.array_list.Managed(u8).init(allocator),
         };
     }
@@ -789,6 +799,7 @@ const LinuxGuiState = struct {
         self.clearGitOverview();
         self.last_document_search_query.deinit();
         self.quick_panel.deinit();
+        self.allocator.free(self.collapsed_dirs);
         self.app.deinit();
         self.* = undefined;
     }
@@ -888,24 +899,230 @@ const LinuxGuiState = struct {
     fn resize(self: *LinuxGuiState, width: u16, height: u16) void {
         self.window_width = @intCast(@max(width, 760));
         self.window_height = @intCast(@max(height, 520));
+        self.refreshWorkspaceTreeState();
         self.ensureFileCursorVisible();
     }
 
-    fn ensureFileCursorVisible(self: *LinuxGuiState) void {
-        const visible = self.visibleFileRows();
-        if (self.app.file_cursor < self.file_scroll_line) {
-            self.file_scroll_line = self.app.file_cursor;
-        } else if (self.app.file_cursor >= self.file_scroll_line + visible) {
-            self.file_scroll_line = self.app.file_cursor - visible + 1;
+    fn refreshWorkspaceTreeState(self: *LinuxGuiState) void {
+        if (self.collapsed_dirs.len == self.app.workspace.entries.items.len) return;
+        const next = self.allocator.alloc(bool, self.app.workspace.entries.items.len) catch |err| {
+            self.message("tree state failed: {s}", .{@errorName(err)});
+            return;
+        };
+        @memset(next, false);
+        const copy_len = @min(self.collapsed_dirs.len, next.len);
+        if (copy_len > 0) @memcpy(next[0..copy_len], self.collapsed_dirs[0..copy_len]);
+        self.allocator.free(self.collapsed_dirs);
+        self.collapsed_dirs = next;
+        if (self.app.file_cursor >= self.app.workspace.entries.items.len) {
+            self.app.file_cursor = if (self.app.workspace.entries.items.len == 0) 0 else self.app.workspace.entries.items.len - 1;
         }
-        const max_start = if (self.app.workspace.entries.items.len > visible) self.app.workspace.entries.items.len - visible else 0;
+        if (self.visibleRankOfIndex(self.app.file_cursor) == null) {
+            self.app.file_cursor = self.nearestVisibleIndex(self.app.file_cursor) orelse 0;
+        }
+    }
+
+    fn ensureFileCursorVisible(self: *LinuxGuiState) void {
+        self.refreshWorkspaceTreeState();
+        const visible = self.visibleFileRows();
+        if (self.visibleRankOfIndex(self.app.file_cursor) == null) {
+            self.app.file_cursor = self.nearestVisibleIndex(self.app.file_cursor) orelse 0;
+        }
+        const selected_rank = self.visibleRankOfIndex(self.app.file_cursor) orelse 0;
+        if (selected_rank < self.file_scroll_line) {
+            self.file_scroll_line = selected_rank;
+        } else if (selected_rank >= self.file_scroll_line + visible) {
+            self.file_scroll_line = selected_rank - visible + 1;
+        }
+        const total = self.visibleEntryCount();
+        const max_start = if (total > visible) total - visible else 0;
         self.file_scroll_line = @min(self.file_scroll_line, max_start);
     }
 
     fn scrollFileTree(self: *LinuxGuiState, delta: isize) void {
+        self.refreshWorkspaceTreeState();
         const visible = self.visibleFileRows();
-        const max_start = if (self.app.workspace.entries.items.len > visible) self.app.workspace.entries.items.len - visible else 0;
+        const total = self.visibleEntryCount();
+        const max_start = if (total > visible) total - visible else 0;
         self.file_scroll_line = scrollValue(self.file_scroll_line, max_start, delta);
+    }
+
+    fn moveFileSelection(self: *LinuxGuiState, delta: isize) void {
+        self.app.focus = .files;
+        self.refreshWorkspaceTreeState();
+        const total = self.visibleEntryCount();
+        if (total == 0) {
+            self.app.file_cursor = 0;
+            return;
+        }
+        const selected_rank = self.visibleRankOfIndex(self.app.file_cursor) orelse 0;
+        const max_rank = total - 1;
+        const next_rank = if (delta < 0) blk: {
+            const amount: usize = @intCast(-delta);
+            break :blk if (amount > selected_rank) 0 else selected_rank - amount;
+        } else blk: {
+            const amount: usize = @intCast(delta);
+            break :blk @min(max_rank, selected_rank + amount);
+        };
+        if (self.entryIndexAtVisibleRank(next_rank)) |index| self.app.file_cursor = index;
+        self.ensureFileCursorVisible();
+    }
+
+    fn openSelectedFileTreeEntry(self: *LinuxGuiState) void {
+        self.refreshWorkspaceTreeState();
+        if (self.app.workspace.entries.items.len == 0) {
+            self.message("no workspace entry selected", .{});
+            return;
+        }
+        const selected_index = @min(self.app.file_cursor, self.app.workspace.entries.items.len - 1);
+        const entry = self.app.workspace.entries.items[selected_index];
+        self.app.focus = .files;
+        if (entry.kind == .directory) {
+            self.toggleDirectoryCollapse(selected_index);
+            return;
+        }
+        const opened = self.app.openSelectedWorkspaceEntry() catch |err| {
+            self.message("open failed: {s}", .{@errorName(err)});
+            return;
+        };
+        if (opened) {
+            self.app.mode = .insert;
+            self.app.focus = .editor;
+            self.message("opened selected file", .{});
+        } else {
+            self.message("select a file to open", .{});
+        }
+    }
+
+    fn collapseSelectedDirectory(self: *LinuxGuiState) void {
+        self.refreshWorkspaceTreeState();
+        if (self.app.workspace.entries.items.len == 0) return;
+        const selected_index = @min(self.app.file_cursor, self.app.workspace.entries.items.len - 1);
+        const entry = self.app.workspace.entries.items[selected_index];
+        if (entry.kind == .directory) {
+            if (selected_index < self.collapsed_dirs.len and !self.collapsed_dirs[selected_index] and self.directoryHasChildren(selected_index)) {
+                self.toggleDirectoryCollapse(selected_index);
+                return;
+            }
+        }
+        if (self.parentDirectoryIndex(selected_index)) |parent| {
+            self.app.file_cursor = parent;
+            self.app.focus = .files;
+            self.ensureFileCursorVisible();
+            self.message("selected parent folder", .{});
+        }
+    }
+
+    fn expandSelectedDirectory(self: *LinuxGuiState) void {
+        self.refreshWorkspaceTreeState();
+        if (self.app.workspace.entries.items.len == 0) return;
+        const selected_index = @min(self.app.file_cursor, self.app.workspace.entries.items.len - 1);
+        const entry = self.app.workspace.entries.items[selected_index];
+        if (entry.kind == .directory and selected_index < self.collapsed_dirs.len and self.directoryHasChildren(selected_index)) {
+            if (self.collapsed_dirs[selected_index]) {
+                self.toggleDirectoryCollapse(selected_index);
+            } else {
+                self.moveFileSelection(1);
+            }
+            return;
+        }
+        self.openSelectedFileTreeEntry();
+    }
+
+    fn toggleDirectoryCollapse(self: *LinuxGuiState, index: usize) void {
+        self.refreshWorkspaceTreeState();
+        if (index >= self.collapsed_dirs.len) return;
+        if (self.app.workspace.entries.items[index].kind != .directory) return;
+        self.collapsed_dirs[index] = !self.collapsed_dirs[index];
+        if (self.collapsed_dirs[index]) {
+            if (self.visibleRankOfIndex(self.app.file_cursor) == null) self.app.file_cursor = index;
+            self.message("folder collapsed", .{});
+        } else {
+            self.message("folder expanded", .{});
+        }
+        self.ensureFileCursorVisible();
+    }
+
+    fn visibleEntryCount(self: *const LinuxGuiState) usize {
+        var count: usize = 0;
+        for (self.app.workspace.entries.items, 0..) |_, index| {
+            if (self.isEntryVisible(index)) count += 1;
+        }
+        return count;
+    }
+
+    fn visibleRankOfIndex(self: *const LinuxGuiState, target: usize) ?usize {
+        var rank: usize = 0;
+        for (self.app.workspace.entries.items, 0..) |_, index| {
+            if (!self.isEntryVisible(index)) continue;
+            if (index == target) return rank;
+            rank += 1;
+        }
+        return null;
+    }
+
+    fn entryIndexAtVisibleRank(self: *const LinuxGuiState, target_rank: usize) ?usize {
+        var rank: usize = 0;
+        for (self.app.workspace.entries.items, 0..) |_, index| {
+            if (!self.isEntryVisible(index)) continue;
+            if (rank == target_rank) return index;
+            rank += 1;
+        }
+        return null;
+    }
+
+    fn nearestVisibleIndex(self: *const LinuxGuiState, target: usize) ?usize {
+        if (self.app.workspace.entries.items.len == 0) return null;
+        var index = @min(target, self.app.workspace.entries.items.len - 1);
+        while (true) {
+            if (self.isEntryVisible(index)) return index;
+            if (index == 0) break;
+            index -= 1;
+        }
+        for (self.app.workspace.entries.items, 0..) |_, forward| {
+            if (forward > target and self.isEntryVisible(forward)) return forward;
+        }
+        return null;
+    }
+
+    fn isEntryVisible(self: *const LinuxGuiState, index: usize) bool {
+        if (index >= self.app.workspace.entries.items.len) return false;
+        const entry = self.app.workspace.entries.items[index];
+        if (entry.depth == 0) return true;
+        var needed_depth = entry.depth;
+        var i = index;
+        while (i > 0) {
+            i -= 1;
+            const candidate = self.app.workspace.entries.items[i];
+            if (candidate.depth >= needed_depth) continue;
+            if (candidate.kind == .directory and i < self.collapsed_dirs.len and self.collapsed_dirs[i]) return false;
+            needed_depth = candidate.depth;
+            if (needed_depth == 0) break;
+        }
+        return true;
+    }
+
+    fn directoryHasChildren(self: *const LinuxGuiState, index: usize) bool {
+        if (index + 1 >= self.app.workspace.entries.items.len) return false;
+        const entry = self.app.workspace.entries.items[index];
+        return self.app.workspace.entries.items[index + 1].depth > entry.depth;
+    }
+
+    fn parentDirectoryIndex(self: *const LinuxGuiState, index: usize) ?usize {
+        if (index >= self.app.workspace.entries.items.len) return null;
+        const depth = self.app.workspace.entries.items[index].depth;
+        if (depth == 0) return null;
+        var i = index;
+        while (i > 0) {
+            i -= 1;
+            const candidate = self.app.workspace.entries.items[i];
+            if (candidate.depth < depth and candidate.kind == .directory) return i;
+        }
+        return null;
+    }
+
+    fn fileTreeHasControl(self: *const LinuxGuiState) bool {
+        return self.app.focus == .files or self.app.documents.active_index == null;
     }
 
     fn scrollEditor(self: *LinuxGuiState, delta: isize) void {
@@ -1754,13 +1971,22 @@ const LinuxGuiState = struct {
     }
 
     fn openWorkspace(self: *LinuxGuiState, root_path: []const u8) void {
-        const next = app_mod.App.init(self.allocator, root_path) catch |err| {
+        var next = app_mod.App.init(self.allocator, root_path) catch |err| {
             self.message("workspace open failed: {s}", .{@errorName(err)});
             self.appendOutput(.stderr, "workspace open failed: {s}\n", .{@errorName(err)});
             return;
         };
+        const next_collapsed = self.allocator.alloc(bool, next.workspace.entries.items.len) catch |err| {
+            next.deinit();
+            self.message("workspace state failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "workspace state failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        @memset(next_collapsed, false);
         self.app.deinit();
+        self.allocator.free(self.collapsed_dirs);
         self.app = next;
+        self.collapsed_dirs = next_collapsed;
         self.quick_panel.close();
         self.file_scroll_line = 0;
         self.editor_scroll_line = 0;
@@ -1823,6 +2049,46 @@ const LinuxGuiState = struct {
                         self.gotoLocalDefinitionAtCursor();
                     }
                     return;
+                },
+                else => {},
+            }
+        }
+
+        if (self.fileTreeHasControl()) {
+            switch (key.code) {
+                .arrow_up => {
+                    self.moveFileSelection(-1);
+                    return;
+                },
+                .arrow_down => {
+                    self.moveFileSelection(1);
+                    return;
+                },
+                .arrow_left => {
+                    self.collapseSelectedDirectory();
+                    return;
+                },
+                .arrow_right => {
+                    self.expandSelectedDirectory();
+                    return;
+                },
+                .enter => {
+                    self.openSelectedFileTreeEntry();
+                    return;
+                },
+                .char => |char| {
+                    if (char == 'j' or char == 'J') {
+                        self.moveFileSelection(1);
+                        return;
+                    }
+                    if (char == 'k' or char == 'K') {
+                        self.moveFileSelection(-1);
+                        return;
+                    }
+                    if (char == 'o' or char == 'O') {
+                        self.openSelectedFileTreeEntry();
+                        return;
+                    }
                 },
                 else => {},
             }
@@ -1992,20 +2258,10 @@ const LinuxGuiState = struct {
         if (y >= 78 and y < bottom and x < FILE_WIDTH) {
             const row = @divTrunc(@as(isize, y - 98), LINE_HEIGHT);
             if (row >= 0) {
-                const index = self.file_scroll_line + @as(usize, @intCast(row));
-                if (index < self.app.workspace.entries.items.len) {
+                if (self.entryIndexAtVisibleRank(self.file_scroll_line + @as(usize, @intCast(row)))) |index| {
                     self.app.file_cursor = index;
                     self.app.focus = .files;
-                    const opened = self.app.openSelectedWorkspaceEntry() catch |err| {
-                        self.message("open failed: {s}", .{@errorName(err)});
-                        return;
-                    };
-                    if (opened) {
-                        self.app.mode = .insert;
-                        self.message("opened selected file", .{});
-                    } else {
-                        self.message("selected workspace folder", .{});
-                    }
+                    self.openSelectedFileTreeEntry();
                 }
             }
             return;
@@ -2312,17 +2568,33 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
     try x11.text(x11.gc.muted, 112, 86, "click opens / Enter opens / j,k move");
     var y: i16 = 112;
     state.ensureFileCursorVisible();
-    const max_files = @min(app.workspace.entries.items.len - @min(state.file_scroll_line, app.workspace.entries.items.len), state.visibleFileRows());
-    for (app.workspace.entries.items[state.file_scroll_line .. state.file_scroll_line + max_files], 0..) |entry, visible_index| {
-        const index = state.file_scroll_line + visible_index;
-        const gc = if (index == app.file_cursor) x11.gc.cyan else if (entry.kind == .directory) x11.gc.green else x11.gc.text;
+    const visible_total = state.visibleEntryCount();
+    const max_files = @min(visible_total - @min(state.file_scroll_line, visible_total), state.visibleFileRows());
+    var visible_index: usize = 0;
+    while (visible_index < max_files) : (visible_index += 1) {
+        const index = state.entryIndexAtVisibleRank(state.file_scroll_line + visible_index) orelse break;
+        const entry = app.workspace.entries.items[index];
+        const marker = riskMarkerForEntry(state, entry.path, entry.kind == .directory);
+        const gc = if (index == app.file_cursor)
+            x11.gc.cyan
+        else if (marker) |risk_marker|
+            riskGc(x11, risk_marker.risk)
+        else if (entry.kind == .directory)
+            x11.gc.green
+        else
+            x11.gc.text;
         if (index == app.file_cursor) try x11.fillRect(x11.gc.panel_2, 8, y - 14, FILE_WIDTH - 16, LINE_HEIGHT);
         var line_buf: [280]u8 = undefined;
-        const prefix: []const u8 = if (entry.kind == .directory) "+ " else "  ";
+        const prefix: []const u8 = if (entry.kind == .directory)
+            if (state.directoryHasChildren(index) and !state.collapsed_dirs[index]) "- " else "+ "
+        else
+            "  ";
         const indent = @min(entry.depth * 2, @as(usize, 12));
         const lang = if (entry.kind == .file) modes.label(entry.language) else "";
+        const risk_label = if (marker) |risk_marker| risk_marker.label else "";
+        const risk_sep = if (marker != null) " " else "";
         @memset(line_buf[0..indent], ' ');
-        const suffix = std.fmt.bufPrint(line_buf[indent..], "{s}{s}  {s}", .{ prefix, entry.path, lang }) catch clipped: {
+        const suffix = std.fmt.bufPrint(line_buf[indent..], "{s}{s}  {s}{s}{s}", .{ prefix, entry.path, lang, risk_sep, risk_label }) catch clipped: {
             const available = line_buf.len - indent;
             const clipped_path = entry.path[0..@min(entry.path.len, available)];
             @memcpy(line_buf[indent..][0..clipped_path.len], clipped_path);
@@ -2377,7 +2649,7 @@ fn drawHeaderActions(x11: *X11) !void {
 }
 
 fn drawFileScrollbar(x11: *X11, state: *LinuxGuiState) !void {
-    const total = state.app.workspace.entries.items.len;
+    const total = state.visibleEntryCount();
     const visible = state.visibleFileRows();
     if (total <= visible or visible == 0) return;
     const bottom = state.bottomTop();
@@ -2593,6 +2865,11 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
         }) catch "policy";
         try x11.text(x11.gc.muted, 18, bottom + 132, policy_line);
 
+        const fingerprint = launchFingerprint(ticket, state.app.workspace.root_path);
+        var fingerprint_buf: [120]u8 = undefined;
+        const fingerprint_line = std.fmt.bufPrint(fingerprint_buf[0..], "fingerprint sha256:{s}", .{fingerprint[0..32]}) catch "fingerprint";
+        try x11.text(x11.gc.cyan, 18, bottom + 156, fingerprint_line);
+
         var gate_buf: [720]u8 = undefined;
         const cwd_ok = permissions.allowsWorkspacePath(ticket.fs_policy, state.app.workspace.root_path, ticket.cwd);
         const network_ok = !ticketLooksNetworked(ticket.executable, ticket.args.items) or permissions.allowsNetwork(ticket.network_policy);
@@ -2602,7 +2879,7 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
             ticket.cwd,
         }) catch "gate";
         var gate_ascii: [720]u8 = undefined;
-        try x11.text(if (cwd_ok and network_ok) x11.gc.muted else x11.gc.red, 18, bottom + 156, asciiInto(gate_ascii[0..], gate_line));
+        try x11.text(if (cwd_ok and network_ok) x11.gc.muted else x11.gc.red, 18, bottom + 180, asciiInto(gate_ascii[0..], gate_line));
     } else {
         try x11.text(x11.gc.muted, 18, bottom + 108, "No queued task. Press TASKS or Ctrl+R, then review PREVIEW/SEAL before RUN.");
         if (queue.latestHistory()) |entry| {
@@ -2684,13 +2961,17 @@ fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
         state.linux_security.dangerous_bounding_caps,
     }) catch "LINUX SELF";
     try x11.text(x11.gc.cyan, 18, bottom + 106, linux_line);
-    var cap_buf: [220]u8 = undefined;
-    const cap_line = std.fmt.bufPrint(cap_buf[0..], "direct X11 / no toolkit host / dangerous bounding caps dropped:{d} failed:{d} / proc:{s}", .{
+    const boundary_grade = linuxBoundaryGrade(&state.linux_security);
+    var cap_buf: [320]u8 = undefined;
+    const cap_line = std.fmt.bufPrint(cap_buf[0..], "LINUX BOUNDARY grade:{s} score:{d}/{d} / direct X11 no-toolkit / dangerous caps dropped:{d} failed:{d} / proc:{s}", .{
+        boundary_grade.label,
+        boundary_grade.score,
+        boundary_grade.max,
         state.linux_security.bounding_caps_dropped,
         state.linux_security.bounding_caps_drop_failed,
         if (state.linux_security.proc_status_read) "read" else "blocked",
     }) catch "linux cap boundary";
-    try x11.text(x11.gc.muted, 18, bottom + 130, cap_line);
+    try x11.text(linuxBoundaryGc(x11, boundary_grade), 18, bottom + 130, cap_line);
     var maps_buf: [260]u8 = undefined;
     const maps_line = std.fmt.bufPrint(maps_buf[0..], "PROC MAPS read:{s} total:{d} exec:{d} wx:{d} so:{d} anon-x:{d}", .{
         if (state.linux_security.proc_maps_read) "yes" else "no",
@@ -3077,6 +3358,17 @@ const BoundaryCounts = struct {
     git: usize = 0,
 };
 
+const RiskMarker = struct {
+    label: []const u8,
+    risk: findings_mod.Risk,
+};
+
+const LinuxBoundaryGrade = struct {
+    label: []const u8,
+    score: u8,
+    max: u8,
+};
+
 fn boundaryCounts(app: *const app_mod.App) BoundaryCounts {
     var counts: BoundaryCounts = .{};
     for (app.security_findings.items.items) |finding| {
@@ -3096,12 +3388,106 @@ fn boundaryCounts(app: *const app_mod.App) BoundaryCounts {
     return counts;
 }
 
+fn riskMarkerForEntry(state: *const LinuxGuiState, entry_path: []const u8, is_directory: bool) ?RiskMarker {
+    var best: ?findings_mod.Risk = null;
+    for (state.app.security_findings.items.items) |finding| {
+        if (!findingPathBelongsToEntry(finding.path, entry_path, is_directory)) continue;
+        if (best == null or riskRank(finding.risk) > riskRank(best.?)) best = finding.risk;
+    }
+    const risk = best orelse return null;
+    return .{ .label = riskMarkerLabel(risk), .risk = risk };
+}
+
+fn findingPathBelongsToEntry(finding_path: []const u8, entry_path: []const u8, is_directory: bool) bool {
+    if (pathEqualNormalizedX11(finding_path, entry_path)) return true;
+    if (!is_directory) return false;
+    if (entry_path.len == 0 or finding_path.len <= entry_path.len) return false;
+    if (!pathStartsWithNormalizedX11(finding_path, entry_path)) return false;
+    const separator = finding_path[entry_path.len];
+    return separator == '/' or separator == '\\';
+}
+
+fn pathStartsWithNormalizedX11(value: []const u8, prefix: []const u8) bool {
+    if (value.len < prefix.len) return false;
+    return pathEqualNormalizedX11(value[0..prefix.len], prefix);
+}
+
+fn pathEqualNormalizedX11(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| {
+        if (normalizePathByteX11(a) != normalizePathByteX11(b)) return false;
+    }
+    return true;
+}
+
+fn normalizePathByteX11(byte: u8) u8 {
+    return if (byte == '\\') '/' else byte;
+}
+
+fn riskMarkerLabel(risk: findings_mod.Risk) []const u8 {
+    return switch (risk) {
+        .critical => "[C]",
+        .high => "[H]",
+        .medium => "[M]",
+        .low => "[L]",
+        .info => "[I]",
+    };
+}
+
+fn riskRank(risk: findings_mod.Risk) u8 {
+    return switch (risk) {
+        .info => 0,
+        .low => 1,
+        .medium => 2,
+        .high => 3,
+        .critical => 4,
+    };
+}
+
 fn riskGc(x11: *X11, risk: findings_mod.Risk) u32 {
     return switch (risk) {
         .critical, .high => x11.gc.red,
         .medium => x11.gc.amber,
         .low, .info => x11.gc.muted,
     };
+}
+
+fn linuxBoundaryGrade(snapshot: *const LinuxSecuritySnapshot) LinuxBoundaryGrade {
+    const max_score: u8 = 14;
+    var score: u8 = 0;
+    if (snapshot.no_new_privs == .on) score += 2;
+    if (snapshot.dumpable == .off) score += 2;
+    if (snapshot.ambient_clear == .on) score += 1;
+    if (snapshot.cap_eff_zero == .on) score += 2;
+    if (snapshot.dangerous_bounding_caps == 0) {
+        score += 2;
+    } else if (snapshot.bounding_caps_dropped > 0) {
+        score += 1;
+    }
+    if (snapshot.maps_writable_executable == 0) score += 2;
+    if (snapshot.fd_cloexec_missing <= 3) {
+        score += 2;
+    } else if (snapshot.fd_cloexec_missing <= 8) {
+        score += 1;
+    }
+    if (snapshot.proc_status_read and snapshot.proc_maps_read and snapshot.proc_fd_read) score += 1;
+
+    const label: []const u8 = if (score >= 12)
+        "sealed"
+    else if (score >= 9)
+        "guarded"
+    else if (score >= 6)
+        "mixed"
+    else
+        "open";
+    return .{ .label = label, .score = score, .max = max_score };
+}
+
+fn linuxBoundaryGc(x11: *X11, grade: LinuxBoundaryGrade) u32 {
+    if (grade.score >= 12) return x11.gc.cyan;
+    if (grade.score >= 9) return x11.gc.green;
+    if (grade.score >= 6) return x11.gc.amber;
+    return x11.gc.red;
 }
 
 fn extensionRiskGc(x11: *X11, risk: extension_registry.Risk) u32 {
@@ -3449,6 +3835,38 @@ fn flagLabel(flag: LinuxFlag) []const u8 {
 
 fn boolLabel(value: bool) []const u8 {
     return if (value) "yes" else "no";
+}
+
+fn launchFingerprint(ticket: *const execution_queue.Ticket, workspace_root: []const u8) LaunchFingerprint {
+    var hasher = Sha256.init(.{});
+    updateLaunchHash(&hasher, "zide-launch-v1");
+    updateLaunchHash(&hasher, ticket.source_command_id);
+    updateLaunchHash(&hasher, ticket.display_command);
+    updateLaunchHash(&hasher, ticket.executable);
+    for (ticket.args.items) |arg| updateLaunchHash(&hasher, arg);
+    updateLaunchHash(&hasher, ticket.cwd);
+    updateLaunchHash(&hasher, workspace_root);
+    updateLaunchHash(&hasher, @tagName(ticket.env_policy));
+    updateLaunchHash(&hasher, @tagName(ticket.fs_policy));
+    updateLaunchHash(&hasher, @tagName(ticket.network_policy));
+    updateLaunchHash(&hasher, if (ticket.output_sanitized) "output:sanitized" else "output:raw");
+
+    var number_buf: [48]u8 = undefined;
+    if (ticket.timeout_ms) |ms| {
+        updateLaunchHash(&hasher, std.fmt.bufPrint(number_buf[0..], "timeout_ms:{d}", .{ms}) catch "timeout_ms:?");
+    } else {
+        updateLaunchHash(&hasher, "timeout_ms:none");
+    }
+    updateLaunchHash(&hasher, std.fmt.bufPrint(number_buf[0..], "output_limit_bytes:{d}", .{ticket.output_limit_bytes}) catch "output_limit_bytes:?");
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn updateLaunchHash(hasher: *Sha256, bytes: []const u8) void {
+    hasher.update(bytes);
+    hasher.update(&[_]u8{0});
 }
 
 fn timeoutLabel(timeout_ms: ?u32) []const u8 {
@@ -4076,7 +4494,7 @@ fn securityFindingsTop(state: *const LinuxGuiState) i16 {
 }
 
 fn taskHistoryTop(state: *const LinuxGuiState) i16 {
-    return state.bottomTop() + 190;
+    return state.bottomTop() + 214;
 }
 
 fn documentTabAt(state: *const LinuxGuiState, x: i16, y: i16) ?usize {

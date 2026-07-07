@@ -2,10 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const app_mod = @import("../core/app.zig");
+const build_consent = @import("../security/build_consent.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const event_mod = @import("../core/event.zig");
 const input_handler = @import("../core/input_handler.zig");
+const navigation = @import("../editor/navigation.zig");
 const modes = @import("../language/modes.zig");
+const findings_mod = @import("../security/findings.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("linux_x11.zig is Linux-only");
@@ -324,8 +327,22 @@ const XAuth = struct {
 
 const BottomPanel = enum {
     output,
-    security,
     git,
+    extensions,
+    diagnostics,
+    security,
+    tutorial,
+    publish,
+};
+
+const HeaderAction = enum {
+    save,
+    save_all,
+    git,
+    audit,
+    extensions,
+    tutorial,
+    publish,
 };
 
 const LinuxGuiState = struct {
@@ -353,6 +370,13 @@ const LinuxGuiState = struct {
         self.message_len = written.len;
     }
 
+    fn appendOutput(self: *LinuxGuiState, stream: @import("../tasks/console.zig").Stream, comptime fmt: []const u8, args: anytype) void {
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        text.writer.print(fmt, args) catch return;
+        self.app.process_console.appendBytes(stream, text.written()) catch return;
+    }
+
     fn execute(self: *LinuxGuiState, id: []const u8, source: @import("../core/command.zig").Source) void {
         const result = dispatcher.dispatch(&self.app, .{ .id = id, .source = source }) catch |err| {
             self.message("{s} failed: {s}", .{ id, @errorName(err) });
@@ -372,35 +396,138 @@ const LinuxGuiState = struct {
 
     fn handleDispatchResult(self: *LinuxGuiState, id: []const u8, result: dispatcher.Result) void {
         switch (result) {
-            .completed => |message_text| self.message("{s}: {s}", .{ id, message_text }),
+            .completed => |message_text| {
+                self.message("{s}: {s}", .{ id, message_text });
+                self.appendOutput(.stdout, "{s}: {s}\n", .{ id, message_text });
+            },
             .blocked => |message_text| {
                 self.message("{s}: blocked", .{id});
-                self.app.process_console.appendBytes(.stderr, message_text) catch {};
+                self.appendOutput(.stderr, "blocked {s}: {s}\n", .{ id, message_text });
+                if (self.app.pending_build_consent) |preview| {
+                    self.appendOutput(.stdout, "pending consent: {s}\n", .{preview.command});
+                    self.appendOutput(.stdout, "review the command, then run task.run_next from the command palette\n", .{});
+                }
             },
-            .unknown_command => self.message("{s}: unknown command", .{id}),
-            .no_active_document => self.message("{s}: no active document", .{id}),
-            .external_command => self.message("{s}: external command requires consent", .{id}),
-            .unsupported => |message_text| self.message("{s}: {s}", .{ id, message_text }),
+            .unknown_command => {
+                self.message("{s}: unknown command", .{id});
+                self.appendOutput(.stderr, "unknown command: {s}\n", .{id});
+            },
+            .no_active_document => {
+                self.message("{s}: no active document", .{id});
+                self.appendOutput(.stderr, "{s}: no active document\n", .{id});
+            },
+            .external_command => |spec| {
+                var preview = build_consent.makePreview(self.allocator, spec, self.app.runtime.trust_state) catch |err| {
+                    self.message("preview failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                defer preview.deinit();
+
+                self.app.execution_queue.enqueueSpec(id, spec, preview.consent) catch |err| {
+                    self.message("queue failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                self.appendOutput(.stdout, "queued external command: {s}\n", .{preview.command});
+
+                const run_result = dispatcher.dispatch(&self.app, .{ .id = "task.run_next", .source = .task }) catch |err| {
+                    self.message("run failed: {s}", .{@errorName(err)});
+                    self.appendOutput(.stderr, "run failed: {s}\n", .{@errorName(err)});
+                    return;
+                };
+                self.handleDispatchResult("task.run_next", run_result);
+            },
+            .unsupported => |message_text| {
+                self.message("{s}: {s}", .{ id, message_text });
+                self.appendOutput(.stderr, "unsupported {s}: {s}\n", .{ id, message_text });
+            },
         }
 
         if (std.mem.eql(u8, id, "git.overview") or std.mem.eql(u8, id, "github.overview")) self.bottom_panel = .git;
+        if (std.mem.eql(u8, id, "view.extensions") or std.mem.eql(u8, id, "extensions.scan")) self.bottom_panel = .extensions;
+        if (std.mem.eql(u8, id, "view.publish") or std.mem.eql(u8, id, "release.checklist")) self.bottom_panel = .publish;
         if (std.mem.eql(u8, id, "security.audit_workspace") or std.mem.eql(u8, id, "security.scan_current")) self.bottom_panel = .security;
     }
 
+    fn runHeaderAction(self: *LinuxGuiState, action: HeaderAction) void {
+        switch (action) {
+            .save => self.execute("file.save", .keybinding),
+            .save_all => self.execute("file.save_all", .keybinding),
+            .git => self.execute("git.overview", .keybinding),
+            .audit => self.execute("security.audit_workspace", .keybinding),
+            .extensions => self.execute("extensions.scan", .keybinding),
+            .tutorial => {
+                self.bottom_panel = .tutorial;
+                self.message("help: tutorial opened", .{});
+            },
+            .publish => self.execute("release.checklist", .keybinding),
+        }
+    }
+
     fn handleKey(self: *LinuxGuiState, key: event_mod.KeyEvent) void {
+        if (self.app.mode == .insert and self.app.focus == .editor) {
+            switch (key.code) {
+                .backspace => {
+                    self.deleteBackward();
+                    return;
+                },
+                .delete => {
+                    self.deleteForward();
+                    return;
+                },
+                else => {},
+            }
+        }
+
+        if (std.meta.activeTag(key.code) == .function) {
+            switch (key.code.function) {
+                1 => {
+                    self.bottom_panel = .tutorial;
+                    self.message("help: tutorial opened", .{});
+                    return;
+                },
+                8 => {
+                    self.bottom_panel = .diagnostics;
+                    self.execute("diagnostics.next", .keybinding);
+                    return;
+                },
+                else => {},
+            }
+        }
+
         if (key.modifiers.ctrl) {
             switch (key.code) {
                 .char => |char| {
+                    if (key.modifiers.shift and (char == 'x' or char == 'X')) {
+                        self.runHeaderAction(.extensions);
+                        return;
+                    }
+                    if (key.modifiers.shift and (char == 'l' or char == 'L')) {
+                        self.runHeaderAction(.publish);
+                        return;
+                    }
+                    if (char == 'z' or char == 'Z') {
+                        self.execute("editor.undo", .keybinding);
+                        return;
+                    }
+                    if (char == 'y' or char == 'Y') {
+                        self.execute("editor.redo", .keybinding);
+                        return;
+                    }
                     if (char == 's' or char == 'S') {
-                        self.execute(if (key.modifiers.shift) "file.save_all" else "file.save", .keybinding);
+                        self.runHeaderAction(if (key.modifiers.shift) .save_all else .save);
                         return;
                     }
                     if (char == 'g' or char == 'G') {
-                        self.execute("git.overview", .keybinding);
+                        self.runHeaderAction(.git);
+                        return;
+                    }
+                    if (char == 'd' or char == 'D') {
+                        self.bottom_panel = .diagnostics;
+                        self.message("diagnostics: {d} item(s)", .{self.app.diagnostics.items.items.len});
                         return;
                     }
                     if (char == 'a' or char == 'A') {
-                        self.execute("security.audit_workspace", .keybinding);
+                        self.runHeaderAction(.audit);
                         return;
                     }
                 },
@@ -415,7 +542,46 @@ const LinuxGuiState = struct {
         self.handleOutcome(outcome);
     }
 
+    fn deleteBackward(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse return;
+        const current = doc.cursor.position.byte_offset;
+        if (current == 0) return;
+        const previous = doc.text.previousByteOffset(current) catch current - 1;
+        doc.deleteRange(previous, current) catch |err| {
+            self.message("delete failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.message("deleted backward", .{});
+    }
+
+    fn deleteForward(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse return;
+        const current = doc.cursor.position.byte_offset;
+        if (current >= doc.text.bytes.len) return;
+        const next = doc.text.nextByteOffset(current) catch current + 1;
+        doc.deleteRange(current, next) catch |err| {
+            self.message("delete failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.message("deleted forward", .{});
+    }
+
     fn handleClick(self: *LinuxGuiState, x: i16, y: i16) void {
+        if (headerActionAt(x, y)) |action| {
+            self.runHeaderAction(action);
+            return;
+        }
+
+        if (documentTabAt(&self.app, x, y)) |index| {
+            self.app.documents.switchTo(index) catch |err| {
+                self.message("tab switch failed: {s}", .{@errorName(err)});
+                return;
+            };
+            self.app.focus = .editor;
+            self.message("switched document", .{});
+            return;
+        }
+
         if (y >= 78 and y < BOTTOM_TOP and x < FILE_WIDTH) {
             const row = @divTrunc(@as(isize, y - 98), LINE_HEIGHT);
             if (row >= 0) {
@@ -436,14 +602,31 @@ const LinuxGuiState = struct {
 
         if (y >= HEADER_HEIGHT and y < BOTTOM_TOP and x >= FILE_WIDTH) {
             self.app.focus = .editor;
+            self.setCursorFromEditorClick(x, y);
             if (self.app.documents.active() != null) self.app.mode = .insert;
             return;
         }
 
         if (y >= BOTTOM_TOP and y < BOTTOM_TOP + 34) {
-            if (x < 135) self.bottom_panel = .output else if (x < 265) self.bottom_panel = .security else if (x < 380) self.bottom_panel = .git;
+            if (bottomPanelAt(x, y)) |panel| self.bottom_panel = panel;
             return;
         }
+    }
+
+    fn setCursorFromEditorClick(self: *LinuxGuiState, x: i16, y: i16) void {
+        const doc = self.app.documents.active() orelse return;
+        if (y < EDITOR_TEXT_TOP - 14) return;
+
+        const line_delta = @divTrunc(@as(isize, y - (EDITOR_TEXT_TOP - 14)), LINE_HEIGHT);
+        if (line_delta < 0) return;
+        const line = self.editor_scroll_line + @as(usize, @intCast(line_delta));
+        if (line >= doc.text.lineCount()) return;
+
+        const column_raw = if (x <= EDITOR_LEFT + 56) 0 else @divTrunc(@as(isize, x - (EDITOR_LEFT + 56)), 8);
+        const column = @min(@as(usize, @intCast(@max(column_raw, 0))), doc.text.lineSlice(line).len);
+        const offset = doc.text.lineColumnToOffset(line, column) catch return;
+        navigation.setCursor(doc, doc.positionFromOffset(offset) catch return);
+        self.message("cursor: {d}:{d}", .{ line + 1, column + 1 });
     }
 };
 
@@ -497,7 +680,8 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
 
     try x11.text(x11.gc.bg, 26, 35, "Z");
     try x11.text(x11.gc.text, 58, 34, "ZIDE");
-    try x11.text(x11.gc.muted, 900, 34, "Linux GUI / direct X11 / shared ZIDE core");
+    try x11.text(x11.gc.muted, 152, 34, "Linux GUI / direct X11 / shared ZIDE core");
+    try drawHeaderActions(x11);
 
     try x11.text(x11.gc.cyan, 18, 86, "FILES");
     try x11.text(x11.gc.muted, 112, 86, "click opens / Enter opens / j,k move");
@@ -525,7 +709,7 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
     const language = if (active) |doc| modes.label(doc.language) else "none";
     const cursor = if (active) |doc| doc.cursor.position else null;
     const status = std.fmt.bufPrint(status_buf[0..],
-        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} trust:{s} risk:{d} files:{d} docs:{d} | Ctrl+P palette Ctrl+S save Ctrl+G git Ctrl+A audit | {s}",
+        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} trust:{s} risk:{d} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+S Ctrl+G Ctrl+A | {s}",
         .{
             @tagName(app.mode),
             @tagName(app.focus),
@@ -536,11 +720,22 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
             @tagName(app.runtime.trust_state),
             app.security_findings.items.items.len,
             app.workspace.entries.items.len,
+            app.workspace.countCodeFiles(),
+            app.workspace.countRecognizedLanguages(),
+            app.workspace.countZigFamily(),
             app.documents.documents.items.len,
             state.message_buf[0..state.message_len],
         },
     ) catch "status unavailable";
     try x11.text(x11.gc.bg, 14, HEIGHT - 9, status);
+}
+
+fn drawHeaderActions(x11: *X11) !void {
+    inline for (.{ HeaderAction.save, HeaderAction.save_all, HeaderAction.git, HeaderAction.audit, HeaderAction.extensions, HeaderAction.tutorial, HeaderAction.publish }) |action| {
+        const rect = headerActionRect(action);
+        try x11.fillRect(x11.gc.panel_2, rect.left, rect.top, @intCast(rect.right - rect.left), @intCast(rect.bottom - rect.top));
+        try x11.text(x11.gc.cyan, rect.left + 10, rect.top + 20, headerActionLabel(action));
+    }
 }
 
 fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
@@ -614,13 +809,21 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
 fn drawBottomPanel(x11: *X11, state: *LinuxGuiState) !void {
     try x11.fillRect(x11.gc.line, 0, BOTTOM_TOP, WIDTH, 1);
     try drawPanelTab(x11, state.bottom_panel == .output, 18, "OUTPUT");
-    try drawPanelTab(x11, state.bottom_panel == .security, 142, "SECURITY");
-    try drawPanelTab(x11, state.bottom_panel == .git, 282, "GIT");
+    try drawPanelTab(x11, state.bottom_panel == .git, 122, "GIT");
+    try drawPanelTab(x11, state.bottom_panel == .extensions, 226, "EXT");
+    try drawPanelTab(x11, state.bottom_panel == .diagnostics, 330, "DIAG");
+    try drawPanelTab(x11, state.bottom_panel == .security, 434, "SEC");
+    try drawPanelTab(x11, state.bottom_panel == .tutorial, 538, "HELP");
+    try drawPanelTab(x11, state.bottom_panel == .publish, 642, "SHIP");
 
     switch (state.bottom_panel) {
         .output => try drawOutputPanel(x11, state),
-        .security => try drawSecurityPanel(x11, state),
         .git => try drawGitPanel(x11, state),
+        .extensions => try drawExtensionsPanel(x11, state),
+        .diagnostics => try drawDiagnosticsPanel(x11, state),
+        .security => try drawSecurityPanel(x11, state),
+        .tutorial => try drawTutorialPanel(x11, state),
+        .publish => try drawPublishPanel(x11, state),
     }
 }
 
@@ -653,7 +856,21 @@ fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
         @tagName(app.runtime.trust_state),
     }) catch "security status unavailable";
     try x11.text(x11.gc.green, 18, BOTTOM_TOP + 58, header);
-    var y: i16 = BOTTOM_TOP + 86;
+    var boundary_buf: [240]u8 = undefined;
+    const counts = boundaryCounts(app);
+    const boundary = std.fmt.bufPrint(boundary_buf[0..], "BOUNDARY mem:{d} exec:{d} fs:{d} net:{d} deps:{d} secret:{d} text:{d} path:{d} git:{d}", .{
+        counts.memory,
+        counts.execution,
+        counts.filesystem,
+        counts.network,
+        counts.dependency,
+        counts.secret,
+        counts.text,
+        counts.path,
+        counts.git,
+    }) catch "BOUNDARY";
+    try x11.text(x11.gc.amber, 18, BOTTOM_TOP + 82, boundary);
+    var y: i16 = BOTTOM_TOP + 110;
     const limit = @min(app.security_findings.items.items.len, @as(usize, 6));
     for (app.security_findings.items.items[0..limit]) |finding| {
         var row_buf: [900]u8 = undefined;
@@ -687,6 +904,88 @@ fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
     }
 }
 
+fn drawExtensionsPanel(x11: *X11, state: *LinuxGuiState) !void {
+    try x11.text(x11.gc.green, 18, BOTTOM_TOP + 58, "Extensions and integrations are manifest-scanned; extension code is not executed.");
+    try drawFilteredConsole(x11, state, BOTTOM_TOP + 86, &.{ "extension", "Extension", "manifest", "capabilities", "integrations" });
+}
+
+fn drawDiagnosticsPanel(x11: *X11, state: *LinuxGuiState) !void {
+    const app = &state.app;
+    var header_buf: [160]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "DIAGNOSTICS total:{d}", .{app.diagnostics.items.items.len}) catch "DIAGNOSTICS";
+    try x11.text(x11.gc.green, 18, BOTTOM_TOP + 58, header);
+    var y: i16 = BOTTOM_TOP + 86;
+    const limit = @min(app.diagnostics.items.items.len, @as(usize, 6));
+    for (app.diagnostics.items.items[0..limit]) |item| {
+        var row_buf: [900]u8 = undefined;
+        const row = std.fmt.bufPrint(row_buf[0..], "{s}:{d}:{d} [{s}] {s}", .{
+            item.path,
+            item.range.start.line + 1,
+            item.range.start.column + 1,
+            @tagName(item.severity),
+            item.message,
+        }) catch item.message;
+        var ascii_buf: [900]u8 = undefined;
+        try x11.text(x11.gc.muted, 18, y, asciiInto(ascii_buf[0..], row));
+        y += LINE_HEIGHT;
+    }
+    if (app.diagnostics.items.items.len == 0) {
+        try x11.text(x11.gc.muted, 18, y, "No diagnostics yet. Build/test output will be sanitized and parsed here.");
+    }
+}
+
+fn drawTutorialPanel(x11: *X11, state: *LinuxGuiState) !void {
+    const app = &state.app;
+    var header_buf: [220]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "HELP / ZIDE security tour   trust={s} risk={d}", .{
+        @tagName(app.runtime.trust_state),
+        app.security_findings.items.items.len,
+    }) catch "HELP / ZIDE security tour";
+    try x11.text(x11.gc.green, 18, BOTTOM_TOP + 58, header);
+
+    const lines = [_][]const u8{
+        "F1 opens help. Ctrl+P opens commands. Ctrl+S saves with atomic write and save-time security scan.",
+        "Click files to open. Insert mode edits the same DocumentStore used by Windows and the TUI.",
+        "SEC shows Zig-owned boundary findings: memory, exec, filesystem, network, dependency, secret, text, path, git.",
+        "GIT reads repository metadata directly; hooks, filters, fsmonitor, and git status are not executed for overview.",
+        "EXT scans extension manifests only. SHIP verifies archives, paths, executable bits, and SHA-256 before release.",
+    };
+    var y: i16 = BOTTOM_TOP + 86;
+    for (lines) |line| {
+        try x11.text(x11.gc.muted, 18, y, line);
+        y += LINE_HEIGHT;
+    }
+}
+
+fn drawPublishPanel(x11: *X11, state: *LinuxGuiState) !void {
+    try x11.text(x11.gc.green, 18, BOTTOM_TOP + 58, "SHIP / release gate");
+    try drawFilteredConsole(x11, state, BOTTOM_TOP + 86, &.{ "release", "bundle", "Linux", "Windows", "sha256", "publish", "GitHub" });
+}
+
+fn drawFilteredConsole(x11: *X11, state: *LinuxGuiState, start_y: i16, needles: []const []const u8) !void {
+    const app = &state.app;
+    var y = start_y;
+    var shown: usize = 0;
+    for (app.process_console.lines.items) |line| {
+        var match = false;
+        for (needles) |needle| {
+            if (std.mem.indexOf(u8, line.text, needle) != null) {
+                match = true;
+                break;
+            }
+        }
+        if (!match) continue;
+        var ascii_buf: [900]u8 = undefined;
+        try x11.text(if (line.stream == .stderr) x11.gc.red else x11.gc.muted, 18, y, asciiInto(ascii_buf[0..], line.text));
+        y += LINE_HEIGHT;
+        shown += 1;
+        if (y > HEIGHT - STATUS_HEIGHT - 12) break;
+    }
+    if (shown == 0) {
+        try x11.text(x11.gc.muted, 18, y, "Run the matching header action or command palette item to populate this panel.");
+    }
+}
+
 fn drawPalette(x11: *X11, state: *LinuxGuiState) !void {
     const left: i16 = 245;
     const top: i16 = 92;
@@ -715,7 +1014,38 @@ fn drawPalette(x11: *X11, state: *LinuxGuiState) !void {
     }
 }
 
-fn riskGc(x11: *X11, risk: @import("../security/findings.zig").Risk) u32 {
+const BoundaryCounts = struct {
+    memory: usize = 0,
+    execution: usize = 0,
+    filesystem: usize = 0,
+    network: usize = 0,
+    dependency: usize = 0,
+    secret: usize = 0,
+    text: usize = 0,
+    path: usize = 0,
+    git: usize = 0,
+};
+
+fn boundaryCounts(app: *const app_mod.App) BoundaryCounts {
+    var counts: BoundaryCounts = .{};
+    for (app.security_findings.items.items) |finding| {
+        switch (findings_mod.boundaryFor(finding.category)) {
+            .memory => counts.memory += 1,
+            .execution => counts.execution += 1,
+            .filesystem => counts.filesystem += 1,
+            .network => counts.network += 1,
+            .dependency => counts.dependency += 1,
+            .secret => counts.secret += 1,
+            .text => counts.text += 1,
+            .path => counts.path += 1,
+            .git => counts.git += 1,
+            else => {},
+        }
+    }
+    return counts;
+}
+
+fn riskGc(x11: *X11, risk: findings_mod.Risk) u32 {
     return switch (risk) {
         .critical, .high => x11.gc.red,
         .medium => x11.gc.amber,
@@ -827,6 +1157,73 @@ fn keycodeToAscii(keycode: u8, shift: bool) ?u21 {
 
 fn shifted(lower: u8, shift: bool) u21 {
     return if (shift) lower - ('a' - 'A') else lower;
+}
+
+const HitRect = struct {
+    left: i16,
+    top: i16,
+    right: i16,
+    bottom: i16,
+};
+
+fn headerActionRect(action: HeaderAction) HitRect {
+    const top: i16 = 15;
+    const height: i16 = 30;
+    return switch (action) {
+        .save => .{ .left = 520, .top = top, .right = 588, .bottom = top + height },
+        .save_all => .{ .left = 596, .top = top, .right = 666, .bottom = top + height },
+        .git => .{ .left = 674, .top = top, .right = 736, .bottom = top + height },
+        .audit => .{ .left = 744, .top = top, .right = 822, .bottom = top + height },
+        .extensions => .{ .left = 830, .top = top, .right = 896, .bottom = top + height },
+        .tutorial => .{ .left = 904, .top = top, .right = 978, .bottom = top + height },
+        .publish => .{ .left = 986, .top = top, .right = 1058, .bottom = top + height },
+    };
+}
+
+fn headerActionLabel(action: HeaderAction) []const u8 {
+    return switch (action) {
+        .save => "SAVE",
+        .save_all => "ALL",
+        .git => "GIT",
+        .audit => "AUDIT",
+        .extensions => "EXT",
+        .tutorial => "HELP",
+        .publish => "SHIP",
+    };
+}
+
+fn headerActionAt(x: i16, y: i16) ?HeaderAction {
+    inline for (.{ HeaderAction.save, HeaderAction.save_all, HeaderAction.git, HeaderAction.audit, HeaderAction.extensions, HeaderAction.tutorial, HeaderAction.publish }) |action| {
+        if (pointIn(headerActionRect(action), x, y)) return action;
+    }
+    return null;
+}
+
+fn bottomPanelAt(x: i16, y: i16) ?BottomPanel {
+    if (y < BOTTOM_TOP or y >= BOTTOM_TOP + 34) return null;
+    const panels = [_]BottomPanel{ .output, .git, .extensions, .diagnostics, .security, .tutorial, .publish };
+    for (panels, 0..) |panel, index| {
+        const left: i16 = 10 + @as(i16, @intCast(index)) * 104;
+        const rect = HitRect{ .left = left, .top = BOTTOM_TOP + 8, .right = left + 96, .bottom = BOTTOM_TOP + 32 };
+        if (pointIn(rect, x, y)) return panel;
+    }
+    return null;
+}
+
+fn documentTabAt(app: *const app_mod.App, x: i16, y: i16) ?usize {
+    if (y < 92 or y >= 122 or x < EDITOR_LEFT) return null;
+    var tab_x: i16 = EDITOR_LEFT;
+    for (app.documents.documents.items, 0..) |_, index| {
+        const rect = HitRect{ .left = tab_x - 4, .top = 96, .right = tab_x + 174, .bottom = 122 };
+        if (pointIn(rect, x, y)) return index;
+        tab_x += 188;
+        if (tab_x > WIDTH - 220) break;
+    }
+    return null;
+}
+
+fn pointIn(rect: HitRect, x: i16, y: i16) bool {
+    return x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom;
 }
 
 fn connectUnix(path: []const u8) !i32 {

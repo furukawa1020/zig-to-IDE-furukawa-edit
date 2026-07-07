@@ -1,5 +1,6 @@
 .zig-cache/
 .zig-global-cache/
+.zig-toolchain/
 .tools/
 zig-cache/
 zig-out/

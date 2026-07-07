@@ -3,13 +3,17 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const app_mod = @import("../core/app.zig");
 const build_consent = @import("../security/build_consent.zig");
+const command_mod = @import("../core/command.zig");
 const dispatcher = @import("../core/dispatcher.zig");
 const event_mod = @import("../core/event.zig");
 const input_handler = @import("../core/input_handler.zig");
+const document_mod = @import("../editor/document.zig");
 const navigation = @import("../editor/navigation.zig");
 const modes = @import("../language/modes.zig");
+const symbols_mod = @import("../language/symbols.zig");
 const findings_mod = @import("../security/findings.zig");
 const file_finder = @import("../search/file_finder.zig");
+const literal_search = @import("../search/literal.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const task_registry = @import("../tasks/registry.zig");
 
@@ -338,6 +342,7 @@ const BottomPanel = enum {
 };
 
 const HeaderAction = enum {
+    open_workspace,
     save,
     save_all,
     build,
@@ -351,11 +356,30 @@ const HeaderAction = enum {
 };
 
 const QuickPanelMode = enum {
+    open_workspace,
     find_file,
     find_document,
+    replace_document,
+    rename_symbol,
     search_workspace,
     new_file,
     run_task,
+    document_symbols,
+};
+
+const ReplaceRequest = struct {
+    find: []const u8,
+    replace: []const u8,
+};
+
+const SelectionRange = struct {
+    start: usize,
+    end: usize,
+};
+
+const SearchDirection = enum {
+    forward,
+    backward,
 };
 
 const DocumentMatch = struct {
@@ -367,6 +391,19 @@ const DocumentMatch = struct {
 
     fn deinit(self: *DocumentMatch, allocator: std.mem.Allocator) void {
         allocator.free(self.preview);
+        self.* = undefined;
+    }
+};
+
+const SymbolMatch = struct {
+    name: []u8,
+    kind: symbols_mod.SymbolKind,
+    line: usize,
+    column: usize,
+    byte_offset: usize,
+
+    fn deinit(self: *SymbolMatch, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
         self.* = undefined;
     }
 };
@@ -386,12 +423,14 @@ const QuickPanel = struct {
     allocator: std.mem.Allocator,
     visible: bool = false,
     mode: QuickPanelMode = .find_file,
+    search_options: literal_search.Options = .{},
     query: std.array_list.Managed(u8),
     selected_index: usize = 0,
     file_matches: ?[]file_finder.Match = null,
     document_matches: ?[]DocumentMatch = null,
     search_results: ?[]workspace_search.Result = null,
     task_matches: ?[]TaskMatch = null,
+    symbol_matches: ?[]SymbolMatch = null,
 
     fn init(allocator: std.mem.Allocator) QuickPanel {
         return .{
@@ -452,17 +491,52 @@ const QuickPanel = struct {
 
     fn itemCount(self: *const QuickPanel) usize {
         return switch (self.mode) {
+            .open_workspace => if (self.query.items.len > 0) 1 else 0,
             .find_file => if (self.file_matches) |items| items.len else 0,
             .find_document => if (self.document_matches) |items| items.len else 0,
+            .replace_document => if (self.document_matches) |items| items.len else 0,
+            .rename_symbol => if (renameRequest(self.query.items)) |_| 1 else 0,
             .search_workspace => if (self.search_results) |items| items.len else 0,
             .new_file => if (self.query.items.len > 0) 1 else 0,
             .run_task => if (self.task_matches) |items| items.len else 0,
+            .document_symbols => if (self.symbol_matches) |items| items.len else 0,
         };
+    }
+
+    fn selectedFile(self: *const QuickPanel) ?file_finder.Match {
+        const items = self.file_matches orelse return null;
+        if (items.len == 0) return null;
+        return items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn selectedDocumentMatch(self: *const QuickPanel) ?*const DocumentMatch {
+        const items = self.document_matches orelse return null;
+        if (items.len == 0) return null;
+        return &items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn selectedSearchResult(self: *const QuickPanel) ?*const workspace_search.Result {
+        const items = self.search_results orelse return null;
+        if (items.len == 0) return null;
+        return &items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn selectedTask(self: *const QuickPanel) ?*const TaskMatch {
+        const items = self.task_matches orelse return null;
+        if (items.len == 0) return null;
+        return &items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn selectedSymbol(self: *const QuickPanel) ?*const SymbolMatch {
+        const items = self.symbol_matches orelse return null;
+        if (items.len == 0) return null;
+        return &items[@min(self.selected_index, items.len - 1)];
     }
 
     fn rebuild(self: *QuickPanel, app: *const app_mod.App) !void {
         self.clearResults();
         switch (self.mode) {
+            .open_workspace => {},
             .find_file => {
                 self.file_matches = try file_finder.find(self.allocator, &app.workspace, self.query.items, 80);
             },
@@ -470,12 +544,22 @@ const QuickPanel = struct {
                 if (self.query.items.len > 0) {
                     const active_index = app.documents.activeIndex() orelse return;
                     const doc = &app.documents.documents.items[active_index];
-                    self.document_matches = try findDocumentMatches(self.allocator, doc.text.bytes, self.query.items, 128);
+                    self.document_matches = try findDocumentMatches(self.allocator, doc, self.query.items, self.search_options, 128);
                 }
             },
+            .replace_document => {
+                const request = parseReplaceRequest(self.query.items) orelse return;
+                if (request.find.len > 0) {
+                    const active_index = app.documents.activeIndex() orelse return;
+                    const doc = &app.documents.documents.items[active_index];
+                    self.document_matches = try findDocumentMatches(self.allocator, doc, request.find, self.search_options, 128);
+                }
+            },
+            .rename_symbol => {},
             .search_workspace => {
                 if (self.query.items.len > 0) {
                     self.search_results = try workspace_search.search(self.allocator, &app.workspace, self.query.items, .{
+                        .literal_options = self.search_options,
                         .max_file_bytes = 512 * 1024,
                         .max_results = 256,
                     });
@@ -494,8 +578,8 @@ const QuickPanel = struct {
 
                 for (registry.tasks.items) |task| {
                     const executable = task.executable orelse "";
-                    const name_match = fuzzyMatch(self.query.items, task.name);
-                    const exe_match = fuzzyMatch(self.query.items, executable);
+                    const name_match = command_mod.fuzzyScore(self.query.items, task.name) != null;
+                    const exe_match = command_mod.fuzzyScore(self.query.items, executable) != null;
                     if (self.query.items.len != 0 and !name_match and !exe_match) continue;
                     try matches.append(.{
                         .name = try self.allocator.dupe(u8, task.name),
@@ -503,6 +587,34 @@ const QuickPanel = struct {
                     });
                 }
                 self.task_matches = try matches.toOwnedSlice();
+            },
+            .document_symbols => {
+                const active_index = app.documents.activeIndex() orelse return;
+                const doc = &app.documents.documents.items[active_index];
+                const path = doc.path orelse "(scratch)";
+                var index = try symbols_mod.collectTopLevel(self.allocator, doc.text.bytes, path);
+                defer index.deinit();
+
+                var matches = std.array_list.Managed(SymbolMatch).init(self.allocator);
+                errdefer {
+                    for (matches.items) |*item| item.deinit(self.allocator);
+                    matches.deinit();
+                }
+
+                for (index.symbols) |symbol| {
+                    const kind_name = @tagName(symbol.kind);
+                    const name_match = command_mod.fuzzyScore(self.query.items, symbol.name) != null;
+                    const kind_match = command_mod.fuzzyScore(self.query.items, kind_name) != null;
+                    if (self.query.items.len != 0 and !name_match and !kind_match) continue;
+                    try matches.append(.{
+                        .name = try self.allocator.dupe(u8, symbol.name),
+                        .kind = symbol.kind,
+                        .line = symbol.range.start.line,
+                        .column = symbol.range.start.column,
+                        .byte_offset = symbol.range.start.byte_offset,
+                    });
+                }
+                self.symbol_matches = try matches.toOwnedSlice();
             },
         }
         if (self.selected_index >= self.itemCount()) self.selected_index = 0;
@@ -528,13 +640,40 @@ const QuickPanel = struct {
             self.allocator.free(items);
             self.task_matches = null;
         }
+        if (self.symbol_matches) |items| {
+            for (items) |*item| item.deinit(self.allocator);
+            self.allocator.free(items);
+            self.symbol_matches = null;
+        }
     }
+};
+
+const LinuxFlag = enum {
+    unknown,
+    off,
+    on,
+};
+
+const LinuxSecuritySnapshot = struct {
+    no_new_privs: LinuxFlag = .unknown,
+    no_new_privs_set: LinuxFlag = .unknown,
+    dumpable: LinuxFlag = .unknown,
+    dumpable_set: LinuxFlag = .unknown,
+    seccomp_mode: ?u8 = null,
+    cap_eff: [32]u8 = [_]u8{0} ** 32,
+    cap_eff_len: usize = 0,
+    cap_eff_zero: LinuxFlag = .unknown,
+    proc_status_read: bool = false,
 };
 
 const LinuxGuiState = struct {
     allocator: std.mem.Allocator,
     app: app_mod.App,
     quick_panel: QuickPanel,
+    linux_security: LinuxSecuritySnapshot = .{},
+    last_document_search_query: std.array_list.Managed(u8),
+    last_document_search_options: literal_search.Options = .{},
+    selection_anchor: ?usize = null,
     bottom_panel: BottomPanel = .output,
     window_width: i16 = WIDTH,
     window_height: i16 = HEIGHT,
@@ -548,10 +687,12 @@ const LinuxGuiState = struct {
             .allocator = allocator,
             .app = try app_mod.App.init(allocator, root_path),
             .quick_panel = QuickPanel.init(allocator),
+            .last_document_search_query = std.array_list.Managed(u8).init(allocator),
         };
     }
 
     fn deinit(self: *LinuxGuiState) void {
+        self.last_document_search_query.deinit();
         self.quick_panel.deinit();
         self.app.deinit();
         self.* = undefined;
@@ -567,6 +708,30 @@ const LinuxGuiState = struct {
         defer text.deinit();
         text.writer.print(fmt, args) catch return;
         self.app.process_console.appendBytes(stream, text.written()) catch return;
+    }
+
+    fn enableLinuxSelfProtection(self: *LinuxGuiState) void {
+        self.linux_security.no_new_privs_set = if (trySetNoNewPrivs()) .on else .off;
+        self.linux_security.dumpable_set = if (trySetDumpable(false)) .on else .off;
+        self.refreshLinuxSelfProtection();
+        self.appendOutput(.stdout, "linux self-protection: no_new_privs_set={s} no_new_privs={s} dumpable={s} dumpable_set={s} seccomp={s} cap_eff={s}\n", .{
+            flagLabel(self.linux_security.no_new_privs_set),
+            flagLabel(self.linux_security.no_new_privs),
+            flagLabel(self.linux_security.dumpable),
+            flagLabel(self.linux_security.dumpable_set),
+            seccompLabel(self.linux_security.seccomp_mode),
+            self.linuxSecurityCapEffLabel(),
+        });
+    }
+
+    fn refreshLinuxSelfProtection(self: *LinuxGuiState) void {
+        self.linux_security = readLinuxSecuritySnapshot(self.allocator, self.linux_security.no_new_privs_set, self.linux_security.dumpable_set);
+    }
+
+    fn linuxSecurityCapEffLabel(self: *const LinuxGuiState) []const u8 {
+        if (self.linux_security.cap_eff_len == 0) return "unknown";
+        if (self.linux_security.cap_eff_zero == .on) return "none";
+        return self.linux_security.cap_eff[0..self.linux_security.cap_eff_len];
     }
 
     fn bottomTop(self: *const LinuxGuiState) i16 {
@@ -608,7 +773,81 @@ const LinuxGuiState = struct {
         self.editor_scroll_line = scrollValue(self.editor_scroll_line, max_start, delta);
     }
 
-    fn execute(self: *LinuxGuiState, id: []const u8, source: @import("../core/command.zig").Source) void {
+    fn ensureEditorCursorVisible(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse return;
+        const bottom = self.bottomTop();
+        const visible: usize = @intCast(@max(@divTrunc(bottom - EDITOR_TEXT_TOP - 16, LINE_HEIGHT), 1));
+        if (doc.cursor.position.line < self.editor_scroll_line) {
+            self.editor_scroll_line = doc.cursor.position.line;
+        } else if (doc.cursor.position.line >= self.editor_scroll_line + visible) {
+            self.editor_scroll_line = doc.cursor.position.line - visible + 1;
+        }
+    }
+
+    fn selectedRange(self: *const LinuxGuiState, doc: *const document_mod.Document) ?SelectionRange {
+        const anchor_raw = self.selection_anchor orelse return null;
+        const cursor_raw = doc.cursor.position.byte_offset;
+        const anchor = @min(anchor_raw, doc.text.bytes.len);
+        const cursor = @min(cursor_raw, doc.text.bytes.len);
+        if (anchor == cursor) return null;
+        return if (anchor < cursor)
+            .{ .start = anchor, .end = cursor }
+        else
+            .{ .start = cursor, .end = anchor };
+    }
+
+    fn execute(self: *LinuxGuiState, id: []const u8, source: command_mod.Source) void {
+        if (std.mem.eql(u8, id, "view.command_palette")) {
+            self.quick_panel.close();
+            self.app.palette.open() catch |err| {
+                self.message("palette failed: {s}", .{@errorName(err)});
+                return;
+            };
+            self.app.mode = .command;
+            self.message("command palette", .{});
+            return;
+        }
+        if (std.mem.eql(u8, id, "workspace.find_file")) {
+            self.openQuickPanel(.find_file);
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.find")) {
+            self.openQuickPanel(.find_document);
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.replace")) {
+            self.openQuickPanel(.replace_document);
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.find_next")) {
+            self.findLastDocumentSearch(.forward);
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.find_previous")) {
+            self.findLastDocumentSearch(.backward);
+            return;
+        }
+        if (std.mem.eql(u8, id, "workspace.search")) {
+            self.openQuickPanel(.search_workspace);
+            return;
+        }
+        if (std.mem.eql(u8, id, "file.new")) {
+            self.openQuickPanel(.new_file);
+            return;
+        }
+        if (std.mem.eql(u8, id, "task.run")) {
+            self.openQuickPanel(.run_task);
+            return;
+        }
+        if (std.mem.eql(u8, id, "symbol.goto_symbol")) {
+            self.openQuickPanel(.document_symbols);
+            return;
+        }
+        if (std.mem.eql(u8, id, "symbol.rename")) {
+            self.openRenamePanel();
+            return;
+        }
+
         const result = dispatcher.dispatch(&self.app, .{ .id = id, .source = source }) catch |err| {
             self.message("{s} failed: {s}", .{ id, @errorName(err) });
             self.app.process_console.appendBytes(.stderr, "command failed\n") catch {};
@@ -677,11 +916,15 @@ const LinuxGuiState = struct {
         if (std.mem.eql(u8, id, "git.overview") or std.mem.eql(u8, id, "github.overview")) self.bottom_panel = .git;
         if (std.mem.eql(u8, id, "view.extensions") or std.mem.eql(u8, id, "extensions.scan")) self.bottom_panel = .extensions;
         if (std.mem.eql(u8, id, "view.publish") or std.mem.eql(u8, id, "release.checklist")) self.bottom_panel = .publish;
-        if (std.mem.eql(u8, id, "security.audit_workspace") or std.mem.eql(u8, id, "security.scan_current")) self.bottom_panel = .security;
+        if (std.mem.eql(u8, id, "security.audit_workspace") or std.mem.eql(u8, id, "security.scan_current")) {
+            self.refreshLinuxSelfProtection();
+            self.bottom_panel = .security;
+        }
     }
 
     fn runHeaderAction(self: *LinuxGuiState, action: HeaderAction) void {
         switch (action) {
+            .open_workspace => self.openQuickPanel(.open_workspace),
             .save => self.execute("file.save", .keybinding),
             .save_all => self.execute("file.save_all", .keybinding),
             .build => self.execute("zig.build", .keybinding),
@@ -704,8 +947,93 @@ const LinuxGuiState = struct {
             self.message("panel failed: {s}", .{@errorName(err)});
             return;
         };
+        self.seedQuickPanelFromLastSearch(mode);
         self.app.mode = .command;
         self.message("{s}", .{quickPanelTitle(mode)});
+    }
+
+    fn openRenamePanel(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse return self.message("no identifier under cursor", .{});
+        self.openQuickPanel(.rename_symbol);
+        self.quick_panel.query.clearRetainingCapacity();
+        self.quick_panel.query.appendSlice(name) catch |err| return self.message("rename failed: {s}", .{@errorName(err)});
+        self.quick_panel.query.appendSlice("=>") catch |err| return self.message("rename failed: {s}", .{@errorName(err)});
+        self.quick_panel.rebuild(&self.app) catch |err| return self.message("rename failed: {s}", .{@errorName(err)});
+        self.message("rename: type new name after =>", .{});
+    }
+
+    fn seedQuickPanelFromLastSearch(self: *LinuxGuiState, mode: QuickPanelMode) void {
+        if (!isDocumentSearchMode(mode)) return;
+        if (self.last_document_search_query.items.len == 0) return;
+        self.quick_panel.query.clearRetainingCapacity();
+        self.quick_panel.query.appendSlice(self.last_document_search_query.items) catch |err| return self.message("panel seed failed: {s}", .{@errorName(err)});
+        if (mode == .replace_document) {
+            self.quick_panel.query.appendSlice("=>") catch |err| return self.message("panel seed failed: {s}", .{@errorName(err)});
+        }
+        self.quick_panel.search_options = self.last_document_search_options;
+        self.quick_panel.rebuild(&self.app) catch |err| return self.message("panel seed failed: {s}", .{@errorName(err)});
+    }
+
+    fn quickPanelInsertText(self: *LinuxGuiState, bytes: []const u8) void {
+        self.quick_panel.insertText(&self.app, bytes) catch |err| {
+            self.message("panel failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.rememberDocumentSearchFromQuickPanel();
+    }
+
+    fn quickPanelDeleteBackward(self: *LinuxGuiState) void {
+        self.quick_panel.deleteBackward(&self.app) catch |err| {
+            self.message("panel failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.rememberDocumentSearchFromQuickPanel();
+    }
+
+    fn toggleQuickPanelCaseSensitive(self: *LinuxGuiState) void {
+        if (!isDocumentSearchMode(self.quick_panel.mode)) return;
+        self.quick_panel.search_options.case_sensitive = !self.quick_panel.search_options.case_sensitive;
+        self.quick_panel.rebuild(&self.app) catch |err| return self.message("panel failed: {s}", .{@errorName(err)});
+        self.rememberDocumentSearchFromQuickPanel();
+        if (self.quick_panel.search_options.case_sensitive) {
+            self.message("find: case sensitive", .{});
+        } else {
+            self.message("find: ignore case", .{});
+        }
+    }
+
+    fn toggleQuickPanelWholeWord(self: *LinuxGuiState) void {
+        if (!isDocumentSearchMode(self.quick_panel.mode)) return;
+        self.quick_panel.search_options.whole_word = !self.quick_panel.search_options.whole_word;
+        self.quick_panel.rebuild(&self.app) catch |err| return self.message("panel failed: {s}", .{@errorName(err)});
+        self.rememberDocumentSearchFromQuickPanel();
+        if (self.quick_panel.search_options.whole_word) {
+            self.message("find: whole word", .{});
+        } else {
+            self.message("find: partial word", .{});
+        }
+    }
+
+    fn rememberDocumentSearchFromQuickPanel(self: *LinuxGuiState) void {
+        if (!isDocumentSearchMode(self.quick_panel.mode)) return;
+        const query = if (self.quick_panel.mode == .replace_document) blk: {
+            const request = parseReplaceRequest(self.quick_panel.query.items) orelse return;
+            break :blk request.find;
+        } else self.quick_panel.query.items;
+        if (query.len == 0) return;
+        self.last_document_search_query.clearRetainingCapacity();
+        self.last_document_search_query.appendSlice(query) catch |err| return self.message("search memory failed: {s}", .{@errorName(err)});
+        self.last_document_search_options = self.quick_panel.search_options;
+    }
+
+    fn moveQuickPanelDocumentMatch(self: *LinuxGuiState, delta: isize) void {
+        if (!isDocumentSearchMode(self.quick_panel.mode)) return;
+        self.quick_panel.moveSelection(delta);
+        const item = self.quick_panel.selectedDocumentMatch() orelse return;
+        self.selectActiveDocumentRange(item.byte_offset, item.end_offset, "selected search match");
+        self.quick_panel.visible = true;
+        self.app.mode = .command;
     }
 
     fn handleQuickPanelKey(self: *LinuxGuiState, key: event_mod.KeyEvent) bool {
@@ -718,7 +1046,7 @@ const LinuxGuiState = struct {
                 return true;
             },
             .backspace => {
-                self.quick_panel.deleteBackward(&self.app) catch |err| self.message("panel failed: {s}", .{@errorName(err)});
+                self.quickPanelDeleteBackward();
                 return true;
             },
             .arrow_up => {
@@ -730,20 +1058,34 @@ const LinuxGuiState = struct {
                 return true;
             },
             .enter => {
-                self.executeSelectedQuickPanelItem();
+                if (key.modifiers.ctrl and self.quick_panel.mode == .replace_document) {
+                    self.replaceAllFromQuickPanel();
+                } else {
+                    self.executeSelectedQuickPanelItem();
+                }
                 return true;
             },
             .tab => {
-                if (self.quick_panel.mode == .find_document) {
+                if (isDocumentSearchMode(self.quick_panel.mode)) {
                     self.quick_panel.mode = .search_workspace;
                     self.quick_panel.rebuild(&self.app) catch |err| self.message("panel failed: {s}", .{@errorName(err)});
                 }
                 return true;
             },
+            .function => |number| {
+                switch (number) {
+                    3 => self.moveQuickPanelDocumentMatch(if (key.modifiers.shift) -1 else 1),
+                    6 => self.toggleQuickPanelCaseSensitive(),
+                    7 => self.toggleQuickPanelWholeWord(),
+                    else => {},
+                }
+                return true;
+            },
             .char => |char| {
+                if (key.modifiers.ctrl) return true;
                 var bytes: [4]u8 = undefined;
                 const len = encodeUtf8(char, &bytes) catch return true;
-                self.quick_panel.insertText(&self.app, bytes[0..len]) catch |err| self.message("panel failed: {s}", .{@errorName(err)});
+                self.quickPanelInsertText(bytes[0..len]);
                 return true;
             },
             else => return true,
@@ -752,30 +1094,48 @@ const LinuxGuiState = struct {
 
     fn executeSelectedQuickPanelItem(self: *LinuxGuiState) void {
         switch (self.quick_panel.mode) {
+            .open_workspace => {
+                if (self.quick_panel.query.items.len == 0) return self.message("type a workspace path", .{});
+                const path = self.allocator.dupe(u8, self.quick_panel.query.items) catch |err| return self.message("open failed: {s}", .{@errorName(err)});
+                defer self.allocator.free(path);
+                self.quick_panel.close();
+                self.openWorkspace(path);
+            },
             .find_file => {
-                const items = self.quick_panel.file_matches orelse return self.message("no file match", .{});
-                if (items.len == 0) return self.message("no file match", .{});
-                const item = items[@min(self.quick_panel.selected_index, items.len - 1)];
+                const item = self.quick_panel.selectedFile() orelse return self.message("no file match", .{});
                 const path = self.allocator.dupe(u8, item.path) catch |err| return self.message("open failed: {s}", .{@errorName(err)});
                 defer self.allocator.free(path);
                 self.quick_panel.close();
                 self.openRelativeLocation(path, 0, 0);
             },
             .find_document => {
-                const items = self.quick_panel.document_matches orelse return self.message("no match", .{});
-                if (items.len == 0) return self.message("no match", .{});
-                const item = items[@min(self.quick_panel.selected_index, items.len - 1)];
-                const doc = self.app.documents.active() orelse return self.message("no active document", .{});
-                navigation.setCursor(doc, doc.positionFromOffset(item.byte_offset) catch doc.cursor.position);
+                const item = self.quick_panel.selectedDocumentMatch() orelse return self.message("no match", .{});
+                const start = item.byte_offset;
+                const end = item.end_offset;
                 self.quick_panel.close();
-                self.app.mode = .insert;
-                self.app.focus = .editor;
-                self.message("found at {d}:{d}", .{ item.line + 1, item.column + 1 });
+                self.selectActiveDocumentRange(start, end, "found match");
+            },
+            .replace_document => {
+                const item = self.quick_panel.selectedDocumentMatch() orelse return self.message("no replacement target", .{});
+                const request = parseReplaceRequest(self.quick_panel.query.items) orelse return self.message("type search=>replacement", .{});
+                const replacement = self.allocator.dupe(u8, request.replace) catch |err| return self.message("replace failed: {s}", .{@errorName(err)});
+                defer self.allocator.free(replacement);
+                const start = item.byte_offset;
+                const end = item.end_offset;
+                self.quick_panel.close();
+                self.replaceActiveDocumentRange(start, end, replacement);
+            },
+            .rename_symbol => {
+                const request = renameRequest(self.quick_panel.query.items) orelse return self.message("type old_name=>new_name", .{});
+                const old_name = self.allocator.dupe(u8, request.find) catch |err| return self.message("rename failed: {s}", .{@errorName(err)});
+                defer self.allocator.free(old_name);
+                const new_name = self.allocator.dupe(u8, request.replace) catch |err| return self.message("rename failed: {s}", .{@errorName(err)});
+                defer self.allocator.free(new_name);
+                self.quick_panel.close();
+                self.renameWorkspaceSymbol(old_name, new_name);
             },
             .search_workspace => {
-                const items = self.quick_panel.search_results orelse return self.message("no workspace match", .{});
-                if (items.len == 0) return self.message("no workspace match", .{});
-                const item = items[@min(self.quick_panel.selected_index, items.len - 1)];
+                const item = self.quick_panel.selectedSearchResult() orelse return self.message("no workspace match", .{});
                 const path = self.allocator.dupe(u8, item.path) catch |err| return self.message("open failed: {s}", .{@errorName(err)});
                 defer self.allocator.free(path);
                 const line = item.line;
@@ -795,9 +1155,7 @@ const LinuxGuiState = struct {
                 self.handleDispatchResult("file.new", result);
             },
             .run_task => {
-                const items = self.quick_panel.task_matches orelse return self.message("no task", .{});
-                if (items.len == 0) return self.message("no task", .{});
-                const item = items[@min(self.quick_panel.selected_index, items.len - 1)];
+                const item = self.quick_panel.selectedTask() orelse return self.message("no task", .{});
                 const name = self.allocator.dupe(u8, item.name) catch |err| return self.message("task failed: {s}", .{@errorName(err)});
                 defer self.allocator.free(name);
                 self.quick_panel.close();
@@ -807,7 +1165,176 @@ const LinuxGuiState = struct {
                 };
                 self.handleDispatchResult("task.run", result);
             },
+            .document_symbols => {
+                const item = self.quick_panel.selectedSymbol() orelse return self.message("no symbol selected", .{});
+                const offset = item.byte_offset;
+                self.quick_panel.close();
+                self.jumpToActiveDocumentOffset(offset, "opened symbol");
+            },
         }
+    }
+
+    fn jumpToActiveDocumentOffset(self: *LinuxGuiState, offset: usize, text: []const u8) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        self.selection_anchor = null;
+        const clamped = @min(offset, doc.text.bytes.len);
+        navigation.setCursor(doc, doc.positionFromOffset(clamped) catch doc.cursor.position);
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        self.message("{s}", .{text});
+    }
+
+    fn selectActiveDocumentRange(self: *LinuxGuiState, start: usize, end: usize, text: []const u8) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        const clamped_start = @min(start, doc.text.bytes.len);
+        const clamped_end = @min(end, doc.text.bytes.len);
+        self.selection_anchor = clamped_start;
+        navigation.setCursor(doc, doc.positionFromOffset(clamped_end) catch doc.cursor.position);
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        self.message("{s}", .{text});
+    }
+
+    fn replaceActiveDocumentRange(self: *LinuxGuiState, start: usize, end: usize, replacement: []const u8) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        const clamped_start = @min(start, doc.text.bytes.len);
+        const clamped_end = @min(end, doc.text.bytes.len);
+        if (clamped_start > clamped_end) return self.message("invalid replacement range", .{});
+        doc.replaceRange(clamped_start, clamped_end, replacement) catch |err| return self.message("replace failed: {s}", .{@errorName(err)});
+        self.selection_anchor = null;
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        self.message("replaced match", .{});
+    }
+
+    fn replaceAllFromQuickPanel(self: *LinuxGuiState) void {
+        if (self.quick_panel.mode != .replace_document) return;
+        const request = parseReplaceRequest(self.quick_panel.query.items) orelse return self.message("type search=>replacement", .{});
+        const find = self.allocator.dupe(u8, request.find) catch |err| return self.message("replace failed: {s}", .{@errorName(err)});
+        defer self.allocator.free(find);
+        const replacement = self.allocator.dupe(u8, request.replace) catch |err| return self.message("replace failed: {s}", .{@errorName(err)});
+        defer self.allocator.free(replacement);
+        const options = self.quick_panel.search_options;
+        self.quick_panel.close();
+        self.replaceAllActiveDocumentMatches(find, replacement, options);
+    }
+
+    fn replaceAllActiveDocumentMatches(self: *LinuxGuiState, find: []const u8, replacement: []const u8, options: literal_search.Options) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        const matches = literal_search.findAll(self.allocator, doc.text.bytes, find, options) catch |err| return self.message("replace failed: {s}", .{@errorName(err)});
+        defer self.allocator.free(matches);
+        if (matches.len == 0) return self.message("no matches to replace", .{});
+
+        var next: std.Io.Writer.Allocating = .init(self.allocator);
+        defer next.deinit();
+        var cursor: usize = 0;
+        for (matches) |match| {
+            next.writer.writeAll(doc.text.bytes[cursor..match.start]) catch |err| return self.message("replace failed: {s}", .{@errorName(err)});
+            next.writer.writeAll(replacement) catch |err| return self.message("replace failed: {s}", .{@errorName(err)});
+            cursor = match.end;
+        }
+        next.writer.writeAll(doc.text.bytes[cursor..]) catch |err| return self.message("replace failed: {s}", .{@errorName(err)});
+
+        const first_start = matches[0].start;
+        doc.replaceRange(0, doc.text.bytes.len, next.written()) catch |err| return self.message("replace failed: {s}", .{@errorName(err)});
+        const target = @min(first_start + replacement.len, doc.text.bytes.len);
+        navigation.setCursor(doc, doc.positionFromOffset(target) catch doc.cursor.position);
+        self.selection_anchor = null;
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        self.message("replaced all {d} match(es)", .{matches.len});
+    }
+
+    fn findLastDocumentSearch(self: *LinuxGuiState, direction: SearchDirection) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        if (self.last_document_search_query.items.len == 0) {
+            self.openQuickPanel(.find_document);
+            return;
+        }
+        const matches = literal_search.findAll(self.allocator, doc.text.bytes, self.last_document_search_query.items, self.last_document_search_options) catch |err| return self.message("find failed: {s}", .{@errorName(err)});
+        defer self.allocator.free(matches);
+        if (matches.len == 0) return self.message("no matches", .{});
+
+        const cursor = doc.cursor.position.byte_offset;
+        const index = switch (direction) {
+            .forward => findNextMatchIndex(matches, cursor),
+            .backward => findPreviousMatchIndex(matches, cursor),
+        };
+        const match = matches[index];
+        self.selectActiveDocumentRange(match.start, match.end, "found match");
+    }
+
+    fn renameWorkspaceSymbol(self: *LinuxGuiState, old_name: []const u8, new_name: []const u8) void {
+        if (std.mem.eql(u8, old_name, new_name)) return self.message("rename target unchanged", .{});
+        const results = workspace_search.search(self.allocator, &self.app.workspace, old_name, .{
+            .literal_options = .{ .whole_word = true },
+            .max_file_bytes = 2 * 1024 * 1024,
+            .max_results = 2048,
+        }) catch |err| return self.message("rename failed: {s}", .{@errorName(err)});
+        defer {
+            for (results) |*item| item.deinit(self.allocator);
+            self.allocator.free(results);
+        }
+        if (results.len == 0) return self.message("no references to rename", .{});
+
+        var replaced: usize = 0;
+        var skipped: usize = 0;
+        var index = results.len;
+        while (index > 0) {
+            index -= 1;
+            const item = results[index];
+            const absolute = std.fs.path.join(self.allocator, &.{ self.app.workspace.root_path, item.path }) catch |err| return self.message("rename path failed: {s}", .{@errorName(err)});
+            defer self.allocator.free(absolute);
+
+            const doc_index = self.app.documents.openFile(absolute) catch |err| {
+                skipped += 1;
+                self.appendOutput(.stderr, "rename skipped open failure: {s}: {s}\n", .{ item.path, @errorName(err) });
+                continue;
+            };
+            const doc = &self.app.documents.documents.items[doc_index];
+            const start = item.byte_offset;
+            const end = start + old_name.len;
+            if (end > doc.text.bytes.len or !std.mem.eql(u8, doc.text.bytes[start..end], old_name)) {
+                skipped += 1;
+                continue;
+            }
+            doc.replaceRange(start, end, new_name) catch |err| {
+                skipped += 1;
+                self.appendOutput(.stderr, "rename skipped edit failure: {s}: {s}\n", .{ item.path, @errorName(err) });
+                continue;
+            };
+            replaced += 1;
+        }
+
+        self.selection_anchor = null;
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        self.bottom_panel = .output;
+        self.appendOutput(.stdout, "rename preview: {s} -> {s}, changed {d}, skipped {d}. Save changed tabs to write files.\n", .{ old_name, new_name, replaced, skipped });
+        self.message("rename preview changed {d} reference(s)", .{replaced});
+    }
+
+    fn openWorkspace(self: *LinuxGuiState, root_path: []const u8) void {
+        const next = app_mod.App.init(self.allocator, root_path) catch |err| {
+            self.message("workspace open failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "workspace open failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.app.deinit();
+        self.app = next;
+        self.quick_panel.close();
+        self.file_scroll_line = 0;
+        self.editor_scroll_line = 0;
+        self.bottom_panel = .output;
+        self.message("workspace opened", .{});
+        self.appendOutput(.stdout, "opened workspace: {s}\n", .{self.app.workspace.root_path});
+        self.execute("git.overview", .startup);
+        self.execute("security.audit_workspace", .startup);
     }
 
     fn handleKey(self: *LinuxGuiState, key: event_mod.KeyEvent) void {
@@ -834,6 +1361,14 @@ const LinuxGuiState = struct {
                     self.message("help: tutorial opened", .{});
                     return;
                 },
+                2 => {
+                    self.openRenamePanel();
+                    return;
+                },
+                3 => {
+                    self.findLastDocumentSearch(if (key.modifiers.shift) .backward else .forward);
+                    return;
+                },
                 8 => {
                     self.bottom_panel = .diagnostics;
                     self.execute("diagnostics.next", .keybinding);
@@ -850,6 +1385,14 @@ const LinuxGuiState = struct {
                         self.execute("view.command_palette", .keybinding);
                         return;
                     }
+                    if (key.modifiers.shift and (char == 'o' or char == 'O')) {
+                        self.openQuickPanel(.document_symbols);
+                        return;
+                    }
+                    if (char == 'o' or char == 'O') {
+                        self.openQuickPanel(.open_workspace);
+                        return;
+                    }
                     if (char == 'p' or char == 'P') {
                         self.openQuickPanel(.find_file);
                         return;
@@ -860,6 +1403,10 @@ const LinuxGuiState = struct {
                     }
                     if (char == 'f' or char == 'F') {
                         self.openQuickPanel(.find_document);
+                        return;
+                    }
+                    if (char == 'h' or char == 'H') {
+                        self.openQuickPanel(.replace_document);
                         return;
                     }
                     if (char == 'n' or char == 'N') {
@@ -1034,7 +1581,7 @@ const LinuxGuiState = struct {
         const bottom = self.bottomTop();
         switch (self.bottom_panel) {
             .security => {
-                const row = @divTrunc(@as(isize, y - (bottom + 96)), LINE_HEIGHT);
+                const row = @divTrunc(@as(isize, y - (bottom + 144)), LINE_HEIGHT);
                 if (row < 0) return true;
                 const index: usize = @intCast(row);
                 if (index >= self.app.security_findings.items.items.len) return true;
@@ -1143,6 +1690,7 @@ pub fn run(allocator: std.mem.Allocator, root_path: []const u8, environ: *const 
     var state = try LinuxGuiState.init(allocator, root_path);
     defer state.deinit();
 
+    state.enableLinuxSelfProtection();
     state.execute("git.overview", .startup);
     state.execute("security.audit_workspace", .startup);
 
@@ -1330,11 +1878,27 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
 
     var line_y: i16 = EDITOR_TEXT_TOP;
     var row: usize = 0;
+    const selection = state.selectedRange(doc);
     while (row < visible_rows and state.editor_scroll_line + row < doc.text.lineCount()) : (row += 1) {
         const line_index = state.editor_scroll_line + row;
         const line = doc.text.lineSlice(line_index);
         const selected = line_index == cursor_line;
         if (selected) try x11.fillRect(x11.gc.panel_2, EDITOR_LEFT - 8, line_y - 14, toU16(state.window_width - EDITOR_LEFT - 20), LINE_HEIGHT);
+
+        if (selection) |range| {
+            if (doc.text.lineStart(line_index)) |line_start| {
+                const line_end = line_start + line.len;
+                const start = @max(range.start, line_start);
+                const end = @min(range.end, line_end);
+                if (start < end) {
+                    const start_col = @min(start - line_start, @as(usize, 140));
+                    const end_col = @min(end - line_start, @as(usize, 140));
+                    const select_x = EDITOR_LEFT + 56 + @as(i16, @intCast(start_col)) * 8;
+                    const select_w: u16 = @intCast(@max(@as(i16, @intCast(end_col - start_col)) * 8, 8));
+                    try x11.fillRect(x11.gc.line, select_x, line_y - 14, select_w, LINE_HEIGHT);
+                }
+            }
+        }
 
         var number_buf: [24]u8 = undefined;
         const number = std.fmt.bufPrint(number_buf[0..], "{d: >4}", .{line_index + 1}) catch "   ?";
@@ -1418,7 +1982,19 @@ fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
         counts.git,
     }) catch "BOUNDARY";
     try x11.text(x11.gc.amber, 18, bottom + 82, boundary);
-    var y: i16 = bottom + 110;
+    var linux_buf: [260]u8 = undefined;
+    const linux_line = std.fmt.bufPrint(linux_buf[0..], "LINUX SELF nnp:{s}/{s} dump:{s}/{s} seccomp:{s} cap_eff:{s} proc:{s}", .{
+        flagLabel(state.linux_security.no_new_privs),
+        flagLabel(state.linux_security.no_new_privs_set),
+        flagLabel(state.linux_security.dumpable),
+        flagLabel(state.linux_security.dumpable_set),
+        seccompLabel(state.linux_security.seccomp_mode),
+        state.linuxSecurityCapEffLabel(),
+        if (state.linux_security.proc_status_read) "read" else "blocked",
+    }) catch "LINUX SELF";
+    try x11.text(x11.gc.cyan, 18, bottom + 106, linux_line);
+    try x11.text(x11.gc.muted, 18, bottom + 130, "direct X11 socket / no toolkit plugin host / no_new_privs children / dumpable off when supported");
+    var y: i16 = bottom + 158;
     const limit = @min(app.security_findings.items.items.len, @as(usize, 6));
     for (app.security_findings.items.items[0..limit]) |finding| {
         var row_buf: [900]u8 = undefined;
@@ -1582,6 +2158,15 @@ fn drawQuickPanel(x11: *X11, state: *LinuxGuiState) !void {
     var meta_buf: [160]u8 = undefined;
     const meta = std.fmt.bufPrint(meta_buf[0..], "{d} item(s)", .{state.quick_panel.itemCount()}) catch "";
     try x11.text(x11.gc.muted, left + 650, top + 34, meta);
+    if (isDocumentSearchMode(state.quick_panel.mode)) {
+        var options_buf: [220]u8 = undefined;
+        const options = std.fmt.bufPrint(options_buf[0..], "F3 next  F6 {s}  F7 {s}{s}", .{
+            if (state.quick_panel.search_options.case_sensitive) "case" else "ignore",
+            if (state.quick_panel.search_options.whole_word) "word" else "partial",
+            if (state.quick_panel.mode == .replace_document) "  Ctrl+Enter all" else "",
+        }) catch "";
+        try x11.text(x11.gc.muted, left + 18, top + 86, options);
+    }
 
     var y: i16 = top + 104;
     const limit = @min(state.quick_panel.itemCount(), @as(usize, 12));
@@ -1606,21 +2191,31 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
             if (row >= items.len) break :blk "";
             break :blk std.fmt.bufPrint(text_buf[0..], "{s}  {s}", .{ items[row].path, modes.label(items[row].language) }) catch items[row].path;
         },
-        .find_document => blk: {
+        .find_document, .replace_document => blk: {
             const items = state.quick_panel.document_matches orelse break :blk "";
             if (row >= items.len) break :blk "";
             break :blk std.fmt.bufPrint(text_buf[0..], "{d}:{d}  {s}", .{ items[row].line + 1, items[row].column + 1, items[row].preview }) catch items[row].preview;
+        },
+        .rename_symbol => blk: {
+            const request = renameRequest(state.quick_panel.query.items) orelse break :blk "Type old_name=>new_name";
+            break :blk std.fmt.bufPrint(text_buf[0..], "{s} -> {s}", .{ request.find, request.replace }) catch "Rename";
         },
         .search_workspace => blk: {
             const items = state.quick_panel.search_results orelse break :blk "";
             if (row >= items.len) break :blk "";
             break :blk std.fmt.bufPrint(text_buf[0..], "{s}:{d}:{d}  {s}", .{ items[row].path, items[row].line + 1, items[row].column + 1, items[row].preview }) catch items[row].path;
         },
+        .open_workspace => if (state.quick_panel.query.items.len > 0) "Open workspace path" else "",
         .new_file => if (state.quick_panel.query.items.len > 0) "Create file inside workspace" else "",
         .run_task => blk: {
             const items = state.quick_panel.task_matches orelse break :blk "";
             if (row >= items.len) break :blk "";
             break :blk std.fmt.bufPrint(text_buf[0..], "{s}  {s}", .{ items[row].name, items[row].executable }) catch items[row].name;
+        },
+        .document_symbols => blk: {
+            const items = state.quick_panel.symbol_matches orelse break :blk "";
+            if (row >= items.len) break :blk "";
+            break :blk std.fmt.bufPrint(text_buf[0..], "{s}  {s}:{d}:{d}", .{ items[row].name, @tagName(items[row].kind), items[row].line + 1, items[row].column + 1 }) catch items[row].name;
         },
     };
     var ascii_buf: [720]u8 = undefined;
@@ -1666,6 +2261,92 @@ fn riskGc(x11: *X11, risk: findings_mod.Risk) u32 {
     };
 }
 
+fn trySetNoNewPrivs() bool {
+    const rc = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
+    return linux.errno(rc) == .SUCCESS;
+}
+
+fn trySetDumpable(enabled: bool) bool {
+    const rc = linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), if (enabled) 1 else 0, 0, 0, 0);
+    return linux.errno(rc) == .SUCCESS;
+}
+
+fn readLinuxSecuritySnapshot(allocator: std.mem.Allocator, no_new_privs_set: LinuxFlag, dumpable_set: LinuxFlag) LinuxSecuritySnapshot {
+    var snapshot = LinuxSecuritySnapshot{
+        .no_new_privs_set = no_new_privs_set,
+        .dumpable_set = dumpable_set,
+    };
+
+    const no_new_privs_rc = linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0);
+    if (linux.errno(no_new_privs_rc) == .SUCCESS) {
+        snapshot.no_new_privs = if (no_new_privs_rc == 0) .off else .on;
+    }
+
+    const dumpable_rc = linux.prctl(@intFromEnum(linux.PR.GET_DUMPABLE), 0, 0, 0, 0);
+    if (linux.errno(dumpable_rc) == .SUCCESS) {
+        snapshot.dumpable = if (dumpable_rc == 0) .off else .on;
+    }
+
+    const seccomp_rc = linux.prctl(@intFromEnum(linux.PR.GET_SECCOMP), 0, 0, 0, 0);
+    if (linux.errno(seccomp_rc) == .SUCCESS) {
+        snapshot.seccomp_mode = @intCast(@min(seccomp_rc, 255));
+    }
+
+    readLinuxProcStatus(allocator, &snapshot);
+    return snapshot;
+}
+
+fn readLinuxProcStatus(allocator: std.mem.Allocator, snapshot: *LinuxSecuritySnapshot) void {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, "/proc/self/status", allocator, .limited(64 * 1024)) catch return;
+    defer allocator.free(bytes);
+    snapshot.proc_status_read = true;
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "NoNewPrivs:")) {
+            const value = std.mem.trim(u8, line["NoNewPrivs:".len..], " \t\r\n");
+            const parsed = std.fmt.parseInt(u8, value, 10) catch continue;
+            snapshot.no_new_privs = if (parsed == 0) .off else .on;
+        } else if (std.mem.startsWith(u8, line, "Seccomp:")) {
+            const value = std.mem.trim(u8, line["Seccomp:".len..], " \t\r\n");
+            snapshot.seccomp_mode = std.fmt.parseInt(u8, value, 10) catch snapshot.seccomp_mode;
+        } else if (std.mem.startsWith(u8, line, "CapEff:")) {
+            const value = std.mem.trim(u8, line["CapEff:".len..], " \t\r\n");
+            const len = @min(value.len, snapshot.cap_eff.len);
+            @memcpy(snapshot.cap_eff[0..len], value[0..len]);
+            snapshot.cap_eff_len = len;
+            snapshot.cap_eff_zero = if (hexIsZero(value)) .on else .off;
+        }
+    }
+}
+
+fn hexIsZero(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (byte == '0' or byte == 'x' or byte == 'X') continue;
+        if (byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n') continue;
+        return false;
+    }
+    return true;
+}
+
+fn flagLabel(flag: LinuxFlag) []const u8 {
+    return switch (flag) {
+        .unknown => "unknown",
+        .off => "off",
+        .on => "on",
+    };
+}
+
+fn seccompLabel(mode: ?u8) []const u8 {
+    const value = mode orelse return "unknown";
+    return switch (value) {
+        0 => "off",
+        1 => "strict",
+        2 => "filter",
+        else => "custom",
+    };
+}
+
 fn ascii(bytes: []const u8) []const u8 {
     for (bytes, 0..) |byte, index| {
         if (byte >= 0x80) return bytes[0..index];
@@ -1687,6 +2368,145 @@ fn asciiInto(buffer: []u8, bytes: []const u8) []const u8 {
     return buffer[0..limit];
 }
 
+fn findDocumentMatches(
+    allocator: std.mem.Allocator,
+    doc: *const document_mod.Document,
+    query: []const u8,
+    options: literal_search.Options,
+    max_results: usize,
+) ![]DocumentMatch {
+    const literal_matches = try literal_search.findAll(allocator, doc.text.bytes, query, options);
+    defer allocator.free(literal_matches);
+
+    var results = std.array_list.Managed(DocumentMatch).init(allocator);
+    errdefer {
+        for (results.items) |*item| item.deinit(allocator);
+        results.deinit();
+    }
+
+    for (literal_matches) |match| {
+        if (results.items.len >= max_results) break;
+        const location = doc.text.offsetToLineColumn(match.start) catch continue;
+        try results.append(.{
+            .line = location.line,
+            .column = location.column,
+            .byte_offset = match.start,
+            .end_offset = match.end,
+            .preview = try allocator.dupe(u8, doc.text.lineSlice(location.line)),
+        });
+    }
+    return results.toOwnedSlice();
+}
+
+fn isDocumentSearchMode(mode: QuickPanelMode) bool {
+    return mode == .find_document or mode == .replace_document;
+}
+
+fn findNextMatchIndex(matches: []const literal_search.Match, pivot: usize) usize {
+    for (matches, 0..) |match, index| {
+        if (match.start >= pivot) return index;
+    }
+    return 0;
+}
+
+fn findPreviousMatchIndex(matches: []const literal_search.Match, pivot: usize) usize {
+    var index = matches.len;
+    while (index > 0) {
+        index -= 1;
+        if (matches[index].end <= pivot) return index;
+    }
+    return matches.len - 1;
+}
+
+fn parseReplaceRequest(query: []const u8) ?ReplaceRequest {
+    const delimiter = std.mem.indexOf(u8, query, "=>") orelse return null;
+    const find = std.mem.trim(u8, query[0..delimiter], " \t\r\n");
+    const replace = query[delimiter + 2 ..];
+    if (find.len == 0) return null;
+    return .{ .find = find, .replace = replace };
+}
+
+fn renameRequest(query: []const u8) ?ReplaceRequest {
+    const request = parseReplaceRequest(query) orelse return null;
+    const replace = std.mem.trim(u8, request.replace, " \t\r\n");
+    if (!isValidIdentifierName(request.find) or !isValidIdentifierName(replace)) return null;
+    return .{ .find = request.find, .replace = replace };
+}
+
+fn isValidIdentifierName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
+    }
+    return true;
+}
+
+fn identifierAtOffset(source: []const u8, offset: usize) ?[]const u8 {
+    if (source.len == 0) return null;
+    var at = @min(offset, source.len - 1);
+    if (!isIdentifierByte(source[at])) {
+        if (offset == 0) return null;
+        at = @min(offset - 1, source.len - 1);
+        if (!isIdentifierByte(source[at])) return null;
+    }
+
+    var start = at;
+    while (start > 0 and isIdentifierByte(source[start - 1])) : (start -= 1) {}
+    var end = at + 1;
+    while (end < source.len and isIdentifierByte(source[end])) : (end += 1) {}
+    if (start == end) return null;
+    return source[start..end];
+}
+
+fn isIdentifierByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
+    return switch (mode) {
+        .open_workspace => "OPEN WORKSPACE",
+        .find_file => "FIND FILE",
+        .find_document => "FIND IN FILE",
+        .replace_document => "REPLACE  search=>replacement",
+        .rename_symbol => "RENAME  old=>new",
+        .search_workspace => "SEARCH WORKSPACE",
+        .new_file => "NEW FILE",
+        .run_task => "RUN TASK",
+        .document_symbols => "SYMBOLS",
+    };
+}
+
+fn isUtf8Continuation(byte: u8) bool {
+    return (byte & 0xc0) == 0x80;
+}
+
+fn encodeUtf8(char: u21, out: *[4]u8) !usize {
+    if (char <= 0x7f) {
+        out[0] = @intCast(char);
+        return 1;
+    }
+    if (char <= 0x7ff) {
+        out[0] = @intCast(0xc0 | (char >> 6));
+        out[1] = @intCast(0x80 | (char & 0x3f));
+        return 2;
+    }
+    if (char <= 0xffff) {
+        out[0] = @intCast(0xe0 | (char >> 12));
+        out[1] = @intCast(0x80 | ((char >> 6) & 0x3f));
+        out[2] = @intCast(0x80 | (char & 0x3f));
+        return 3;
+    }
+    if (char <= 0x10ffff) {
+        out[0] = @intCast(0xf0 | (char >> 18));
+        out[1] = @intCast(0x80 | ((char >> 12) & 0x3f));
+        out[2] = @intCast(0x80 | ((char >> 6) & 0x3f));
+        out[3] = @intCast(0x80 | (char & 0x3f));
+        return 4;
+    }
+    return error.InvalidCodepoint;
+}
+
 fn keyEventFromX(bytes: []const u8) ?event_mod.KeyEvent {
     const keycode = bytes[1];
     const state = readLe16(bytes[28..30]);
@@ -1703,6 +2523,10 @@ fn keyEventFromX(bytes: []const u8) ?event_mod.KeyEvent {
         23 => .tab,
         36 => .enter,
         67 => .{ .function = 1 },
+        68 => .{ .function = 2 },
+        69 => .{ .function = 3 },
+        72 => .{ .function = 6 },
+        73 => .{ .function = 7 },
         111 => .arrow_up,
         113 => .arrow_left,
         114 => .arrow_right,
@@ -1779,12 +2603,13 @@ const HitRect = struct {
     bottom: i16,
 };
 
-const header_actions = [_]HeaderAction{ .save, .save_all, .build, .test_run, .git, .audit, .scan, .extensions, .tutorial, .publish };
+const header_actions = [_]HeaderAction{ .open_workspace, .save, .save_all, .build, .test_run, .git, .audit, .scan, .extensions, .tutorial, .publish };
 
 fn headerActionRect(action: HeaderAction) HitRect {
     const top: i16 = 15;
     const height: i16 = 30;
     return switch (action) {
+        .open_workspace => .{ .left = 410, .top = top, .right = 472, .bottom = top + height },
         .save => .{ .left = 480, .top = top, .right = 540, .bottom = top + height },
         .save_all => .{ .left = 548, .top = top, .right = 606, .bottom = top + height },
         .build => .{ .left = 614, .top = top, .right = 684, .bottom = top + height },
@@ -1800,6 +2625,7 @@ fn headerActionRect(action: HeaderAction) HitRect {
 
 fn headerActionLabel(action: HeaderAction) []const u8 {
     return switch (action) {
+        .open_workspace => "OPEN",
         .save => "SAVE",
         .save_all => "ALL",
         .build => "BUILD",

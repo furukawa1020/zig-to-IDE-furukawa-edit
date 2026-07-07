@@ -1249,6 +1249,7 @@ fn renderReleasePreflight(app: *app_mod.App, argument: ?[]const u8) !bool {
     try preflightRequired(writer, &blockers, workspaceHasPath(app, "docs/security.md"), "docs/security.md explains the trust/security model", .{});
     try preflightRequired(writer, &blockers, workspaceHasPath(app, "LICENSE") or workspaceHasPath(app, "LICENSE.md") or workspaceHasPath(app, "COPYING"), "license file is present", .{});
     try preflightRequired(writer, &blockers, workspaceHasPrefix(app, ".github/workflows/"), "GitHub Actions workflow is present", .{});
+    try preflightWarning(writer, &warnings, workspaceHasPath(app, ".github/workflows/pages.yml"), "GitHub Pages may need one-time repository enablement or a PAGES_TOKEN secret", .{});
 
     try writer.writeAll("\ngit state\n");
     try preflightRequired(writer, &blockers, overview.present, ".git metadata is readable without executing git", .{});

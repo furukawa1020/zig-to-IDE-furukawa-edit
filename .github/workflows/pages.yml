@@ -23,12 +23,15 @@ jobs:
       ZIG_SHA256: 68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
 
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
+        with:
+          enablement: true
+          token: ${{ secrets.PAGES_TOKEN || github.token }}
 
       - name: Download pinned Zig
         shell: pwsh
@@ -61,7 +64,7 @@ jobs:
         run: zig build site --cache-dir .zig-cache --global-cache-dir .zig-global-cache
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
           path: zig-out/site
 
@@ -75,4 +78,4 @@ jobs:
     steps:
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

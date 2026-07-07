@@ -46,3 +46,6 @@ jobs:
 
       - name: Linux CLI/TUI cross build
         run: zig build install-linux --cache-dir .zig-cache --global-cache-dir .zig-global-cache
+
+      - name: Linux GUI cross build
+        run: zig build install-linux-gui --cache-dir .zig-cache --global-cache-dir .zig-global-cache

@@ -37,22 +37,41 @@ pub fn build(b: *std.Build) void {
     const install_linux_step = b.step("install-linux", "Install Linux x86_64 CLI/TUI zide");
     install_linux_step.dependOn(&install_linux_cmd.step);
 
+    const linux_gui_module = b.createModule(.{
+        .root_source_file = b.path("src/gui_main.zig"),
+        .target = linux_target,
+        .optimize = optimize,
+    });
+    const linux_gui_exe = b.addExecutable(.{
+        .name = "zide-gui",
+        .root_module = linux_gui_module,
+    });
+    const install_linux_gui_cmd = b.addInstallArtifact(linux_gui_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "linux-x86_64/bin" } },
+    });
+    const install_linux_gui_step = b.step("install-linux-gui", "Install Linux x86_64 GUI zide");
+    install_linux_gui_step.dependOn(&install_linux_gui_cmd.step);
+
     const gui_module = b.createModule(.{
         .root_source_file = b.path("src/gui_main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    gui_module.linkSystemLibrary("user32", .{});
-    gui_module.linkSystemLibrary("gdi32", .{});
-    gui_module.linkSystemLibrary("kernel32", .{});
-    gui_module.linkSystemLibrary("shell32", .{});
-    gui_module.linkSystemLibrary("ole32", .{});
+    if (target.result.os.tag == .windows) {
+        gui_module.linkSystemLibrary("user32", .{});
+        gui_module.linkSystemLibrary("gdi32", .{});
+        gui_module.linkSystemLibrary("kernel32", .{});
+        gui_module.linkSystemLibrary("shell32", .{});
+        gui_module.linkSystemLibrary("ole32", .{});
+    }
 
     const gui_exe = b.addExecutable(.{
         .name = "zide-gui",
         .root_module = gui_module,
     });
-    gui_exe.subsystem = .windows;
+    if (target.result.os.tag == .windows) {
+        gui_exe.subsystem = .windows;
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {

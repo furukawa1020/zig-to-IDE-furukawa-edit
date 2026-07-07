@@ -889,6 +889,7 @@ fn renderReleaseChecklist(app: *app_mod.App) !void {
     try writer.print("{s} docs/security.md present (trust model explainer)\n", .{checkMark(workspaceHasPath(app, "docs/security.md"))});
     try writer.print("{s} built Windows GUI artifact zig-out/bin/zide-gui.exe\n", .{checkMark(workspaceFileExists(app, "zig-out/bin/zide-gui.exe"))});
     try writer.print("{s} built Windows CLI artifact zig-out/bin/zide.exe\n", .{checkMark(workspaceFileExists(app, "zig-out/bin/zide.exe"))});
+    try writer.print("{s} built Linux GUI artifact zig-out/linux-x86_64/bin/zide-gui\n", .{checkMark(workspaceFileExists(app, release_linux_gui_asset.relative_path))});
     try writer.print("{s} built Linux CLI/TUI artifact zig-out/linux-x86_64/bin/zide\n", .{checkMark(workspaceFileExists(app, release_linux_cli_asset.relative_path))});
     try writer.print("{s} bundled Windows ZIP zig-out/release/zide-windows-x86_64.zip\n", .{checkMark(workspaceFileExists(app, release_bundle_asset.relative_path))});
     try writer.print("{s} bundled Linux TAR zig-out/release/zide-linux-x86_64.tar\n", .{checkMark(workspaceFileExists(app, release_linux_bundle_asset.relative_path))});
@@ -933,6 +934,7 @@ const release_bundle_asset = ReleaseAsset{ .label = "WIN ZIP", .relative_path = 
 const release_linux_bundle_asset = ReleaseAsset{ .label = "LINUX TAR", .relative_path = "zig-out/release/zide-linux-x86_64.tar", .release_name = "zide-linux-x86_64.tar" };
 const release_gui_asset = ReleaseAsset{ .label = "WIN GUI", .relative_path = "zig-out/bin/zide-gui.exe", .release_name = "zide-gui.exe" };
 const release_cli_asset = ReleaseAsset{ .label = "WIN CLI", .relative_path = "zig-out/bin/zide.exe", .release_name = "zide.exe" };
+const release_linux_gui_asset = ReleaseAsset{ .label = "LINUX GUI", .relative_path = "zig-out/linux-x86_64/bin/zide-gui", .release_name = "zide-gui" };
 const release_linux_cli_asset = ReleaseAsset{ .label = "LINUX CLI", .relative_path = "zig-out/linux-x86_64/bin/zide", .release_name = "zide" };
 
 const release_assets = [_]ReleaseAsset{
@@ -940,6 +942,7 @@ const release_assets = [_]ReleaseAsset{
     release_linux_bundle_asset,
     release_gui_asset,
     release_cli_asset,
+    release_linux_gui_asset,
     release_linux_cli_asset,
 };
 
@@ -957,7 +960,7 @@ fn renderReleaseAssets(app: *app_mod.App) !void {
     }
 
     if (found == 0) {
-        try writer.writeAll("\nno release artifacts found yet; run zig build install, zig build install-gui, and zig build install-linux first\n");
+        try writer.writeAll("\nno release artifacts found yet; run zig build install, zig build install-gui, zig build install-linux, and zig build install-linux-gui first\n");
     } else {
         try writer.writeAll("\ncopy targets\n");
         try writer.writeAll("- GitHub release notes: include each sha256 line below the attached file name.\n");
@@ -1055,25 +1058,32 @@ fn renderReleaseBundle(app: *app_mod.App) !bool {
     defer {
         if (cli_bytes_opt) |bytes| app.allocator.free(bytes);
     }
+    const linux_gui_bytes_opt = try readReleaseAssetBytes(app, release_linux_gui_asset);
+    defer {
+        if (linux_gui_bytes_opt) |bytes| app.allocator.free(bytes);
+    }
     const linux_cli_bytes_opt = try readReleaseAssetBytes(app, release_linux_cli_asset);
     defer {
         if (linux_cli_bytes_opt) |bytes| app.allocator.free(bytes);
     }
 
-    if (gui_bytes_opt == null or cli_bytes_opt == null or linux_cli_bytes_opt == null) {
+    if (gui_bytes_opt == null or cli_bytes_opt == null or linux_gui_bytes_opt == null or linux_cli_bytes_opt == null) {
         if (gui_bytes_opt == null) try writer.print("- missing: {s}\n", .{release_gui_asset.relative_path});
         if (cli_bytes_opt == null) try writer.print("- missing: {s}\n", .{release_cli_asset.relative_path});
+        if (linux_gui_bytes_opt == null) try writer.print("- missing: {s}\n", .{release_linux_gui_asset.relative_path});
         if (linux_cli_bytes_opt == null) try writer.print("- missing: {s}\n", .{release_linux_cli_asset.relative_path});
-        try writer.writeAll("\nrun zig build install, zig build install-gui, and zig build install-linux before creating release bundles\n");
+        try writer.writeAll("\nrun zig build install, zig build install-gui, zig build install-linux, and zig build install-linux-gui before creating release bundles\n");
         try app.process_console.appendBytes(.stdout, text.written());
         return false;
     }
 
     const gui_bytes = gui_bytes_opt.?;
     const cli_bytes = cli_bytes_opt.?;
+    const linux_gui_bytes = linux_gui_bytes_opt.?;
     const linux_cli_bytes = linux_cli_bytes_opt.?;
     const gui_sha = try sha256Hex(gui_bytes);
     const cli_sha = try sha256Hex(cli_bytes);
+    const linux_gui_sha = try sha256Hex(linux_gui_bytes);
     const linux_cli_sha = try sha256Hex(linux_cli_bytes);
 
     var windows_checksums: std.Io.Writer.Allocating = .init(app.allocator);
@@ -1085,6 +1095,7 @@ fn renderReleaseBundle(app: *app_mod.App) !bool {
 
     var linux_checksums: std.Io.Writer.Allocating = .init(app.allocator);
     defer linux_checksums.deinit();
+    try linux_checksums.writer.print("{s}  {s}/zide-gui\n", .{ linux_gui_sha[0..], release_linux_bundle_root });
     try linux_checksums.writer.print("{s}  {s}/zide\n", .{ linux_cli_sha[0..], release_linux_bundle_root });
     const linux_checksum_bytes = try linux_checksums.toOwnedSlice();
     defer app.allocator.free(linux_checksum_bytes);
@@ -1101,6 +1112,7 @@ fn renderReleaseBundle(app: *app_mod.App) !bool {
     const linux_release_note =
         "ZIDE Linux x86_64 release bundle\n" ++
         "\n" ++
+        "- zide-gui: Linux GUI IDE/workbench using Zig-only direct X11 protocol\n" ++
         "- zide: Linux CLI/TUI IDE/workbench entry point\n" ++
         "- CHECKSUMS.sha256: SHA-256 values for files inside this archive\n" ++
         "\n" ++
@@ -1116,6 +1128,7 @@ fn renderReleaseBundle(app: *app_mod.App) !bool {
     defer app.allocator.free(zip_bytes);
 
     const tar_entries = [_]TarInputEntry{
+        .{ .name = release_linux_bundle_root ++ "/zide-gui", .bytes = linux_gui_bytes, .mode = 0o755 },
         .{ .name = release_linux_bundle_root ++ "/zide", .bytes = linux_cli_bytes, .mode = 0o755 },
         .{ .name = release_linux_bundle_root ++ "/CHECKSUMS.sha256", .bytes = linux_checksum_bytes, .mode = 0o644 },
         .{ .name = release_linux_bundle_root ++ "/ZIDE-RELEASE.txt", .bytes = linux_release_note, .mode = 0o644 },
@@ -1417,9 +1430,11 @@ fn renderReleasePreflight(app: *app_mod.App, argument: ?[]const u8) !bool {
     const linux_bundle = try hashReleaseAsset(app, release_linux_bundle_asset);
     const gui = try hashReleaseAsset(app, release_gui_asset);
     const cli = try hashReleaseAsset(app, release_cli_asset);
+    const linux_gui = try hashReleaseAsset(app, release_linux_gui_asset);
     const linux_cli = try hashReleaseAsset(app, release_linux_cli_asset);
     try preflightRequired(writer, &blockers, gui != null, "GUI artifact exists: {s}", .{release_gui_asset.relative_path});
     try preflightRequired(writer, &blockers, cli != null, "CLI artifact exists: {s}", .{release_cli_asset.relative_path});
+    try preflightRequired(writer, &blockers, linux_gui != null, "Linux GUI artifact exists: {s}", .{release_linux_gui_asset.relative_path});
     try preflightRequired(writer, &blockers, linux_cli != null, "Linux CLI/TUI artifact exists: {s}", .{release_linux_cli_asset.relative_path});
     try preflightRequired(writer, &blockers, bundle != null, "Windows release ZIP exists: {s}", .{release_bundle_asset.relative_path});
     try preflightRequired(writer, &blockers, linux_bundle != null, "Linux release TAR exists: {s}", .{release_linux_bundle_asset.relative_path});
@@ -1710,9 +1725,11 @@ fn verifyStoredReleaseTar(writer: *std.Io.Writer, bytes: []const u8) !bool {
     var issues: usize = 0;
     var pos: usize = 0;
     var entry_count: usize = 0;
+    var gui_data: ?[]const u8 = null;
     var cli_data: ?[]const u8 = null;
     var checksum_data: ?[]const u8 = null;
     var note_seen = false;
+    var gui_mode: ?u32 = null;
     var cli_mode: ?u32 = null;
 
     while (pos + 512 <= bytes.len) {
@@ -1761,7 +1778,11 @@ fn verifyStoredReleaseTar(writer: *std.Io.Writer, bytes: []const u8) !bool {
         }
         const data = bytes[data_start..][0..size];
 
-        if (std.mem.eql(u8, name, release_linux_bundle_root ++ "/zide")) {
+        if (std.mem.eql(u8, name, release_linux_bundle_root ++ "/zide-gui")) {
+            if (gui_data != null) try reportTarIssue(writer, &ok, &issues, "duplicate Linux zide-gui entry", .{});
+            gui_data = data;
+            gui_mode = @intCast(mode);
+        } else if (std.mem.eql(u8, name, release_linux_bundle_root ++ "/zide")) {
             if (cli_data != null) try reportTarIssue(writer, &ok, &issues, "duplicate Linux zide entry", .{});
             cli_data = data;
             cli_mode = @intCast(mode);
@@ -1782,14 +1803,24 @@ fn verifyStoredReleaseTar(writer: *std.Io.Writer, bytes: []const u8) !bool {
 
     if (pos > bytes.len) try reportTarIssue(writer, &ok, &issues, "TAR cursor moved beyond archive length", .{});
     if (entry_count == 0) try reportTarIssue(writer, &ok, &issues, "TAR has no entries", .{});
+    if (gui_data == null) try reportTarIssue(writer, &ok, &issues, "missing Linux zide-gui entry", .{});
     if (cli_data == null) try reportTarIssue(writer, &ok, &issues, "missing Linux zide entry", .{});
     if (checksum_data == null) try reportTarIssue(writer, &ok, &issues, "missing Linux CHECKSUMS.sha256 entry", .{});
     if (!note_seen) try reportTarIssue(writer, &ok, &issues, "missing Linux ZIDE-RELEASE.txt entry", .{});
+    if (gui_mode) |mode| {
+        if ((mode & 0o111) == 0) try reportTarIssue(writer, &ok, &issues, "Linux zide-gui entry is not executable", .{});
+    }
     if (cli_mode) |mode| {
         if ((mode & 0o111) == 0) try reportTarIssue(writer, &ok, &issues, "Linux zide entry is not executable", .{});
     }
 
     if (checksum_data) |checksums| {
+        if (gui_data) |gui_bytes| {
+            const gui_sha = try sha256Hex(gui_bytes);
+            if (std.mem.indexOf(u8, checksums, gui_sha[0..]) == null) {
+                try reportTarIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the Linux GUI SHA-256", .{});
+            }
+        }
         if (cli_data) |cli_bytes| {
             const cli_sha = try sha256Hex(cli_bytes);
             if (std.mem.indexOf(u8, checksums, cli_sha[0..]) == null) {
@@ -1809,7 +1840,9 @@ fn isZeroBlock(block: []const u8) bool {
 
 fn tarString(field: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, field, 0) orelse field.len;
-    return std.mem.trimRight(u8, field[0..end], " ");
+    var trimmed_end = end;
+    while (trimmed_end > 0 and field[trimmed_end - 1] == ' ') : (trimmed_end -= 1) {}
+    return field[0..trimmed_end];
 }
 
 fn parseTarOctal(field: []const u8) ?usize {
@@ -1928,6 +1961,7 @@ fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
     const linux_bundle = try hashReleaseAsset(app, release_linux_bundle_asset);
     const gui = try hashReleaseAsset(app, release_gui_asset);
     const cli = try hashReleaseAsset(app, release_cli_asset);
+    const linux_gui = try hashReleaseAsset(app, release_linux_gui_asset);
     const linux_cli = try hashReleaseAsset(app, release_linux_cli_asset);
 
     try writer.writeAll("release manifest drafts\n");
@@ -1936,7 +1970,7 @@ fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
     try writer.print("tag     : {s}\n", .{tag});
     try writer.print("version : {s}\n", .{package_version});
     if (bundle == null or linux_bundle == null) {
-        try writer.writeAll("missing : run release.bundle after zig build install, zig build install-gui, and zig build install-linux for preferred archive assets\n");
+        try writer.writeAll("missing : run release.bundle after zig build install, zig build install-gui, zig build install-linux, and zig build install-linux-gui for preferred archive assets\n");
     }
 
     try writer.writeAll("\nGitHub Release assets\n");
@@ -1944,8 +1978,9 @@ fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
     if (linux_bundle) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
     if (gui) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
     if (cli) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
+    if (linux_gui) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
     if (linux_cli) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
-    if (bundle == null and linux_bundle == null and gui == null and cli == null and linux_cli == null) try writer.writeAll("- no local artifacts found yet\n");
+    if (bundle == null and linux_bundle == null and gui == null and cli == null and linux_gui == null and linux_cli == null) try writer.writeAll("- no local artifacts found yet\n");
 
     try writer.writeAll("\nwinget portable draft\n");
     try writer.print(
@@ -2663,8 +2698,11 @@ test "release assets command renders artifact hashes" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/bin");
+    try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/linux-x86_64/bin");
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide-gui.exe", .data = "gui-bytes" });
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide.exe", .data = "cli-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/linux-x86_64/bin/zide-gui", .data = "linux-gui-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/linux-x86_64/bin/zide", .data = "linux-cli-bytes" });
 
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
@@ -2683,13 +2721,16 @@ test "release assets command renders artifact hashes" {
     try std.testing.expect(saw_hash);
 }
 
-test "release bundle command creates zip artifact" {
+test "release bundle command creates Windows zip and Linux tar artifacts" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/bin");
+    try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/linux-x86_64/bin");
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide-gui.exe", .data = "gui-bytes" });
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide.exe", .data = "cli-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/linux-x86_64/bin/zide-gui", .data = "linux-gui-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/linux-x86_64/bin/zide", .data = "linux-cli-bytes" });
 
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
@@ -2701,8 +2742,10 @@ test "release bundle command creates zip artifact" {
     const result = try dispatch(&app, .{ .id = "release.bundle" });
     try std.testing.expect(std.meta.activeTag(result) == .completed);
 
-    const stat = try tmp.dir.statFile(std.Options.debug_io, release_bundle_asset.relative_path, .{});
-    try std.testing.expect(stat.size > 22);
+    const zip_stat = try tmp.dir.statFile(std.Options.debug_io, release_bundle_asset.relative_path, .{});
+    try std.testing.expect(zip_stat.size > 22);
+    const tar_stat = try tmp.dir.statFile(std.Options.debug_io, release_linux_bundle_asset.relative_path, .{});
+    try std.testing.expect(tar_stat.size > 1024);
 
     const bytes = try tmp.dir.readFileAlloc(std.Options.debug_io, release_bundle_asset.relative_path, std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(bytes);
@@ -2710,15 +2753,25 @@ test "release bundle command creates zip artifact" {
     try std.testing.expectEqualSlices(u8, "PK\x03\x04", bytes[0..4]);
     try std.testing.expect(std.mem.indexOf(u8, bytes, release_bundle_root ++ "/zide.exe") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, release_bundle_root ++ "/CHECKSUMS.sha256") != null);
+
+    const tar_bytes = try tmp.dir.readFileAlloc(std.Options.debug_io, release_linux_bundle_asset.relative_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(tar_bytes);
+    try std.testing.expect(tar_bytes.len >= 1024);
+    try std.testing.expect(std.mem.indexOf(u8, tar_bytes, "ustar") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tar_bytes, release_linux_bundle_root ++ "/zide-gui") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tar_bytes, release_linux_bundle_root ++ "/zide") != null);
 }
 
-test "release verify validates bundled zip artifact" {
+test "release verify validates bundled Windows zip and Linux tar artifacts" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/bin");
+    try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/linux-x86_64/bin");
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide-gui.exe", .data = "gui-bytes" });
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide.exe", .data = "cli-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/linux-x86_64/bin/zide-gui", .data = "linux-gui-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/linux-x86_64/bin/zide", .data = "linux-cli-bytes" });
 
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
@@ -2732,11 +2785,14 @@ test "release verify validates bundled zip artifact" {
     const result = try dispatch(&app, .{ .id = "release.verify" });
     try std.testing.expect(std.meta.activeTag(result) == .completed);
 
-    var saw_ok = false;
+    var saw_zip_ok = false;
+    var saw_tar_ok = false;
     for (app.process_console.lines.items) |line| {
-        if (std.mem.indexOf(u8, line.text, "verification: OK") != null) saw_ok = true;
+        if (std.mem.indexOf(u8, line.text, "verification: OK") != null) saw_zip_ok = true;
+        if (std.mem.indexOf(u8, line.text, "linux tar verification: OK") != null) saw_tar_ok = true;
     }
-    try std.testing.expect(saw_ok);
+    try std.testing.expect(saw_zip_ok);
+    try std.testing.expect(saw_tar_ok);
 }
 
 test "release verify rejects unsafe zip paths" {

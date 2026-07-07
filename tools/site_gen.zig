@@ -234,8 +234,8 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         \\        </article>
         \\        <article class="download-card">
         \\          <div class="platform">Linux x86_64</div>
-        \\          <h3>ZIDE CLI/TUI bundle</h3>
-        \\          <p>Ships a musl-targeted CLI/TUI binary with executable permissions preserved in a TAR archive.</p>
+        \\          <h3>ZIDE Linux bundle</h3>
+        \\          <p>Includes the direct-X11 GUI workbench and musl-targeted CLI/TUI binary in one TAR archive.</p>
         \\          <a class="button primary wide" href="{s}" download>Download {s}</a>
         \\          <code>{s}</code>
         \\        </article>
@@ -245,6 +245,7 @@ fn writeHtml(allocator: std.mem.Allocator, out_dir: []const u8, file_name: []con
         \\.\\zide-windows-x86_64\\zide-gui.exe
         \\
         \\tar -xf zide-linux-x86_64.tar
+        \\./zide-linux-x86_64/zide-gui
         \\./zide-linux-x86_64/zide</code></pre>
         \\        </article>
         \\      </div>

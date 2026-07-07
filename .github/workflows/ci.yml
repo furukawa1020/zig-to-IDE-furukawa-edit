@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zig-windows:
+    name: Zig 0.16.0 / Windows
+    runs-on: windows-latest
+    env:
+      ZIG_VERSION: 0.16.0
+      ZIG_SHA256: 68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download pinned Zig
+        shell: pwsh
+        run: |
+          $archive = "zig-x86_64-windows-$env:ZIG_VERSION.zip"
+          $uri = "https://ziglang.org/download/$env:ZIG_VERSION/$archive"
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $env:ZIG_SHA256) {
+            throw "Zig archive SHA-256 mismatch: expected $env:ZIG_SHA256, got $actual"
+          }
+          Expand-Archive -Path $archive -DestinationPath .zig-toolchain
+          $zigDir = Join-Path $PWD ".zig-toolchain\zig-x86_64-windows-$env:ZIG_VERSION"
+          $zigDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Zig version
+        run: zig version
+
+      - name: Test
+        run: zig build test --cache-dir .zig-cache --global-cache-dir .zig-global-cache
+
+      - name: GUI type check
+        run: zig build-exe src\gui_main.zig -fno-emit-bin -luser32 -lgdi32 -lkernel32 -lshell32 -lole32 --cache-dir .zig-cache --global-cache-dir .zig-global-cache

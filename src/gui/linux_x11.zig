@@ -2575,10 +2575,13 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
         const index = state.entryIndexAtVisibleRank(state.file_scroll_line + visible_index) orelse break;
         const entry = app.workspace.entries.items[index];
         const marker = riskMarkerForEntry(state, entry.path, entry.kind == .directory);
+        const git_marker = gitMarkerForEntry(state, entry.path, entry.kind == .directory);
         const gc = if (index == app.file_cursor)
             x11.gc.cyan
         else if (marker) |risk_marker|
             riskGc(x11, risk_marker.risk)
+        else if (git_marker) |git_marker_value|
+            gitChangeGc(x11, git_marker_value.status)
         else if (entry.kind == .directory)
             x11.gc.green
         else
@@ -2593,8 +2596,10 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
         const lang = if (entry.kind == .file) modes.label(entry.language) else "";
         const risk_label = if (marker) |risk_marker| risk_marker.label else "";
         const risk_sep = if (marker != null) " " else "";
+        const git_label = if (git_marker) |git_marker_value| git_marker_value.label else "";
+        const git_sep = if (git_marker != null) " " else "";
         @memset(line_buf[0..indent], ' ');
-        const suffix = std.fmt.bufPrint(line_buf[indent..], "{s}{s}  {s}{s}{s}", .{ prefix, entry.path, lang, risk_sep, risk_label }) catch clipped: {
+        const suffix = std.fmt.bufPrint(line_buf[indent..], "{s}{s}  {s}{s}{s}{s}{s}", .{ prefix, entry.path, lang, risk_sep, risk_label, git_sep, git_label }) catch clipped: {
             const available = line_buf.len - indent;
             const clipped_path = entry.path[0..@min(entry.path.len, available)];
             @memcpy(line_buf[indent..][0..clipped_path.len], clipped_path);
@@ -2613,13 +2618,18 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
     if (app.palette.visible) try drawPalette(x11, state);
 
     try x11.fillRect(x11.gc.cyan, 0, state.window_height - STATUS_HEIGHT, width_u, STATUS_HEIGHT);
-    var status_buf: [520]u8 = undefined;
+    var status_buf: [760]u8 = undefined;
+    var hot_buf: [80]u8 = undefined;
     const active = app.documents.active();
     const dirty_count = app.documents.dirtyCount();
     const language = if (active) |doc| modes.label(doc.language) else "none";
     const cursor = if (active) |doc| doc.cursor.position else null;
+    const current_risk = currentDocumentRiskCounts(state);
+    const hot_boundary = currentLineBoundaryHint(state, hot_buf[0..]);
+    const git_changes = if (state.git_overview) |overview| overview.changes.len else 0;
+    const linux_grade = linuxBoundaryGrade(&state.linux_security);
     const status = std.fmt.bufPrint(status_buf[0..],
-        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} trust:{s} risk:{d} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+S Ctrl+G Ctrl+A | {s}",
+        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} linux:{s} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+S Ctrl+G Ctrl+A | {s}",
         .{
             @tagName(app.mode),
             @tagName(app.focus),
@@ -2628,7 +2638,12 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
             dirty_count,
             language,
             @tagName(app.runtime.trust_state),
-            app.security_findings.items.items.len,
+            current_risk.critical,
+            current_risk.high,
+            current_risk.medium,
+            hot_boundary,
+            git_changes,
+            linux_grade.label,
             app.workspace.entries.items.len,
             app.workspace.countCodeFiles(),
             app.workspace.countRecognizedLanguages(),
@@ -3034,15 +3049,20 @@ fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
         return;
     }
 
+    const workflow_risk = workflowRiskCounts(state, overview);
     var meta_buf: [720]u8 = undefined;
-    const meta = std.fmt.bufPrint(meta_buf[0..], "branch:{s} commit:{s} index:v{d} entries:{d} tracked-clean:{d} changes:{d} workflows:{d}", .{
+    const meta = std.fmt.bufPrint(meta_buf[0..], "branch:{s} commit:{s} index:v{d} entries:{d} tracked-clean:{d} changes:{d} ignored:{d} workflows:{d} wf-risk:{d}/{d}/{d}", .{
         overview.branch orelse "(detached)",
         if (overview.commit) |commit| commit[0..@min(commit.len, 12)] else "unknown",
         overview.index_version orelse 0,
         overview.index_entries,
         overview.clean_tracked,
         overview.changes.len,
+        overview.ignored_untracked,
         overview.workflow_files,
+        workflow_risk.critical,
+        workflow_risk.high,
+        workflow_risk.medium,
     }) catch "git overview";
     var meta_ascii: [720]u8 = undefined;
     try x11.text(x11.gc.muted, 18, bottom + 82, asciiInto(meta_ascii[0..], meta));
@@ -3071,16 +3091,22 @@ fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
     var row: usize = 0;
     while (start + row < limit) : (row += 1) {
         const change = overview.changes[start + row];
+        const counts = pathRiskCounts(state, change.path);
+        const worst = highestRisk(counts);
         var row_buf: [720]u8 = undefined;
-        const line = std.fmt.bufPrint(row_buf[0..], "{s}  {s}  +{d}/-{d}{s}", .{
-            @tagName(change.status),
+        const line = std.fmt.bufPrint(row_buf[0..], "{s}  {s}  +{d}/-{d}{s}  risk:{d}/{d}/{d}", .{
+            gitChangeLabel(change.status),
             change.path,
             change.additions,
             change.deletions,
             if (change.diff_available) " diff" else "",
+            counts.critical,
+            counts.high,
+            counts.medium,
         }) catch change.path;
         var row_ascii: [720]u8 = undefined;
-        try x11.text(if (change.status == .deleted) x11.gc.red else x11.gc.muted, 18, y, asciiInto(row_ascii[0..], line));
+        const row_gc = if (worst) |risk| riskGc(x11, risk) else gitChangeGc(x11, change.status);
+        try x11.text(row_gc, 18, y, asciiInto(row_ascii[0..], line));
         y += LINE_HEIGHT;
     }
     if (overview.changes.len == 0) {
@@ -3346,6 +3372,14 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
     try x11.text(color, x, y, asciiInto(ascii_buf[0..], text));
 }
 
+const RiskCounts = struct {
+    info: usize = 0,
+    low: usize = 0,
+    medium: usize = 0,
+    high: usize = 0,
+    critical: usize = 0,
+};
+
 const BoundaryCounts = struct {
     memory: usize = 0,
     execution: usize = 0,
@@ -3361,6 +3395,11 @@ const BoundaryCounts = struct {
 const RiskMarker = struct {
     label: []const u8,
     risk: findings_mod.Risk,
+};
+
+const GitMarker = struct {
+    label: []const u8,
+    status: git_repository.ChangeStatus,
 };
 
 const LinuxBoundaryGrade = struct {
@@ -3388,6 +3427,81 @@ fn boundaryCounts(app: *const app_mod.App) BoundaryCounts {
     return counts;
 }
 
+fn riskCounts(collection: *const findings_mod.Collection) RiskCounts {
+    var counts: RiskCounts = .{};
+    for (collection.items.items) |item| addRisk(&counts, item.risk);
+    return counts;
+}
+
+fn currentDocumentRiskCounts(state: *LinuxGuiState) RiskCounts {
+    const doc = state.app.documents.active() orelse return .{};
+    const path = doc.path orelse return .{};
+    return pathRiskCounts(state, path);
+}
+
+fn currentLineBoundaryHint(state: *LinuxGuiState, buffer: []u8) []const u8 {
+    const doc = state.app.documents.active() orelse return "clear";
+    const path = doc.path orelse return "clear";
+    const line = doc.cursor.position.line;
+
+    var best_risk: ?findings_mod.Risk = null;
+    var best_boundary: ?findings_mod.Boundary = null;
+    for (state.app.security_findings.items.items) |item| {
+        if (item.line != line) continue;
+        if (!pathMatchesX11(path, item.path)) continue;
+        if (best_risk == null or riskRank(item.risk) > riskRank(best_risk.?)) {
+            best_risk = item.risk;
+            best_boundary = findings_mod.boundaryFor(item.category);
+        }
+    }
+
+    const risk = best_risk orelse return "clear";
+    const boundary = best_boundary orelse return @tagName(risk);
+    return std.fmt.bufPrint(buffer, "{s}/{s}", .{ @tagName(risk), findings_mod.boundaryLabel(boundary) }) catch "hot";
+}
+
+fn workflowRiskCounts(state: *const LinuxGuiState, overview: git_repository.Overview) RiskCounts {
+    var counts: RiskCounts = .{};
+    for (overview.workflow_paths) |path| addRiskCounts(&counts, pathRiskCounts(state, path));
+    return counts;
+}
+
+fn pathRiskCounts(state: *const LinuxGuiState, path: []const u8) RiskCounts {
+    var counts: RiskCounts = .{};
+    for (state.app.security_findings.items.items) |item| {
+        if (!pathMatchesX11(path, item.path)) continue;
+        addRisk(&counts, item.risk);
+    }
+    return counts;
+}
+
+fn addRisk(counts: *RiskCounts, risk: findings_mod.Risk) void {
+    switch (risk) {
+        .info => counts.info += 1,
+        .low => counts.low += 1,
+        .medium => counts.medium += 1,
+        .high => counts.high += 1,
+        .critical => counts.critical += 1,
+    }
+}
+
+fn addRiskCounts(counts: *RiskCounts, other: RiskCounts) void {
+    counts.info += other.info;
+    counts.low += other.low;
+    counts.medium += other.medium;
+    counts.high += other.high;
+    counts.critical += other.critical;
+}
+
+fn highestRisk(counts: RiskCounts) ?findings_mod.Risk {
+    if (counts.critical > 0) return .critical;
+    if (counts.high > 0) return .high;
+    if (counts.medium > 0) return .medium;
+    if (counts.low > 0) return .low;
+    if (counts.info > 0) return .info;
+    return null;
+}
+
 fn riskMarkerForEntry(state: *const LinuxGuiState, entry_path: []const u8, is_directory: bool) ?RiskMarker {
     var best: ?findings_mod.Risk = null;
     for (state.app.security_findings.items.items) |finding| {
@@ -3398,13 +3512,45 @@ fn riskMarkerForEntry(state: *const LinuxGuiState, entry_path: []const u8, is_di
     return .{ .label = riskMarkerLabel(risk), .risk = risk };
 }
 
+fn gitMarkerForEntry(state: *const LinuxGuiState, entry_path: []const u8, is_directory: bool) ?GitMarker {
+    const overview = state.git_overview orelse return null;
+    if (!overview.present) return null;
+    for (overview.changes) |change| {
+        if (is_directory) {
+            if (pathIsInsideDirectoryX11(change.path, entry_path)) {
+                return .{ .label = "*", .status = change.status };
+            }
+        } else if (pathMatchesX11(entry_path, change.path)) {
+            return .{ .label = gitChangeLabel(change.status), .status = change.status };
+        }
+    }
+    return null;
+}
+
 fn findingPathBelongsToEntry(finding_path: []const u8, entry_path: []const u8, is_directory: bool) bool {
     if (pathEqualNormalizedX11(finding_path, entry_path)) return true;
     if (!is_directory) return false;
-    if (entry_path.len == 0 or finding_path.len <= entry_path.len) return false;
-    if (!pathStartsWithNormalizedX11(finding_path, entry_path)) return false;
-    const separator = finding_path[entry_path.len];
+    return pathIsInsideDirectoryX11(finding_path, entry_path);
+}
+
+fn pathIsInsideDirectoryX11(path: []const u8, directory: []const u8) bool {
+    if (directory.len == 0 or path.len <= directory.len) return false;
+    if (!pathStartsWithNormalizedX11(path, directory)) return false;
+    const separator = path[directory.len];
     return separator == '/' or separator == '\\';
+}
+
+fn pathMatchesX11(path: []const u8, candidate: []const u8) bool {
+    if (candidate.len == 0) return false;
+    if (pathEqualNormalizedX11(path, candidate)) return true;
+    return pathEndsWithNormalizedX11(path, candidate);
+}
+
+fn pathEndsWithNormalizedX11(path: []const u8, suffix: []const u8) bool {
+    if (suffix.len == 0 or suffix.len > path.len) return false;
+    const start = path.len - suffix.len;
+    if (!pathEqualNormalizedX11(path[start..], suffix)) return false;
+    return start == 0 or path[start - 1] == '/' or path[start - 1] == '\\';
 }
 
 fn pathStartsWithNormalizedX11(value: []const u8, prefix: []const u8) bool {
@@ -3431,6 +3577,22 @@ fn riskMarkerLabel(risk: findings_mod.Risk) []const u8 {
         .medium => "[M]",
         .low => "[L]",
         .info => "[I]",
+    };
+}
+
+fn gitChangeLabel(status: git_repository.ChangeStatus) []const u8 {
+    return switch (status) {
+        .modified => "M",
+        .deleted => "D",
+        .untracked => "??",
+    };
+}
+
+fn gitChangeGc(x11: *X11, status: git_repository.ChangeStatus) u32 {
+    return switch (status) {
+        .modified => x11.gc.amber,
+        .deleted => x11.gc.red,
+        .untracked => x11.gc.cyan,
     };
 }
 

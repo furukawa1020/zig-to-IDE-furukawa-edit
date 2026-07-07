@@ -1,5 +1,7 @@
 .zig-cache/
+.zig-cache*/
 .zig-global-cache/
+.zig-global-cache*/
 .zig-toolchain/
 .tools/
 zig-cache/

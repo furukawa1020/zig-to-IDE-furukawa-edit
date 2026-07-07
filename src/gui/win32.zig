@@ -82,6 +82,7 @@ const PublishPanelAction = enum {
     manifests,
     bundle,
     verify,
+    preflight,
 };
 
 const SelectionRange = struct {
@@ -933,6 +934,7 @@ const GuiState = struct {
             .manifests => "release.manifests",
             .bundle => "release.bundle",
             .verify => "release.verify",
+            .preflight => "release.preflight",
         };
         const result = dispatcher.dispatch(&self.app, .{ .id = id, .source = .command_palette }) catch |err| {
             self.setError(err) catch {};
@@ -4069,7 +4071,7 @@ fn drawPublishPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
 
 fn drawPublishPanelActions(hdc: windows.HDC, rect: RECT) void {
     if (!publishPanelHasActionButtons(rect)) return;
-    const actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle, .verify };
+    const actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle, .verify, .preflight };
     for (actions) |action| {
         drawButton(hdc, publishPanelActionButtonRect(rect, action), publishPanelActionLabel(action));
     }
@@ -4078,7 +4080,7 @@ fn drawPublishPanelActions(hdc: windows.HDC, rect: RECT) void {
 fn publishPanelActionAt(rect: RECT, x: c_int, y: c_int) ?PublishPanelAction {
     if (!publishPanelHasActionButtons(rect)) return null;
     if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle, .verify };
+    const actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle, .verify, .preflight };
     for (actions) |action| {
         if (pointIn(publishPanelActionButtonRect(rect, action), x, y)) return action;
     }
@@ -4086,18 +4088,19 @@ fn publishPanelActionAt(rect: RECT, x: c_int, y: c_int) ?PublishPanelAction {
 }
 
 fn publishPanelHasActionButtons(rect: RECT) bool {
-    return rect.right - rect.left >= 600;
+    return rect.right - rect.left >= 680;
 }
 
 fn publishPanelActionButtonRect(rect: RECT, action: PublishPanelAction) RECT {
     const width: c_int = 72;
     const gap: c_int = 8;
     const slot: c_int = switch (action) {
-        .verify => 0,
-        .bundle => 1,
-        .manifests => 2,
-        .assets => 3,
-        .checklist => 4,
+        .preflight => 0,
+        .verify => 1,
+        .bundle => 2,
+        .manifests => 3,
+        .assets => 4,
+        .checklist => 5,
     };
     const right = rect.right - 12 - slot * (width + gap);
     return .{
@@ -4115,6 +4118,7 @@ fn publishPanelActionLabel(action: PublishPanelAction) []const u8 {
         .manifests => "MANI",
         .bundle => "ZIP",
         .verify => "VFY",
+        .preflight => "GATE",
     };
 }
 
@@ -5297,6 +5301,7 @@ fn publishLines() []const []const u8 {
         "[ship] GitHub Releases: publish a draft first, attach zide-windows-x86_64.zip and a short demo clip.",
         "[ship] Press ZIP after builds to create zide-windows-x86_64.zip with pure Zig archive writing.",
         "[ship] Press VFY before upload to verify ZIP paths, central directory, CRC32, and embedded checksums.",
+        "[ship] Press GATE for the final local publish decision: docs, git state, artifacts, verification, and hashes.",
         "[hash] Press HASH after builds to render size and SHA-256 for GitHub Releases, winget, and Scoop.",
         "[ship] Press MANI to render GitHub Release, winget, and Scoop draft manifests; ZIP is preferred when present.",
         "[ship] Mark the first tag as prerelease until outside users exercise edit/save/git/security flows.",
@@ -5333,16 +5338,33 @@ fn workspaceHasAnyLicense(app: *const app_mod.App) bool {
 
 fn workspaceHasPathGui(app: *const app_mod.App, relative: []const u8) bool {
     for (app.workspace.entries.items) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.path, relative)) return true;
+        if (pathEqualIgnoreCaseAndSlashGui(entry.path, relative)) return true;
     }
     return false;
 }
 
 fn workspaceHasPrefixGui(app: *const app_mod.App, prefix: []const u8) bool {
     for (app.workspace.entries.items) |entry| {
-        if (entry.path.len >= prefix.len and std.ascii.eqlIgnoreCase(entry.path[0..prefix.len], prefix)) return true;
+        if (pathStartsWithIgnoreCaseAndSlashGui(entry.path, prefix)) return true;
     }
     return false;
+}
+
+fn pathEqualIgnoreCaseAndSlashGui(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (normalizePathByteGui(left) != normalizePathByteGui(right)) return false;
+    }
+    return true;
+}
+
+fn pathStartsWithIgnoreCaseAndSlashGui(value: []const u8, prefix: []const u8) bool {
+    if (value.len < prefix.len) return false;
+    return pathEqualIgnoreCaseAndSlashGui(value[0..prefix.len], prefix);
+}
+
+fn normalizePathByteGui(byte: u8) u8 {
+    return if (byte == '\\') '/' else std.ascii.toLower(byte);
 }
 
 fn workspaceFileExistsGui(app: *const app_mod.App, relative: []const u8) bool {

@@ -24,7 +24,6 @@ const LINE_HEIGHT = 19;
 const EDITOR_LEFT = FILE_WIDTH + 24;
 const EDITOR_TOP = HEADER_HEIGHT + 58;
 const EDITOR_TEXT_TOP = EDITOR_TOP + 44;
-const BOTTOM_TOP = HEIGHT - OUTPUT_HEIGHT - STATUS_HEIGHT;
 
 const X = struct {
     const EventMask = struct {
@@ -559,7 +558,7 @@ const LinuxGuiState = struct {
                         return;
                     }
                     if (char == 't' or char == 'T') {
-                        self.runHeaderAction(.test);
+                        self.runHeaderAction(.test_run);
                         return;
                     }
                     if (char == 'z' or char == 'Z') {
@@ -669,12 +668,16 @@ const LinuxGuiState = struct {
                 if (index < self.app.workspace.entries.items.len) {
                     self.app.file_cursor = index;
                     self.app.focus = .files;
-                    _ = self.app.openSelectedWorkspaceEntry() catch |err| {
+                    const opened = self.app.openSelectedWorkspaceEntry() catch |err| {
                         self.message("open failed: {s}", .{@errorName(err)});
                         return;
                     };
-                    if (self.app.documents.active() != null) self.app.mode = .insert;
-                    self.message("opened selected workspace entry", .{});
+                    if (opened) {
+                        self.app.mode = .insert;
+                        self.message("opened selected file", .{});
+                    } else {
+                        self.message("selected workspace folder", .{});
+                    }
                 }
             }
             return;
@@ -862,7 +865,12 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
         const indent = @min(entry.depth * 2, @as(usize, 12));
         const lang = if (entry.kind == .file) modes.label(entry.language) else "";
         @memset(line_buf[0..indent], ' ');
-        const suffix = std.fmt.bufPrint(line_buf[indent..], "{s}{s}  {s}", .{ prefix, entry.path, lang }) catch entry.path;
+        const suffix = std.fmt.bufPrint(line_buf[indent..], "{s}{s}  {s}", .{ prefix, entry.path, lang }) catch clipped: {
+            const available = line_buf.len - indent;
+            const clipped_path = entry.path[0..@min(entry.path.len, available)];
+            @memcpy(line_buf[indent..][0..clipped_path.len], clipped_path);
+            break :clipped line_buf[indent..][0..clipped_path.len];
+        };
         const label = line_buf[0 .. indent + suffix.len];
         var ascii_buf: [260]u8 = undefined;
         try x11.text(gc, 18, y, asciiInto(ascii_buf[0..], label));

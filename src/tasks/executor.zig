@@ -1,6 +1,7 @@
 const std = @import("std");
 const console = @import("console.zig");
 const execution_queue = @import("execution_queue.zig");
+const audit_chain = @import("../security/audit_chain.zig");
 const command_intent = @import("../security/command_intent.zig");
 const permissions = @import("../security/permissions.zig");
 
@@ -216,8 +217,6 @@ fn recordRunHistory(
 
 fn persistLatestAudit(queue: *const execution_queue.Queue, process_console: *console.ProcessConsole, options: RunOptions) !void {
     const entry = queue.latestHistory() orelse return;
-    var line = try auditJsonLine(process_console.allocator, entry);
-    defer line.deinit();
 
     const audit_dir = try std.fs.path.join(process_console.allocator, &.{ options.workspace_root, ".zide", "audit" });
     defer process_console.allocator.free(audit_dir);
@@ -233,12 +232,30 @@ fn persistLatestAudit(queue: *const execution_queue.Queue, process_console: *con
     defer file.close(options.io);
 
     const offset = try file.length(options.io);
+    const prev_record_hash = try previousAuditRecordHash(process_console.allocator, file, options.io, offset);
+    var line = try auditJsonLine(process_console.allocator, entry, prev_record_hash);
+    defer line.deinit();
+
     try file.writePositionalAll(options.io, line.written(), offset);
     try file.sync(options.io);
-    try appendFormatted(process_console, .stdout, "audit log: .zide/audit/run-history.jsonl id={s}\n", .{entry.audit_id[0..12]});
+    const record_hash = audit_chain.lastRecordHash(line.written()) orelse audit_chain.zero_digest;
+    try appendFormatted(process_console, .stdout, "audit log: .zide/audit/run-history.jsonl id={s} chain={s}\n", .{ entry.audit_id[0..12], record_hash[0..12] });
 }
 
-fn auditJsonLine(allocator: std.mem.Allocator, entry: *const execution_queue.HistoryEntry) !std.Io.Writer.Allocating {
+fn previousAuditRecordHash(allocator: std.mem.Allocator, file: std.Io.File, io: std.Io, length: u64) !audit_chain.Digest {
+    if (length == 0) return audit_chain.zero_digest;
+
+    const tail_len_u64 = @min(length, 64 * 1024);
+    const tail_len: usize = @intCast(tail_len_u64);
+    const offset = length - tail_len_u64;
+    const buffer = try allocator.alloc(u8, tail_len);
+    defer allocator.free(buffer);
+
+    const read_len = try file.readPositionalAll(io, buffer, offset);
+    return audit_chain.lastRecordHash(buffer[0..read_len]) orelse audit_chain.zero_digest;
+}
+
+fn auditJsonLine(allocator: std.mem.Allocator, entry: *const execution_queue.HistoryEntry, prev_record_hash: audit_chain.Digest) !std.Io.Writer.Allocating {
     var text: std.Io.Writer.Allocating = .init(allocator);
     errdefer text.deinit();
     const writer = &text.writer;
@@ -277,7 +294,10 @@ fn auditJsonLine(allocator: std.mem.Allocator, entry: *const execution_queue.His
         entry.intent.package_manager,
     });
     try writeJsonField(writer, "reason", entry.intent.reason);
-    try writer.writeAll("}}\n");
+    try writer.writeAll("}");
+
+    const record_hash = audit_chain.hashRecord(prev_record_hash[0..], text.written());
+    try writer.print(",\"prev_record_hash\":\"{s}\",\"record_hash\":\"{s}\"}}\n", .{ prev_record_hash[0..], record_hash[0..] });
     return text;
 }
 
@@ -460,7 +480,7 @@ test "audit json line escapes command metadata" {
     defer ticket.deinit();
     try queue.recordHistory(&ticket, ".", .finished, 0, 2, 0);
 
-    var line = try auditJsonLine(std.testing.allocator, queue.latestHistory().?);
+    var line = try auditJsonLine(std.testing.allocator, queue.latestHistory().?, audit_chain.zero_digest);
     defer line.deinit();
     const bytes = line.written();
     try std.testing.expect(std.mem.endsWith(u8, bytes, "\n"));
@@ -469,6 +489,9 @@ test "audit json line escapes command metadata" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\\\"quoted\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"schema\":\"zide.run-history.v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"intent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"prev_record_hash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"record_hash\"") != null);
+    try std.testing.expect(audit_chain.verify(bytes).ok());
 }
 
 test "runner blocks approved command cwd traversal before spawn" {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const app_mod = @import("app.zig");
+const audit_chain = @import("../security/audit_chain.zig");
 const build_commands = @import("../build/commands.zig");
 const build_consent = @import("../security/build_consent.zig");
 const command = @import("command.zig");
@@ -386,6 +387,10 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "run audit log rendered" };
     }
 
+    if (std.mem.eql(u8, definition.id, "security.audit_verify")) {
+        return try verifyRunAuditLog(app);
+    }
+
     if (std.mem.eql(u8, definition.id, "git.overview") or std.mem.eql(u8, definition.id, "github.overview")) {
         var overview = try git_repository.inspect(app.allocator, &app.workspace, .{});
         defer overview.deinit();
@@ -646,6 +651,62 @@ fn renderRunAuditLog(app: *app_mod.App) !void {
     if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') try writer.writeAll("\n");
     try writer.writeAll("--- jsonl end ---\n");
     try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn verifyRunAuditLog(app: *app_mod.App) !Result {
+    const path = try std.fs.path.join(app.allocator, &.{ app.workspace.root_path, ".zide", "audit", "run-history.jsonl" });
+    defer app.allocator.free(path);
+
+    var file = std.Io.Dir.cwd().openFile(std.Options.debug_io, path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .lock = .shared,
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            try appendConsole(app, .stdout, "run audit verification\npath: .zide/audit/run-history.jsonl\nstatus: no persisted launch audit yet\n", .{});
+            return .{ .blocked = "no persisted launch audit yet" };
+        },
+        else => return err,
+    };
+    defer file.close(std.Options.debug_io);
+
+    const length = try file.length(std.Options.debug_io);
+    if (length > 16 * 1024 * 1024) {
+        try appendConsole(app, .stderr, "run audit verification blocked: log is {d} bytes; rotate or export before full verification\n", .{length});
+        return .{ .blocked = "run audit log is too large for in-process verification" };
+    }
+
+    const size: usize = @intCast(length);
+    const buffer = try app.allocator.alloc(u8, size);
+    defer app.allocator.free(buffer);
+    const read_len = try file.readPositionalAll(std.Options.debug_io, buffer, 0);
+    const stats = audit_chain.verify(buffer[0..read_len]);
+
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+    try writer.writeAll("run audit verification\n");
+    try writer.writeAll("path: .zide/audit/run-history.jsonl\n");
+    try writer.print("bytes: {d}\n", .{length});
+    try writer.print("lines: {d}\n", .{stats.lines});
+    try writer.print("chained: {d}\n", .{stats.chained});
+    try writer.print("legacy: {d}\n", .{stats.legacy});
+    try writer.print("broken: {d}\n", .{stats.broken});
+    if (stats.first_broken_line) |line| try writer.print("first_broken_line: {d}\n", .{line});
+    if (stats.last_record_hash) |hash| try writer.print("last_record_hash: {s}\n", .{hash[0..]});
+    if (stats.ok()) {
+        if (stats.legacy > 0) {
+            try writer.writeAll("status: ok with legacy unchained entries\n");
+        } else {
+            try writer.writeAll("status: ok\n");
+        }
+    } else {
+        try writer.writeAll("status: broken\n");
+    }
+    try app.process_console.appendBytes(.stdout, text.written());
+
+    if (!stats.ok()) return .{ .blocked = "run audit chain verification failed" };
+    return .{ .completed = "run audit chain verified" };
 }
 
 fn syncDiagnosticsFromConsole(app: *app_mod.App) !void {

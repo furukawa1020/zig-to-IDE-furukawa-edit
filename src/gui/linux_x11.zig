@@ -569,8 +569,11 @@ const ContextAction = enum {
     find,
     scan,
     scan_selection,
+    boundary_lens,
     references,
     rename,
+    goto_line,
+    close_editor,
     task_queue,
     palette,
 };
@@ -581,6 +584,7 @@ const QuickPanelMode = enum {
     find_document,
     replace_document,
     rename_symbol,
+    goto_line,
     search_workspace,
     new_file,
     run_task,
@@ -590,6 +594,11 @@ const QuickPanelMode = enum {
 const ReplaceRequest = struct {
     find: []const u8,
     replace: []const u8,
+};
+
+const GotoLineTarget = struct {
+    line: usize,
+    column: usize = 0,
 };
 
 const SelectionRange = struct {
@@ -716,6 +725,7 @@ const QuickPanel = struct {
             .find_document => if (self.document_matches) |items| items.len else 0,
             .replace_document => if (self.document_matches) |items| items.len else 0,
             .rename_symbol => if (renameRequest(self.query.items)) |_| 1 else 0,
+            .goto_line => if (parseGotoLine(self.query.items)) |_| 1 else 0,
             .search_workspace => if (self.search_results) |items| items.len else 0,
             .new_file => if (self.query.items.len > 0) 1 else 0,
             .run_task => if (self.task_matches) |items| items.len else 0,
@@ -776,6 +786,7 @@ const QuickPanel = struct {
                 }
             },
             .rename_symbol => {},
+            .goto_line => {},
             .search_workspace => {
                 if (self.query.items.len > 0) {
                     self.search_results = try workspace_search.search(self.allocator, &app.workspace, self.query.items, .{
@@ -1644,11 +1655,97 @@ const LinuxGuiState = struct {
             .find => self.execute("editor.find", .command_palette),
             .scan => self.execute("security.scan_current", .command_palette),
             .scan_selection => self.scanSelectedRangeSecurity(),
+            .boundary_lens => self.explainBoundaryLens(),
             .references => self.findReferencesAtCursor(),
             .rename => self.openRenamePanel(),
+            .goto_line => self.execute("editor.goto_line", .command_palette),
+            .close_editor => self.closeActiveDocument(),
             .task_queue => self.execute("task.preview_next", .command_palette),
             .palette => self.execute("view.command_palette", .command_palette),
         }
+    }
+
+    fn explainBoundaryLens(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        const base_path = doc.path orelse "(scratch)";
+        const Scope = struct {
+            label: []const u8,
+            bytes: []const u8,
+            line: usize,
+            column: usize,
+        };
+        const scope: Scope = if (self.selectedRange(doc)) |range| blk: {
+            const lc = doc.text.offsetToLineColumn(range.start) catch return self.message("selection offset invalid", .{});
+            break :blk .{
+                .label = "selection",
+                .bytes = doc.text.bytes[range.start..range.end],
+                .line = lc.line,
+                .column = lc.column,
+            };
+        } else blk: {
+            const line = doc.cursor.position.line;
+            break :blk .{
+                .label = "current-line",
+                .bytes = doc.text.lineSlice(line),
+                .line = line,
+                .column = 0,
+            };
+        };
+        if (scope.bytes.len == 0) return self.message("boundary lens: empty {s}", .{scope.label});
+
+        var collection = self.scanSelectionSource(scope.bytes, base_path, doc.language) catch |err| {
+            self.message("boundary lens failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "boundary lens failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer collection.deinit();
+
+        var boundaries: BoundaryCounts = .{};
+        for (collection.items.items) |item| addBoundary(&boundaries, findings_mod.boundaryFor(item.category));
+        const risks = riskCounts(&collection);
+
+        self.bottom_panel = .output;
+        self.appendOutput(.stdout, "boundary lens: {s}:{d}:{d} scope={s} bytes={d} findings={d} risk c/h/m/l/i={d}/{d}/{d}/{d}/{d}\n", .{
+            base_path,
+            scope.line + 1,
+            scope.column + 1,
+            scope.label,
+            scope.bytes.len,
+            collection.items.items.len,
+            risks.critical,
+            risks.high,
+            risks.medium,
+            risks.low,
+            risks.info,
+        });
+        self.appendOutput(.stdout, "boundary counts: memory={d} execution={d} filesystem={d} network={d} dependency={d} secret={d} text={d} path={d} git={d}\n", .{
+            boundaries.memory,
+            boundaries.execution,
+            boundaries.filesystem,
+            boundaries.network,
+            boundaries.dependency,
+            boundaries.secret,
+            boundaries.text,
+            boundaries.path,
+            boundaries.git,
+        });
+
+        for (collection.items.items[0..@min(collection.items.items.len, @as(usize, 10))]) |item| {
+            const line = scope.line + item.line + 1;
+            const column = if (item.line == 0) scope.column + item.column + 1 else item.column + 1;
+            const boundary = findings_mod.boundaryFor(item.category);
+            self.appendOutput(.stdout, "- {s}:{d}:{d} [{s}/{s}/{s}] {s}\n", .{
+                base_path,
+                line,
+                column,
+                @tagName(item.risk),
+                findings_mod.boundaryLabel(boundary),
+                @tagName(item.category),
+                item.message,
+            });
+        }
+        if (collection.items.items.len > 10) self.appendOutput(.stdout, "... {d} more boundary item(s)\n", .{collection.items.items.len - 10});
+        self.message("boundary lens: {d} finding(s)", .{collection.items.items.len});
     }
 
     fn scanSelectedRangeSecurity(self: *LinuxGuiState) void {
@@ -1659,14 +1756,14 @@ const LinuxGuiState = struct {
         const base_path = doc.path orelse "(scratch)";
         const start_lc = doc.text.offsetToLineColumn(range.start) catch return self.message("selection offset invalid", .{});
 
-        var path_buf: [760]u8 = undefined;
-        const selection_path = std.fmt.bufPrint(path_buf[0..], "{s}#selection:{d}:{d}", .{
+        var label_buf: [760]u8 = undefined;
+        const selection_label = std.fmt.bufPrint(label_buf[0..], "{s}#selection:{d}:{d}", .{
             base_path,
             start_lc.line + 1,
             start_lc.column + 1,
         }) catch base_path;
 
-        var collection = self.scanSelectionSource(selected, selection_path, doc.language) catch |err| {
+        var collection = self.scanSelectionSource(selected, base_path, doc.language) catch |err| {
             self.message("selection scan failed: {s}", .{@errorName(err)});
             self.appendOutput(.stderr, "selection scan failed: {s}\n", .{@errorName(err)});
             return;
@@ -1677,7 +1774,7 @@ const LinuxGuiState = struct {
         for (collection.items.items) |item| {
             const line = start_lc.line + item.line;
             const column = if (item.line == 0) start_lc.column + item.column else item.column;
-            self.app.security_findings.append(item.category, item.risk, selection_path, line, column, item.message, item.evidence) catch |err| {
+            self.app.security_findings.append(item.category, item.risk, base_path, line, column, item.message, item.evidence) catch |err| {
                 self.message("selection scan store failed: {s}", .{@errorName(err)});
                 self.appendOutput(.stderr, "selection scan store failed: {s}\n", .{@errorName(err)});
                 return;
@@ -1686,7 +1783,7 @@ const LinuxGuiState = struct {
 
         self.security_scroll_line = 0;
         self.bottom_panel = .security;
-        self.appendOutput(.stdout, "selection security scan: {s} bytes={d} findings={d}\n", .{ selection_path, selected.len, collection.items.items.len });
+        self.appendOutput(.stdout, "selection security scan: {s} bytes={d} findings={d}\n", .{ selection_label, selected.len, collection.items.items.len });
         for (collection.items.items[0..@min(collection.items.items.len, @as(usize, 12))]) |item| {
             const line = start_lc.line + item.line + 1;
             const column = if (item.line == 0) start_lc.column + item.column + 1 else item.column + 1;
@@ -1816,6 +1913,22 @@ const LinuxGuiState = struct {
         }
         if (std.mem.eql(u8, id, "editor.replace")) {
             self.openQuickPanel(.replace_document);
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.goto_line")) {
+            self.openQuickPanel(.goto_line);
+            return;
+        }
+        if (std.mem.eql(u8, id, "file.close")) {
+            self.closeActiveDocument();
+            return;
+        }
+        if (std.mem.eql(u8, id, "file.next_editor")) {
+            self.switchActiveDocument(1);
+            return;
+        }
+        if (std.mem.eql(u8, id, "file.previous_editor")) {
+            self.switchActiveDocument(-1);
             return;
         }
         if (std.mem.eql(u8, id, "editor.normalize_newlines_lf")) {
@@ -2324,6 +2437,7 @@ const LinuxGuiState = struct {
                 self.quick_panel.close();
                 self.renameWorkspaceSymbol(old_name, new_name);
             },
+            .goto_line => self.gotoLineFromQuickPanel(),
             .search_workspace => {
                 const item = self.quick_panel.selectedSearchResult() orelse return self.message("no workspace match", .{});
                 const path = self.allocator.dupe(u8, item.path) catch |err| return self.message("open failed: {s}", .{@errorName(err)});
@@ -2636,6 +2750,54 @@ const LinuxGuiState = struct {
         self.message("rename preview changed {d} reference(s)", .{replaced});
     }
 
+    fn gotoLineFromQuickPanel(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        const target = parseGotoLine(self.quick_panel.query.items) orelse return self.message("type line or line:column", .{});
+        const last_line = if (doc.text.lineCount() == 0) 0 else doc.text.lineCount() - 1;
+        const line = @min(target.line, last_line);
+        const column = @min(target.column, doc.text.lineSlice(line).len);
+        const offset = doc.text.lineColumnToOffset(line, column) catch |err| return self.message("goto failed: {s}", .{@errorName(err)});
+        navigation.setCursor(doc, doc.positionFromOffset(offset) catch doc.cursor.position);
+        self.clearSelection();
+        self.quick_panel.close();
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        self.message("line {d}:{d}", .{ line + 1, column + 1 });
+    }
+
+    fn closeActiveDocument(self: *LinuxGuiState) void {
+        const index = self.app.documents.activeIndex() orelse return self.message("no active document", .{});
+        self.closeDocumentAt(index);
+    }
+
+    fn closeDocumentAt(self: *LinuxGuiState, index: usize) void {
+        if (index >= self.app.documents.documents.items.len) return self.message("no document at tab", .{});
+        if (self.app.documents.documents.items[index].dirty) return self.message("save before closing dirty editor", .{});
+        self.app.documents.closeAt(index, .deny_dirty) catch |err| return self.message("close failed: {s}", .{@errorName(err)});
+        self.clearSelection();
+        self.editor_dragging = false;
+        self.app.focus = if (self.app.documents.active() != null) .editor else .files;
+        self.ensureEditorCursorVisible();
+        self.message("closed editor", .{});
+    }
+
+    fn switchActiveDocument(self: *LinuxGuiState, delta: isize) void {
+        if (self.app.documents.documents.items.len == 0) return self.message("no open editors", .{});
+        self.app.documents.moveActive(delta);
+        self.clearSelection();
+        self.editor_dragging = false;
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        if (self.app.documents.active()) |doc| {
+            const label = if (doc.path) |path| std.fs.path.basename(path) else "(scratch)";
+            self.message("editor: {s}", .{label});
+        } else {
+            self.message("no open editors", .{});
+        }
+    }
+
     fn openWorkspace(self: *LinuxGuiState, root_path: []const u8) void {
         var next = app_mod.App.initWithProcess(self.allocator, root_path, std.Options.debug_io, self.app.environ) catch |err| {
             self.message("workspace open failed: {s}", .{@errorName(err)});
@@ -2676,6 +2838,10 @@ const LinuxGuiState = struct {
     fn handleKey(self: *LinuxGuiState, x11: *X11, key: event_mod.KeyEvent) void {
         if (self.handleContextMenuKey(x11, key)) return;
         if (self.handleQuickPanelKey(key)) return;
+        if (key.modifiers.ctrl and std.meta.activeTag(key.code) == .tab) {
+            self.execute(if (key.modifiers.shift) "file.previous_editor" else "file.next_editor", .keybinding);
+            return;
+        }
 
         if (self.app.mode == .insert and self.app.focus == .editor) {
             if (key.modifiers.ctrl) {
@@ -2697,6 +2863,79 @@ const LinuxGuiState = struct {
                             self.pasteFromClipboard(x11);
                             return;
                         }
+                        if (char == 'g' or char == 'G') {
+                            self.execute("editor.goto_line", .keybinding);
+                            return;
+                        }
+                        if (char == 'w' or char == 'W') {
+                            self.execute("file.close", .keybinding);
+                            return;
+                        }
+                        if (key.modifiers.shift and (char == 'p' or char == 'P')) {
+                            self.execute("view.command_palette", .keybinding);
+                            return;
+                        }
+                        if (key.modifiers.shift and (char == 'o' or char == 'O')) {
+                            self.openQuickPanel(.document_symbols);
+                            return;
+                        }
+                        if (key.modifiers.shift and (char == 'f' or char == 'F')) {
+                            self.openQuickPanel(.search_workspace);
+                            return;
+                        }
+                        if (char == 'f' or char == 'F') {
+                            self.openQuickPanel(.find_document);
+                            return;
+                        }
+                        if (char == 'h' or char == 'H') {
+                            self.openQuickPanel(.replace_document);
+                            return;
+                        }
+                        if (char == 'p' or char == 'P') {
+                            self.openQuickPanel(.find_file);
+                            return;
+                        }
+                        if (char == 'o' or char == 'O') {
+                            self.openQuickPanel(.open_workspace);
+                            return;
+                        }
+                        if (char == 'n' or char == 'N') {
+                            self.openQuickPanel(.new_file);
+                            return;
+                        }
+                        if (char == 'r' or char == 'R') {
+                            self.openQuickPanel(.run_task);
+                            return;
+                        }
+                        if (char == 's' or char == 'S') {
+                            self.runHeaderAction(if (key.modifiers.shift) .save_all else .save);
+                            return;
+                        }
+                        if (char == 'z' or char == 'Z') {
+                            self.execute("editor.undo", .keybinding);
+                            return;
+                        }
+                        if (char == 'y' or char == 'Y') {
+                            self.execute("editor.redo", .keybinding);
+                            return;
+                        }
+                        if (char == 'b' or char == 'B') {
+                            self.runHeaderAction(.build);
+                            return;
+                        }
+                        if (char == 't' or char == 'T') {
+                            self.runHeaderAction(.test_run);
+                            return;
+                        }
+                        if (key.modifiers.shift and (char == 'x' or char == 'X')) {
+                            self.runHeaderAction(.extensions);
+                            return;
+                        }
+                        if (key.modifiers.shift and (char == 'l' or char == 'L')) {
+                            self.runHeaderAction(.publish);
+                            return;
+                        }
+                        return;
                     },
                     else => {},
                 }
@@ -2765,6 +3004,14 @@ const LinuxGuiState = struct {
                     }
                     if (char == 'v' or char == 'V') {
                         self.pasteFromClipboard(x11);
+                        return;
+                    }
+                    if (char == 'g' or char == 'G') {
+                        self.execute("editor.goto_line", .keybinding);
+                        return;
+                    }
+                    if (char == 'w' or char == 'W') {
+                        self.execute("file.close", .keybinding);
                         return;
                     }
                 },
@@ -2938,7 +3185,15 @@ const LinuxGuiState = struct {
                         return;
                     }
                     if (char == 'g' or char == 'G') {
-                        self.runHeaderAction(.git);
+                        if (key.modifiers.shift) {
+                            self.runHeaderAction(.git);
+                        } else {
+                            self.execute("editor.goto_line", .keybinding);
+                        }
+                        return;
+                    }
+                    if (char == 'w' or char == 'W') {
+                        self.execute("file.close", .keybinding);
                         return;
                     }
                     if (char == 'd' or char == 'D') {
@@ -3009,6 +3264,12 @@ const LinuxGuiState = struct {
                 self.scrollBottomPanel(delta);
             }
             return;
+        }
+        if (button == 2) {
+            if (documentTabAt(self, x, y)) |index| {
+                self.closeDocumentAt(index);
+                return;
+            }
         }
         if (button == 2 and x >= FILE_WIDTH and y >= HEADER_HEIGHT and y < self.bottomTop()) {
             self.app.focus = .editor;
@@ -3110,6 +3371,7 @@ const LinuxGuiState = struct {
 
         if (y >= HEADER_HEIGHT and y < bottom and x >= FILE_WIDTH) {
             self.app.focus = .editor;
+            if (self.handleBoundaryGutterClick(x, y)) return;
             const extend_selection = (state_mask & X11_SHIFT_MASK) != 0;
             if (!extend_selection and self.consumeEditorDoubleClick(time, x, y)) {
                 if (!self.selectIdentifierAtPoint(x11, x, y)) self.beginEditorSelection(x11, x, y, false);
@@ -3130,6 +3392,45 @@ const LinuxGuiState = struct {
         }
     }
 
+    fn handleBoundaryGutterClick(self: *LinuxGuiState, x: i16, y: i16) bool {
+        if (x < EDITOR_LEFT + 34 or x >= EDITOR_LEFT + 56) return false;
+        const doc = self.app.documents.active() orelse return false;
+        const path = doc.path orelse return false;
+        if (y < EDITOR_TEXT_TOP - 14) return false;
+        const line_delta = @divTrunc(@as(isize, y - (EDITOR_TEXT_TOP - 14)), LINE_HEIGHT);
+        if (line_delta < 0) return false;
+        const line = self.editor_scroll_line + @as(usize, @intCast(line_delta));
+        if (line >= doc.text.lineCount()) return false;
+        const marker = lineBoundaryMarker(self, path, line) orelse return false;
+        navigation.setCursor(doc, doc.positionFromOffset(doc.text.lineStart(line) orelse 0) catch doc.cursor.position);
+        self.clearSelection();
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        self.bottom_panel = .security;
+        self.appendOutput(.stdout, "line boundary: {s}:{d} {s}/{s} findings={d}\n", .{
+            path,
+            line + 1,
+            @tagName(marker.risk),
+            findings_mod.boundaryLabel(marker.boundary),
+            marker.count,
+        });
+        var emitted: usize = 0;
+        for (self.app.security_findings.items.items) |item| {
+            if (item.line != line or !pathMatchesX11(path, item.path)) continue;
+            self.appendOutput(.stdout, "- col:{d} [{s}/{s}] {s}\n", .{
+                item.column + 1,
+                @tagName(item.risk),
+                @tagName(item.category),
+                item.message,
+            });
+            emitted += 1;
+            if (emitted >= 8) break;
+        }
+        self.message("line boundary: {s}/{s}", .{ @tagName(marker.risk), findings_mod.boundaryLabel(marker.boundary) });
+        return true;
+    }
+
     fn handleBottomPanelContentClick(self: *LinuxGuiState, x: i16, y: i16) bool {
         const bottom = self.bottomTop();
         switch (self.bottom_panel) {
@@ -3143,8 +3444,7 @@ const LinuxGuiState = struct {
                 const index = self.security_scroll_line + @as(usize, @intCast(row));
                 if (index >= self.app.security_findings.items.items.len) return true;
                 const finding = self.app.security_findings.items.items[index];
-                const line = if (finding.line > 0) finding.line - 1 else 0;
-                self.openRelativeLocation(finding.path, line, finding.column);
+                self.openRelativeLocation(finding.path, finding.line, finding.column);
                 return true;
             },
             .diagnostics => {
@@ -3564,7 +3864,7 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
     const linux_grade = linuxBoundaryGrade(&state.linux_security);
     const status = std.fmt.bufPrint(
         status_buf[0..],
-        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} linux:{s} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+S Ctrl+G Ctrl+A | {s}",
+        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} linux:{s} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+S Ctrl+G Ctrl+Tab | {s}",
         .{
             @tagName(app.mode),
             @tagName(app.focus),
@@ -3686,6 +3986,13 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
         var number_buf: [24]u8 = undefined;
         const number = std.fmt.bufPrint(number_buf[0..], "{d: >4}", .{line_index + 1}) catch "   ?";
         try x11.text(x11.gc.muted, EDITOR_LEFT, line_y, number);
+        if (lineBoundaryMarker(state, path, line_index)) |marker| {
+            const marker_gc = riskGc(x11, marker.risk);
+            try x11.fillRect(marker_gc, EDITOR_LEFT + 52, line_y - 14, 3, LINE_HEIGHT);
+            var marker_buf: [8]u8 = undefined;
+            const marker_text = std.fmt.bufPrint(marker_buf[0..], "{s}{s}", .{ riskInitial(marker.risk), boundaryInitial(marker.boundary) }) catch "!!";
+            try x11.text(marker_gc, EDITOR_LEFT + 36, line_y, marker_text);
+        }
 
         var line_buf: [720]u8 = undefined;
         try x11.text(if (selected) x11.gc.text else x11.gc.muted, EDITOR_LEFT + 56, line_y, asciiInto(line_buf[0..], line));
@@ -4021,10 +4328,14 @@ fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
     try drawScrollHint(x11, state, app.security_findings.items.items.len, visible, start, y);
     for (app.security_findings.items.items[start..limit]) |finding| {
         var row_buf: [900]u8 = undefined;
-        const row = std.fmt.bufPrint(row_buf[0..], "{s}:{d} [{s}] {s}", .{
+        const finding_boundary = findings_mod.boundaryFor(finding.category);
+        const row = std.fmt.bufPrint(row_buf[0..], "{s}:{d}:{d} [{s}/{s}/{s}] {s}", .{
             finding.path,
-            finding.line,
+            finding.line + 1,
+            finding.column + 1,
             @tagName(finding.risk),
+            findings_mod.boundaryLabel(finding_boundary),
+            @tagName(finding.category),
             finding.message,
         }) catch finding.message;
         var ascii_buf: [900]u8 = undefined;
@@ -4363,6 +4674,10 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
             const request = renameRequest(state.quick_panel.query.items) orelse break :blk "Type old_name=>new_name";
             break :blk std.fmt.bufPrint(text_buf[0..], "{s} -> {s}", .{ request.find, request.replace }) catch "Rename";
         },
+        .goto_line => blk: {
+            const target = parseGotoLine(state.quick_panel.query.items) orelse break :blk "Type line or line:column";
+            break :blk std.fmt.bufPrint(text_buf[0..], "Jump to {d}:{d}", .{ target.line + 1, target.column + 1 }) catch "Jump";
+        },
         .search_workspace => blk: {
             const items = state.quick_panel.search_results orelse break :blk "";
             if (row >= items.len) break :blk "";
@@ -4410,6 +4725,12 @@ const RiskMarker = struct {
     risk: findings_mod.Risk,
 };
 
+const LineBoundaryMarker = struct {
+    risk: findings_mod.Risk,
+    boundary: findings_mod.Boundary,
+    count: usize,
+};
+
 const GitMarker = struct {
     label: []const u8,
     status: git_repository.ChangeStatus,
@@ -4424,20 +4745,24 @@ const LinuxBoundaryGrade = struct {
 fn boundaryCounts(app: *const app_mod.App) BoundaryCounts {
     var counts: BoundaryCounts = .{};
     for (app.security_findings.items.items) |finding| {
-        switch (findings_mod.boundaryFor(finding.category)) {
-            .memory => counts.memory += 1,
-            .execution => counts.execution += 1,
-            .filesystem => counts.filesystem += 1,
-            .network => counts.network += 1,
-            .dependency => counts.dependency += 1,
-            .secret => counts.secret += 1,
-            .text => counts.text += 1,
-            .path => counts.path += 1,
-            .git => counts.git += 1,
-            else => {},
-        }
+        addBoundary(&counts, findings_mod.boundaryFor(finding.category));
     }
     return counts;
+}
+
+fn addBoundary(counts: *BoundaryCounts, boundary: findings_mod.Boundary) void {
+    switch (boundary) {
+        .memory => counts.memory += 1,
+        .execution => counts.execution += 1,
+        .filesystem => counts.filesystem += 1,
+        .network => counts.network += 1,
+        .dependency => counts.dependency += 1,
+        .secret => counts.secret += 1,
+        .text => counts.text += 1,
+        .path => counts.path += 1,
+        .git => counts.git += 1,
+        else => {},
+    }
 }
 
 fn riskCounts(collection: *const findings_mod.Collection) RiskCounts {
@@ -4471,6 +4796,25 @@ fn currentLineBoundaryHint(state: *LinuxGuiState, buffer: []u8) []const u8 {
     const risk = best_risk orelse return "clear";
     const boundary = best_boundary orelse return @tagName(risk);
     return std.fmt.bufPrint(buffer, "{s}/{s}", .{ @tagName(risk), findings_mod.boundaryLabel(boundary) }) catch "hot";
+}
+
+fn lineBoundaryMarker(state: *const LinuxGuiState, path: []const u8, line: usize) ?LineBoundaryMarker {
+    var marker: ?LineBoundaryMarker = null;
+    for (state.app.security_findings.items.items) |item| {
+        if (item.line != line) continue;
+        if (!pathMatchesX11(path, item.path)) continue;
+        const boundary = findings_mod.boundaryFor(item.category);
+        if (marker) |*current| {
+            current.count += 1;
+            if (riskRank(item.risk) > riskRank(current.risk)) {
+                current.risk = item.risk;
+                current.boundary = boundary;
+            }
+        } else {
+            marker = .{ .risk = item.risk, .boundary = boundary, .count = 1 };
+        }
+    }
+    return marker;
 }
 
 fn workflowRiskCounts(state: *const LinuxGuiState, overview: git_repository.Overview) RiskCounts {
@@ -4616,6 +4960,32 @@ fn riskRank(risk: findings_mod.Risk) u8 {
         .medium => 2,
         .high => 3,
         .critical => 4,
+    };
+}
+
+fn riskInitial(risk: findings_mod.Risk) []const u8 {
+    return switch (risk) {
+        .info => "I",
+        .low => "L",
+        .medium => "M",
+        .high => "H",
+        .critical => "C",
+    };
+}
+
+fn boundaryInitial(boundary: findings_mod.Boundary) []const u8 {
+    return switch (boundary) {
+        .workspace => "W",
+        .memory => "M",
+        .execution => "E",
+        .filesystem => "F",
+        .network => "N",
+        .dependency => "D",
+        .secret => "S",
+        .text => "T",
+        .path => "P",
+        .git => "G",
+        .output => "O",
     };
 }
 
@@ -5283,6 +5653,28 @@ fn renameRequest(query: []const u8) ?ReplaceRequest {
     return .{ .find = request.find, .replace = replace };
 }
 
+fn parseGotoLine(query: []const u8) ?GotoLineTarget {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    const delimiter = std.mem.indexOfAny(u8, trimmed, ":,");
+    const line_text = if (delimiter) |index| std.mem.trim(u8, trimmed[0..index], " \t\r\n") else trimmed;
+    const column_text = if (delimiter) |index| std.mem.trim(u8, trimmed[index + 1 ..], " \t\r\n") else "";
+    if (line_text.len == 0) return null;
+
+    const line_one = std.fmt.parseUnsigned(usize, line_text, 10) catch return null;
+    if (line_one == 0) return null;
+
+    var column: usize = 0;
+    if (column_text.len > 0) {
+        const column_one = std.fmt.parseUnsigned(usize, column_text, 10) catch return null;
+        if (column_one == 0) return null;
+        column = column_one - 1;
+    }
+
+    return .{ .line = line_one - 1, .column = column };
+}
+
 fn isValidIdentifierName(name: []const u8) bool {
     if (name.len == 0) return false;
     if (!(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
@@ -5325,6 +5717,7 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .find_document => "FIND IN FILE",
         .replace_document => "REPLACE  search=>replacement",
         .rename_symbol => "RENAME  old=>new",
+        .goto_line => "GO TO LINE  line[:column]",
         .search_workspace => "SEARCH WORKSPACE",
         .new_file => "NEW FILE",
         .run_task => "RUN TASK",
@@ -5523,7 +5916,7 @@ const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf
 const extension_panel_actions = [_]ExtensionPanelAction{.scan};
 const tutorial_panel_actions = [_]TutorialPanelAction{ .ja, .en };
 const publish_panel_actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle, .verify, .preflight };
-const context_actions = [_]ContextAction{ .copy, .cut, .paste, .select_all, .find, .scan, .scan_selection, .references, .rename, .task_queue, .palette };
+const context_actions = [_]ContextAction{ .copy, .cut, .paste, .select_all, .find, .goto_line, .scan, .scan_selection, .boundary_lens, .references, .rename, .close_editor, .task_queue, .palette };
 
 fn drawGitPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
     inline for (git_panel_actions) |action| {
@@ -5809,12 +6202,15 @@ fn contextActionIndex(action: ContextAction) usize {
         .paste => 2,
         .select_all => 3,
         .find => 4,
-        .scan => 5,
-        .scan_selection => 6,
-        .references => 7,
-        .rename => 8,
-        .task_queue => 9,
-        .palette => 10,
+        .goto_line => 5,
+        .scan => 6,
+        .scan_selection => 7,
+        .boundary_lens => 8,
+        .references => 9,
+        .rename => 10,
+        .close_editor => 11,
+        .task_queue => 12,
+        .palette => 13,
     };
 }
 
@@ -5834,7 +6230,7 @@ fn contextActionEnabled(state: *const LinuxGuiState, action: ContextAction) bool
             break :blk state.selectedRange(doc) != null;
         },
         .paste => true,
-        .select_all, .find, .scan, .references, .rename => state.app.documents.activeIndex() != null,
+        .select_all, .find, .goto_line, .scan, .boundary_lens, .references, .rename, .close_editor => state.app.documents.activeIndex() != null,
         .task_queue, .palette => true,
     };
 }
@@ -5846,10 +6242,13 @@ fn contextActionLabel(action: ContextAction) []const u8 {
         .paste => "Paste",
         .select_all => "Select all",
         .find => "Find in file",
+        .goto_line => "Go to line",
         .scan => "Scan current file",
         .scan_selection => "Scan selection",
+        .boundary_lens => "Boundary lens",
         .references => "Find references",
         .rename => "Rename symbol",
+        .close_editor => "Close editor",
         .task_queue => "Preview run queue",
         .palette => "Command palette",
     };
@@ -5862,10 +6261,13 @@ fn contextActionHint(action: ContextAction) []const u8 {
         .paste => "Ctrl+V",
         .select_all => "Ctrl+A",
         .find => "Ctrl+F",
+        .goto_line => "Ctrl+G",
         .scan => "Alt+S",
         .scan_selection => "SEL",
+        .boundary_lens => "LENS",
         .references => "F12+S",
         .rename => "F2",
+        .close_editor => "Ctrl+W",
         .task_queue => "RUN",
         .palette => "C+S+P",
     };

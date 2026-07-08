@@ -205,6 +205,15 @@ pub const Queue = struct {
         return &self.tickets.items[self.tickets.items.len - 1];
     }
 
+    pub fn latestQueued(self: *Queue) ?*Ticket {
+        var index = self.tickets.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (self.tickets.items[index].state == .queued) return &self.tickets.items[index];
+        }
+        return null;
+    }
+
     pub fn latestHistory(self: *const Queue) ?*const HistoryEntry {
         if (self.history.items.len == 0) return null;
         return &self.history.items[self.history.items.len - 1];
@@ -282,7 +291,7 @@ test "execution queue hands ownership to runner" {
     try queue.enqueueSpec("zig.build", .{
         .command = .{
             .executable = "zig",
-            .args = &.{ "build" },
+            .args = &.{"build"},
             .cwd = ".",
         },
     }, .{
@@ -303,6 +312,47 @@ test "execution queue hands ownership to runner" {
     try std.testing.expectEqualStrings("zig", ticket.executable);
 }
 
+test "execution queue exposes latest queued ticket for policy edits" {
+    var queue = Queue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    try queue.enqueueSpec("old", .{
+        .command = .{
+            .executable = "zig",
+            .args = &.{"build"},
+            .cwd = ".",
+        },
+    }, .{
+        .command = "zig build",
+        .cwd = ".",
+        .env_policy = .allowlist,
+        .fs_policy = .workspace_only,
+        .network_policy = .deny,
+        .output_sanitized = true,
+    });
+    try queue.enqueueSpec("new", .{
+        .command = .{
+            .executable = "zig",
+            .args = &.{"test"},
+            .cwd = ".",
+        },
+    }, .{
+        .command = "zig test",
+        .cwd = ".",
+        .env_policy = .allowlist,
+        .fs_policy = .workspace_only,
+        .network_policy = .deny,
+        .output_sanitized = true,
+    });
+
+    const latest = queue.latestQueued() orelse return error.ExpectedTicket;
+    latest.network_policy = .unrestricted;
+
+    try std.testing.expectEqualStrings("new", latest.source_command_id);
+    try std.testing.expectEqual(permissions.NetworkPolicy.deny, queue.tickets.items[0].network_policy);
+    try std.testing.expectEqual(permissions.NetworkPolicy.unrestricted, queue.tickets.items[1].network_policy);
+}
+
 test "execution queue records bounded run history" {
     var queue = Queue.init(std.testing.allocator);
     defer queue.deinit();
@@ -311,7 +361,7 @@ test "execution queue records bounded run history" {
     try queue.enqueueSpec("zig.build", .{
         .command = .{
             .executable = "zig",
-            .args = &.{ "build" },
+            .args = &.{"build"},
             .cwd = ".",
         },
     }, .{

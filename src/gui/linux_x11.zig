@@ -387,11 +387,22 @@ const SecurityPanelAction = enum {
 };
 
 const TaskPanelAction = enum {
+    profile_read_only,
+    profile_safe,
+    profile_network,
+    profile_publish,
     tasks,
     preview,
     seal,
     run_next,
     history,
+};
+
+const LinuxLaunchProfile = enum {
+    read_only,
+    safe,
+    network,
+    publish,
 };
 
 const ExtensionPanelAction = enum {
@@ -769,6 +780,7 @@ const LinuxGuiState = struct {
     git_overview: ?git_repository.Overview = null,
     extensions_registry: ?extension_registry.Registry = null,
     tutorial_language: TutorialLanguage = .ja,
+    linux_launch_profile: LinuxLaunchProfile = .safe,
     linux_security: LinuxSecuritySnapshot = .{},
     last_document_search_query: std.array_list.Managed(u8),
     last_document_search_options: literal_search.Options = .{},
@@ -882,7 +894,32 @@ const LinuxGuiState = struct {
         self.message("linux fd seal: +{d} failed:{d}", .{ seals.sealed, seals.failed });
     }
 
+    fn setLinuxLaunchProfile(self: *LinuxGuiState, profile: LinuxLaunchProfile) void {
+        self.linux_launch_profile = profile;
+        if (self.applyLinuxLaunchProfileToLatestQueued("profile selected")) {
+            self.message("launch profile: {s}", .{linuxLaunchProfileLabel(profile)});
+        } else {
+            self.message("launch profile: {s} (next task)", .{linuxLaunchProfileLabel(profile)});
+        }
+    }
+
+    fn applyLinuxLaunchProfileToLatestQueued(self: *LinuxGuiState, reason: []const u8) bool {
+        const ticket = self.app.execution_queue.latestQueued() orelse return false;
+        applyLinuxLaunchProfile(ticket, self.linux_launch_profile);
+        self.appendOutput(.stdout, "linux launch profile: {s} ({s}) env:{s} fs:{s} net:{s} timeout:{s} output:{d}\n", .{
+            linuxLaunchProfileLabel(self.linux_launch_profile),
+            reason,
+            @tagName(ticket.env_policy),
+            @tagName(ticket.fs_policy),
+            @tagName(ticket.network_policy),
+            timeoutLabel(ticket.timeout_ms),
+            ticket.output_limit_bytes,
+        });
+        return true;
+    }
+
     fn prepareLinuxLaunchBoundary(self: *LinuxGuiState) bool {
+        _ = self.applyLinuxLaunchProfileToLatestQueued("before run");
         self.linux_security.no_new_privs_set = if (trySetNoNewPrivs()) .on else .off;
         self.linux_security.dumpable_set = if (trySetDumpable(false)) .on else .off;
         self.linux_security.ambient_clear = if (tryClearAmbientCapabilities()) .on else .off;
@@ -1303,6 +1340,7 @@ const LinuxGuiState = struct {
                     self.message("queue failed: {s}", .{@errorName(err)});
                     return;
                 };
+                _ = self.applyLinuxLaunchProfileToLatestQueued("external command queued");
                 self.appendOutput(.stdout, "queued external command: {s}\n", .{preview.command});
 
                 if (!self.prepareLinuxLaunchBoundary()) return;
@@ -1411,6 +1449,10 @@ const LinuxGuiState = struct {
     fn executeTaskPanelAction(self: *LinuxGuiState, action: TaskPanelAction) void {
         self.bottom_panel = .tasks;
         switch (action) {
+            .profile_read_only => self.setLinuxLaunchProfile(.read_only),
+            .profile_safe => self.setLinuxLaunchProfile(.safe),
+            .profile_network => self.setLinuxLaunchProfile(.network),
+            .profile_publish => self.setLinuxLaunchProfile(.publish),
             .tasks => self.openQuickPanel(.run_task),
             .preview => self.execute("task.preview_next", .command_palette),
             .seal => self.sealLinuxExecBoundary(),
@@ -1729,6 +1771,7 @@ const LinuxGuiState = struct {
         };
         self.handleDispatchResult("task.run", queued);
         if (std.meta.activeTag(queued) != .completed) return;
+        _ = self.applyLinuxLaunchProfileToLatestQueued("task queued");
 
         const preview = dispatcher.dispatch(&self.app, .{ .id = "task.preview_next", .source = .task }) catch |err| {
             self.message("task preview failed: {s}", .{@errorName(err)});
@@ -2659,7 +2702,8 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
     const hot_boundary = currentLineBoundaryHint(state, hot_buf[0..]);
     const git_changes = if (state.git_overview) |overview| overview.changes.len else 0;
     const linux_grade = linuxBoundaryGrade(&state.linux_security);
-    const status = std.fmt.bufPrint(status_buf[0..],
+    const status = std.fmt.bufPrint(
+        status_buf[0..],
         "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} linux:{s} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+S Ctrl+G Ctrl+A | {s}",
         .{
             @tagName(app.mode),
@@ -2828,6 +2872,11 @@ fn drawActionButton(x11: *X11, rect: HitRect, label: []const u8) !void {
     try x11.text(x11.gc.cyan, rect.left + 7, rect.top + 16, label);
 }
 
+fn drawActionButtonState(x11: *X11, rect: HitRect, label: []const u8, active: bool, color: u32) !void {
+    try x11.fillRect(if (active) color else x11.gc.panel_2, rect.left, rect.top, @intCast(rect.right - rect.left), @intCast(rect.bottom - rect.top));
+    try x11.text(if (active) x11.gc.bg else color, rect.left + 7, rect.top + 16, label);
+}
+
 fn drawScrollHint(x11: *X11, state: *const LinuxGuiState, total: usize, visible: usize, start: usize, y: i16) !void {
     if (total <= visible or visible == 0) return;
     var buf: [96]u8 = undefined;
@@ -2865,13 +2914,21 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
     const queue = &state.app.execution_queue;
     try drawTaskPanelActions(x11, state);
 
-    var header_buf: [260]u8 = undefined;
-    const header = std.fmt.bufPrint(header_buf[0..], "RUN / Linux launch boundary queued:{d} history:{d} console:{s}", .{
+    var header_buf: [300]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "RUN / Linux policy profile:{s} queued:{d} history:{d} console:{s}", .{
+        linuxLaunchProfileLabel(state.linux_launch_profile),
         queue.queuedCount(),
         queue.history.items.len,
         if (state.app.process_console.running) "running" else "idle",
-    }) catch "RUN / Linux launch boundary";
+    }) catch "RUN / Linux policy profile";
     try x11.text(x11.gc.green, 18, bottom + 58, header);
+
+    var profile_buf: [560]u8 = undefined;
+    const profile_line = std.fmt.bufPrint(profile_buf[0..], "PROFILE {s}: {s}", .{
+        linuxLaunchProfileLabel(state.linux_launch_profile),
+        linuxLaunchProfileDescription(state.linux_launch_profile),
+    }) catch "PROFILE";
+    try x11.text(linuxLaunchProfileGc(x11, state.linux_launch_profile), 18, bottom + 82, profile_line);
 
     var linux_buf: [420]u8 = undefined;
     const linux_line = std.fmt.bufPrint(linux_buf[0..], "INHERITED nnp:{s} dump:{s} ambient_clear:{s} seccomp:{s} cap_eff:{s} fd:{d} no-cloexec:{d} sealed:{d}/{d} wx:{d}", .{
@@ -2887,7 +2944,7 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
         state.linux_security.maps_writable_executable,
     }) catch "INHERITED";
     const linux_gc = if (state.linux_security.no_new_privs == .on and state.linux_security.maps_writable_executable == 0) x11.gc.cyan else x11.gc.amber;
-    try x11.text(linux_gc, 18, bottom + 82, linux_line);
+    try x11.text(linux_gc, 18, bottom + 106, linux_line);
 
     if (queue.latest()) |ticket| {
         var command_ascii: [900]u8 = undefined;
@@ -2898,7 +2955,7 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
             ticket.args.items.len + 1,
             ticket.display_command,
         }) catch ticket.display_command;
-        try x11.text(x11.gc.text, 18, bottom + 108, asciiInto(command_ascii[0..], command_line));
+        try x11.text(x11.gc.text, 18, bottom + 132, asciiInto(command_ascii[0..], command_line));
 
         var policy_buf: [520]u8 = undefined;
         const policy_line = std.fmt.bufPrint(policy_buf[0..], "policy env:{s} fs:{s} net:{s} sanitized:{s} timeout:{s} output:{d}", .{
@@ -2909,25 +2966,27 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
             timeoutLabel(ticket.timeout_ms),
             ticket.output_limit_bytes,
         }) catch "policy";
-        try x11.text(x11.gc.muted, 18, bottom + 132, policy_line);
+        try x11.text(x11.gc.muted, 18, bottom + 156, policy_line);
 
         const fingerprint = launchFingerprint(ticket, state.app.workspace.root_path);
         var fingerprint_buf: [120]u8 = undefined;
         const fingerprint_line = std.fmt.bufPrint(fingerprint_buf[0..], "fingerprint sha256:{s}", .{fingerprint[0..32]}) catch "fingerprint";
-        try x11.text(x11.gc.cyan, 18, bottom + 156, fingerprint_line);
+        try x11.text(x11.gc.cyan, 18, bottom + 180, fingerprint_line);
 
         var gate_buf: [720]u8 = undefined;
         const cwd_ok = permissions.allowsWorkspacePath(ticket.fs_policy, state.app.workspace.root_path, ticket.cwd);
         const network_ok = !ticketLooksNetworked(ticket.executable, ticket.args.items) or permissions.allowsNetwork(ticket.network_policy);
-        const gate_line = std.fmt.bufPrint(gate_buf[0..], "gate cwd:{s} net:{s} cwd_path:{s}", .{
+        const readonly_note = if (ticket.fs_policy == .read_only_workspace) " requested-read-only" else "";
+        const gate_line = std.fmt.bufPrint(gate_buf[0..], "gate cwd:{s} net:{s}{s} cwd_path:{s}", .{
             if (cwd_ok) "ok" else "blocked",
             if (network_ok) "ok" else "blocked",
+            readonly_note,
             ticket.cwd,
         }) catch "gate";
         var gate_ascii: [720]u8 = undefined;
-        try x11.text(if (cwd_ok and network_ok) x11.gc.muted else x11.gc.red, 18, bottom + 180, asciiInto(gate_ascii[0..], gate_line));
+        try x11.text(if (cwd_ok and network_ok) x11.gc.muted else x11.gc.red, 18, bottom + 204, asciiInto(gate_ascii[0..], gate_line));
     } else {
-        try x11.text(x11.gc.muted, 18, bottom + 108, "No queued task. Press TASKS or Ctrl+R, then review PREVIEW/SEAL before RUN.");
+        try x11.text(x11.gc.muted, 18, bottom + 132, "No queued task. Pick RO/SAFE/NET/PUB, press TASKS or Ctrl+R, then review PLAN/SEAL before RUN.");
         if (queue.latestHistory()) |entry| {
             var last_buf: [720]u8 = undefined;
             const last_line = std.fmt.bufPrint(last_buf[0..], "LAST {s} {s} lines:{d} sanitized:{d}  {s}", .{
@@ -2938,7 +2997,7 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
                 entry.display_command,
             }) catch entry.display_command;
             var last_ascii: [720]u8 = undefined;
-            try x11.text(x11.gc.cyan, 18, bottom + 132, asciiInto(last_ascii[0..], last_line));
+            try x11.text(x11.gc.cyan, 18, bottom + 156, asciiInto(last_ascii[0..], last_line));
         }
     }
 
@@ -3718,6 +3777,70 @@ fn linuxBoundaryGc(x11: *X11, grade: LinuxBoundaryGrade) u32 {
     if (grade.score >= 13) return x11.gc.green;
     if (grade.score >= 8) return x11.gc.amber;
     return x11.gc.red;
+}
+
+fn applyLinuxLaunchProfile(ticket: *execution_queue.Ticket, profile: LinuxLaunchProfile) void {
+    switch (profile) {
+        .read_only => {
+            ticket.env_policy = .allowlist;
+            ticket.fs_policy = .read_only_workspace;
+            ticket.network_policy = .deny;
+            ticket.output_sanitized = true;
+            ticket.timeout_ms = 15_000;
+            ticket.output_limit_bytes = 256 * 1024;
+        },
+        .safe => {
+            ticket.env_policy = .allowlist;
+            ticket.fs_policy = .workspace_only;
+            ticket.network_policy = .deny;
+            ticket.output_sanitized = true;
+            ticket.timeout_ms = 60_000;
+            ticket.output_limit_bytes = 512 * 1024;
+        },
+        .network => {
+            ticket.env_policy = .allowlist;
+            ticket.fs_policy = .workspace_only;
+            ticket.network_policy = .unrestricted;
+            ticket.output_sanitized = true;
+            ticket.timeout_ms = 90_000;
+            ticket.output_limit_bytes = 768 * 1024;
+        },
+        .publish => {
+            ticket.env_policy = .inherit_all;
+            ticket.fs_policy = .workspace_only;
+            ticket.network_policy = .unrestricted;
+            ticket.output_sanitized = true;
+            ticket.timeout_ms = 180_000;
+            ticket.output_limit_bytes = 2 * 1024 * 1024;
+        },
+    }
+}
+
+fn linuxLaunchProfileLabel(profile: LinuxLaunchProfile) []const u8 {
+    return switch (profile) {
+        .read_only => "RO",
+        .safe => "SAFE",
+        .network => "NET",
+        .publish => "PUB",
+    };
+}
+
+fn linuxLaunchProfileDescription(profile: LinuxLaunchProfile) []const u8 {
+    return switch (profile) {
+        .read_only => "allowlist env / read-only workspace policy / network denied / tight output",
+        .safe => "allowlist env / workspace cwd / network denied / normal build limits",
+        .network => "allowlist env / workspace cwd / network allowed / larger output",
+        .publish => "inherit env / workspace cwd / network allowed / release-sized output",
+    };
+}
+
+fn linuxLaunchProfileGc(x11: *const X11, profile: LinuxLaunchProfile) u32 {
+    return switch (profile) {
+        .read_only => x11.gc.cyan,
+        .safe => x11.gc.green,
+        .network => x11.gc.amber,
+        .publish => x11.gc.red,
+    };
 }
 
 fn extensionRiskGc(x11: *X11, risk: extension_registry.Risk) u32 {
@@ -4537,7 +4660,7 @@ fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
 }
 
 const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
-const task_panel_actions = [_]TaskPanelAction{ .tasks, .preview, .seal, .run_next, .history };
+const task_panel_actions = [_]TaskPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .tasks, .preview, .seal, .run_next, .history };
 const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .seal, .linux };
 const extension_panel_actions = [_]ExtensionPanelAction{.scan};
 const tutorial_panel_actions = [_]TutorialPanelAction{ .ja, .en };
@@ -4551,7 +4674,10 @@ fn drawGitPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
 
 fn drawTaskPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
     inline for (task_panel_actions) |action| {
-        try drawActionButton(x11, taskPanelActionRect(state, action), taskPanelActionLabel(action));
+        const profile = taskPanelActionProfile(action);
+        const active = if (profile) |value| value == state.linux_launch_profile else false;
+        const color = if (profile) |value| linuxLaunchProfileGc(x11, value) else x11.gc.cyan;
+        try drawActionButtonState(x11, taskPanelActionRect(state, action), taskPanelActionLabel(action), active, color);
     }
 }
 
@@ -4640,15 +4766,19 @@ fn gitPanelActionRect(state: *const LinuxGuiState, action: GitPanelAction) HitRe
 
 fn taskPanelActionRect(state: *const LinuxGuiState, action: TaskPanelAction) HitRect {
     const index: i16 = switch (action) {
-        .tasks => 0,
-        .preview => 1,
-        .seal => 2,
-        .run_next => 3,
-        .history => 4,
+        .profile_read_only => 0,
+        .profile_safe => 1,
+        .profile_network => 2,
+        .profile_publish => 3,
+        .tasks => 4,
+        .preview => 5,
+        .seal => 6,
+        .run_next => 7,
+        .history => 8,
     };
-    const width: i16 = 70;
-    const gap: i16 = 8;
-    const right = state.window_width - 18 - (4 - index) * (width + gap);
+    const width: i16 = 56;
+    const gap: i16 = 7;
+    const right = state.window_width - 18 - (8 - index) * (width + gap);
     const bottom = state.bottomTop();
     return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
@@ -4731,11 +4861,25 @@ fn gitPanelActionCommand(action: GitPanelAction) []const u8 {
 
 fn taskPanelActionLabel(action: TaskPanelAction) []const u8 {
     return switch (action) {
+        .profile_read_only => "RO",
+        .profile_safe => "SAFE",
+        .profile_network => "NET",
+        .profile_publish => "PUB",
         .tasks => "TASKS",
         .preview => "PLAN",
         .seal => "SEAL",
         .run_next => "RUN",
         .history => "HIST",
+    };
+}
+
+fn taskPanelActionProfile(action: TaskPanelAction) ?LinuxLaunchProfile {
+    return switch (action) {
+        .profile_read_only => .read_only,
+        .profile_safe => .safe,
+        .profile_network => .network,
+        .profile_publish => .publish,
+        else => null,
     };
 }
 
@@ -4803,7 +4947,7 @@ fn securityFindingsTop(state: *const LinuxGuiState) i16 {
 }
 
 fn taskHistoryTop(state: *const LinuxGuiState) i16 {
-    return state.bottomTop() + 214;
+    return state.bottomTop() + 238;
 }
 
 fn documentTabAt(state: *const LinuxGuiState, x: i16, y: i16) ?usize {

@@ -15,6 +15,7 @@ const modes = @import("../language/modes.zig");
 const symbols_mod = @import("../language/symbols.zig");
 const findings_mod = @import("../security/findings.zig");
 const text_integrity = @import("../security/text_integrity.zig");
+const command_intent = @import("../security/command_intent.zig");
 const file_finder = @import("../search/file_finder.zig");
 const literal_search = @import("../search/literal.zig");
 const workspace_search = @import("../search/workspace_search.zig");
@@ -2975,14 +2976,16 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
 
         var gate_buf: [720]u8 = undefined;
         const cwd_ok = permissions.allowsWorkspacePath(ticket.fs_policy, state.app.workspace.root_path, ticket.cwd);
-        const network_ok = !ticketLooksNetworked(ticket.executable, ticket.args.items) or permissions.allowsNetwork(ticket.network_policy);
-        const write_ok = ticket.fs_policy != .read_only_workspace or !ticketLooksWorkspaceMutating(ticket.executable, ticket.args.items);
+        const intent = command_intent.classify(ticket.executable, ticket.args.items);
+        const network_ok = !intent.network or permissions.allowsNetwork(ticket.network_policy);
+        const write_ok = ticket.fs_policy != .read_only_workspace or !intent.mutating;
         const readonly_note = if (ticket.fs_policy == .read_only_workspace) " requested-read-only" else "";
-        const gate_line = std.fmt.bufPrint(gate_buf[0..], "gate cwd:{s} net:{s} write:{s}{s} cwd_path:{s}", .{
+        const gate_line = std.fmt.bufPrint(gate_buf[0..], "gate cwd:{s} net:{s} write:{s}{s} intent:{s} cwd:{s}", .{
             if (cwd_ok) "ok" else "blocked",
             if (network_ok) "ok" else "blocked",
             if (write_ok) "ok" else "blocked",
             readonly_note,
+            intent.reason,
             ticket.cwd,
         }) catch "gate";
         var gate_ascii: [720]u8 = undefined;
@@ -4303,120 +4306,6 @@ fn taskStateGc(x11: *const X11, state: execution_queue.State) u32 {
         .blocked, .failed, .timed_out, .output_limited => x11.gc.red,
         .cancelled => x11.gc.amber,
     };
-}
-
-fn ticketLooksNetworked(executable: []const u8, args: []const []u8) bool {
-    if (looksNetworkExecutable(executable)) return true;
-    for (args) |arg| {
-        if (std.mem.indexOf(u8, arg, "://") != null) return true;
-        if (std.mem.startsWith(u8, arg, "git@")) return true;
-    }
-    return false;
-}
-
-fn looksNetworkExecutable(executable: []const u8) bool {
-    const basename = std.fs.path.basename(executable);
-    const known = [_][]const u8{
-        "curl",
-        "curl.exe",
-        "wget",
-        "wget.exe",
-        "git",
-        "git.exe",
-        "ssh",
-        "ssh.exe",
-        "scp",
-        "scp.exe",
-        "sftp",
-        "sftp.exe",
-    };
-    for (known) |candidate| {
-        if (std.ascii.eqlIgnoreCase(basename, candidate)) return true;
-    }
-    return false;
-}
-
-fn ticketLooksWorkspaceMutating(executable: []const u8, args: []const []u8) bool {
-    const basename = std.fs.path.basename(executable);
-    if (looksAlwaysMutatingExecutable(basename)) return true;
-
-    if (std.ascii.eqlIgnoreCase(basename, "zig") or std.ascii.eqlIgnoreCase(basename, "zig.exe")) {
-        return firstArgMatches(args, &.{ "build", "test", "fmt", "run", "cc", "c++", "ar", "objcopy", "init", "fetch" });
-    }
-    if (std.ascii.eqlIgnoreCase(basename, "git") or std.ascii.eqlIgnoreCase(basename, "git.exe")) {
-        return firstArgMatches(args, &.{ "add", "am", "apply", "bisect", "checkout", "clean", "clone", "commit", "fetch", "init", "merge", "mv", "pull", "push", "rebase", "reset", "restore", "rm", "stash", "submodule", "switch" });
-    }
-    if (std.ascii.eqlIgnoreCase(basename, "cargo") or std.ascii.eqlIgnoreCase(basename, "cargo.exe")) {
-        return !firstArgMatches(args, &.{"metadata"});
-    }
-    if (std.ascii.eqlIgnoreCase(basename, "go") or std.ascii.eqlIgnoreCase(basename, "go.exe")) {
-        return firstArgMatches(args, &.{ "build", "clean", "env", "fmt", "generate", "get", "install", "mod", "run", "test", "work" });
-    }
-    if (std.ascii.eqlIgnoreCase(basename, "npm") or std.ascii.eqlIgnoreCase(basename, "npm.cmd") or
-        std.ascii.eqlIgnoreCase(basename, "pnpm") or std.ascii.eqlIgnoreCase(basename, "pnpm.cmd") or
-        std.ascii.eqlIgnoreCase(basename, "yarn") or std.ascii.eqlIgnoreCase(basename, "yarn.cmd") or
-        std.ascii.eqlIgnoreCase(basename, "bun") or std.ascii.eqlIgnoreCase(basename, "bun.exe"))
-    {
-        return firstArgMatches(args, &.{ "add", "build", "ci", "exec", "install", "rebuild", "remove", "run", "test", "update" });
-    }
-
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, ">") or std.mem.eql(u8, arg, ">>")) return true;
-        if (std.mem.indexOf(u8, arg, "--write") != null) return true;
-        if (std.mem.indexOf(u8, arg, "--fix") != null) return true;
-        if (std.mem.indexOf(u8, arg, "--in-place") != null) return true;
-    }
-    return false;
-}
-
-fn looksAlwaysMutatingExecutable(basename: []const u8) bool {
-    const known = [_][]const u8{
-        "bash",
-        "bash.exe",
-        "cmd",
-        "cmd.exe",
-        "cmake",
-        "cmake.exe",
-        "cp",
-        "cp.exe",
-        "copy",
-        "del",
-        "make",
-        "make.exe",
-        "mkdir",
-        "mkdir.exe",
-        "move",
-        "mv",
-        "mv.exe",
-        "ninja",
-        "ninja.exe",
-        "powershell",
-        "powershell.exe",
-        "pwsh",
-        "pwsh.exe",
-        "rm",
-        "rm.exe",
-        "rmdir",
-        "rmdir.exe",
-        "sh",
-        "sh.exe",
-        "tee",
-        "tee.exe",
-        "touch",
-        "touch.exe",
-    };
-    for (known) |candidate| {
-        if (std.ascii.eqlIgnoreCase(basename, candidate)) return true;
-    }
-    return false;
-}
-
-fn firstArgMatches(args: []const []const u8, comptime names: []const []const u8) bool {
-    if (args.len == 0) return false;
-    for (names) |name| {
-        if (std.ascii.eqlIgnoreCase(args[0], name)) return true;
-    }
-    return false;
 }
 
 fn seccompLabel(mode: ?u8) []const u8 {

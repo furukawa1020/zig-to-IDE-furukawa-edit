@@ -366,18 +366,27 @@ const X11 = struct {
         try self.writeRequest(req[0..]);
     }
 
-    fn requestClipboardText(self: *X11, allocator: std.mem.Allocator) ![]u8 {
-        try self.convertSelection(self.atoms.clipboard, self.atoms.utf8_string, self.atoms.zide_clipboard);
+    fn requestSelectionText(self: *X11, allocator: std.mem.Allocator, selection: u32) ![]u8 {
+        return self.requestSelectionTextTarget(allocator, selection, self.atoms.utf8_string) catch |utf8_err| {
+            return self.requestSelectionTextTarget(allocator, selection, self.atoms.string) catch |string_err| switch (string_err) {
+                error.NoClipboardText, error.ClipboardTimeout, error.UnsupportedClipboardFormat => utf8_err,
+                else => string_err,
+            };
+        };
+    }
+
+    fn requestSelectionTextTarget(self: *X11, allocator: std.mem.Allocator, requested_selection: u32, requested_target: u32) ![]u8 {
+        try self.convertSelection(requested_selection, requested_target, self.atoms.zide_clipboard);
         var ignored: usize = 0;
         while (ignored < 64) : (ignored += 1) {
             var event: [32]u8 = undefined;
             try readExact(self.fd, event[0..]);
             const event_type = event[0] & 0x7f;
             if (event_type != 31) continue;
-            const selection = readLe32(event[12..16]);
-            const target = readLe32(event[16..20]);
+            const actual_selection = readLe32(event[12..16]);
+            const actual_target = readLe32(event[16..20]);
             const property = readLe32(event[20..24]);
-            if (selection != self.atoms.clipboard or target != self.atoms.utf8_string or property == 0) return error.NoClipboardText;
+            if (actual_selection != requested_selection or actual_target != requested_target or property == 0) return error.NoClipboardText;
             return try self.getProperty8(allocator, self.window, property);
         }
         return error.ClipboardTimeout;
@@ -908,6 +917,7 @@ const LinuxGuiState = struct {
     editor_dragging: bool = false,
     clipboard: std.array_list.Managed(u8),
     clipboard_owned: bool = false,
+    primary_owned: bool = false,
     bottom_panel: BottomPanel = .output,
     window_width: i16 = WIDTH,
     window_height: i16 = HEIGHT,

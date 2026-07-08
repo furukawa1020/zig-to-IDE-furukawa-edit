@@ -15,6 +15,9 @@ const modes = @import("../language/modes.zig");
 const symbols_mod = @import("../language/symbols.zig");
 const findings_mod = @import("../security/findings.zig");
 const text_integrity = @import("../security/text_integrity.zig");
+const zig_scanner = @import("../security/zig_scanner.zig");
+const polyglot_scanner = @import("../security/polyglot_scanner.zig");
+const package_trust = @import("../security/package_trust.zig");
 const command_intent = @import("../security/command_intent.zig");
 const launch_audit = @import("../security/launch_audit.zig");
 const file_finder = @import("../search/file_finder.zig");
@@ -565,6 +568,9 @@ const ContextAction = enum {
     select_all,
     find,
     scan,
+    scan_selection,
+    references,
+    rename,
     task_queue,
     palette,
 };
@@ -1626,6 +1632,10 @@ const LinuxGuiState = struct {
     }
 
     fn executeContextAction(self: *LinuxGuiState, x11: *X11, action: ContextAction) void {
+        if (!contextActionEnabled(self, action)) {
+            self.message("{s} unavailable", .{contextActionLabel(action)});
+            return;
+        }
         switch (action) {
             .copy => _ = self.copySelectionToClipboard(x11),
             .cut => self.cutSelectionToClipboard(x11),
@@ -1633,9 +1643,89 @@ const LinuxGuiState = struct {
             .select_all => self.selectAll(x11),
             .find => self.execute("editor.find", .command_palette),
             .scan => self.execute("security.scan_current", .command_palette),
+            .scan_selection => self.scanSelectedRangeSecurity(),
+            .references => self.findReferencesAtCursor(),
+            .rename => self.openRenamePanel(),
             .task_queue => self.execute("task.preview_next", .command_palette),
             .palette => self.execute("view.command_palette", .command_palette),
         }
+    }
+
+    fn scanSelectedRangeSecurity(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        const range = self.selectedRange(doc) orelse return self.message("select code to scan", .{});
+        if (range.start >= range.end) return self.message("select code to scan", .{});
+        const selected = doc.text.bytes[range.start..range.end];
+        const base_path = doc.path orelse "(scratch)";
+        const start_lc = doc.text.offsetToLineColumn(range.start) catch return self.message("selection offset invalid", .{});
+
+        var path_buf: [760]u8 = undefined;
+        const selection_path = std.fmt.bufPrint(path_buf[0..], "{s}#selection:{d}:{d}", .{
+            base_path,
+            start_lc.line + 1,
+            start_lc.column + 1,
+        }) catch base_path;
+
+        var collection = self.scanSelectionSource(selected, selection_path, doc.language) catch |err| {
+            self.message("selection scan failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "selection scan failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer collection.deinit();
+
+        self.app.security_findings.clear();
+        for (collection.items.items) |item| {
+            const line = start_lc.line + item.line;
+            const column = if (item.line == 0) start_lc.column + item.column else item.column;
+            self.app.security_findings.append(item.category, item.risk, selection_path, line, column, item.message, item.evidence) catch |err| {
+                self.message("selection scan store failed: {s}", .{@errorName(err)});
+                self.appendOutput(.stderr, "selection scan store failed: {s}\n", .{@errorName(err)});
+                return;
+            };
+        }
+
+        self.security_scroll_line = 0;
+        self.bottom_panel = .security;
+        self.appendOutput(.stdout, "selection security scan: {s} bytes={d} findings={d}\n", .{ selection_path, selected.len, collection.items.items.len });
+        for (collection.items.items[0..@min(collection.items.items.len, @as(usize, 12))]) |item| {
+            const line = start_lc.line + item.line + 1;
+            const column = if (item.line == 0) start_lc.column + item.column + 1 else item.column + 1;
+            self.appendOutput(.stdout, "{s}:{d}:{d} [{s}/{s}] {s}\n", .{
+                base_path,
+                line,
+                column,
+                @tagName(item.category),
+                @tagName(item.risk),
+                item.message,
+            });
+        }
+        if (collection.items.items.len > 12) self.appendOutput(.stdout, "... {d} more selection finding(s)\n", .{collection.items.items.len - 12});
+        self.message("selection scan: {d} finding(s)", .{collection.items.items.len});
+    }
+
+    fn scanSelectionSource(self: *LinuxGuiState, source: []const u8, path: []const u8, language: modes.LanguageMode) !findings_mod.Collection {
+        var collection = try text_integrity.scan(self.allocator, source, .{ .path = path });
+        errdefer collection.deinit();
+
+        if (language == .zon or std.mem.endsWith(u8, path, "build.zig.zon")) {
+            var package_findings = try package_trust.scanZon(self.allocator, source, .{ .path = path });
+            defer package_findings.deinit();
+            try appendSecurityFindings(&collection, &package_findings);
+            return collection;
+        }
+        if (language == .zig) {
+            var zig_findings = try zig_scanner.scanSource(self.allocator, source, .{ .path = path });
+            defer zig_findings.deinit();
+            try appendSecurityFindings(&collection, &zig_findings);
+            return collection;
+        }
+        if (polyglot_scanner.isInterestingPath(path, language)) {
+            var polyglot_findings = try polyglot_scanner.scanSource(self.allocator, source, .{ .path = path, .language = language });
+            defer polyglot_findings.deinit();
+            try appendSecurityFindings(&collection, &polyglot_findings);
+            return collection;
+        }
+        return collection;
     }
 
     fn moveEditorCursor(self: *LinuxGuiState, x11: *X11, move: navigation.Move, extend_selection: bool) void {
@@ -2905,6 +2995,10 @@ const LinuxGuiState = struct {
     }
 
     fn handlePointer(self: *LinuxGuiState, x11: *X11, button: u8, x: i16, y: i16, time: u32, state_mask: u16) void {
+        if (self.context_menu_visible and (button == 4 or button == 5)) {
+            self.moveContextSelection(if (button == 4) -1 else 1);
+            return;
+        }
         if (button == 4 or button == 5) {
             const delta: isize = if (button == 4) -3 else 3;
             if (x < FILE_WIDTH) {
@@ -2922,6 +3016,7 @@ const LinuxGuiState = struct {
             return;
         }
         if (button == 3) {
+            self.prepareContextMenuPoint(x, y);
             self.openContextMenu(x, y);
             return;
         }
@@ -2930,6 +3025,10 @@ const LinuxGuiState = struct {
     }
 
     fn handlePointerMotion(self: *LinuxGuiState, x: i16, y: i16) void {
+        if (self.context_menu_visible) {
+            if (contextActionAt(self, x, y)) |action| self.context_menu_selected = contextActionIndex(action);
+            return;
+        }
         if (!self.editor_dragging) return;
         const doc = self.app.documents.active() orelse return;
         const position = self.editorPositionFromPoint(x, y) orelse return;
@@ -2950,6 +3049,24 @@ const LinuxGuiState = struct {
                 self.publishPrimarySelection(x11);
             }
         }
+    }
+
+    fn prepareContextMenuPoint(self: *LinuxGuiState, x: i16, y: i16) void {
+        if (x < FILE_WIDTH or y < HEADER_HEIGHT or y >= self.bottomTop()) return;
+        const doc = self.app.documents.active() orelse return;
+        const position = self.editorPositionFromPoint(x, y) orelse return;
+        const clicked_offset = position.byte_offset;
+        if (self.selectedRange(doc)) |range| {
+            if (clicked_offset >= range.start and clicked_offset <= range.end) {
+                self.app.focus = .editor;
+                return;
+            }
+        }
+        self.clearSelection();
+        navigation.setCursor(doc, position);
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
     }
 
     fn handleClick(self: *LinuxGuiState, x11: *X11, x: i16, y: i16, time: u32, state_mask: u16) void {
@@ -5406,7 +5523,7 @@ const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf
 const extension_panel_actions = [_]ExtensionPanelAction{.scan};
 const tutorial_panel_actions = [_]TutorialPanelAction{ .ja, .en };
 const publish_panel_actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle, .verify, .preflight };
-const context_actions = [_]ContextAction{ .copy, .cut, .paste, .select_all, .find, .scan, .task_queue, .palette };
+const context_actions = [_]ContextAction{ .copy, .cut, .paste, .select_all, .find, .scan, .scan_selection, .references, .rename, .task_queue, .palette };
 
 fn drawGitPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
     inline for (git_panel_actions) |action| {
@@ -5676,21 +5793,28 @@ fn contextMenuRect(state: *const LinuxGuiState) HitRect {
 }
 
 fn contextActionRect(state: *const LinuxGuiState, action: ContextAction) HitRect {
-    const index: i16 = switch (action) {
+    const index: i16 = @intCast(contextActionIndex(action));
+    return .{
+        .left = state.context_menu_x + 6,
+        .top = state.context_menu_y + 32 + index * 28,
+        .right = state.context_menu_x + 224,
+        .bottom = state.context_menu_y + 32 + index * 28 + 28,
+    };
+}
+
+fn contextActionIndex(action: ContextAction) usize {
+    return switch (action) {
         .copy => 0,
         .cut => 1,
         .paste => 2,
         .select_all => 3,
         .find => 4,
         .scan => 5,
-        .task_queue => 6,
-        .palette => 7,
-    };
-    return .{
-        .left = state.context_menu_x + 6,
-        .top = state.context_menu_y + 32 + index * 28,
-        .right = state.context_menu_x + 224,
-        .bottom = state.context_menu_y + 32 + index * 28 + 28,
+        .scan_selection => 6,
+        .references => 7,
+        .rename => 8,
+        .task_queue => 9,
+        .palette => 10,
     };
 }
 
@@ -5704,12 +5828,13 @@ fn contextActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?ContextAction {
 
 fn contextActionEnabled(state: *const LinuxGuiState, action: ContextAction) bool {
     return switch (action) {
-        .copy, .cut => blk: {
-            const doc = state.app.documents.active() orelse break :blk false;
+        .copy, .cut, .scan_selection => blk: {
+            const active_index = state.app.documents.activeIndex() orelse break :blk false;
+            const doc = &state.app.documents.documents.items[active_index];
             break :blk state.selectedRange(doc) != null;
         },
         .paste => true,
-        .select_all, .find, .scan => state.app.documents.active() != null,
+        .select_all, .find, .scan, .references, .rename => state.app.documents.activeIndex() != null,
         .task_queue, .palette => true,
     };
 }
@@ -5722,6 +5847,9 @@ fn contextActionLabel(action: ContextAction) []const u8 {
         .select_all => "Select all",
         .find => "Find in file",
         .scan => "Scan current file",
+        .scan_selection => "Scan selection",
+        .references => "Find references",
+        .rename => "Rename symbol",
         .task_queue => "Preview run queue",
         .palette => "Command palette",
     };
@@ -5735,9 +5863,18 @@ fn contextActionHint(action: ContextAction) []const u8 {
         .select_all => "Ctrl+A",
         .find => "Ctrl+F",
         .scan => "Alt+S",
+        .scan_selection => "SEL",
+        .references => "F12+S",
+        .rename => "F2",
         .task_queue => "RUN",
         .palette => "C+S+P",
     };
+}
+
+fn appendSecurityFindings(target: *findings_mod.Collection, source: *const findings_mod.Collection) !void {
+    for (source.items.items) |item| {
+        try target.appendFinding(item);
+    }
 }
 
 fn gitChangesTop(state: *const LinuxGuiState) i16 {

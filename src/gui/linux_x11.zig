@@ -1319,6 +1319,14 @@ const LinuxGuiState = struct {
                 self.appendOutput(.stderr, "blocked {s}: {s}\n", .{ id, message_text });
                 if (self.app.pending_build_consent) |preview| {
                     self.appendOutput(.stdout, "pending consent: {s}\n", .{preview.command});
+                    self.appendOutput(.stdout, "pending intent: network={} mutating={} shell={} destructive={} package={} reason={s}\n", .{
+                        preview.intent.network,
+                        preview.intent.mutating,
+                        preview.intent.shell,
+                        preview.intent.destructive,
+                        preview.intent.package_manager,
+                        preview.intent.reason,
+                    });
                     self.appendOutput(.stdout, "review the command, then run task.run_next from the command palette\n", .{});
                 }
             },
@@ -1343,6 +1351,14 @@ const LinuxGuiState = struct {
                 };
                 _ = self.applyLinuxLaunchProfileToLatestQueued("external command queued");
                 self.appendOutput(.stdout, "queued external command: {s}\n", .{preview.command});
+                self.appendOutput(.stdout, "queued intent: network={} mutating={} shell={} destructive={} package={} reason={s}\n", .{
+                    preview.intent.network,
+                    preview.intent.mutating,
+                    preview.intent.shell,
+                    preview.intent.destructive,
+                    preview.intent.package_manager,
+                    preview.intent.reason,
+                });
 
                 if (!self.prepareLinuxLaunchBoundary()) return;
                 const run_result = dispatcher.dispatch(&self.app, .{ .id = "task.run_next", .source = .task }) catch |err| {

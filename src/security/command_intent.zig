@@ -53,22 +53,38 @@ pub fn classify(executable: []const u8, args: []const []const u8) Intent {
             intent.mutating = true;
             intent.reason = "Git subcommand mutates repository or network state";
         }
+        if (firstArgIn(args, &.{ "clone", "fetch", "ls-remote", "pull", "push", "remote", "submodule" })) {
+            intent.network = true;
+            intent.reason = "Git subcommand may access remotes";
+        }
     } else if (isOneOf(basename, &.{ "cargo", "cargo.exe" })) {
         if (!firstArgIn(args, &.{"metadata"})) {
             intent.package_manager = true;
             intent.mutating = true;
             intent.reason = "Cargo command may write target/cache";
         }
+        if (firstArgIn(args, &.{ "add", "build", "fetch", "install", "run", "test", "update" })) {
+            intent.network = true;
+            intent.reason = "Cargo command may fetch dependencies";
+        }
     } else if (isOneOf(basename, &.{ "go", "go.exe" })) {
         if (firstArgIn(args, &.{ "build", "clean", "env", "fmt", "generate", "get", "install", "mod", "run", "test", "work" })) {
             intent.mutating = true;
             intent.reason = "Go subcommand may write workspace/module/cache";
+        }
+        if (firstArgIn(args, &.{ "get", "install", "mod", "run", "test", "work" })) {
+            intent.network = true;
+            intent.reason = "Go subcommand may resolve modules";
         }
     } else if (isOneOf(basename, &.{ "npm", "npm.cmd", "pnpm", "pnpm.cmd", "yarn", "yarn.cmd", "bun", "bun.exe" })) {
         intent.package_manager = true;
         if (firstArgIn(args, &.{ "add", "build", "ci", "exec", "install", "rebuild", "remove", "run", "test", "update" })) {
             intent.mutating = true;
             intent.reason = "package manager command may write dependencies or scripts";
+        }
+        if (firstArgIn(args, &.{ "add", "ci", "exec", "install", "rebuild", "remove", "run", "test", "update" })) {
+            intent.network = true;
+            intent.reason = "package manager command may access registry";
         }
     }
 
@@ -111,7 +127,7 @@ fn executableBaseName(path: []const u8) []const u8 {
 }
 
 fn looksNetworkExecutableBase(basename: []const u8) bool {
-    return isOneOf(basename, &.{ "curl", "curl.exe", "wget", "wget.exe", "git", "git.exe", "ssh", "ssh.exe", "scp", "scp.exe", "sftp", "sftp.exe" });
+    return isOneOf(basename, &.{ "curl", "curl.exe", "wget", "wget.exe", "ssh", "ssh.exe", "scp", "scp.exe", "sftp", "sftp.exe" });
 }
 
 fn looksAlwaysMutatingExecutableBase(basename: []const u8) bool {
@@ -153,6 +169,17 @@ test "command intent detects network and mutation boundaries" {
     intent = classify("git", &.{ "push", "origin", "main" });
     try std.testing.expect(intent.network);
     try std.testing.expect(intent.mutating);
+}
+
+test "command intent distinguishes local git from remote and package manager commands" {
+    var intent = classify("git", &.{"status"});
+    try std.testing.expect(!intent.network);
+    try std.testing.expect(!intent.mutating);
+
+    intent = classify("npm", &.{"install"});
+    try std.testing.expect(intent.network);
+    try std.testing.expect(intent.mutating);
+    try std.testing.expect(intent.package_manager);
 }
 
 test "command intent handles shell and path basenames" {

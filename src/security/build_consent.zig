@@ -1,4 +1,5 @@
 const std = @import("std");
+const command_intent = @import("command_intent.zig");
 const permissions = @import("permissions.zig");
 const process = @import("../platform/process.zig");
 const trust = @import("trust.zig");
@@ -8,6 +9,7 @@ pub const Preview = struct {
     command: []u8,
     cwd: []u8,
     trust_state: trust.TrustState,
+    intent: command_intent.Intent,
     consent: permissions.Consent,
     warnings: [][]const u8,
 
@@ -24,6 +26,7 @@ pub fn makePreview(allocator: std.mem.Allocator, spec: process.SpawnSpec, state:
     errdefer allocator.free(command_text);
     const cwd = try allocator.dupe(u8, spec.command.cwd orelse ".");
     errdefer allocator.free(cwd);
+    const intent = command_intent.classify(spec.command.executable, spec.command.args);
 
     var warnings = std.array_list.Managed([]const u8).init(allocator);
     errdefer warnings.deinit();
@@ -39,12 +42,25 @@ pub fn makePreview(allocator: std.mem.Allocator, spec: process.SpawnSpec, state:
     if (state != .trusted) {
         try warnings.append("execution timeout is enforced for approved commands");
     }
+    if (intent.network) {
+        try warnings.append("command intent uses network; deny-network profiles will block it");
+    }
+    if (intent.mutating) {
+        try warnings.append("command intent may mutate workspace or build artifacts");
+    }
+    if (intent.shell) {
+        try warnings.append("command intent enters a shell boundary; review quoting and arguments");
+    }
+    if (intent.destructive) {
+        try warnings.append("command intent looks destructive; prefer an explicit safer task");
+    }
 
     return .{
         .allocator = allocator,
         .command = command_text,
         .cwd = cwd,
         .trust_state = state,
+        .intent = intent,
         .consent = .{
             .command = command_text,
             .cwd = cwd,
@@ -67,6 +83,8 @@ test "consent preview names command and trust state" {
 
     try std.testing.expect(std.mem.indexOf(u8, preview.command, "zig build test") != null);
     try std.testing.expect(preview.warnings.len > 0);
+    try std.testing.expect(preview.intent.mutating);
+    try std.testing.expect(!preview.intent.network);
     try std.testing.expectEqual(@as(?u32, 30_000), preview.consent.timeout_ms);
     try std.testing.expectEqual(@as(usize, 512 * 1024), preview.consent.output_limit_bytes);
 }

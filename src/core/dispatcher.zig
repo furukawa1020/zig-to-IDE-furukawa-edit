@@ -333,6 +333,12 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         if (!permissions.allowsWorkspacePath(preview.consent.fs_policy, app.workspace.root_path, cwd)) {
             return .{ .blocked = "approved command cwd is outside the permitted workspace boundary" };
         }
+        if (preview.intent.network and !permissions.allowsNetwork(preview.consent.network_policy)) {
+            return .{ .blocked = "approved command intent requires network but consent denies network" };
+        }
+        if (preview.intent.mutating and preview.consent.fs_policy == .read_only_workspace) {
+            return .{ .blocked = "approved command intent may write but consent is read-only" };
+        }
         try app.execution_queue.enqueueSpec(source_id, spec, preview.consent);
         app.clearPendingBuildConsent();
         return .{ .completed = "approved command queued" };

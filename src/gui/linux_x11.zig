@@ -3048,7 +3048,7 @@ pub fn run(
             2 => {
                 if (keyEventFromX(event[0..])) |key| {
                     if (std.meta.activeTag(key.code) == .escape and state.app.mode == .normal and !state.app.palette.visible) break;
-                    state.handleKey(key);
+                    state.handleKey(&x11, key);
                     try draw(&x11, &state);
                 }
             },
@@ -3068,6 +3068,12 @@ pub fn run(
             22 => {
                 state.resize(readLe16(event[20..22]), readLe16(event[22..24]));
                 try draw(&x11, &state);
+            },
+            29 => {
+                state.handleSelectionClear(readLe32(event[12..16]), &x11);
+            },
+            30 => {
+                state.handleSelectionRequest(&x11, event[0..]);
             },
             33 => {
                 const message_type = readLe32(event[8..12]);

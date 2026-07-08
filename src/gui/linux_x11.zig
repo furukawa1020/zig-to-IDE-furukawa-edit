@@ -382,6 +382,7 @@ const SecurityPanelAction = enum {
     lf,
     crlf,
     clean,
+    seal,
     linux,
 };
 
@@ -727,6 +728,13 @@ const LinuxSecuritySnapshot = struct {
     dumpable_set: LinuxFlag = .unknown,
     ambient_clear: LinuxFlag = .unknown,
     seccomp_mode: ?u8 = null,
+    seccomp_filters: ?usize = null,
+    tracer_pid: ?usize = null,
+    core_dumping: LinuxFlag = .unknown,
+    euid: ?usize = null,
+    euid_root: LinuxFlag = .unknown,
+    nspid_count: usize = 0,
+    pid_namespace: LinuxFlag = .unknown,
     dangerous_bounding_caps: usize = 0,
     bounding_caps_dropped: usize = 0,
     bounding_caps_drop_failed: usize = 0,
@@ -830,14 +838,24 @@ const LinuxGuiState = struct {
         self.linux_security.fd_cloexec_sealed = seals.sealed;
         self.linux_security.fd_cloexec_seal_failed = seals.failed;
         self.refreshLinuxSelfProtection();
-        self.appendOutput(.stdout, "linux self-protection: no_new_privs_set={s} no_new_privs={s} dumpable={s} dumpable_set={s} ambient_clear={s} seccomp={s} cap_eff={s} dangerous_bound={d} dropped={d} drop_failed={d} fd_sealed={d} fd_seal_failed={d}\n", .{
+        var tracer_buf: [32]u8 = undefined;
+        var euid_buf: [32]u8 = undefined;
+        var filters_buf: [32]u8 = undefined;
+        self.appendOutput(.stdout, "linux self-protection: no_new_privs_set={s} no_new_privs={s} dumpable={s} dumpable_set={s} ambient_clear={s} seccomp={s} filters={s} cap_eff={s} euid={s}/{s} tracer={s} core={s} nspid={d}/{s} dangerous_bound={d} dropped={d} drop_failed={d} fd_sealed={d} fd_seal_failed={d}\n", .{
             flagLabel(self.linux_security.no_new_privs_set),
             flagLabel(self.linux_security.no_new_privs),
             flagLabel(self.linux_security.dumpable),
             flagLabel(self.linux_security.dumpable_set),
             flagLabel(self.linux_security.ambient_clear),
             seccompLabel(self.linux_security.seccomp_mode),
+            optionalUsizeLabel(filters_buf[0..], self.linux_security.seccomp_filters),
             self.linuxSecurityCapEffLabel(),
+            optionalUsizeLabel(euid_buf[0..], self.linux_security.euid),
+            flagLabel(self.linux_security.euid_root),
+            optionalUsizeLabel(tracer_buf[0..], self.linux_security.tracer_pid),
+            flagLabel(self.linux_security.core_dumping),
+            self.linux_security.nspid_count,
+            flagLabel(self.linux_security.pid_namespace),
             self.linux_security.dangerous_bounding_caps,
             self.linux_security.bounding_caps_dropped,
             self.linux_security.bounding_caps_drop_failed,
@@ -1414,6 +1432,10 @@ const LinuxGuiState = struct {
             .lf => self.normalizeActiveDocumentNewlines(.lf),
             .crlf => self.normalizeActiveDocumentNewlines(.crlf),
             .clean => self.sanitizeActiveDocumentHiddenControls(),
+            .seal => {
+                self.sealLinuxExecBoundary();
+                self.message("linux fd inheritance boundary sealed", .{});
+            },
             .linux => {
                 self.refreshLinuxSelfProtection();
                 self.message("linux self-protection refreshed", .{});
@@ -3021,6 +3043,26 @@ fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
         state.linux_security.fd_files,
     }) catch "PROC FD";
     try x11.text(if (state.linux_security.fd_cloexec_missing > 3) x11.gc.amber else x11.gc.muted, 18, bottom + 178, fd_line);
+    var euid_buf: [32]u8 = undefined;
+    var tracer_buf: [32]u8 = undefined;
+    var filters_buf: [32]u8 = undefined;
+    var identity_buf: [360]u8 = undefined;
+    const identity_line = std.fmt.bufPrint(identity_buf[0..], "LINUX ID euid:{s} root:{s} tracer:{s} core:{s} nspid:{d}/{s} seccomp_filters:{s}", .{
+        optionalUsizeLabel(euid_buf[0..], state.linux_security.euid),
+        flagLabel(state.linux_security.euid_root),
+        optionalUsizeLabel(tracer_buf[0..], state.linux_security.tracer_pid),
+        flagLabel(state.linux_security.core_dumping),
+        state.linux_security.nspid_count,
+        flagLabel(state.linux_security.pid_namespace),
+        optionalUsizeLabel(filters_buf[0..], state.linux_security.seccomp_filters),
+    }) catch "LINUX ID";
+    const identity_gc = if (state.linux_security.euid_root == .on or
+        (state.linux_security.tracer_pid orelse 0) != 0 or
+        state.linux_security.core_dumping == .on)
+        x11.gc.red
+    else
+        x11.gc.muted;
+    try x11.text(identity_gc, 18, bottom + 202, identity_line);
     var y: i16 = securityFindingsTop(state);
     const visible = state.bottomRowsFrom(y);
     const start = @min(state.security_scroll_line, app.security_findings.items.items.len);
@@ -3635,12 +3677,18 @@ fn riskGc(x11: *X11, risk: findings_mod.Risk) u32 {
 }
 
 fn linuxBoundaryGrade(snapshot: *const LinuxSecuritySnapshot) LinuxBoundaryGrade {
-    const max_score: u8 = 14;
+    const max_score: u8 = 20;
     var score: u8 = 0;
     if (snapshot.no_new_privs == .on) score += 2;
     if (snapshot.dumpable == .off) score += 2;
     if (snapshot.ambient_clear == .on) score += 1;
+    if (snapshot.seccomp_mode != null and snapshot.seccomp_mode.? > 0) score += 1;
+    if (snapshot.seccomp_filters != null and snapshot.seccomp_filters.? > 0) score += 1;
     if (snapshot.cap_eff_zero == .on) score += 2;
+    if (snapshot.euid_root == .off) score += 2;
+    if ((snapshot.tracer_pid orelse 0) == 0) score += 2;
+    if (snapshot.core_dumping == .off) score += 1;
+    if (snapshot.pid_namespace == .on) score += 1;
     if (snapshot.dangerous_bounding_caps == 0) {
         score += 2;
     } else if (snapshot.bounding_caps_dropped > 0) {
@@ -3654,11 +3702,11 @@ fn linuxBoundaryGrade(snapshot: *const LinuxSecuritySnapshot) LinuxBoundaryGrade
     }
     if (snapshot.proc_status_read and snapshot.proc_maps_read and snapshot.proc_fd_read) score += 1;
 
-    const label: []const u8 = if (score >= 12)
+    const label: []const u8 = if (score >= 17)
         "sealed"
-    else if (score >= 9)
+    else if (score >= 13)
         "guarded"
-    else if (score >= 6)
+    else if (score >= 8)
         "mixed"
     else
         "open";
@@ -3666,9 +3714,9 @@ fn linuxBoundaryGrade(snapshot: *const LinuxSecuritySnapshot) LinuxBoundaryGrade
 }
 
 fn linuxBoundaryGc(x11: *X11, grade: LinuxBoundaryGrade) u32 {
-    if (grade.score >= 12) return x11.gc.cyan;
-    if (grade.score >= 9) return x11.gc.green;
-    if (grade.score >= 6) return x11.gc.amber;
+    if (grade.score >= 17) return x11.gc.cyan;
+    if (grade.score >= 13) return x11.gc.green;
+    if (grade.score >= 8) return x11.gc.amber;
     return x11.gc.red;
 }
 
@@ -3906,6 +3954,33 @@ fn readLinuxSecuritySnapshot(allocator: std.mem.Allocator, no_new_privs_set: Lin
     return snapshot;
 }
 
+fn parseStatusUsize(line: []const u8, prefix: []const u8) ?usize {
+    return parseStatusUsizeField(line, prefix, 0);
+}
+
+fn parseStatusUsizeField(line: []const u8, prefix: []const u8, target_index: usize) ?usize {
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    const rest = std.mem.trim(u8, line[prefix.len..], " \t\r\n");
+    var fields = std.mem.tokenizeAny(u8, rest, " \t\r\n");
+    var index: usize = 0;
+    while (fields.next()) |field| : (index += 1) {
+        if (index == target_index) return std.fmt.parseInt(usize, field, 10) catch null;
+    }
+    return null;
+}
+
+fn countStatusUsizeFields(line: []const u8, prefix: []const u8) usize {
+    if (!std.mem.startsWith(u8, line, prefix)) return 0;
+    const rest = std.mem.trim(u8, line[prefix.len..], " \t\r\n");
+    var fields = std.mem.tokenizeAny(u8, rest, " \t\r\n");
+    var count: usize = 0;
+    while (fields.next()) |field| {
+        _ = std.fmt.parseInt(usize, field, 10) catch continue;
+        count += 1;
+    }
+    return count;
+}
+
 fn readLinuxProcStatus(allocator: std.mem.Allocator, snapshot: *LinuxSecuritySnapshot) void {
     const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, "/proc/self/status", allocator, .limited(64 * 1024)) catch return;
     defer allocator.free(bytes);
@@ -3920,6 +3995,20 @@ fn readLinuxProcStatus(allocator: std.mem.Allocator, snapshot: *LinuxSecuritySna
         } else if (std.mem.startsWith(u8, line, "Seccomp:")) {
             const value = std.mem.trim(u8, line["Seccomp:".len..], " \t\r\n");
             snapshot.seccomp_mode = std.fmt.parseInt(u8, value, 10) catch snapshot.seccomp_mode;
+        } else if (std.mem.startsWith(u8, line, "Seccomp_filters:")) {
+            snapshot.seccomp_filters = parseStatusUsize(line, "Seccomp_filters:") orelse snapshot.seccomp_filters;
+        } else if (std.mem.startsWith(u8, line, "TracerPid:")) {
+            snapshot.tracer_pid = parseStatusUsize(line, "TracerPid:") orelse snapshot.tracer_pid;
+        } else if (std.mem.startsWith(u8, line, "CoreDumping:")) {
+            if (parseStatusUsize(line, "CoreDumping:")) |value| snapshot.core_dumping = if (value == 0) .off else .on;
+        } else if (std.mem.startsWith(u8, line, "Uid:")) {
+            if (parseStatusUsizeField(line, "Uid:", 1) orelse parseStatusUsizeField(line, "Uid:", 0)) |euid| {
+                snapshot.euid = euid;
+                snapshot.euid_root = if (euid == 0) .on else .off;
+            }
+        } else if (std.mem.startsWith(u8, line, "NSpid:")) {
+            snapshot.nspid_count = countStatusUsizeFields(line, "NSpid:");
+            snapshot.pid_namespace = if (snapshot.nspid_count > 1) .on else if (snapshot.nspid_count == 1) .off else .unknown;
         } else if (std.mem.startsWith(u8, line, "CapEff:")) {
             const value = std.mem.trim(u8, line["CapEff:".len..], " \t\r\n");
             const len = @min(value.len, snapshot.cap_eff.len);
@@ -4018,6 +4107,11 @@ fn hexIsZero(bytes: []const u8) bool {
         return false;
     }
     return true;
+}
+
+fn optionalUsizeLabel(buffer: []u8, value: ?usize) []const u8 {
+    if (value) |number| return std.fmt.bufPrint(buffer, "{d}", .{number}) catch "n/a";
+    return "unknown";
 }
 
 fn flagLabel(flag: LinuxFlag) []const u8 {
@@ -4444,7 +4538,7 @@ fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
 
 const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
 const task_panel_actions = [_]TaskPanelAction{ .tasks, .preview, .seal, .run_next, .history };
-const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .linux };
+const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .seal, .linux };
 const extension_panel_actions = [_]ExtensionPanelAction{.scan};
 const tutorial_panel_actions = [_]TutorialPanelAction{ .ja, .en };
 const publish_panel_actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle, .verify, .preflight };
@@ -4567,11 +4661,12 @@ fn securityPanelActionRect(state: *const LinuxGuiState, action: SecurityPanelAct
         .lf => 3,
         .crlf => 4,
         .clean => 5,
-        .linux => 6,
+        .seal => 6,
+        .linux => 7,
     };
-    const width: i16 = 64;
+    const width: i16 = 58;
     const gap: i16 = 7;
-    const right = state.window_width - 18 - (6 - index) * (width + gap);
+    const right = state.window_width - 18 - (7 - index) * (width + gap);
     const bottom = state.bottomTop();
     return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
@@ -4652,6 +4747,7 @@ fn securityPanelActionLabel(action: SecurityPanelAction) []const u8 {
         .lf => "LF",
         .crlf => "CRLF",
         .clean => "CLEAN",
+        .seal => "SEAL",
         .linux => "LINUX",
     };
 }
@@ -4703,7 +4799,7 @@ fn extensionRowAt(state: *const LinuxGuiState, y: i16) ?usize {
 }
 
 fn securityFindingsTop(state: *const LinuxGuiState) i16 {
-    return state.bottomTop() + 206;
+    return state.bottomTop() + 230;
 }
 
 fn taskHistoryTop(state: *const LinuxGuiState) i16 {

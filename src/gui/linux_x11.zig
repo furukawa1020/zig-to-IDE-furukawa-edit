@@ -23,6 +23,7 @@ const workspace_search = @import("../search/workspace_search.zig");
 const task_registry = @import("../tasks/registry.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
 const permissions = @import("../security/permissions.zig");
+const types = @import("../core/types.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("linux_x11.zig is Linux-only");
@@ -43,6 +44,8 @@ const X = struct {
     const EventMask = struct {
         const key_press: u32 = 1 << 0;
         const button_press: u32 = 1 << 2;
+        const button_release: u32 = 1 << 3;
+        const pointer_motion: u32 = 1 << 6;
         const exposure: u32 = 1 << 15;
         const structure_notify: u32 = 1 << 17;
     };
@@ -81,6 +84,14 @@ const SetupInfo = struct {
 const Atoms = struct {
     wm_protocols: u32,
     wm_delete_window: u32,
+    clipboard: u32,
+    primary: u32,
+    targets: u32,
+    utf8_string: u32,
+    string: u32,
+    text: u32,
+    atom: u32,
+    zide_clipboard: u32,
 };
 
 const Graphics = struct {
@@ -136,7 +147,18 @@ const X11 = struct {
             .fd = fd,
             .setup = setup,
             .window = 0,
-            .atoms = .{ .wm_protocols = 0, .wm_delete_window = 0 },
+            .atoms = .{
+                .wm_protocols = 0,
+                .wm_delete_window = 0,
+                .clipboard = 0,
+                .primary = 0,
+                .targets = 0,
+                .utf8_string = 0,
+                .string = 0,
+                .text = 0,
+                .atom = 0,
+                .zide_clipboard = 0,
+            },
             .gc = undefined,
         };
         self.gc = try self.createGraphics();
@@ -144,6 +166,14 @@ const X11 = struct {
         self.atoms = .{
             .wm_protocols = try self.internAtom("WM_PROTOCOLS"),
             .wm_delete_window = try self.internAtom("WM_DELETE_WINDOW"),
+            .clipboard = try self.internAtom("CLIPBOARD"),
+            .primary = try self.internAtom("PRIMARY"),
+            .targets = try self.internAtom("TARGETS"),
+            .utf8_string = try self.internAtom("UTF8_STRING"),
+            .string = try self.internAtom("STRING"),
+            .text = try self.internAtom("TEXT"),
+            .atom = try self.internAtom("ATOM"),
+            .zide_clipboard = try self.internAtom("ZIDE_CLIPBOARD"),
         };
         try self.setWindowTitle("ZIDE - Linux GUI");
         try self.setWmDelete();
@@ -218,7 +248,7 @@ const X11 = struct {
         writeLe32(req[24..28], self.setup.root_visual);
         writeLe32(req[28..32], X.Cw.back_pixel | X.Cw.event_mask);
         writeLe32(req[32..36], rgb(5, 7, 8));
-        writeLe32(req[36..40], X.EventMask.exposure | X.EventMask.key_press | X.EventMask.button_press | X.EventMask.structure_notify);
+        writeLe32(req[36..40], X.EventMask.exposure | X.EventMask.key_press | X.EventMask.button_press | X.EventMask.button_release | X.EventMask.pointer_motion | X.EventMask.structure_notify);
         try self.writeRequest(req[0..]);
         return window;
     }
@@ -289,6 +319,97 @@ const X11 = struct {
         writeLe32(req[20..24], @intCast(data.len / 4));
         @memcpy(req[24..], data);
         try self.writeRequest(req);
+    }
+
+    fn setSelectionOwner(self: *X11, selection: u32) !void {
+        var req: [16]u8 = undefined;
+        @memset(req[0..], 0);
+        req[0] = 22;
+        req[1] = 0;
+        writeLe16(req[2..4], 4);
+        writeLe32(req[4..8], self.window);
+        writeLe32(req[8..12], selection);
+        writeLe32(req[12..16], 0);
+        try self.writeRequest(req[0..]);
+    }
+
+    fn convertSelection(self: *X11, selection: u32, target: u32, property: u32) !void {
+        var req: [24]u8 = undefined;
+        @memset(req[0..], 0);
+        req[0] = 24;
+        req[1] = 0;
+        writeLe16(req[2..4], 6);
+        writeLe32(req[4..8], self.window);
+        writeLe32(req[8..12], selection);
+        writeLe32(req[12..16], target);
+        writeLe32(req[16..20], property);
+        writeLe32(req[20..24], 0);
+        try self.writeRequest(req[0..]);
+    }
+
+    fn sendSelectionNotify(self: *X11, requestor: u32, selection: u32, target: u32, property: u32, time: u32) !void {
+        var req: [44]u8 = undefined;
+        @memset(req[0..], 0);
+        req[0] = 25;
+        req[1] = 0;
+        writeLe16(req[2..4], 11);
+        writeLe32(req[4..8], requestor);
+        writeLe32(req[8..12], 0);
+        req[12] = 31;
+        req[13] = 0;
+        writeLe16(req[14..16], 0);
+        writeLe32(req[16..20], time);
+        writeLe32(req[20..24], requestor);
+        writeLe32(req[24..28], selection);
+        writeLe32(req[28..32], target);
+        writeLe32(req[32..36], property);
+        try self.writeRequest(req[0..]);
+    }
+
+    fn requestClipboardText(self: *X11, allocator: std.mem.Allocator) ![]u8 {
+        try self.convertSelection(self.atoms.clipboard, self.atoms.utf8_string, self.atoms.zide_clipboard);
+        var ignored: usize = 0;
+        while (ignored < 64) : (ignored += 1) {
+            var event: [32]u8 = undefined;
+            try readExact(self.fd, event[0..]);
+            const event_type = event[0] & 0x7f;
+            if (event_type != 31) continue;
+            const selection = readLe32(event[12..16]);
+            const target = readLe32(event[16..20]);
+            const property = readLe32(event[20..24]);
+            if (selection != self.atoms.clipboard or target != self.atoms.utf8_string or property == 0) return error.NoClipboardText;
+            return try self.getProperty8(allocator, self.window, property);
+        }
+        return error.ClipboardTimeout;
+    }
+
+    fn getProperty8(self: *X11, allocator: std.mem.Allocator, window: u32, property: u32) ![]u8 {
+        var req: [24]u8 = undefined;
+        @memset(req[0..], 0);
+        req[0] = 20;
+        req[1] = 1;
+        writeLe16(req[2..4], 6);
+        writeLe32(req[4..8], window);
+        writeLe32(req[8..12], property);
+        writeLe32(req[12..16], 0);
+        writeLe32(req[16..20], 0);
+        writeLe32(req[20..24], 1024 * 1024);
+        try self.writeRequest(req[0..]);
+
+        var reply: [32]u8 = undefined;
+        try readReply(self.fd, reply[0..]);
+        if (reply[0] != 1) return error.X11ProtocolError;
+        if (reply[1] != 8) return error.UnsupportedClipboardFormat;
+        const value_len = readLe32(reply[16..20]);
+        const reply_extra_len = readLe32(reply[4..8]) * 4;
+        if (value_len > 8 * 1024 * 1024 or reply_extra_len > 8 * 1024 * 1024) return error.ClipboardTooLarge;
+        const bytes = try allocator.alloc(u8, @intCast(value_len));
+        errdefer allocator.free(bytes);
+        const extra = try allocator.alloc(u8, @intCast(reply_extra_len));
+        defer allocator.free(extra);
+        if (reply_extra_len > 0) try readExact(self.fd, extra);
+        if (value_len > 0) @memcpy(bytes[0..], extra[0..value_len]);
+        return bytes;
     }
 
     fn mapWindow(self: *X11) !void {
@@ -784,6 +905,9 @@ const LinuxGuiState = struct {
     last_document_search_query: std.array_list.Managed(u8),
     last_document_search_options: literal_search.Options = .{},
     selection_anchor: ?usize = null,
+    editor_dragging: bool = false,
+    clipboard: std.array_list.Managed(u8),
+    clipboard_owned: bool = false,
     bottom_panel: BottomPanel = .output,
     window_width: i16 = WIDTH,
     window_height: i16 = HEIGHT,
@@ -813,12 +937,14 @@ const LinuxGuiState = struct {
             .quick_panel = QuickPanel.init(allocator),
             .collapsed_dirs = collapsed_dirs,
             .last_document_search_query = std.array_list.Managed(u8).init(allocator),
+            .clipboard = std.array_list.Managed(u8).init(allocator),
         };
     }
 
     fn deinit(self: *LinuxGuiState) void {
         self.clearExtensionsRegistry();
         self.clearGitOverview();
+        self.clipboard.deinit();
         self.last_document_search_query.deinit();
         self.quick_panel.deinit();
         self.allocator.free(self.collapsed_dirs);
@@ -1211,6 +1337,174 @@ const LinuxGuiState = struct {
             .{ .start = anchor, .end = cursor }
         else
             .{ .start = cursor, .end = anchor };
+    }
+
+    fn clearSelection(self: *LinuxGuiState) void {
+        self.selection_anchor = null;
+    }
+
+    fn deleteSelectedRange(self: *LinuxGuiState, doc: *document_mod.Document) bool {
+        const range = self.selectedRange(doc) orelse return false;
+        doc.deleteRange(range.start, range.end) catch |err| {
+            self.message("delete failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        self.clearSelection();
+        self.ensureEditorCursorVisible();
+        return true;
+    }
+
+    fn insertText(self: *LinuxGuiState, bytes: []const u8) void {
+        const doc = self.app.documents.active() orelse {
+            self.message("open a file before typing", .{});
+            return;
+        };
+        if (self.selectedRange(doc)) |range| {
+            doc.replaceRange(range.start, range.end, bytes) catch |err| {
+                self.message("insert failed: {s}", .{@errorName(err)});
+                return;
+            };
+            self.clearSelection();
+        } else {
+            doc.insert(doc.cursor.position.byte_offset, bytes) catch |err| {
+                self.message("insert failed: {s}", .{@errorName(err)});
+                return;
+            };
+        }
+        self.app.mode = .insert;
+        self.app.focus = .editor;
+        self.ensureEditorCursorVisible();
+    }
+
+    fn insertNewline(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse {
+            self.message("open a file before typing", .{});
+            return;
+        };
+        self.insertText(doc.preferredNewline());
+    }
+
+    fn selectAll(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse return;
+        self.selection_anchor = 0;
+        const position = doc.positionFromOffset(doc.text.bytes.len) catch return;
+        navigation.setCursor(doc, position);
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        self.message("selected all", .{});
+    }
+
+    fn copySelectionToClipboard(self: *LinuxGuiState, x11: *X11) bool {
+        const doc = self.app.documents.active() orelse return false;
+        const range = self.selectedRange(doc) orelse {
+            self.message("no selection to copy", .{});
+            return false;
+        };
+        self.clipboard.clearRetainingCapacity();
+        self.clipboard.appendSlice(doc.text.bytes[range.start..range.end]) catch |err| {
+            self.message("copy failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "clipboard copy failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        x11.setSelectionOwner(x11.atoms.clipboard) catch |err| {
+            self.clipboard_owned = false;
+            self.message("x11 clipboard failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "x11 clipboard owner failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        self.clipboard_owned = true;
+        self.message("copied selection", .{});
+        return true;
+    }
+
+    fn cutSelectionToClipboard(self: *LinuxGuiState, x11: *X11) void {
+        const doc = self.app.documents.active() orelse return;
+        if (!self.copySelectionToClipboard(x11)) return;
+        _ = self.deleteSelectedRange(doc);
+        self.message("cut selection", .{});
+    }
+
+    fn pasteFromClipboard(self: *LinuxGuiState, x11: *X11) void {
+        if (!self.clipboard_owned) {
+            const external = x11.requestClipboardText(self.allocator) catch |err| {
+                if (self.clipboard.items.len == 0) {
+                    self.message("clipboard paste failed: {s}", .{@errorName(err)});
+                    self.appendOutput(.stderr, "x11 clipboard paste failed: {s}\n", .{@errorName(err)});
+                    return;
+                }
+                self.message("external clipboard unavailable; using ZIDE clipboard", .{});
+                self.insertText(self.clipboard.items);
+                return;
+            };
+            defer self.allocator.free(external);
+            if (external.len == 0) return;
+            self.insertText(external);
+            self.message("pasted from X11 clipboard", .{});
+            return;
+        }
+        if (self.clipboard.items.len == 0) {
+            self.message("clipboard is empty", .{});
+            return;
+        }
+        self.insertText(self.clipboard.items);
+        self.message("pasted", .{});
+    }
+
+    fn moveEditorCursor(self: *LinuxGuiState, move: navigation.Move, extend_selection: bool) void {
+        const doc = self.app.documents.active() orelse return;
+        const anchor = doc.cursor.position.byte_offset;
+        if (extend_selection and self.selection_anchor == null) {
+            self.selection_anchor = anchor;
+        }
+        navigation.moveCursor(doc, move) catch return;
+        if (!extend_selection) {
+            self.clearSelection();
+        } else if (self.selection_anchor) |selection_anchor| {
+            if (selection_anchor == doc.cursor.position.byte_offset) self.clearSelection();
+        }
+        self.app.focus = .editor;
+        self.ensureEditorCursorVisible();
+    }
+
+    fn handleSelectionClear(self: *LinuxGuiState, selection: u32, x11: *const X11) void {
+        if (selection == x11.atoms.clipboard) {
+            self.clipboard_owned = false;
+            self.message("x11 clipboard ownership moved", .{});
+        }
+    }
+
+    fn handleSelectionRequest(self: *LinuxGuiState, x11: *X11, event: []const u8) void {
+        const time = readLe32(event[4..8]);
+        const requestor = readLe32(event[12..16]);
+        const selection = readLe32(event[16..20]);
+        const target = readLe32(event[20..24]);
+        const requested_property = readLe32(event[24..28]);
+        const property = if (requested_property == 0) target else requested_property;
+        var response_property: u32 = 0;
+
+        if (selection == x11.atoms.clipboard and self.clipboard_owned) {
+            if (target == x11.atoms.targets) {
+                var data: [16]u8 = undefined;
+                writeLe32(data[0..4], x11.atoms.targets);
+                writeLe32(data[4..8], x11.atoms.utf8_string);
+                writeLe32(data[8..12], x11.atoms.string);
+                writeLe32(data[12..16], x11.atoms.text);
+                x11.changeProperty32(requestor, property, x11.atoms.atom, data[0..]) catch |err| {
+                    self.appendOutput(.stderr, "x11 clipboard TARGETS failed: {s}\n", .{@errorName(err)});
+                };
+                response_property = property;
+            } else if (target == x11.atoms.utf8_string or target == x11.atoms.string or target == x11.atoms.text) {
+                x11.changeProperty8(requestor, property, target, self.clipboard.items) catch |err| {
+                    self.appendOutput(.stderr, "x11 clipboard transfer failed: {s}\n", .{@errorName(err)});
+                };
+                response_property = property;
+            }
+        }
+
+        x11.sendSelectionNotify(requestor, selection, target, response_property, time) catch |err| {
+            self.appendOutput(.stderr, "x11 selection notify failed: {s}\n", .{@errorName(err)});
+        };
     }
 
     fn execute(self: *LinuxGuiState, id: []const u8, source: command_mod.Source) void {
@@ -2072,6 +2366,8 @@ const LinuxGuiState = struct {
         self.app = next;
         self.collapsed_dirs = next_collapsed;
         self.quick_panel.close();
+        self.clearSelection();
+        self.editor_dragging = false;
         self.file_scroll_line = 0;
         self.editor_scroll_line = 0;
         self.output_scroll_line = 0;
@@ -2089,17 +2385,120 @@ const LinuxGuiState = struct {
         self.execute("security.audit_workspace", .startup);
     }
 
-    fn handleKey(self: *LinuxGuiState, key: event_mod.KeyEvent) void {
+    fn handleKey(self: *LinuxGuiState, x11: *X11, key: event_mod.KeyEvent) void {
         if (self.handleQuickPanelKey(key)) return;
 
         if (self.app.mode == .insert and self.app.focus == .editor) {
+            if (key.modifiers.ctrl) {
+                switch (key.code) {
+                    .char => |char| {
+                        if (char == 'a' or char == 'A') {
+                            self.selectAll();
+                            return;
+                        }
+                        if (char == 'c' or char == 'C') {
+                            _ = self.copySelectionToClipboard(x11);
+                            return;
+                        }
+                        if (char == 'x' or char == 'X') {
+                            self.cutSelectionToClipboard(x11);
+                            return;
+                        }
+                        if (char == 'v' or char == 'V') {
+                            self.pasteFromClipboard(x11);
+                            return;
+                        }
+                    },
+                    else => {},
+                }
+            }
             switch (key.code) {
+                .escape => {
+                    self.execute("editor.exit_insert", .keybinding);
+                    return;
+                },
                 .backspace => {
                     self.deleteBackward();
                     return;
                 },
                 .delete => {
                     self.deleteForward();
+                    return;
+                },
+                .enter => {
+                    self.insertNewline();
+                    return;
+                },
+                .tab => {
+                    self.insertText("    ");
+                    return;
+                },
+                .arrow_left => {
+                    self.moveEditorCursor(.left, key.modifiers.shift);
+                    return;
+                },
+                .arrow_right => {
+                    self.moveEditorCursor(.right, key.modifiers.shift);
+                    return;
+                },
+                .arrow_up => {
+                    self.moveEditorCursor(.up, key.modifiers.shift);
+                    return;
+                },
+                .arrow_down => {
+                    self.moveEditorCursor(.down, key.modifiers.shift);
+                    return;
+                },
+                .char => |char| {
+                    var bytes: [4]u8 = undefined;
+                    const len = encodeUtf8(char, &bytes) catch return;
+                    self.insertText(bytes[0..len]);
+                    return;
+                },
+                else => {},
+            }
+        }
+
+        if (key.modifiers.ctrl and self.app.focus == .editor) {
+            switch (key.code) {
+                .char => |char| {
+                    if (char == 'a' or char == 'A') {
+                        self.selectAll();
+                        return;
+                    }
+                    if (char == 'c' or char == 'C') {
+                        _ = self.copySelectionToClipboard(x11);
+                        return;
+                    }
+                    if (char == 'x' or char == 'X') {
+                        self.cutSelectionToClipboard(x11);
+                        return;
+                    }
+                    if (char == 'v' or char == 'V') {
+                        self.pasteFromClipboard(x11);
+                        return;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (self.app.focus == .editor) {
+            switch (key.code) {
+                .arrow_left => {
+                    self.moveEditorCursor(.left, key.modifiers.shift);
+                    return;
+                },
+                .arrow_right => {
+                    self.moveEditorCursor(.right, key.modifiers.shift);
+                    return;
+                },
+                .arrow_up => {
+                    self.moveEditorCursor(.up, key.modifiers.shift);
+                    return;
+                },
+                .arrow_down => {
+                    self.moveEditorCursor(.down, key.modifiers.shift);
                     return;
                 },
                 else => {},
@@ -2276,6 +2675,10 @@ const LinuxGuiState = struct {
 
     fn deleteBackward(self: *LinuxGuiState) void {
         const doc = self.app.documents.active() orelse return;
+        if (self.deleteSelectedRange(doc)) {
+            self.message("deleted selection", .{});
+            return;
+        }
         const current = doc.cursor.position.byte_offset;
         if (current == 0) return;
         const previous = doc.text.previousByteOffset(current) catch current - 1;
@@ -2288,6 +2691,10 @@ const LinuxGuiState = struct {
 
     fn deleteForward(self: *LinuxGuiState) void {
         const doc = self.app.documents.active() orelse return;
+        if (self.deleteSelectedRange(doc)) {
+            self.message("deleted selection", .{});
+            return;
+        }
         const current = doc.cursor.position.byte_offset;
         if (current >= doc.text.bytes.len) return;
         const next = doc.text.nextByteOffset(current) catch current + 1;
@@ -2312,6 +2719,25 @@ const LinuxGuiState = struct {
         }
         if (button != 1) return;
         self.handleClick(x, y);
+    }
+
+    fn handlePointerMotion(self: *LinuxGuiState, x: i16, y: i16) void {
+        if (!self.editor_dragging) return;
+        const doc = self.app.documents.active() orelse return;
+        const position = self.editorPositionFromPoint(x, y) orelse return;
+        navigation.setCursor(doc, position);
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+    }
+
+    fn handlePointerRelease(self: *LinuxGuiState, button: u8) void {
+        if (button != 1) return;
+        if (!self.editor_dragging) return;
+        self.editor_dragging = false;
+        if (self.app.documents.active()) |doc| {
+            if (self.selectedRange(doc) == null) self.clearSelection();
+        }
     }
 
     fn handleClick(self: *LinuxGuiState, x: i16, y: i16) void {
@@ -2353,7 +2779,7 @@ const LinuxGuiState = struct {
 
         if (y >= HEADER_HEIGHT and y < bottom and x >= FILE_WIDTH) {
             self.app.focus = .editor;
-            self.setCursorFromEditorClick(x, y);
+            self.beginEditorSelection(x, y);
             if (self.app.documents.active() != null) self.app.mode = .insert;
             return;
         }
@@ -2511,20 +2937,30 @@ const LinuxGuiState = struct {
         return true;
     }
 
-    fn setCursorFromEditorClick(self: *LinuxGuiState, x: i16, y: i16) void {
+    fn beginEditorSelection(self: *LinuxGuiState, x: i16, y: i16) void {
         const doc = self.app.documents.active() orelse return;
-        if (y < EDITOR_TEXT_TOP - 14) return;
+        const position = self.editorPositionFromPoint(x, y) orelse return;
+        self.selection_anchor = position.byte_offset;
+        navigation.setCursor(doc, position);
+        self.editor_dragging = true;
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        self.message("cursor: {d}:{d}", .{ position.line + 1, position.column + 1 });
+    }
+
+    fn editorPositionFromPoint(self: *LinuxGuiState, x: i16, y: i16) ?types.Position {
+        const doc = self.app.documents.active() orelse return null;
+        if (doc.text.lineCount() == 0) return types.Position.start();
+        if (y < EDITOR_TEXT_TOP - 14) return null;
 
         const line_delta = @divTrunc(@as(isize, y - (EDITOR_TEXT_TOP - 14)), LINE_HEIGHT);
-        if (line_delta < 0) return;
-        const line = self.editor_scroll_line + @as(usize, @intCast(line_delta));
-        if (line >= doc.text.lineCount()) return;
-
+        if (line_delta < 0) return null;
+        const line = @min(self.editor_scroll_line + @as(usize, @intCast(line_delta)), doc.text.lineCount() - 1);
         const column_raw = if (x <= EDITOR_LEFT + 56) 0 else @divTrunc(@as(isize, x - (EDITOR_LEFT + 56)), 8);
         const column = @min(@as(usize, @intCast(@max(column_raw, 0))), doc.text.lineSlice(line).len);
-        const offset = doc.text.lineColumnToOffset(line, column) catch return;
-        navigation.setCursor(doc, doc.positionFromOffset(offset) catch return);
-        self.message("cursor: {d}:{d}", .{ line + 1, column + 1 });
+        const offset = doc.text.lineColumnToOffset(line, column) catch return null;
+        return doc.positionFromOffset(offset) catch null;
     }
 
     fn bottomRowsFrom(self: *const LinuxGuiState, top: i16) usize {
@@ -2618,6 +3054,14 @@ pub fn run(
             },
             4 => {
                 state.handlePointer(event[1], @bitCast(readLe16(event[24..26])), @bitCast(readLe16(event[26..28])));
+                try draw(&x11, &state);
+            },
+            5 => {
+                state.handlePointerRelease(event[1]);
+                try draw(&x11, &state);
+            },
+            6 => {
+                state.handlePointerMotion(@bitCast(readLe16(event[24..26])), @bitCast(readLe16(event[26..28])));
                 try draw(&x11, &state);
             },
             12 => try draw(&x11, &state),

@@ -558,6 +558,17 @@ const PublishPanelAction = enum {
     preflight,
 };
 
+const ContextAction = enum {
+    copy,
+    cut,
+    paste,
+    select_all,
+    find,
+    scan,
+    task_queue,
+    palette,
+};
+
 const QuickPanelMode = enum {
     open_workspace,
     find_file,
@@ -919,6 +930,10 @@ const LinuxGuiState = struct {
     last_editor_click_time: u32 = 0,
     last_editor_click_x: i16 = 0,
     last_editor_click_y: i16 = 0,
+    context_menu_visible: bool = false,
+    context_menu_x: i16 = 0,
+    context_menu_y: i16 = 0,
+    context_menu_selected: usize = 0,
     clipboard: std.array_list.Managed(u8),
     primary_selection: std.array_list.Managed(u8),
     clipboard_owned: bool = false,
@@ -1540,6 +1555,87 @@ const LinuxGuiState = struct {
         if (self.primary_selection.items.len == 0) return self.message("primary is empty", .{});
         self.insertText(self.primary_selection.items);
         self.message("pasted from ZIDE primary", .{});
+    }
+
+    fn openContextMenu(self: *LinuxGuiState, x: i16, y: i16) void {
+        const menu_w: i16 = 230;
+        const menu_h = contextMenuHeight();
+        self.context_menu_x = @min(@max(x, @as(i16, 8)), @max(@as(i16, 8), self.window_width - menu_w - 8));
+        self.context_menu_y = @min(@max(y, @as(i16, 8)), @max(@as(i16, 8), self.window_height - STATUS_HEIGHT - menu_h - 8));
+        self.context_menu_selected = 0;
+        self.context_menu_visible = true;
+        self.quick_panel.close();
+        self.app.palette.close();
+        self.message("context menu", .{});
+    }
+
+    fn closeContextMenu(self: *LinuxGuiState) void {
+        self.context_menu_visible = false;
+        self.context_menu_selected = 0;
+    }
+
+    fn moveContextSelection(self: *LinuxGuiState, delta: isize) void {
+        const count = context_actions.len;
+        if (count == 0) return;
+        if (delta < 0) {
+            const amount: usize = @intCast(-delta);
+            self.context_menu_selected = if (amount > self.context_menu_selected) 0 else self.context_menu_selected - amount;
+        } else {
+            const amount: usize = @intCast(delta);
+            self.context_menu_selected = @min(count - 1, self.context_menu_selected + amount);
+        }
+    }
+
+    fn handleContextMenuKey(self: *LinuxGuiState, x11: *X11, key: event_mod.KeyEvent) bool {
+        if (!self.context_menu_visible) return false;
+        switch (key.code) {
+            .escape => {
+                self.closeContextMenu();
+                return true;
+            },
+            .arrow_up => {
+                self.moveContextSelection(-1);
+                return true;
+            },
+            .arrow_down => {
+                self.moveContextSelection(1);
+                return true;
+            },
+            .enter => {
+                const action = context_actions[@min(self.context_menu_selected, context_actions.len - 1)];
+                self.closeContextMenu();
+                self.executeContextAction(x11, action);
+                return true;
+            },
+            else => {
+                self.closeContextMenu();
+                return false;
+            },
+        }
+    }
+
+    fn handleContextMenuClick(self: *LinuxGuiState, x11: *X11, x: i16, y: i16) bool {
+        if (!self.context_menu_visible) return false;
+        const action = contextActionAt(self, x, y) orelse {
+            self.closeContextMenu();
+            return true;
+        };
+        self.closeContextMenu();
+        self.executeContextAction(x11, action);
+        return true;
+    }
+
+    fn executeContextAction(self: *LinuxGuiState, x11: *X11, action: ContextAction) void {
+        switch (action) {
+            .copy => _ = self.copySelectionToClipboard(x11),
+            .cut => self.cutSelectionToClipboard(x11),
+            .paste => self.pasteFromClipboard(x11),
+            .select_all => self.selectAll(x11),
+            .find => self.execute("editor.find", .command_palette),
+            .scan => self.execute("security.scan_current", .command_palette),
+            .task_queue => self.execute("task.preview_next", .command_palette),
+            .palette => self.execute("view.command_palette", .command_palette),
+        }
     }
 
     fn moveEditorCursor(self: *LinuxGuiState, x11: *X11, move: navigation.Move, extend_selection: bool) void {
@@ -2488,6 +2584,7 @@ const LinuxGuiState = struct {
     }
 
     fn handleKey(self: *LinuxGuiState, x11: *X11, key: event_mod.KeyEvent) void {
+        if (self.handleContextMenuKey(x11, key)) return;
         if (self.handleQuickPanelKey(key)) return;
 
         if (self.app.mode == .insert and self.app.focus == .editor) {
@@ -2824,6 +2921,10 @@ const LinuxGuiState = struct {
             self.pasteFromPrimary(x11);
             return;
         }
+        if (button == 3) {
+            self.openContextMenu(x, y);
+            return;
+        }
         if (button != 1) return;
         self.handleClick(x11, x, y, time, state_mask);
     }
@@ -2852,6 +2953,8 @@ const LinuxGuiState = struct {
     }
 
     fn handleClick(self: *LinuxGuiState, x11: *X11, x: i16, y: i16, time: u32, state_mask: u16) void {
+        if (self.handleContextMenuClick(x11, x, y)) return;
+
         if (self.quick_panel.visible) {
             if (self.handleQuickPanelClick(x, y)) return;
         }
@@ -3329,6 +3432,7 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
     try drawBottomPanel(x11, state);
     if (state.quick_panel.visible) try drawQuickPanel(x11, state);
     if (app.palette.visible) try drawPalette(x11, state);
+    if (state.context_menu_visible) try drawContextMenu(x11, state);
 
     try x11.fillRect(x11.gc.cyan, 0, state.window_height - STATUS_HEIGHT, width_u, STATUS_HEIGHT);
     var status_buf: [760]u8 = undefined;
@@ -3514,6 +3618,28 @@ fn drawActionButton(x11: *X11, rect: HitRect, label: []const u8) !void {
 fn drawActionButtonState(x11: *X11, rect: HitRect, label: []const u8, active: bool, color: u32) !void {
     try x11.fillRect(if (active) color else x11.gc.panel_2, rect.left, rect.top, @intCast(rect.right - rect.left), @intCast(rect.bottom - rect.top));
     try x11.text(if (active) x11.gc.bg else color, rect.left + 7, rect.top + 16, label);
+}
+
+fn drawContextMenu(x11: *X11, state: *const LinuxGuiState) !void {
+    const rect = contextMenuRect(state);
+    try x11.fillRect(x11.gc.panel_2, rect.left, rect.top, @intCast(rect.right - rect.left), @intCast(rect.bottom - rect.top));
+    try x11.fillRect(x11.gc.cyan, rect.left, rect.top, @intCast(rect.right - rect.left), 2);
+    try x11.fillRect(x11.gc.line, rect.left, rect.bottom - 2, @intCast(rect.right - rect.left), 2);
+    try x11.fillRect(x11.gc.line, rect.left, rect.top, 2, @intCast(rect.bottom - rect.top));
+    try x11.fillRect(x11.gc.line, rect.right - 2, rect.top, 2, @intCast(rect.bottom - rect.top));
+    try x11.text(x11.gc.green, rect.left + 12, rect.top + 23, "ZIDE ACTIONS");
+
+    inline for (context_actions, 0..) |action, index| {
+        const item = contextActionRect(state, action);
+        const selected = state.context_menu_selected == index;
+        const enabled = contextActionEnabled(state, action);
+        if (selected) try x11.fillRect(x11.gc.cyan, item.left + 4, item.top + 2, @intCast(item.right - item.left - 8), @intCast(item.bottom - item.top - 4));
+        const gc = if (selected) x11.gc.bg else if (enabled) x11.gc.text else x11.gc.muted;
+        try x11.text(gc, item.left + 14, item.top + 19, contextActionLabel(action));
+        if (contextActionHint(action).len > 0) {
+            try x11.text(if (selected) x11.gc.bg else x11.gc.cyan, item.right - 74, item.top + 19, contextActionHint(action));
+        }
+    }
 }
 
 fn drawScrollHint(x11: *X11, state: *const LinuxGuiState, total: usize, visible: usize, start: usize, y: i16) !void {
@@ -5280,6 +5406,7 @@ const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf
 const extension_panel_actions = [_]ExtensionPanelAction{.scan};
 const tutorial_panel_actions = [_]TutorialPanelAction{ .ja, .en };
 const publish_panel_actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle, .verify, .preflight };
+const context_actions = [_]ContextAction{ .copy, .cut, .paste, .select_all, .find, .scan, .task_queue, .palette };
 
 fn drawGitPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
     inline for (git_panel_actions) |action| {
@@ -5532,6 +5659,84 @@ fn publishPanelActionLabel(action: PublishPanelAction) []const u8 {
         .bundle => "ZIP",
         .verify => "VFY",
         .preflight => "GATE",
+    };
+}
+
+fn contextMenuHeight() i16 {
+    return 34 + @as(i16, @intCast(context_actions.len)) * 28 + 8;
+}
+
+fn contextMenuRect(state: *const LinuxGuiState) HitRect {
+    return .{
+        .left = state.context_menu_x,
+        .top = state.context_menu_y,
+        .right = state.context_menu_x + 230,
+        .bottom = state.context_menu_y + contextMenuHeight(),
+    };
+}
+
+fn contextActionRect(state: *const LinuxGuiState, action: ContextAction) HitRect {
+    const index: i16 = switch (action) {
+        .copy => 0,
+        .cut => 1,
+        .paste => 2,
+        .select_all => 3,
+        .find => 4,
+        .scan => 5,
+        .task_queue => 6,
+        .palette => 7,
+    };
+    return .{
+        .left = state.context_menu_x + 6,
+        .top = state.context_menu_y + 32 + index * 28,
+        .right = state.context_menu_x + 224,
+        .bottom = state.context_menu_y + 32 + index * 28 + 28,
+    };
+}
+
+fn contextActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?ContextAction {
+    if (!state.context_menu_visible) return null;
+    inline for (context_actions) |action| {
+        if (pointIn(contextActionRect(state, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn contextActionEnabled(state: *const LinuxGuiState, action: ContextAction) bool {
+    return switch (action) {
+        .copy, .cut => blk: {
+            const doc = state.app.documents.active() orelse break :blk false;
+            break :blk state.selectedRange(doc) != null;
+        },
+        .paste => true,
+        .select_all, .find, .scan => state.app.documents.active() != null,
+        .task_queue, .palette => true,
+    };
+}
+
+fn contextActionLabel(action: ContextAction) []const u8 {
+    return switch (action) {
+        .copy => "Copy selection",
+        .cut => "Cut selection",
+        .paste => "Paste",
+        .select_all => "Select all",
+        .find => "Find in file",
+        .scan => "Scan current file",
+        .task_queue => "Preview run queue",
+        .palette => "Command palette",
+    };
+}
+
+fn contextActionHint(action: ContextAction) []const u8 {
+    return switch (action) {
+        .copy => "Ctrl+C",
+        .cut => "Ctrl+X",
+        .paste => "Ctrl+V",
+        .select_all => "Ctrl+A",
+        .find => "Ctrl+F",
+        .scan => "Alt+S",
+        .task_queue => "RUN",
+        .palette => "C+S+P",
     };
 }
 

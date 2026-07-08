@@ -20,6 +20,7 @@ pub const RunOptions = struct {
     environ: std.process.Environ = std.process.Environ.empty,
     stdout_limit: usize = 512 * 1024,
     stderr_limit: usize = 512 * 1024,
+    audit_log: bool = true,
 };
 
 pub const RunResult = union(enum) {
@@ -118,7 +119,7 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
         const message = "approved command cwd is outside the permitted workspace boundary";
         try appendFormatted(process_console, .stderr, "blocked: {s}\n", .{message});
         process_console.finish(-1);
-        try queue.recordHistory(&ticket, options.workspace_root, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+        try recordRunHistory(queue, &ticket, process_console, options, .blocked, -1);
         return .{ .blocked = message };
     }
 
@@ -128,7 +129,7 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
         try appendFormatted(process_console, .stderr, "blocked: {s}\n", .{message});
         try appendFormatted(process_console, .stderr, "intent reason: {s}\n", .{intent.reason});
         process_console.finish(-1);
-        try queue.recordHistory(&ticket, options.workspace_root, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+        try recordRunHistory(queue, &ticket, process_console, options, .blocked, -1);
         return .{ .blocked = message };
     }
 
@@ -137,7 +138,7 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
         try appendFormatted(process_console, .stderr, "blocked: {s}\n", .{message});
         try appendFormatted(process_console, .stderr, "intent reason: {s}\n", .{intent.reason});
         process_console.finish(-1);
-        try queue.recordHistory(&ticket, options.workspace_root, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+        try recordRunHistory(queue, &ticket, process_console, options, .blocked, -1);
         return .{ .blocked = message };
     }
 
@@ -164,18 +165,18 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
         if (err == error.Timeout) {
             try appendTimeoutExceeded(process_console, ticket.timeout_ms);
             process_console.finish(-1);
-            try queue.recordHistory(&ticket, options.workspace_root, .timed_out, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+            try recordRunHistory(queue, &ticket, process_console, options, .timed_out, -1);
             return .timed_out;
         }
         if (err == error.StreamTooLong) {
             try appendFormatted(process_console, .stderr, "output exceeded {d} byte limit\n", .{ticket.output_limit_bytes});
             process_console.finish(-1);
-            try queue.recordHistory(&ticket, options.workspace_root, .output_limited, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+            try recordRunHistory(queue, &ticket, process_console, options, .output_limited, -1);
             return .output_limited;
         }
         try appendFormatted(process_console, .stderr, "spawn failed: {s}\n", .{@errorName(err)});
         process_console.finish(-1);
-        try queue.recordHistory(&ticket, options.workspace_root, .failed, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+        try recordRunHistory(queue, &ticket, process_console, options, .failed, -1);
         return .{ .failed = @errorName(err) };
     };
     defer process_console.allocator.free(result.stdout);
@@ -186,9 +187,119 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
     const exit_code = termExitCode(result.term);
     process_console.finish(exit_code);
     try appendFormatted(process_console, .stdout, "exit: {d}\n", .{exit_code});
-    try queue.recordHistory(&ticket, options.workspace_root, .finished, exit_code, process_console.lines.items.len, process_console.sanitized_stats.total());
+    try recordRunHistory(queue, &ticket, process_console, options, .finished, exit_code);
 
     return .{ .ran = exit_code };
+}
+
+fn recordRunHistory(
+    queue: *execution_queue.Queue,
+    ticket: *const execution_queue.Ticket,
+    process_console: *console.ProcessConsole,
+    options: RunOptions,
+    state: execution_queue.State,
+    exit_code: ?i32,
+) !void {
+    try queue.recordHistory(
+        ticket,
+        options.workspace_root,
+        state,
+        exit_code,
+        process_console.lines.items.len,
+        process_console.sanitized_stats.total(),
+    );
+    if (!options.audit_log) return;
+    persistLatestAudit(queue, process_console, options) catch |err| {
+        try appendFormatted(process_console, .stderr, "audit log write failed: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn persistLatestAudit(queue: *const execution_queue.Queue, process_console: *console.ProcessConsole, options: RunOptions) !void {
+    const entry = queue.latestHistory() orelse return;
+    var line = try auditJsonLine(process_console.allocator, entry);
+    defer line.deinit();
+
+    const audit_dir = try std.fs.path.join(process_console.allocator, &.{ options.workspace_root, ".zide", "audit" });
+    defer process_console.allocator.free(audit_dir);
+    try std.Io.Dir.cwd().createDirPath(options.io, audit_dir);
+
+    const log_path = try std.fs.path.join(process_console.allocator, &.{ audit_dir, "run-history.jsonl" });
+    defer process_console.allocator.free(log_path);
+
+    var file = try std.Io.Dir.cwd().createFile(options.io, log_path, .{
+        .truncate = false,
+        .lock = .exclusive,
+    });
+    defer file.close(options.io);
+
+    const offset = try file.length(options.io);
+    try file.writePositionalAll(options.io, line.written(), offset);
+    try file.sync(options.io);
+    try appendFormatted(process_console, .stdout, "audit log: .zide/audit/run-history.jsonl id={s}\n", .{entry.audit_id[0..12]});
+}
+
+fn auditJsonLine(allocator: std.mem.Allocator, entry: *const execution_queue.HistoryEntry) !std.Io.Writer.Allocating {
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    errdefer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("{\"schema\":\"zide.run-history.v1\"");
+    try writer.print(",\"audit_id\":\"{s}\"", .{entry.audit_id[0..]});
+    try writeJsonField(writer, "source", entry.source_command_id);
+    try writeJsonField(writer, "command", entry.display_command);
+    try writeJsonField(writer, "cwd", entry.cwd);
+    try writer.print(",\"state\":\"{s}\"", .{@tagName(entry.state)});
+    if (entry.exit_code) |code| {
+        try writer.print(",\"exit_code\":{d}", .{code});
+    } else {
+        try writer.writeAll(",\"exit_code\":null");
+    }
+    try writer.print(",\"output_lines\":{d}", .{entry.output_lines});
+    try writer.print(",\"sanitized_controls\":{d}", .{entry.sanitized_controls});
+    try writer.print(",\"output_sanitized\":{}", .{entry.output_sanitized});
+    try writer.print(",\"timeout_ms\":", .{});
+    if (entry.timeout_ms) |ms| {
+        try writer.print("{d}", .{ms});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.print(",\"output_limit_bytes\":{d}", .{entry.output_limit_bytes});
+    try writer.print(",\"policies\":{{\"env\":\"{s}\",\"fs\":\"{s}\",\"network\":\"{s}\"}}", .{
+        @tagName(entry.env_policy),
+        @tagName(entry.fs_policy),
+        @tagName(entry.network_policy),
+    });
+    try writer.print(",\"intent\":{{\"network\":{},\"mutating\":{},\"shell\":{},\"destructive\":{},\"package_manager\":{}", .{
+        entry.intent.network,
+        entry.intent.mutating,
+        entry.intent.shell,
+        entry.intent.destructive,
+        entry.intent.package_manager,
+    });
+    try writeJsonField(writer, "reason", entry.intent.reason);
+    try writer.writeAll("}}\n");
+    return text;
+}
+
+fn writeJsonField(writer: *std.Io.Writer, comptime name: []const u8, value: []const u8) !void {
+    try writer.print(",\"{s}\":", .{name});
+    try writeJsonString(writer, value);
+}
+
+fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+    try writer.writeByte('"');
+    for (value) |byte| {
+        switch (byte) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0...8, 11...12, 14...0x1f => try writer.print("\\u00{x:0>2}", .{byte}),
+            else => try writer.writeByte(byte),
+        }
+    }
+    try writer.writeByte('"');
 }
 
 fn argvFromTicket(allocator: std.mem.Allocator, ticket: *const execution_queue.Ticket) !std.array_list.Managed([]const u8) {
@@ -327,6 +438,39 @@ test "executor renders task history" {
     try std.testing.expect(process_console.lines.items.len > 0);
 }
 
+test "audit json line escapes command metadata" {
+    var queue = execution_queue.Queue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    try queue.enqueueSpec("demo.audit", .{
+        .command = .{
+            .executable = "zig",
+            .args = &.{ "build\ncheck", "\"quoted\"" },
+            .cwd = ".",
+        },
+    }, .{
+        .command = "zig build\ncheck \"quoted\"",
+        .cwd = ".",
+        .env_policy = .allowlist,
+        .fs_policy = .workspace_only,
+        .network_policy = .deny,
+        .output_sanitized = true,
+    });
+    var ticket = queue.takeNextQueued() orelse return error.ExpectedTicket;
+    defer ticket.deinit();
+    try queue.recordHistory(&ticket, ".", .finished, 0, 2, 0);
+
+    var line = try auditJsonLine(std.testing.allocator, queue.latestHistory().?);
+    defer line.deinit();
+    const bytes = line.written();
+    try std.testing.expect(std.mem.endsWith(u8, bytes, "\n"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, bytes[0 .. bytes.len - 1], '\n') == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\\\"quoted\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"schema\":\"zide.run-history.v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"intent\"") != null);
+}
+
 test "runner blocks approved command cwd traversal before spawn" {
     var queue = execution_queue.Queue.init(std.testing.allocator);
     defer queue.deinit();
@@ -348,7 +492,7 @@ test "runner blocks approved command cwd traversal before spawn" {
         .output_sanitized = true,
     });
 
-    const result = try runNext(&queue, &process_console, .{ .workspace_root = "." });
+    const result = try runNext(&queue, &process_console, .{ .workspace_root = ".", .audit_log = false });
     try std.testing.expect(std.meta.activeTag(result) == .blocked);
     try std.testing.expectEqual(@as(usize, 0), queue.queuedCount());
     try std.testing.expectEqual(@as(usize, 1), queue.history.items.len);
@@ -377,7 +521,7 @@ test "runner blocks obvious network command when network is denied" {
         .output_sanitized = true,
     });
 
-    const result = try runNext(&queue, &process_console, .{ .workspace_root = "." });
+    const result = try runNext(&queue, &process_console, .{ .workspace_root = ".", .audit_log = false });
     try std.testing.expect(std.meta.activeTag(result) == .blocked);
     try std.testing.expect(process_console.exit_code.? == -1);
     try std.testing.expectEqual(execution_queue.State.blocked, queue.latestHistory().?.state);
@@ -404,7 +548,7 @@ test "runner blocks obvious mutating command when workspace is read only" {
         .output_sanitized = true,
     });
 
-    const result = try runNext(&queue, &process_console, .{ .workspace_root = "." });
+    const result = try runNext(&queue, &process_console, .{ .workspace_root = ".", .audit_log = false });
     try std.testing.expect(std.meta.activeTag(result) == .blocked);
     try std.testing.expect(process_console.exit_code.? == -1);
     try std.testing.expectEqual(execution_queue.State.blocked, queue.latestHistory().?.state);

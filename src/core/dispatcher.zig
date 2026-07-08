@@ -381,6 +381,11 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         };
     }
 
+    if (std.mem.eql(u8, definition.id, "security.audit_log")) {
+        try renderRunAuditLog(app);
+        return .{ .completed = "run audit log rendered" };
+    }
+
     if (std.mem.eql(u8, definition.id, "git.overview") or std.mem.eql(u8, definition.id, "github.overview")) {
         var overview = try git_repository.inspect(app.allocator, &app.workspace, .{});
         defer overview.deinit();
@@ -593,6 +598,54 @@ fn renderTaskList(app: *app_mod.App, registry: *const task_registry.Registry, mi
         try writer.print("- {s}\n", .{task.name});
     }
     try app.process_console.appendBytes(.stderr, text.written());
+}
+
+fn renderRunAuditLog(app: *app_mod.App) !void {
+    const path = try std.fs.path.join(app.allocator, &.{ app.workspace.root_path, ".zide", "audit", "run-history.jsonl" });
+    defer app.allocator.free(path);
+
+    var file = std.Io.Dir.cwd().openFile(std.Options.debug_io, path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .lock = .shared,
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            try appendConsole(app, .stdout, "run audit log\npath: .zide/audit/run-history.jsonl\nstatus: no persisted launch audit yet\n", .{});
+            return;
+        },
+        else => return err,
+    };
+    defer file.close(std.Options.debug_io);
+
+    const length = try file.length(std.Options.debug_io);
+    const tail_len_u64 = @min(length, 64 * 1024);
+    const tail_len: usize = @intCast(tail_len_u64);
+    const offset = length - tail_len_u64;
+    const buffer = try app.allocator.alloc(u8, tail_len);
+    defer app.allocator.free(buffer);
+    const read_len = try file.readPositionalAll(std.Options.debug_io, buffer, offset);
+    const bytes = buffer[0..read_len];
+
+    var start: usize = 0;
+    if (offset > 0) {
+        if (std.mem.indexOfScalar(u8, bytes, '\n')) |line_end| {
+            start = line_end + 1;
+        }
+    }
+
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("run audit log\n");
+    try writer.writeAll("path: .zide/audit/run-history.jsonl\n");
+    try writer.print("bytes: {d}\n", .{length});
+    if (start > 0) try writer.writeAll("showing: tail, truncated to last 64 KiB boundary\n");
+    try writer.writeAll("--- jsonl begin ---\n");
+    try writer.writeAll(bytes[start..]);
+    if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') try writer.writeAll("\n");
+    try writer.writeAll("--- jsonl end ---\n");
+    try app.process_console.appendBytes(.stdout, text.written());
 }
 
 fn syncDiagnosticsFromConsole(app: *app_mod.App) !void {

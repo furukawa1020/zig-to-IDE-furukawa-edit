@@ -100,6 +100,7 @@ const definitions = [_]Definition{
     .{ .id = "diagnostics.next", .title = "Next Diagnostic", .description = "Jump to the next diagnostic.", .default_key = "f8", .scope = .workspace, .capability = .safe },
     .{ .id = "security.scan_current", .title = "Scan Current File", .description = "Scan the current file for Zig and polyglot security boundaries.", .default_key = "ctrl-alt-s", .scope = .workspace, .capability = .safe },
     .{ .id = "security.audit_workspace", .title = "Audit Workspace", .description = "Run static Security Workbench audit for the workspace.", .default_key = "ctrl-alt-a", .scope = .workspace, .capability = .safe },
+    .{ .id = "security.audit_log", .title = "Show Run Audit Log", .description = "Render persisted command launch audit JSONL without running external tools.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "security.mark_reviewed", .title = "Mark Workspace Reviewed", .description = "Mark the workspace as reviewed without allowing execution.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "security.trust_workspace", .title = "Trust Workspace", .description = "Trust audited workspace when no high-risk findings are present.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "security.lock_workspace", .title = "Lock Workspace", .description = "Lock workspace writes and execution until review.", .default_key = "", .scope = .workspace, .capability = .safe },
@@ -171,6 +172,8 @@ fn isBoundary(c: u8) bool {
 test "find command by id" {
     const definition = findById("zig.build") orelse return error.ExpectedCommand;
     try std.testing.expectEqual(Scope.zig, definition.scope);
+    const audit_definition = findById("security.audit_log") orelse return error.ExpectedCommand;
+    try std.testing.expectEqual(Capability.safe, audit_definition.capability);
 }
 
 test "fuzzy score prefers consecutive matches" {

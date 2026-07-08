@@ -4,6 +4,7 @@
 .zig-global-cache*/
 .zig-toolchain/
 .tools/
+.zide/audit/
 zig-cache/
 zig-out/
 zig-*.zip

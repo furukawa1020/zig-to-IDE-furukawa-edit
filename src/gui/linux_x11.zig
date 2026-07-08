@@ -16,15 +16,13 @@ const symbols_mod = @import("../language/symbols.zig");
 const findings_mod = @import("../security/findings.zig");
 const text_integrity = @import("../security/text_integrity.zig");
 const command_intent = @import("../security/command_intent.zig");
+const launch_audit = @import("../security/launch_audit.zig");
 const file_finder = @import("../search/file_finder.zig");
 const literal_search = @import("../search/literal.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const task_registry = @import("../tasks/registry.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
 const permissions = @import("../security/permissions.zig");
-
-const Sha256 = std.crypto.hash.sha2.Sha256;
-const LaunchFingerprint = [Sha256.digest_length * 2]u8;
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("linux_x11.zig is Linux-only");
@@ -2985,9 +2983,9 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
         }) catch "policy";
         try x11.text(x11.gc.muted, 18, bottom + 156, policy_line);
 
-        const fingerprint = launchFingerprint(ticket, state.app.workspace.root_path);
+        const fingerprint = launchAuditFingerprint(ticket, state.app.workspace.root_path);
         var fingerprint_buf: [120]u8 = undefined;
-        const fingerprint_line = std.fmt.bufPrint(fingerprint_buf[0..], "fingerprint sha256:{s}", .{fingerprint[0..32]}) catch "fingerprint";
+        const fingerprint_line = std.fmt.bufPrint(fingerprint_buf[0..], "audit sha256:{s}", .{fingerprint[0..32]}) catch "audit";
         try x11.text(x11.gc.cyan, 18, bottom + 180, fingerprint_line);
 
         var gate_buf: [720]u8 = undefined;
@@ -3031,10 +3029,11 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
     var y: i16 = history_top;
     for (queue.history.items[start..limit], start..) |entry, index| {
         var row_buf: [900]u8 = undefined;
-        const row = std.fmt.bufPrint(row_buf[0..], "{d}. {s} {s} lines:{d} clean:{d} intent:n{} w{} sh{} d{} pkg{} env:{s} fs:{s} net:{s}  {s}", .{
+        const row = std.fmt.bufPrint(row_buf[0..], "{d}. {s} {s} audit:{s} lines:{d} clean:{d} intent:n{} w{} sh{} d{} pkg{} env:{s} fs:{s} net:{s}  {s}", .{
             index + 1,
             @tagName(entry.state),
             exitCodeLabel(entry.exit_code),
+            entry.audit_id[0..12],
             entry.output_lines,
             entry.sanitized_controls,
             entry.intent.network,
@@ -4275,36 +4274,28 @@ fn boolLabel(value: bool) []const u8 {
     return if (value) "yes" else "no";
 }
 
-fn launchFingerprint(ticket: *const execution_queue.Ticket, workspace_root: []const u8) LaunchFingerprint {
-    var hasher = Sha256.init(.{});
-    updateLaunchHash(&hasher, "zide-launch-v1");
-    updateLaunchHash(&hasher, ticket.source_command_id);
-    updateLaunchHash(&hasher, ticket.display_command);
-    updateLaunchHash(&hasher, ticket.executable);
-    for (ticket.args.items) |arg| updateLaunchHash(&hasher, arg);
-    updateLaunchHash(&hasher, ticket.cwd);
-    updateLaunchHash(&hasher, workspace_root);
-    updateLaunchHash(&hasher, @tagName(ticket.env_policy));
-    updateLaunchHash(&hasher, @tagName(ticket.fs_policy));
-    updateLaunchHash(&hasher, @tagName(ticket.network_policy));
-    updateLaunchHash(&hasher, if (ticket.output_sanitized) "output:sanitized" else "output:raw");
-
-    var number_buf: [48]u8 = undefined;
-    if (ticket.timeout_ms) |ms| {
-        updateLaunchHash(&hasher, std.fmt.bufPrint(number_buf[0..], "timeout_ms:{d}", .{ms}) catch "timeout_ms:?");
-    } else {
-        updateLaunchHash(&hasher, "timeout_ms:none");
-    }
-    updateLaunchHash(&hasher, std.fmt.bufPrint(number_buf[0..], "output_limit_bytes:{d}", .{ticket.output_limit_bytes}) catch "output_limit_bytes:?");
-
-    var digest: [Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    return std.fmt.bytesToHex(digest, .lower);
-}
-
-fn updateLaunchHash(hasher: *Sha256, bytes: []const u8) void {
-    hasher.update(bytes);
-    hasher.update(&[_]u8{0});
+fn launchAuditFingerprint(ticket: *const execution_queue.Ticket, workspace_root: []const u8) launch_audit.Fingerprint {
+    const intent = command_intent.classify(ticket.executable, ticket.args.items);
+    return launch_audit.fingerprint(.{
+        .source_command_id = ticket.source_command_id,
+        .display_command = ticket.display_command,
+        .executable = ticket.executable,
+        .args = ticket.args.items,
+        .cwd = ticket.cwd,
+        .workspace_root = workspace_root,
+        .env_policy = @tagName(ticket.env_policy),
+        .fs_policy = @tagName(ticket.fs_policy),
+        .network_policy = @tagName(ticket.network_policy),
+        .output_sanitized = ticket.output_sanitized,
+        .timeout_ms = ticket.timeout_ms,
+        .output_limit_bytes = ticket.output_limit_bytes,
+        .intent_network = intent.network,
+        .intent_mutating = intent.mutating,
+        .intent_shell = intent.shell,
+        .intent_destructive = intent.destructive,
+        .intent_package_manager = intent.package_manager,
+        .intent_reason = intent.reason,
+    });
 }
 
 fn timeoutLabel(timeout_ms: ?u32) []const u8 {

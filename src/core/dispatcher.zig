@@ -2616,7 +2616,7 @@ test "task history command renders recorded command results" {
     });
     var ticket = app.execution_queue.takeNextQueued() orelse return error.ExpectedTicket;
     defer ticket.deinit();
-    try app.execution_queue.recordHistory(&ticket, .finished, 0, 2, 0);
+    try app.execution_queue.recordHistory(&ticket, app.workspace.root_path, .finished, 0, 2, 0);
 
     const result = try dispatch(&app, .{ .id = "task.history" });
     try std.testing.expect(std.meta.activeTag(result) == .completed);

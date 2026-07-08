@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_intent = @import("../security/command_intent.zig");
+const launch_audit = @import("../security/launch_audit.zig");
 const permissions = @import("../security/permissions.zig");
 const process = @import("../platform/process.zig");
 
@@ -99,6 +100,7 @@ pub const HistoryEntry = struct {
     fs_policy: permissions.FileSystemPolicy,
     network_policy: permissions.NetworkPolicy,
     intent: command_intent.Intent,
+    audit_id: launch_audit.Fingerprint,
     output_sanitized: bool,
     timeout_ms: ?u32,
     output_limit_bytes: usize,
@@ -110,6 +112,7 @@ pub const HistoryEntry = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         ticket: *const Ticket,
+        workspace_root: []const u8,
         state: State,
         exit_code: ?i32,
         output_lines: usize,
@@ -121,6 +124,7 @@ pub const HistoryEntry = struct {
         errdefer allocator.free(owned_display);
         const owned_cwd = try allocator.dupe(u8, ticket.cwd);
         errdefer allocator.free(owned_cwd);
+        const intent = command_intent.classify(ticket.executable, ticket.args.items);
 
         return .{
             .allocator = allocator,
@@ -130,7 +134,27 @@ pub const HistoryEntry = struct {
             .env_policy = ticket.env_policy,
             .fs_policy = ticket.fs_policy,
             .network_policy = ticket.network_policy,
-            .intent = command_intent.classify(ticket.executable, ticket.args.items),
+            .intent = intent,
+            .audit_id = launch_audit.fingerprint(.{
+                .source_command_id = ticket.source_command_id,
+                .display_command = ticket.display_command,
+                .executable = ticket.executable,
+                .args = ticket.args.items,
+                .cwd = ticket.cwd,
+                .workspace_root = workspace_root,
+                .env_policy = @tagName(ticket.env_policy),
+                .fs_policy = @tagName(ticket.fs_policy),
+                .network_policy = @tagName(ticket.network_policy),
+                .output_sanitized = ticket.output_sanitized,
+                .timeout_ms = ticket.timeout_ms,
+                .output_limit_bytes = ticket.output_limit_bytes,
+                .intent_network = intent.network,
+                .intent_mutating = intent.mutating,
+                .intent_shell = intent.shell,
+                .intent_destructive = intent.destructive,
+                .intent_package_manager = intent.package_manager,
+                .intent_reason = intent.reason,
+            }),
             .output_sanitized = ticket.output_sanitized,
             .timeout_ms = ticket.timeout_ms,
             .output_limit_bytes = ticket.output_limit_bytes,
@@ -225,6 +249,7 @@ pub const Queue = struct {
     pub fn recordHistory(
         self: *Queue,
         ticket: *const Ticket,
+        workspace_root: []const u8,
         state: State,
         exit_code: ?i32,
         output_lines: usize,
@@ -238,6 +263,7 @@ pub const Queue = struct {
         const entry = try HistoryEntry.init(
             self.allocator,
             ticket,
+            workspace_root,
             state,
             exit_code,
             output_lines,
@@ -378,12 +404,13 @@ test "execution queue records bounded run history" {
 
     var first = queue.takeNextQueued() orelse return error.ExpectedTicket;
     defer first.deinit();
-    try queue.recordHistory(&first, .finished, 0, 3, 1);
-    try queue.recordHistory(&first, .failed, -1, 4, 2);
+    try queue.recordHistory(&first, ".", .finished, 0, 3, 1);
+    try queue.recordHistory(&first, ".", .failed, -1, 4, 2);
 
     try std.testing.expectEqual(@as(usize, 1), queue.history.items.len);
     try std.testing.expectEqual(State.failed, queue.latestHistory().?.state);
     try std.testing.expectEqual(@as(usize, 2), queue.latestHistory().?.sanitized_controls);
     try std.testing.expect(queue.latestHistory().?.intent.mutating);
     try std.testing.expect(!queue.latestHistory().?.intent.network);
+    try std.testing.expectEqual(@as(usize, 64), queue.latestHistory().?.audit_id.len);
 }

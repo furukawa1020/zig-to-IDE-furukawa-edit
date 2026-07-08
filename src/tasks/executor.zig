@@ -90,7 +90,8 @@ pub fn renderHistory(queue: *const execution_queue.Queue, process_console: *cons
         } else {
             try writer.writeAll(" timeout_ms=none");
         }
-        try writer.print(" output_limit={d} lines={d} sanitized={d} intent:n{} w{} sh{} d{} pkg{} reason={s} cwd={s}\n", .{
+        try writer.print(" audit={s} output_limit={d} lines={d} sanitized={d} intent:n{} w{} sh{} d{} pkg{} reason={s} cwd={s}\n", .{
+            entry.audit_id[0..12],
             entry.output_limit_bytes,
             entry.output_lines,
             entry.sanitized_controls,
@@ -117,7 +118,7 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
         const message = "approved command cwd is outside the permitted workspace boundary";
         try appendFormatted(process_console, .stderr, "blocked: {s}\n", .{message});
         process_console.finish(-1);
-        try queue.recordHistory(&ticket, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+        try queue.recordHistory(&ticket, options.workspace_root, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
         return .{ .blocked = message };
     }
 
@@ -127,7 +128,7 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
         try appendFormatted(process_console, .stderr, "blocked: {s}\n", .{message});
         try appendFormatted(process_console, .stderr, "intent reason: {s}\n", .{intent.reason});
         process_console.finish(-1);
-        try queue.recordHistory(&ticket, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+        try queue.recordHistory(&ticket, options.workspace_root, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
         return .{ .blocked = message };
     }
 
@@ -136,7 +137,7 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
         try appendFormatted(process_console, .stderr, "blocked: {s}\n", .{message});
         try appendFormatted(process_console, .stderr, "intent reason: {s}\n", .{intent.reason});
         process_console.finish(-1);
-        try queue.recordHistory(&ticket, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+        try queue.recordHistory(&ticket, options.workspace_root, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
         return .{ .blocked = message };
     }
 
@@ -163,18 +164,18 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
         if (err == error.Timeout) {
             try appendTimeoutExceeded(process_console, ticket.timeout_ms);
             process_console.finish(-1);
-            try queue.recordHistory(&ticket, .timed_out, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+            try queue.recordHistory(&ticket, options.workspace_root, .timed_out, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
             return .timed_out;
         }
         if (err == error.StreamTooLong) {
             try appendFormatted(process_console, .stderr, "output exceeded {d} byte limit\n", .{ticket.output_limit_bytes});
             process_console.finish(-1);
-            try queue.recordHistory(&ticket, .output_limited, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+            try queue.recordHistory(&ticket, options.workspace_root, .output_limited, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
             return .output_limited;
         }
         try appendFormatted(process_console, .stderr, "spawn failed: {s}\n", .{@errorName(err)});
         process_console.finish(-1);
-        try queue.recordHistory(&ticket, .failed, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
+        try queue.recordHistory(&ticket, options.workspace_root, .failed, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
         return .{ .failed = @errorName(err) };
     };
     defer process_console.allocator.free(result.stdout);
@@ -185,7 +186,7 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
     const exit_code = termExitCode(result.term);
     process_console.finish(exit_code);
     try appendFormatted(process_console, .stdout, "exit: {d}\n", .{exit_code});
-    try queue.recordHistory(&ticket, .finished, exit_code, process_console.lines.items.len, process_console.sanitized_stats.total());
+    try queue.recordHistory(&ticket, options.workspace_root, .finished, exit_code, process_console.lines.items.len, process_console.sanitized_stats.total());
 
     return .{ .ran = exit_code };
 }
@@ -320,7 +321,7 @@ test "executor renders task history" {
     });
     var ticket = queue.takeNextQueued() orelse return error.ExpectedTicket;
     defer ticket.deinit();
-    try queue.recordHistory(&ticket, .finished, 0, 2, 0);
+    try queue.recordHistory(&ticket, ".", .finished, 0, 2, 0);
 
     try std.testing.expectEqual(HistoryResult.rendered, try renderHistory(&queue, &process_console));
     try std.testing.expect(process_console.lines.items.len > 0);

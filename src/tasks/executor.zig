@@ -1,6 +1,7 @@
 const std = @import("std");
 const console = @import("console.zig");
 const execution_queue = @import("execution_queue.zig");
+const command_intent = @import("../security/command_intent.zig");
 const permissions = @import("../security/permissions.zig");
 
 pub const PreviewResult = enum {
@@ -44,6 +45,15 @@ pub fn previewLatest(queue: *const execution_queue.Queue, process_console: *cons
     try writer.print("env: {s}\n", .{@tagName(ticket.env_policy)});
     try writer.print("fs: {s}\n", .{@tagName(ticket.fs_policy)});
     try writer.print("network: {s}\n", .{@tagName(ticket.network_policy)});
+    const intent = command_intent.classify(ticket.executable, ticket.args.items);
+    try writer.print("intent: network={} mutating={} shell={} destructive={} package={} reason={s}\n", .{
+        intent.network,
+        intent.mutating,
+        intent.shell,
+        intent.destructive,
+        intent.package_manager,
+        intent.reason,
+    });
     try writer.print("output_sanitized: {}\n", .{ticket.output_sanitized});
     if (ticket.timeout_ms) |ms| {
         try writer.print("timeout_ms: {d}\n", .{ms});
@@ -105,17 +115,20 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
         return .{ .blocked = message };
     }
 
-    if (looksNetworked(&ticket) and !permissions.allowsNetwork(ticket.network_policy)) {
+    const intent = command_intent.classify(ticket.executable, ticket.args.items);
+    if (intent.network and !permissions.allowsNetwork(ticket.network_policy)) {
         const message = "approved command looks networked but network policy is deny";
         try appendFormatted(process_console, .stderr, "blocked: {s}\n", .{message});
+        try appendFormatted(process_console, .stderr, "intent reason: {s}\n", .{intent.reason});
         process_console.finish(-1);
         try queue.recordHistory(&ticket, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
         return .{ .blocked = message };
     }
 
-    if (ticket.fs_policy == .read_only_workspace and looksWorkspaceMutating(&ticket)) {
+    if (ticket.fs_policy == .read_only_workspace and intent.mutating) {
         const message = "approved command looks mutating but file system policy is read_only_workspace";
         try appendFormatted(process_console, .stderr, "blocked: {s}\n", .{message});
+        try appendFormatted(process_console, .stderr, "intent reason: {s}\n", .{intent.reason});
         process_console.finish(-1);
         try queue.recordHistory(&ticket, .blocked, -1, process_console.lines.items.len, process_console.sanitized_stats.total());
         return .{ .blocked = message };
@@ -204,121 +217,6 @@ fn environmentMapForPolicy(
             return filtered;
         },
     }
-}
-
-fn looksNetworked(ticket: *const execution_queue.Ticket) bool {
-    if (looksNetworkExecutable(ticket.executable)) return true;
-    for (ticket.args.items) |arg| {
-        if (std.mem.indexOf(u8, arg, "://") != null) return true;
-        if (std.mem.startsWith(u8, arg, "git@")) return true;
-    }
-    return false;
-}
-
-fn looksNetworkExecutable(executable: []const u8) bool {
-    const basename = std.fs.path.basename(executable);
-    const known = [_][]const u8{
-        "curl",
-        "curl.exe",
-        "wget",
-        "wget.exe",
-        "git",
-        "git.exe",
-        "ssh",
-        "ssh.exe",
-        "scp",
-        "scp.exe",
-        "sftp",
-        "sftp.exe",
-    };
-    for (known) |candidate| {
-        if (std.ascii.eqlIgnoreCase(basename, candidate)) return true;
-    }
-    return false;
-}
-
-fn looksWorkspaceMutating(ticket: *const execution_queue.Ticket) bool {
-    const basename = std.fs.path.basename(ticket.executable);
-    if (looksAlwaysMutatingExecutable(basename)) return true;
-
-    if (std.ascii.eqlIgnoreCase(basename, "zig") or std.ascii.eqlIgnoreCase(basename, "zig.exe")) {
-        return firstArgIn(ticket, &.{ "build", "test", "fmt", "run", "cc", "c++", "ar", "objcopy", "init", "fetch" });
-    }
-    if (std.ascii.eqlIgnoreCase(basename, "git") or std.ascii.eqlIgnoreCase(basename, "git.exe")) {
-        return firstArgIn(ticket, &.{ "add", "am", "apply", "bisect", "checkout", "clean", "clone", "commit", "fetch", "init", "merge", "mv", "pull", "push", "rebase", "reset", "restore", "rm", "stash", "submodule", "switch" });
-    }
-    if (std.ascii.eqlIgnoreCase(basename, "cargo") or std.ascii.eqlIgnoreCase(basename, "cargo.exe")) {
-        return !firstArgIn(ticket, &.{"metadata"});
-    }
-    if (std.ascii.eqlIgnoreCase(basename, "go") or std.ascii.eqlIgnoreCase(basename, "go.exe")) {
-        return firstArgIn(ticket, &.{ "build", "clean", "env", "fmt", "generate", "get", "install", "mod", "run", "test", "work" });
-    }
-    if (std.ascii.eqlIgnoreCase(basename, "npm") or std.ascii.eqlIgnoreCase(basename, "npm.cmd") or
-        std.ascii.eqlIgnoreCase(basename, "pnpm") or std.ascii.eqlIgnoreCase(basename, "pnpm.cmd") or
-        std.ascii.eqlIgnoreCase(basename, "yarn") or std.ascii.eqlIgnoreCase(basename, "yarn.cmd") or
-        std.ascii.eqlIgnoreCase(basename, "bun") or std.ascii.eqlIgnoreCase(basename, "bun.exe"))
-    {
-        return firstArgIn(ticket, &.{ "add", "build", "ci", "exec", "install", "rebuild", "remove", "run", "test", "update" });
-    }
-
-    for (ticket.args.items) |arg| {
-        if (std.mem.eql(u8, arg, ">") or std.mem.eql(u8, arg, ">>")) return true;
-        if (std.mem.indexOf(u8, arg, "--write") != null) return true;
-        if (std.mem.indexOf(u8, arg, "--fix") != null) return true;
-        if (std.mem.indexOf(u8, arg, "--in-place") != null) return true;
-    }
-    return false;
-}
-
-fn looksAlwaysMutatingExecutable(basename: []const u8) bool {
-    const known = [_][]const u8{
-        "bash",
-        "bash.exe",
-        "cmd",
-        "cmd.exe",
-        "cmake",
-        "cmake.exe",
-        "cp",
-        "cp.exe",
-        "copy",
-        "del",
-        "make",
-        "make.exe",
-        "mkdir",
-        "mkdir.exe",
-        "move",
-        "mv",
-        "mv.exe",
-        "ninja",
-        "ninja.exe",
-        "powershell",
-        "powershell.exe",
-        "pwsh",
-        "pwsh.exe",
-        "rm",
-        "rm.exe",
-        "rmdir",
-        "rmdir.exe",
-        "sh",
-        "sh.exe",
-        "tee",
-        "tee.exe",
-        "touch",
-        "touch.exe",
-    };
-    for (known) |candidate| {
-        if (std.ascii.eqlIgnoreCase(basename, candidate)) return true;
-    }
-    return false;
-}
-
-fn firstArgIn(ticket: *const execution_queue.Ticket, comptime names: []const []const u8) bool {
-    if (ticket.args.items.len == 0) return false;
-    const first = ticket.args.items[0];
-    for (names) |name| {
-        if (std.ascii.eqlIgnoreCase(first, name)) return true;
-    }
-    return false;
 }
 
 fn termExitCode(term: std.process.Child.Term) i32 {

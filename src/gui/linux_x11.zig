@@ -3031,12 +3031,17 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
     var y: i16 = history_top;
     for (queue.history.items[start..limit], start..) |entry, index| {
         var row_buf: [900]u8 = undefined;
-        const row = std.fmt.bufPrint(row_buf[0..], "{d}. {s} {s} lines:{d} clean:{d} env:{s} fs:{s} net:{s}  {s}", .{
+        const row = std.fmt.bufPrint(row_buf[0..], "{d}. {s} {s} lines:{d} clean:{d} intent:n{} w{} sh{} d{} pkg{} env:{s} fs:{s} net:{s}  {s}", .{
             index + 1,
             @tagName(entry.state),
             exitCodeLabel(entry.exit_code),
             entry.output_lines,
             entry.sanitized_controls,
+            entry.intent.network,
+            entry.intent.mutating,
+            entry.intent.shell,
+            entry.intent.destructive,
+            entry.intent.package_manager,
             @tagName(entry.env_policy),
             @tagName(entry.fs_policy),
             @tagName(entry.network_policy),

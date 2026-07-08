@@ -90,10 +90,16 @@ pub fn renderHistory(queue: *const execution_queue.Queue, process_console: *cons
         } else {
             try writer.writeAll(" timeout_ms=none");
         }
-        try writer.print(" output_limit={d} lines={d} sanitized={d} cwd={s}\n", .{
+        try writer.print(" output_limit={d} lines={d} sanitized={d} intent:n{} w{} sh{} d{} pkg{} reason={s} cwd={s}\n", .{
             entry.output_limit_bytes,
             entry.output_lines,
             entry.sanitized_controls,
+            entry.intent.network,
+            entry.intent.mutating,
+            entry.intent.shell,
+            entry.intent.destructive,
+            entry.intent.package_manager,
+            entry.intent.reason,
             entry.cwd,
         });
     }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const command_intent = @import("../security/command_intent.zig");
 const permissions = @import("../security/permissions.zig");
 const process = @import("../platform/process.zig");
 
@@ -97,6 +98,7 @@ pub const HistoryEntry = struct {
     env_policy: permissions.EnvPolicy,
     fs_policy: permissions.FileSystemPolicy,
     network_policy: permissions.NetworkPolicy,
+    intent: command_intent.Intent,
     output_sanitized: bool,
     timeout_ms: ?u32,
     output_limit_bytes: usize,
@@ -128,6 +130,7 @@ pub const HistoryEntry = struct {
             .env_policy = ticket.env_policy,
             .fs_policy = ticket.fs_policy,
             .network_policy = ticket.network_policy,
+            .intent = command_intent.classify(ticket.executable, ticket.args.items),
             .output_sanitized = ticket.output_sanitized,
             .timeout_ms = ticket.timeout_ms,
             .output_limit_bytes = ticket.output_limit_bytes,
@@ -381,4 +384,6 @@ test "execution queue records bounded run history" {
     try std.testing.expectEqual(@as(usize, 1), queue.history.items.len);
     try std.testing.expectEqual(State.failed, queue.latestHistory().?.state);
     try std.testing.expectEqual(@as(usize, 2), queue.latestHistory().?.sanitized_controls);
+    try std.testing.expect(queue.latestHistory().?.intent.mutating);
+    try std.testing.expect(!queue.latestHistory().?.intent.network);
 }

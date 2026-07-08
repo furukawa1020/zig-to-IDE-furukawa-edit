@@ -39,6 +39,7 @@ const LINE_HEIGHT = 19;
 const EDITOR_LEFT = FILE_WIDTH + 24;
 const EDITOR_TOP = HEADER_HEIGHT + 58;
 const EDITOR_TEXT_TOP = EDITOR_TOP + 44;
+const X11_SHIFT_MASK: u16 = 1 << 0;
 
 const X = struct {
     const EventMask = struct {
@@ -915,7 +916,11 @@ const LinuxGuiState = struct {
     last_document_search_options: literal_search.Options = .{},
     selection_anchor: ?usize = null,
     editor_dragging: bool = false,
+    last_editor_click_time: u32 = 0,
+    last_editor_click_x: i16 = 0,
+    last_editor_click_y: i16 = 0,
     clipboard: std.array_list.Managed(u8),
+    primary_selection: std.array_list.Managed(u8),
     clipboard_owned: bool = false,
     primary_owned: bool = false,
     bottom_panel: BottomPanel = .output,
@@ -948,12 +953,14 @@ const LinuxGuiState = struct {
             .collapsed_dirs = collapsed_dirs,
             .last_document_search_query = std.array_list.Managed(u8).init(allocator),
             .clipboard = std.array_list.Managed(u8).init(allocator),
+            .primary_selection = std.array_list.Managed(u8).init(allocator),
         };
     }
 
     fn deinit(self: *LinuxGuiState) void {
         self.clearExtensionsRegistry();
         self.clearGitOverview();
+        self.primary_selection.deinit();
         self.clipboard.deinit();
         self.last_document_search_query.deinit();
         self.quick_panel.deinit();
@@ -1353,6 +1360,23 @@ const LinuxGuiState = struct {
         self.selection_anchor = null;
     }
 
+    fn publishPrimarySelection(self: *LinuxGuiState, x11: *X11) void {
+        const doc = self.app.documents.active() orelse return;
+        const range = self.selectedRange(doc) orelse return;
+        self.primary_selection.clearRetainingCapacity();
+        self.primary_selection.appendSlice(doc.text.bytes[range.start..range.end]) catch |err| {
+            self.primary_owned = false;
+            self.appendOutput(.stderr, "x11 primary copy failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        x11.setSelectionOwner(x11.atoms.primary) catch |err| {
+            self.primary_owned = false;
+            self.appendOutput(.stderr, "x11 primary owner failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.primary_owned = true;
+    }
+
     fn deleteSelectedRange(self: *LinuxGuiState, doc: *document_mod.Document) bool {
         const range = self.selectedRange(doc) orelse return false;
         doc.deleteRange(range.start, range.end) catch |err| {
@@ -1394,7 +1418,7 @@ const LinuxGuiState = struct {
         self.insertText(doc.preferredNewline());
     }
 
-    fn selectAll(self: *LinuxGuiState) void {
+    fn selectAll(self: *LinuxGuiState, x11: *X11) void {
         const doc = self.app.documents.active() orelse return;
         self.selection_anchor = 0;
         const position = doc.positionFromOffset(doc.text.bytes.len) catch return;
@@ -1402,6 +1426,7 @@ const LinuxGuiState = struct {
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureEditorCursorVisible();
+        self.publishPrimarySelection(x11);
         self.message("selected all", .{});
     }
 
@@ -1415,6 +1440,12 @@ const LinuxGuiState = struct {
         self.clipboard.appendSlice(doc.text.bytes[range.start..range.end]) catch |err| {
             self.message("copy failed: {s}", .{@errorName(err)});
             self.appendOutput(.stderr, "clipboard copy failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        self.primary_selection.clearRetainingCapacity();
+        self.primary_selection.appendSlice(self.clipboard.items) catch |err| {
+            self.message("primary copy failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "primary copy failed: {s}\n", .{@errorName(err)});
             return false;
         };
         x11.setSelectionOwner(x11.atoms.clipboard) catch |err| {
@@ -1480,11 +1511,11 @@ const LinuxGuiState = struct {
             return;
         }
 
-        if (self.clipboard.items.len == 0) {
-            self.message("clipboard is empty", .{});
+        if (self.primary_selection.items.len == 0) {
+            self.message("primary is empty", .{});
             return;
         }
-        self.insertText(self.clipboard.items);
+        self.insertText(self.primary_selection.items);
         self.message("pasted from ZIDE primary", .{});
     }
 
@@ -1506,12 +1537,12 @@ const LinuxGuiState = struct {
             return;
         }
 
-        if (self.clipboard.items.len == 0) return self.message("primary is empty", .{});
-        self.insertText(self.clipboard.items);
+        if (self.primary_selection.items.len == 0) return self.message("primary is empty", .{});
+        self.insertText(self.primary_selection.items);
         self.message("pasted from ZIDE primary", .{});
     }
 
-    fn moveEditorCursor(self: *LinuxGuiState, move: navigation.Move, extend_selection: bool) void {
+    fn moveEditorCursor(self: *LinuxGuiState, x11: *X11, move: navigation.Move, extend_selection: bool) void {
         const doc = self.app.documents.active() orelse return;
         const anchor = doc.cursor.position.byte_offset;
         if (extend_selection and self.selection_anchor == null) {
@@ -1525,6 +1556,7 @@ const LinuxGuiState = struct {
         }
         self.app.focus = .editor;
         self.ensureEditorCursorVisible();
+        if (extend_selection) self.publishPrimarySelection(x11);
     }
 
     fn handleSelectionClear(self: *LinuxGuiState, selection: u32, x11: *const X11) void {
@@ -1546,9 +1578,13 @@ const LinuxGuiState = struct {
         const property = if (requested_property == 0) target else requested_property;
         var response_property: u32 = 0;
 
-        const owns_selection =
-            (selection == x11.atoms.clipboard and self.clipboard_owned) or
-            (selection == x11.atoms.primary and self.primary_owned);
+        const selection_data: ?[]const u8 = if (selection == x11.atoms.clipboard and self.clipboard_owned)
+            self.clipboard.items
+        else if (selection == x11.atoms.primary and self.primary_owned)
+            self.primary_selection.items
+        else
+            null;
+        const owns_selection = selection_data != null;
         if (owns_selection) {
             if (target == x11.atoms.targets) {
                 var data: [16]u8 = undefined;
@@ -1561,7 +1597,7 @@ const LinuxGuiState = struct {
                 };
                 response_property = property;
             } else if (target == x11.atoms.utf8_string or target == x11.atoms.string or target == x11.atoms.text) {
-                x11.changeProperty8(requestor, property, target, self.clipboard.items) catch |err| {
+                x11.changeProperty8(requestor, property, target, selection_data.?) catch |err| {
                     self.appendOutput(.stderr, "x11 clipboard transfer failed: {s}\n", .{@errorName(err)});
                 };
                 response_property = property;
@@ -2459,7 +2495,7 @@ const LinuxGuiState = struct {
                 switch (key.code) {
                     .char => |char| {
                         if (char == 'a' or char == 'A') {
-                            self.selectAll();
+                            self.selectAll(x11);
                             return;
                         }
                         if (char == 'c' or char == 'C') {
@@ -2500,19 +2536,19 @@ const LinuxGuiState = struct {
                     return;
                 },
                 .arrow_left => {
-                    self.moveEditorCursor(.left, key.modifiers.shift);
+                    self.moveEditorCursor(x11, .left, key.modifiers.shift);
                     return;
                 },
                 .arrow_right => {
-                    self.moveEditorCursor(.right, key.modifiers.shift);
+                    self.moveEditorCursor(x11, .right, key.modifiers.shift);
                     return;
                 },
                 .arrow_up => {
-                    self.moveEditorCursor(.up, key.modifiers.shift);
+                    self.moveEditorCursor(x11, .up, key.modifiers.shift);
                     return;
                 },
                 .arrow_down => {
-                    self.moveEditorCursor(.down, key.modifiers.shift);
+                    self.moveEditorCursor(x11, .down, key.modifiers.shift);
                     return;
                 },
                 .char => |char| {
@@ -2529,7 +2565,7 @@ const LinuxGuiState = struct {
             switch (key.code) {
                 .char => |char| {
                     if (char == 'a' or char == 'A') {
-                        self.selectAll();
+                        self.selectAll(x11);
                         return;
                     }
                     if (char == 'c' or char == 'C') {
@@ -2552,19 +2588,19 @@ const LinuxGuiState = struct {
         if (self.app.focus == .editor) {
             switch (key.code) {
                 .arrow_left => {
-                    self.moveEditorCursor(.left, key.modifiers.shift);
+                    self.moveEditorCursor(x11, .left, key.modifiers.shift);
                     return;
                 },
                 .arrow_right => {
-                    self.moveEditorCursor(.right, key.modifiers.shift);
+                    self.moveEditorCursor(x11, .right, key.modifiers.shift);
                     return;
                 },
                 .arrow_up => {
-                    self.moveEditorCursor(.up, key.modifiers.shift);
+                    self.moveEditorCursor(x11, .up, key.modifiers.shift);
                     return;
                 },
                 .arrow_down => {
-                    self.moveEditorCursor(.down, key.modifiers.shift);
+                    self.moveEditorCursor(x11, .down, key.modifiers.shift);
                     return;
                 },
                 else => {},
@@ -2771,7 +2807,7 @@ const LinuxGuiState = struct {
         self.message("deleted forward", .{});
     }
 
-    fn handlePointer(self: *LinuxGuiState, x11: *X11, button: u8, x: i16, y: i16) void {
+    fn handlePointer(self: *LinuxGuiState, x11: *X11, button: u8, x: i16, y: i16, time: u32, state_mask: u16) void {
         if (button == 4 or button == 5) {
             const delta: isize = if (button == 4) -3 else 3;
             if (x < FILE_WIDTH) {
@@ -2789,7 +2825,7 @@ const LinuxGuiState = struct {
             return;
         }
         if (button != 1) return;
-        self.handleClick(x, y);
+        self.handleClick(x11, x, y, time, state_mask);
     }
 
     fn handlePointerMotion(self: *LinuxGuiState, x: i16, y: i16) void {
@@ -2802,16 +2838,20 @@ const LinuxGuiState = struct {
         self.ensureEditorCursorVisible();
     }
 
-    fn handlePointerRelease(self: *LinuxGuiState, button: u8) void {
+    fn handlePointerRelease(self: *LinuxGuiState, x11: *X11, button: u8) void {
         if (button != 1) return;
         if (!self.editor_dragging) return;
         self.editor_dragging = false;
         if (self.app.documents.active()) |doc| {
-            if (self.selectedRange(doc) == null) self.clearSelection();
+            if (self.selectedRange(doc) == null) {
+                self.clearSelection();
+            } else {
+                self.publishPrimarySelection(x11);
+            }
         }
     }
 
-    fn handleClick(self: *LinuxGuiState, x: i16, y: i16) void {
+    fn handleClick(self: *LinuxGuiState, x11: *X11, x: i16, y: i16, time: u32, state_mask: u16) void {
         if (self.quick_panel.visible) {
             if (self.handleQuickPanelClick(x, y)) return;
         }
@@ -2850,7 +2890,12 @@ const LinuxGuiState = struct {
 
         if (y >= HEADER_HEIGHT and y < bottom and x >= FILE_WIDTH) {
             self.app.focus = .editor;
-            self.beginEditorSelection(x, y);
+            const extend_selection = (state_mask & X11_SHIFT_MASK) != 0;
+            if (!extend_selection and self.consumeEditorDoubleClick(time, x, y)) {
+                if (!self.selectIdentifierAtPoint(x11, x, y)) self.beginEditorSelection(x11, x, y, false);
+            } else {
+                self.beginEditorSelection(x11, x, y, extend_selection);
+            }
             if (self.app.documents.active() != null) self.app.mode = .insert;
             return;
         }
@@ -3008,11 +3053,69 @@ const LinuxGuiState = struct {
         return true;
     }
 
-    fn beginEditorSelection(self: *LinuxGuiState, x: i16, y: i16) void {
+    fn consumeEditorDoubleClick(self: *LinuxGuiState, time: u32, x: i16, y: i16) bool {
+        const elapsed = time -% self.last_editor_click_time;
+        const close_x = absI16(x - self.last_editor_click_x) <= 5;
+        const close_y = absI16(y - self.last_editor_click_y) <= 5;
+        const is_double = self.last_editor_click_time != 0 and elapsed <= 500 and close_x and close_y;
+        self.last_editor_click_time = time;
+        self.last_editor_click_x = x;
+        self.last_editor_click_y = y;
+        return is_double;
+    }
+
+    fn selectIdentifierAtPoint(self: *LinuxGuiState, x11: *X11, x: i16, y: i16) bool {
+        const doc = self.app.documents.active() orelse return false;
+        const position = self.editorPositionFromPoint(x, y) orelse return false;
+        const source = doc.text.bytes;
+        if (source.len == 0) return false;
+        var at = @min(position.byte_offset, source.len - 1);
+        if (!isIdentifierByte(source[at])) {
+            if (position.byte_offset > 0 and isIdentifierByte(source[position.byte_offset - 1])) {
+                at = position.byte_offset - 1;
+            } else {
+                navigation.setCursor(doc, position);
+                self.clearSelection();
+                self.ensureEditorCursorVisible();
+                self.message("cursor: {d}:{d}", .{ position.line + 1, position.column + 1 });
+                return false;
+            }
+        }
+
+        var start = at;
+        while (start > 0 and isIdentifierByte(source[start - 1])) : (start -= 1) {}
+        var end = at + 1;
+        while (end < source.len and isIdentifierByte(source[end])) : (end += 1) {}
+        if (start == end) return false;
+
+        self.selection_anchor = start;
+        navigation.setCursor(doc, doc.positionFromOffset(end) catch position);
+        self.editor_dragging = false;
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        self.publishPrimarySelection(x11);
+        self.message("selected identifier", .{});
+        return true;
+    }
+
+    fn beginEditorSelection(self: *LinuxGuiState, x11: *X11, x: i16, y: i16, extend_selection: bool) void {
         const doc = self.app.documents.active() orelse return;
+        const previous = doc.cursor.position.byte_offset;
         const position = self.editorPositionFromPoint(x, y) orelse return;
-        self.selection_anchor = position.byte_offset;
+        if (extend_selection) {
+            if (self.selection_anchor == null) self.selection_anchor = previous;
+        } else {
+            self.selection_anchor = position.byte_offset;
+        }
         navigation.setCursor(doc, position);
+        if (extend_selection) {
+            if (self.selectedRange(doc) == null) {
+                self.clearSelection();
+            } else {
+                self.publishPrimarySelection(x11);
+            }
+        }
         self.editor_dragging = true;
         self.app.focus = .editor;
         self.app.mode = .insert;
@@ -3124,11 +3227,11 @@ pub fn run(
                 }
             },
             4 => {
-                state.handlePointer(&x11, event[1], @bitCast(readLe16(event[24..26])), @bitCast(readLe16(event[26..28])));
+                state.handlePointer(&x11, event[1], @bitCast(readLe16(event[24..26])), @bitCast(readLe16(event[26..28])), readLe32(event[4..8]), readLe16(event[28..30]));
                 try draw(&x11, &state);
             },
             5 => {
-                state.handlePointerRelease(event[1]);
+                state.handlePointerRelease(&x11, event[1]);
                 try draw(&x11, &state);
             },
             6 => {
@@ -4944,6 +5047,11 @@ fn isValidIdentifierName(name: []const u8) bool {
         if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
     }
     return true;
+}
+
+fn absI16(value: i16) u16 {
+    const wide: i32 = value;
+    return @intCast(if (wide < 0) -wide else wide);
 }
 
 fn identifierAtOffset(source: []const u8, offset: usize) ?[]const u8 {

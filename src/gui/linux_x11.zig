@@ -1424,6 +1424,13 @@ const LinuxGuiState = struct {
             return false;
         };
         self.clipboard_owned = true;
+        x11.setSelectionOwner(x11.atoms.primary) catch |err| {
+            self.primary_owned = false;
+            self.appendOutput(.stderr, "x11 primary owner failed: {s}\n", .{@errorName(err)});
+            self.message("copied selection (clipboard only)", .{});
+            return true;
+        };
+        self.primary_owned = true;
         self.message("copied selection", .{});
         return true;
     }
@@ -1437,15 +1444,8 @@ const LinuxGuiState = struct {
 
     fn pasteFromClipboard(self: *LinuxGuiState, x11: *X11) void {
         if (!self.clipboard_owned) {
-            const external = x11.requestClipboardText(self.allocator) catch |err| {
-                if (self.clipboard.items.len == 0) {
-                    self.message("clipboard paste failed: {s}", .{@errorName(err)});
-                    self.appendOutput(.stderr, "x11 clipboard paste failed: {s}\n", .{@errorName(err)});
-                    return;
-                }
-                self.message("external clipboard unavailable; using ZIDE clipboard", .{});
-                self.insertText(self.clipboard.items);
-                return;
+            const external = x11.requestSelectionText(self.allocator, x11.atoms.clipboard) catch |clipboard_err| {
+                return self.pasteFromPrimaryOrLocal(x11, clipboard_err);
             };
             defer self.allocator.free(external);
             if (external.len == 0) return;
@@ -1459,6 +1459,56 @@ const LinuxGuiState = struct {
         }
         self.insertText(self.clipboard.items);
         self.message("pasted", .{});
+    }
+
+    fn pasteFromPrimaryOrLocal(self: *LinuxGuiState, x11: *X11, clipboard_err: anyerror) void {
+        if (!self.primary_owned) {
+            const primary = x11.requestSelectionText(self.allocator, x11.atoms.primary) catch |primary_err| {
+                if (self.clipboard.items.len == 0) {
+                    self.message("clipboard paste failed: {s}", .{@errorName(clipboard_err)});
+                    self.appendOutput(.stderr, "x11 clipboard paste failed: {s}; primary failed: {s}\n", .{ @errorName(clipboard_err), @errorName(primary_err) });
+                    return;
+                }
+                self.message("external clipboard unavailable; using ZIDE clipboard", .{});
+                self.insertText(self.clipboard.items);
+                return;
+            };
+            defer self.allocator.free(primary);
+            if (primary.len == 0) return;
+            self.insertText(primary);
+            self.message("pasted from X11 primary", .{});
+            return;
+        }
+
+        if (self.clipboard.items.len == 0) {
+            self.message("clipboard is empty", .{});
+            return;
+        }
+        self.insertText(self.clipboard.items);
+        self.message("pasted from ZIDE primary", .{});
+    }
+
+    fn pasteFromPrimary(self: *LinuxGuiState, x11: *X11) void {
+        if (!self.primary_owned) {
+            const primary = x11.requestSelectionText(self.allocator, x11.atoms.primary) catch |err| {
+                if (self.clipboard.items.len == 0) {
+                    self.message("primary paste failed: {s}", .{@errorName(err)});
+                    return;
+                }
+                self.insertText(self.clipboard.items);
+                self.message("primary unavailable; pasted ZIDE clipboard", .{});
+                return;
+            };
+            defer self.allocator.free(primary);
+            if (primary.len == 0) return;
+            self.insertText(primary);
+            self.message("pasted from X11 primary", .{});
+            return;
+        }
+
+        if (self.clipboard.items.len == 0) return self.message("primary is empty", .{});
+        self.insertText(self.clipboard.items);
+        self.message("pasted from ZIDE primary", .{});
     }
 
     fn moveEditorCursor(self: *LinuxGuiState, move: navigation.Move, extend_selection: bool) void {
@@ -1481,6 +1531,9 @@ const LinuxGuiState = struct {
         if (selection == x11.atoms.clipboard) {
             self.clipboard_owned = false;
             self.message("x11 clipboard ownership moved", .{});
+        } else if (selection == x11.atoms.primary) {
+            self.primary_owned = false;
+            self.message("x11 primary ownership moved", .{});
         }
     }
 
@@ -1493,7 +1546,10 @@ const LinuxGuiState = struct {
         const property = if (requested_property == 0) target else requested_property;
         var response_property: u32 = 0;
 
-        if (selection == x11.atoms.clipboard and self.clipboard_owned) {
+        const owns_selection =
+            (selection == x11.atoms.clipboard and self.clipboard_owned) or
+            (selection == x11.atoms.primary and self.primary_owned);
+        if (owns_selection) {
             if (target == x11.atoms.targets) {
                 var data: [16]u8 = undefined;
                 writeLe32(data[0..4], x11.atoms.targets);
@@ -2715,7 +2771,7 @@ const LinuxGuiState = struct {
         self.message("deleted forward", .{});
     }
 
-    fn handlePointer(self: *LinuxGuiState, button: u8, x: i16, y: i16) void {
+    fn handlePointer(self: *LinuxGuiState, x11: *X11, button: u8, x: i16, y: i16) void {
         if (button == 4 or button == 5) {
             const delta: isize = if (button == 4) -3 else 3;
             if (x < FILE_WIDTH) {
@@ -2725,6 +2781,11 @@ const LinuxGuiState = struct {
             } else if (y < self.window_height - STATUS_HEIGHT) {
                 self.scrollBottomPanel(delta);
             }
+            return;
+        }
+        if (button == 2 and x >= FILE_WIDTH and y >= HEADER_HEIGHT and y < self.bottomTop()) {
+            self.app.focus = .editor;
+            self.pasteFromPrimary(x11);
             return;
         }
         if (button != 1) return;
@@ -3063,7 +3124,7 @@ pub fn run(
                 }
             },
             4 => {
-                state.handlePointer(event[1], @bitCast(readLe16(event[24..26])), @bitCast(readLe16(event[26..28])));
+                state.handlePointer(&x11, event[1], @bitCast(readLe16(event[24..26])), @bitCast(readLe16(event[26..28])));
                 try draw(&x11, &state);
             },
             5 => {

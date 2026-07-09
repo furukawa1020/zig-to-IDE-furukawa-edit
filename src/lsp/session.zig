@@ -54,6 +54,7 @@ pub const IngestResult = union(enum) {
     completion: usize,
     hover: usize,
     locations: usize,
+    workspace_edit: usize,
     acknowledged: RequestKind,
 };
 
@@ -67,6 +68,7 @@ pub const Session = struct {
     last_completion: ?responses.CompletionItems = null,
     last_hover: ?responses.Hover = null,
     last_locations: ?responses.Locations = null,
+    last_workspace_edit: ?responses.WorkspaceEdit = null,
 
     pub fn init(allocator: std.mem.Allocator, workspace_root: []const u8) !Session {
         return .{
@@ -103,6 +105,7 @@ pub const Session = struct {
             .completion => self.clearLastCompletion(),
             .hover => self.clearLastHover(),
             .definition, .references, .implementation, .type_definition => self.clearLastLocations(),
+            .rename => self.clearLastWorkspaceEdit(),
             else => {},
         }
     }
@@ -247,7 +250,15 @@ pub const Session = struct {
                 }
                 return .ignored;
             },
-            .document_highlight, .signature_help, .rename, .document_symbol, .workspace_symbol => {
+            .rename => {
+                if (try responses.parseWorkspaceEditResponse(self.allocator, payload, self.workspace_root)) |edit| {
+                    self.clearLastWorkspaceEdit();
+                    self.last_workspace_edit = edit;
+                    return .{ .workspace_edit = edit.edits.len };
+                }
+                return .ignored;
+            },
+            .document_highlight, .signature_help, .document_symbol, .workspace_symbol => {
                 return .{ .acknowledged = pending.kind };
             },
         }
@@ -316,6 +327,7 @@ pub const Session = struct {
         self.clearLastCompletion();
         self.clearLastHover();
         self.clearLastLocations();
+        self.clearLastWorkspaceEdit();
     }
 
     fn clearLastCompletion(self: *Session) void {
@@ -331,6 +343,11 @@ pub const Session = struct {
     fn clearLastLocations(self: *Session) void {
         if (self.last_locations) |*locations| locations.deinit();
         self.last_locations = null;
+    }
+
+    fn clearLastWorkspaceEdit(self: *Session) void {
+        if (self.last_workspace_edit) |*edit| edit.deinit();
+        self.last_workspace_edit = null;
     }
 };
 
@@ -456,4 +473,23 @@ test "session routes definition locations by pending id" {
     try std.testing.expectEqual(IngestResult{ .locations = 1 }, result);
     try std.testing.expect(session.last_locations != null);
     try std.testing.expectEqualStrings("src/lib.zig", session.last_locations.?.items[0].path);
+}
+
+test "session routes rename workspace edit by pending id" {
+    var session = try Session.init(std.testing.allocator, "/tmp/project");
+    defer session.deinit();
+
+    var outbound = try session.requestRename("src/main.zig", .{ .line = 0, .column = 4, .byte_offset = 4 }, "renamed");
+    defer outbound.deinit();
+
+    var collection = diagnostics_collection.Collection.init(std.testing.allocator);
+    defer collection.deinit();
+    const payload =
+        \\{"jsonrpc":"2.0","id":1,"result":{"changes":{"file:///tmp/project/src/main.zig":[{"range":{"start":{"line":0,"character":4},"end":{"line":0,"character":8}},"newText":"renamed"}]}}}
+    ;
+    const result = try session.ingestPayload(payload, &collection);
+    try std.testing.expectEqual(IngestResult{ .workspace_edit = 1 }, result);
+    try std.testing.expect(session.last_workspace_edit != null);
+    try std.testing.expectEqualStrings("src/main.zig", session.last_workspace_edit.?.edits[0].path);
+    try std.testing.expectEqualStrings("renamed", session.last_workspace_edit.?.edits[0].new_text);
 }

@@ -12,6 +12,7 @@ const extension_registry = @import("../extensions/registry.zig");
 const navigation = @import("../editor/navigation.zig");
 const git_repository = @import("../git/repository.zig");
 const highlight = @import("../language/highlight.zig");
+const lsp_responses = @import("../lsp/responses.zig");
 const modes = @import("../language/modes.zig");
 const completion_mod = @import("../language/completion.zig");
 const symbols_mod = @import("../language/symbols.zig");
@@ -497,6 +498,7 @@ const PendingLspAction = enum {
     none,
     goto_definition,
     find_references,
+    rename_preview,
 };
 
 const HeaderAction = enum {
@@ -3394,6 +3396,7 @@ const LinuxGuiState = struct {
                 const new_name = self.allocator.dupe(u8, request.replace) catch |err| return self.message("rename failed: {s}", .{@errorName(err)});
                 defer self.allocator.free(new_name);
                 self.quick_panel.close();
+                if (self.requestRenameFromLsp(new_name)) return;
                 self.renameWorkspaceSymbol(old_name, new_name);
             },
             .goto_line => self.gotoLineFromQuickPanel(),

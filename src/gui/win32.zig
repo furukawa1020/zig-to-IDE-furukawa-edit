@@ -11,6 +11,7 @@ const extension_registry = @import("../extensions/registry.zig");
 const git_repository = @import("../git/repository.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
 const highlight = @import("../language/highlight.zig");
+const lsp_responses = @import("../lsp/responses.zig");
 const modes = @import("../language/modes.zig");
 const completion_mod = @import("../language/completion.zig");
 const symbols_mod = @import("../language/symbols.zig");
@@ -54,6 +55,7 @@ const PendingLspAction = enum {
     none,
     goto_definition,
     find_references,
+    rename_preview,
 };
 
 const GitPanelAction = enum {
@@ -1454,6 +1456,7 @@ const GuiState = struct {
                 };
                 defer self.allocator.free(new_name);
                 self.quick_panel.close();
+                if (self.requestRenameFromLsp(new_name)) return;
                 self.renameWorkspaceSymbol(old_name, new_name);
             },
             .search_workspace => {
@@ -2244,6 +2247,17 @@ const GuiState = struct {
         return true;
     }
 
+    fn requestRenameFromLsp(self: *GuiState, new_name: []const u8) bool {
+        const sent = dispatcher.requestActiveRenameFromRunningLsp(&self.app, new_name) catch |err| {
+            self.appendOutput(.stderr, "lsp rename request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.pending_lsp_action = .rename_preview;
+        self.setMessage("LSP rename requested") catch {};
+        return true;
+    }
+
     fn finishPendingLspAction(self: *GuiState) void {
         switch (self.pending_lsp_action) {
             .none => {},
@@ -2273,6 +2287,14 @@ const GuiState = struct {
                     }
                 }
             },
+            .rename_preview => {
+                if (self.app.activeLspSessionConst()) |session| {
+                    if (session.last_workspace_edit) |edit| {
+                        self.pending_lsp_action = .none;
+                        self.showLspWorkspaceEdit("LSP rename preview", &edit);
+                    }
+                }
+            },
         }
     }
 
@@ -2287,6 +2309,25 @@ const GuiState = struct {
         }
         if (locations.items.len > 80) self.appendOutput(.stdout, "... {d} more LSP location(s)\n", .{locations.items.len - 80});
         self.setMessage("Showing LSP locations") catch {};
+    }
+
+    fn showLspWorkspaceEdit(self: *GuiState, label: []const u8, edit: *const lsp_responses.WorkspaceEdit) void {
+        self.show_output = true;
+        self.bottom_panel = .output;
+        self.appendOutput(.stdout, "{s}: edits={d} skipped_resource_ops={d}\n", .{ label, edit.edits.len, edit.skipped_resource_ops });
+        for (edit.edits[0..@min(edit.edits.len, @as(usize, 80))]) |item| {
+            const preview_len = @min(item.new_text.len, @as(usize, 80));
+            self.appendOutput(.stdout, "{s}:{d}:{d}-{d}:{d} -> \"{s}\"\n", .{
+                item.path,
+                item.range.start.line + 1,
+                item.range.start.column + 1,
+                item.range.end.line + 1,
+                item.range.end.column + 1,
+                item.new_text[0..preview_len],
+            });
+        }
+        if (edit.edits.len > 80) self.appendOutput(.stdout, "... {d} more LSP edit(s)\n", .{edit.edits.len - 80});
+        self.setMessage("Showing LSP rename preview") catch {};
     }
 
     fn setError(self: *GuiState, err: anyerror) !void {

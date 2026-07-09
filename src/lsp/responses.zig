@@ -39,6 +39,27 @@ pub const Locations = struct {
     }
 };
 
+pub const TextEdit = struct {
+    path: []u8,
+    range: types.Range,
+    new_text: []u8,
+};
+
+pub const WorkspaceEdit = struct {
+    allocator: std.mem.Allocator,
+    edits: []TextEdit,
+    skipped_resource_ops: usize = 0,
+
+    pub fn deinit(self: *WorkspaceEdit) void {
+        for (self.edits) |edit| {
+            self.allocator.free(edit.path);
+            self.allocator.free(edit.new_text);
+        }
+        self.allocator.free(self.edits);
+        self.* = undefined;
+    }
+};
+
 pub fn parseCompletionResponse(allocator: std.mem.Allocator, payload: []const u8) !?CompletionItems {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
     defer parsed.deinit();
@@ -130,6 +151,81 @@ pub fn parseLocationResponse(allocator: std.mem.Allocator, payload: []const u8, 
     };
 }
 
+pub fn parseWorkspaceEditResponse(allocator: std.mem.Allocator, payload: []const u8, workspace_root: ?[]const u8) !?WorkspaceEdit {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const result = resultValue(parsed.value) orelse return null;
+    if (result == .null) return null;
+    const object = switch (result) {
+        .object => |object| object,
+        else => return error.InvalidWorkspaceEditResult,
+    };
+
+    var edits = std.array_list.Managed(TextEdit).init(allocator);
+    errdefer {
+        for (edits.items) |edit| {
+            allocator.free(edit.path);
+            allocator.free(edit.new_text);
+        }
+        edits.deinit();
+    }
+    var skipped_resource_ops: usize = 0;
+
+    if (object.get("changes")) |changes_value| {
+        const changes = switch (changes_value) {
+            .object => |changes| changes,
+            else => return error.InvalidWorkspaceEditChanges,
+        };
+        var iterator = changes.iterator();
+        while (iterator.next()) |entry| {
+            const uri = entry.key_ptr.*;
+            const edit_array = switch (entry.value_ptr.*) {
+                .array => |array| array,
+                else => return error.InvalidWorkspaceEditEdits,
+            };
+            try appendTextEditsForUri(allocator, &edits, uri, edit_array, workspace_root);
+        }
+    }
+
+    if (object.get("documentChanges")) |document_changes_value| {
+        const document_changes = switch (document_changes_value) {
+            .array => |array| array,
+            else => return error.InvalidWorkspaceEditDocumentChanges,
+        };
+        for (document_changes.items) |document_change_value| {
+            const document_change = switch (document_change_value) {
+                .object => |document_change| document_change,
+                else => continue,
+            };
+            if (stringField(document_change, "kind") != null) {
+                skipped_resource_ops += 1;
+                continue;
+            }
+            const text_document_value = document_change.get("textDocument") orelse {
+                skipped_resource_ops += 1;
+                continue;
+            };
+            const text_document = switch (text_document_value) {
+                .object => |text_document| text_document,
+                else => return error.InvalidWorkspaceEditTextDocument,
+            };
+            const uri = stringField(text_document, "uri") orelse return error.MissingWorkspaceEditUri;
+            const edit_array = switch (document_change.get("edits") orelse return error.MissingWorkspaceEditEdits) {
+                .array => |array| array,
+                else => return error.InvalidWorkspaceEditEdits,
+            };
+            try appendTextEditsForUri(allocator, &edits, uri, edit_array, workspace_root);
+        }
+    }
+
+    return .{
+        .allocator = allocator,
+        .edits = try edits.toOwnedSlice(),
+        .skipped_resource_ops = skipped_resource_ops,
+    };
+}
+
 fn appendCompletion(allocator: std.mem.Allocator, items: *std.array_list.Managed(completion.Item), object: std.json.ObjectMap) !void {
     const label = stringField(object, "label") orelse return;
     const insert_text = stringField(object, "insertText") orelse label;
@@ -159,6 +255,26 @@ fn completionKind(kind: usize) completion.Kind {
         1, 6, 12 => .word,
         else => .builtin,
     };
+}
+
+fn appendTextEditsForUri(allocator: std.mem.Allocator, edits: *std.array_list.Managed(TextEdit), uri: []const u8, edit_array: std.json.Array, workspace_root: ?[]const u8) !void {
+    for (edit_array.items) |edit_value| {
+        const edit_object = switch (edit_value) {
+            .object => |object| object,
+            else => continue,
+        };
+        const range_value = edit_object.get("range") orelse return error.MissingWorkspaceEditRange;
+        const new_text = stringField(edit_object, "newText") orelse return error.MissingWorkspaceEditNewText;
+        const path = try lsp_diagnostics.fileUriToPath(allocator, uri, workspace_root);
+        errdefer allocator.free(path);
+        const owned_text = try allocator.dupe(u8, new_text);
+        errdefer allocator.free(owned_text);
+        try edits.append(.{
+            .path = path,
+            .range = try parseRange(range_value),
+            .new_text = owned_text,
+        });
+    }
 }
 
 fn parseLocation(allocator: std.mem.Allocator, value: std.json.Value, workspace_root: ?[]const u8) !?Location {
@@ -279,4 +395,31 @@ test "parse location response" {
     try std.testing.expectEqualStrings("src/main.zig", locations.items[0].path);
     try std.testing.expectEqual(@as(usize, 9), locations.items[0].range.start.line);
     try std.testing.expectEqual(@as(usize, 1), locations.items[0].range.start.column);
+}
+
+test "parse workspace edit response changes map" {
+    const payload =
+        \\{"jsonrpc":"2.0","id":9,"result":{"changes":{"file:///C:/Projects/zide/src/main.zig":[{"range":{"start":{"line":2,"character":4},"end":{"line":2,"character":8}},"newText":"renamed"}]}}}
+    ;
+    var edit = (try parseWorkspaceEditResponse(std.testing.allocator, payload, "C:\\Projects\\zide")).?;
+    defer edit.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), edit.edits.len);
+    try std.testing.expectEqualStrings("src/main.zig", edit.edits[0].path);
+    try std.testing.expectEqual(@as(usize, 2), edit.edits[0].range.start.line);
+    try std.testing.expectEqual(@as(usize, 4), edit.edits[0].range.start.column);
+    try std.testing.expectEqualStrings("renamed", edit.edits[0].new_text);
+}
+
+test "parse workspace edit response document changes" {
+    const payload =
+        \\{"jsonrpc":"2.0","id":10,"result":{"documentChanges":[{"textDocument":{"uri":"file:///tmp/project/src/main.zig","version":1},"edits":[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":3}},"newText":"pub"}]},{"kind":"rename","oldUri":"file:///tmp/project/old.zig","newUri":"file:///tmp/project/new.zig"}]}}
+    ;
+    var edit = (try parseWorkspaceEditResponse(std.testing.allocator, payload, "/tmp/project")).?;
+    defer edit.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), edit.edits.len);
+    try std.testing.expectEqual(@as(usize, 1), edit.skipped_resource_ops);
+    try std.testing.expectEqualStrings("src/main.zig", edit.edits[0].path);
+    try std.testing.expectEqualStrings("pub", edit.edits[0].new_text);
 }

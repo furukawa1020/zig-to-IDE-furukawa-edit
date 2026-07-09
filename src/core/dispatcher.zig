@@ -293,6 +293,15 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return try stopLspTransport(app);
     }
 
+    if (std.mem.eql(u8, definition.id, "lsp.ingest_payload")) {
+        const payload = request.argument orelse return .{ .unsupported = "lsp.ingest_payload requires a JSON-RPC payload argument" };
+        return try ingestLspPayload(app, payload);
+    }
+
+    if (std.mem.eql(u8, definition.id, "lsp.drain")) {
+        return try drainLspFrames(app);
+    }
+
     if (std.mem.eql(u8, definition.id, "security.scan_current")) {
         const doc = app.documents.active() orelse return .no_active_document;
         const path = doc.path orelse "(scratch)";
@@ -828,8 +837,8 @@ fn syncCurrentDocumentToLsp(app: *app_mod.App) !Result {
         try app.lsp_session.makeDidChange(path, version, doc.text.bytes);
     defer outbound.deinit();
 
-    try emitLspOutbound(app, if (existing_version == null) "didOpen" else "didChange", &outbound);
-    return .{ .completed = if (existing_version == null) "LSP didOpen packet built" else "LSP didChange packet built" };
+    const sent = try deliverLspOutbound(app, if (existing_version == null) "didOpen" else "didChange", &outbound);
+    return .{ .completed = if (sent) "LSP document sync sent" else "LSP document sync packet built" };
 }
 
 fn requestCurrentPositionLsp(app: *app_mod.App, kind: lsp_session.RequestKind, label: []const u8) !Result {
@@ -838,8 +847,8 @@ fn requestCurrentPositionLsp(app: *app_mod.App, kind: lsp_session.RequestKind, l
 
     var outbound = try app.lsp_session.requestPosition(kind, path, doc.cursor.position);
     defer outbound.deinit();
-    try emitLspOutbound(app, label, &outbound);
-    return .{ .completed = "LSP request packet built" };
+    const sent = try deliverLspOutbound(app, label, &outbound);
+    return .{ .completed = if (sent) "LSP request sent" else "LSP request packet built" };
 }
 
 fn startLspTransport(app: *app_mod.App) !Result {
@@ -887,6 +896,49 @@ fn stopLspTransport(app: *app_mod.App) !Result {
     return .{ .blocked = "no LSP transport is running" };
 }
 
+fn ingestLspPayload(app: *app_mod.App, payload: []const u8) !Result {
+    const result = try app.lsp_session.ingestPayload(payload, &app.diagnostics);
+    try renderLspIngestResult(app, result);
+    return switch (result) {
+        .ignored => .{ .blocked = "LSP payload ignored" },
+        else => .{ .completed = "LSP payload ingested" },
+    };
+}
+
+fn drainLspFrames(app: *app_mod.App) !Result {
+    const transport = if (app.lsp_transport) |*transport| transport else return .{ .blocked = "no LSP transport is running" };
+    var frames: usize = 0;
+    while (true) {
+        var frame = (try transport.nextStdoutFrame()) orelse break;
+        const result = try app.lsp_session.ingestPayload(frame.body, &app.diagnostics);
+        try renderLspIngestResult(app, result);
+        frame.deinit();
+        frames += 1;
+    }
+    if (transport.stderrText().len > 0) {
+        const preview_len = @min(transport.stderrText().len, 4096);
+        try appendConsole(app, .stderr, "lsp stderr buffered ({d} bytes)\n{s}\n", .{ transport.stderrText().len, transport.stderrText()[0..preview_len] });
+    }
+    if (frames == 0) return .{ .blocked = "no complete LSP frames buffered" };
+    return .{ .completed = "LSP frames drained" };
+}
+
+fn deliverLspOutbound(app: *app_mod.App, label: []const u8, outbound: *const lsp_session.Outbound) !bool {
+    if (app.lsp_transport) |*transport| {
+        transport.send(outbound.framed) catch |err| {
+            if (outbound.id) |id| app.lsp_session.cancelPending(id);
+            try appendConsole(app, .stderr, "lsp send failed ({s}): {s}\n", .{ label, @errorName(err) });
+            return err;
+        };
+        try appendConsole(app, .stdout, "lsp sent: {s} bytes:{d}\n", .{ label, outbound.framed.len });
+        return true;
+    }
+
+    if (outbound.id) |id| app.lsp_session.cancelPending(id);
+    try emitLspOutbound(app, label, outbound);
+    return false;
+}
+
 fn emitLspOutbound(app: *app_mod.App, label: []const u8, outbound: *const lsp_session.Outbound) !void {
     var text: std.Io.Writer.Allocating = .init(app.allocator);
     defer text.deinit();
@@ -905,6 +957,17 @@ fn emitLspOutbound(app: *app_mod.App, label: []const u8, outbound: *const lsp_se
     }
     try writer.writeAll("\n--- end ---\n");
     try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn renderLspIngestResult(app: *app_mod.App, result: lsp_session.IngestResult) !void {
+    switch (result) {
+        .ignored => try appendConsole(app, .stdout, "lsp ingest: ignored\n", .{}),
+        .diagnostics => |count| try appendConsole(app, .stdout, "lsp ingest: diagnostics {d}\n", .{count}),
+        .completion => |count| try appendConsole(app, .stdout, "lsp ingest: completion items {d}\n", .{count}),
+        .hover => |bytes| try appendConsole(app, .stdout, "lsp ingest: hover bytes {d}\n", .{bytes}),
+        .locations => |count| try appendConsole(app, .stdout, "lsp ingest: locations {d}\n", .{count}),
+        .acknowledged => |kind| try appendConsole(app, .stdout, "lsp ingest: acknowledged {s}\n", .{@tagName(kind)}),
+    }
 }
 
 fn syncDiagnosticsFromConsole(app: *app_mod.App) !void {

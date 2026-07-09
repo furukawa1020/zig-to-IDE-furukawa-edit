@@ -1020,6 +1020,152 @@ fn requestCurrentRenameLsp(app: *app_mod.App, new_name: []const u8) !Result {
     return .{ .completed = if (sent) "LSP rename request sent" else "LSP rename request packet built" };
 }
 
+const WorkspaceEditApplySummary = struct {
+    edits: usize = 0,
+    applied: usize = 0,
+    failed: usize = 0,
+    blocked: usize = 0,
+    files: usize = 0,
+    skipped_resource_ops: usize = 0,
+
+    fn ok(self: WorkspaceEditApplySummary) bool {
+        return self.failed == 0 and self.blocked == 0;
+    }
+};
+
+const WorkspaceEditApplyStatus = enum {
+    applied,
+    blocked,
+    failed,
+};
+
+fn applyLastLspWorkspaceEdit(app: *app_mod.App) !Result {
+    const session = app.activeLspSession() orelse return .{ .blocked = "no LSP session for active document" };
+    const edit = session.last_workspace_edit orelse return .{ .blocked = "no cached LSP workspace edit to apply" };
+
+    const summary = try applyWorkspaceEdit(app, &edit);
+    try appendConsole(
+        app,
+        if (summary.ok()) .stdout else .stderr,
+        "lsp workspace edit apply: edits={d} applied={d} files={d} blocked={d} failed={d} skipped_resource_ops={d}\n",
+        .{ summary.edits, summary.applied, summary.files, summary.blocked, summary.failed, summary.skipped_resource_ops },
+    );
+
+    if (summary.applied > 0) {
+        session.clearCachedResultForRequest(.rename);
+    }
+    if (summary.ok()) return .{ .completed = "LSP workspace edit applied to editor buffers" };
+    return .{ .blocked = "LSP workspace edit partially applied; review output" };
+}
+
+fn applyWorkspaceEdit(app: *app_mod.App, edit: *const lsp_responses.WorkspaceEdit) !WorkspaceEditApplySummary {
+    var summary: WorkspaceEditApplySummary = .{
+        .edits = edit.edits.len,
+        .skipped_resource_ops = edit.skipped_resource_ops,
+    };
+    if (edit.edits.len == 0) return summary;
+
+    const previous_active = app.documents.activeIndex();
+    defer {
+        if (previous_active) |index| {
+            if (index < app.documents.documents.items.len) app.documents.active_index = index;
+        }
+    }
+
+    var indices = try app.allocator.alloc(usize, edit.edits.len);
+    defer app.allocator.free(indices);
+    for (indices, 0..) |*slot, index| slot.* = index;
+    std.mem.sort(usize, indices, edit.edits, workspaceEditIndexLess);
+
+    var last_applied_path: ?[]const u8 = null;
+    for (indices) |index| {
+        const item = edit.edits[index];
+        switch (try applyWorkspaceTextEdit(app, item)) {
+            .applied => {
+                summary.applied += 1;
+                if (last_applied_path == null or !pathEqualIgnoreCaseAndSlash(last_applied_path.?, item.path)) {
+                    summary.files += 1;
+                    last_applied_path = item.path;
+                }
+            },
+            .blocked => summary.blocked += 1,
+            .failed => summary.failed += 1,
+        }
+    }
+
+    return summary;
+}
+
+fn workspaceEditIndexLess(edits: []const lsp_responses.TextEdit, left_index: usize, right_index: usize) bool {
+    const left = edits[left_index];
+    const right = edits[right_index];
+    const path_order = std.mem.order(u8, left.path, right.path);
+    if (path_order != .eq) return path_order == .lt;
+    if (left.range.start.line != right.range.start.line) return left.range.start.line > right.range.start.line;
+    if (left.range.start.column != right.range.start.column) return left.range.start.column > right.range.start.column;
+    if (left.range.end.line != right.range.end.line) return left.range.end.line > right.range.end.line;
+    if (left.range.end.column != right.range.end.column) return left.range.end.column > right.range.end.column;
+    return left_index > right_index;
+}
+
+fn applyWorkspaceTextEdit(app: *app_mod.App, edit: lsp_responses.TextEdit) !WorkspaceEditApplyStatus {
+    const absolute = try workspacePath(app, edit.path);
+    defer app.allocator.free(absolute);
+
+    if (!permissions.allowsWrite(.workspace_only, app.workspace.root_path, absolute)) {
+        try appendConsole(app, .stderr, "lsp edit blocked outside workspace: {s}\n", .{edit.path});
+        return .blocked;
+    }
+
+    const doc_index = app.documents.openFile(absolute) catch |err| {
+        try appendConsole(app, .stderr, "lsp edit failed open: {s}: {s}\n", .{ edit.path, @errorName(err) });
+        return .failed;
+    };
+    const doc = &app.documents.documents.items[doc_index];
+
+    const start = doc.text.lineColumnToOffset(edit.range.start.line, edit.range.start.column) catch |err| {
+        try appendConsole(app, .stderr, "lsp edit failed start range: {s}:{d}:{d}: {s}\n", .{
+            edit.path,
+            edit.range.start.line + 1,
+            edit.range.start.column + 1,
+            @errorName(err),
+        });
+        return .failed;
+    };
+    const end = doc.text.lineColumnToOffset(edit.range.end.line, edit.range.end.column) catch |err| {
+        try appendConsole(app, .stderr, "lsp edit failed end range: {s}:{d}:{d}: {s}\n", .{
+            edit.path,
+            edit.range.end.line + 1,
+            edit.range.end.column + 1,
+            @errorName(err),
+        });
+        return .failed;
+    };
+    if (start > end) {
+        try appendConsole(app, .stderr, "lsp edit failed inverted range: {s}:{d}:{d}-{d}:{d}\n", .{
+            edit.path,
+            edit.range.start.line + 1,
+            edit.range.start.column + 1,
+            edit.range.end.line + 1,
+            edit.range.end.column + 1,
+        });
+        return .failed;
+    }
+
+    doc.replaceRange(start, end, edit.new_text) catch |err| {
+        try appendConsole(app, .stderr, "lsp edit failed apply: {s}:{d}:{d}-{d}:{d}: {s}\n", .{
+            edit.path,
+            edit.range.start.line + 1,
+            edit.range.start.column + 1,
+            edit.range.end.line + 1,
+            edit.range.end.column + 1,
+            @errorName(err),
+        });
+        return .failed;
+    };
+    return .applied;
+}
+
 fn startLspTransport(app: *app_mod.App) !Result {
     const doc = app.documents.active() orelse return .no_active_document;
     const server = try app.lsp_manager.ensureServer(doc.language);

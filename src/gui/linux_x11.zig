@@ -28,6 +28,7 @@ const task_registry = @import("../tasks/registry.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
 const permissions = @import("../security/permissions.zig");
 const terminal_command_line = @import("../terminal/command_line.zig");
+const terminal_pty = @import("../terminal/pty.zig");
 const types = @import("../core/types.zig");
 const workbench_settings = @import("workbench_settings.zig");
 
@@ -544,6 +545,7 @@ const TaskPanelAction = enum {
     profile_publish,
     terminal,
     queue_terminal,
+    run_pty,
     tasks,
     preview,
     seal,
@@ -978,6 +980,11 @@ const LinuxGuiState = struct {
     terminal_input: std.array_list.Managed(u8),
     terminal_focused: bool = false,
     terminal_history_cursor: ?usize = null,
+    pty_session: ?terminal_pty.Session = null,
+    pty_ticket: ?execution_queue.Ticket = null,
+    pty_forced_state: ?execution_queue.State = null,
+    pty_started_ms: i64 = 0,
+    pty_output_bytes: usize = 0,
     bottom_panel: BottomPanel = .output,
     window_width: i16 = WIDTH,
     window_height: i16 = HEIGHT,
@@ -1019,6 +1026,7 @@ const LinuxGuiState = struct {
     }
 
     fn deinit(self: *LinuxGuiState) void {
+        self.closePtySession();
         self.clearExtensionsRegistry();
         self.clearGitOverview();
         self.terminal_input.deinit();
@@ -1048,7 +1056,11 @@ const LinuxGuiState = struct {
         self.terminal_focused = true;
         self.app.mode = .command;
         self.saveWorkbenchSettings();
-        self.message("terminal: type command, Enter queues with boundary checks", .{});
+        if (self.pty_session != null) {
+            self.message("pty terminal: Enter sends input, Ctrl+C sends interrupt", .{});
+        } else {
+            self.message("terminal: type command, Enter queues with boundary checks", .{});
+        }
     }
 
     fn blurTerminalInput(self: *LinuxGuiState) void {
@@ -1119,7 +1131,11 @@ const LinuxGuiState = struct {
                 return true;
             },
             .enter => {
-                self.queueTerminalInput();
+                if (self.pty_session != null) {
+                    self.sendTerminalInputToPty();
+                } else {
+                    self.queueTerminalInput();
+                }
                 return true;
             },
             .backspace => {
@@ -1141,7 +1157,17 @@ const LinuxGuiState = struct {
             .char => |char| {
                 if (key.modifiers.ctrl) {
                     if (char == 'u' or char == 'U') self.terminalClearInput();
-                    if (char == 'c' or char == 'C') self.blurTerminalInput();
+                    if (char == 'c' or char == 'C') {
+                        if (self.pty_session != null) {
+                            self.writeBytesToPty("\x03");
+                            self.message("pty: sent interrupt", .{});
+                        } else {
+                            self.blurTerminalInput();
+                        }
+                    }
+                    if (char == 'd' or char == 'D') {
+                        if (self.pty_session != null) self.writeBytesToPty("\x04");
+                    }
                     return true;
                 }
                 if (key.modifiers.alt) return true;
@@ -1210,7 +1236,190 @@ const LinuxGuiState = struct {
             return;
         };
         self.handleDispatchResult("task.preview_next", preview_result);
-        self.message("terminal queued; review PLAN, then RUN", .{});
+        self.message("terminal queued; review PLAN, then PTY or RUN", .{});
+    }
+
+    fn startPtyFromQueue(self: *LinuxGuiState) void {
+        if (self.pty_session != null) return self.message("pty already running", .{});
+        if (!self.prepareLinuxLaunchBoundary()) return;
+
+        var ticket = self.app.execution_queue.takeNextQueued() orelse return self.message("pty: no queued command", .{});
+        errdefer ticket.deinit();
+
+        if (terminal_pty.validateTicket(&ticket, self.app.workspace.root_path)) |reason| {
+            self.app.process_console.begin();
+            self.appendOutput(.stderr, "pty blocked: {s}\n", .{reason});
+            self.app.process_console.finish(-1);
+            self.recordPtyTicket(&ticket, .blocked, -1);
+            self.message("pty blocked", .{});
+            return;
+        }
+
+        self.app.process_console.begin();
+        self.appendOutput(.stdout, "$ {s}\n", .{ticket.display_command});
+        self.appendOutput(.stdout, "pty profile:{s} env:{s} fs:{s} net:{s} timeout:{s} output:{d}\n", .{
+            linuxLaunchProfileLabel(self.linux_launch_profile),
+            @tagName(ticket.env_policy),
+            @tagName(ticket.fs_policy),
+            @tagName(ticket.network_policy),
+            timeoutLabel(ticket.timeout_ms),
+            ticket.output_limit_bytes,
+        });
+
+        const session = terminal_pty.spawnTicket(self.allocator, &ticket, .{
+            .workspace_root = self.app.workspace.root_path,
+            .environ = self.app.environ,
+            .size = self.terminalPtySize(),
+        }) catch |err| {
+            self.appendOutput(.stderr, "pty spawn failed: {s}\n", .{@errorName(err)});
+            self.app.process_console.finish(-1);
+            self.recordPtyTicket(&ticket, .failed, -1);
+            self.message("pty spawn failed: {s}", .{@errorName(err)});
+            return;
+        };
+
+        self.pty_ticket = ticket;
+        self.pty_session = session;
+        self.pty_forced_state = null;
+        self.pty_started_ms = std.time.milliTimestamp();
+        self.pty_output_bytes = 0;
+        self.terminal_focused = true;
+        self.bottom_panel = .tasks;
+        self.message("pty running pid:{d}", .{session.pid});
+    }
+
+    fn terminalPtySize(self: *const LinuxGuiState) terminal_pty.Size {
+        const cols: u16 = @intCast(@max(@divTrunc(self.window_width - 36, 8), 40));
+        const rows: u16 = @intCast(@max(self.bottomRowsFrom(outputLinesTop(self)), 12));
+        return .{ .rows = rows, .cols = cols };
+    }
+
+    fn activePtyFd(self: *const LinuxGuiState) ?i32 {
+        if (self.pty_session) |session| return session.master_fd;
+        return null;
+    }
+
+    fn ptyStatusLabel(self: *const LinuxGuiState) []const u8 {
+        if (self.pty_session != null) return "running";
+        return "idle";
+    }
+
+    fn pumpPtySession(self: *LinuxGuiState) bool {
+        var changed = false;
+        if (self.pty_session) |*session| {
+            var buffer: [4096]u8 = undefined;
+            while (true) {
+                const result = session.read(buffer[0..]) catch {
+                    self.pty_forced_state = .failed;
+                    session.terminate();
+                    break;
+                };
+                switch (result) {
+                    .data => |len| {
+                        self.pty_output_bytes += len;
+                        self.app.process_console.appendBytes(.stdout, buffer[0..len]) catch {};
+                        changed = true;
+                        if (self.pty_ticket) |ticket| {
+                            if (self.pty_output_bytes > ticket.output_limit_bytes and self.pty_forced_state == null) {
+                                self.pty_forced_state = .output_limited;
+                                self.appendOutput(.stderr, "pty output exceeded {d} byte limit; terminating\n", .{ticket.output_limit_bytes});
+                                session.terminate();
+                            }
+                        }
+                    },
+                    .would_block => break,
+                    .closed => break,
+                }
+            }
+
+            if (self.pty_ticket) |ticket| {
+                if (ticket.timeout_ms) |timeout_ms| {
+                    const elapsed: u64 = @intCast(@max(std.time.milliTimestamp() - self.pty_started_ms, 0));
+                    if (elapsed > timeout_ms and self.pty_forced_state == null) {
+                        self.pty_forced_state = .timed_out;
+                        self.appendOutput(.stderr, "pty timeout after {d}ms; terminating\n", .{timeout_ms});
+                        session.terminate();
+                        changed = true;
+                    }
+                }
+            }
+
+            if (session.pollExit()) |exit_status| {
+                self.finishPtySession(exit_status.exit_code);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    fn finishPtySession(self: *LinuxGuiState, exit_code: i32) void {
+        var ticket = self.pty_ticket orelse return;
+        self.pty_ticket = null;
+        defer ticket.deinit();
+
+        const state = self.pty_forced_state orelse .finished;
+        self.pty_forced_state = null;
+        if (self.pty_session) |*session| {
+            session.deinit();
+            self.pty_session = null;
+        }
+
+        self.app.process_console.finish(exit_code);
+        self.appendOutput(.stdout, "pty exit: {d}\n", .{exit_code});
+        self.recordPtyTicket(&ticket, state, exit_code);
+        self.refreshLinuxSelfProtection();
+        self.message("pty {s}: {d}", .{ @tagName(state), exit_code });
+    }
+
+    fn recordPtyTicket(self: *LinuxGuiState, ticket: *const execution_queue.Ticket, state: execution_queue.State, exit_code: i32) void {
+        self.app.execution_queue.recordHistory(
+            ticket,
+            self.app.workspace.root_path,
+            state,
+            exit_code,
+            self.app.process_console.lines.items.len,
+            self.app.process_console.sanitized_stats.total(),
+        ) catch |err| {
+            self.appendOutput(.stderr, "pty history failed: {s}\n", .{@errorName(err)});
+        };
+    }
+
+    fn sendTerminalInputToPty(self: *LinuxGuiState) void {
+        if (self.pty_session == null) return self.queueTerminalInput();
+        var line: std.Io.Writer.Allocating = .init(self.allocator);
+        defer line.deinit();
+        line.writer.writeAll(self.terminal_input.items) catch |err| return self.message("pty input failed: {s}", .{@errorName(err)});
+        line.writer.writeByte('\n') catch |err| return self.message("pty input failed: {s}", .{@errorName(err)});
+        self.writeBytesToPty(line.written());
+        self.terminal_input.clearRetainingCapacity();
+        self.terminal_history_cursor = null;
+    }
+
+    fn writeBytesToPty(self: *LinuxGuiState, bytes: []const u8) void {
+        if (self.pty_session) |*pty| {
+            var index: usize = 0;
+            while (index < bytes.len) {
+                const written = pty.write(bytes[index..]) catch |err| {
+                    self.message("pty write failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                if (written == 0) return;
+                index += written;
+            }
+        }
+    }
+
+    fn closePtySession(self: *LinuxGuiState) void {
+        if (self.pty_session) |*session| {
+            session.terminate();
+            session.deinit();
+            self.pty_session = null;
+        }
+        if (self.pty_ticket) |*ticket| {
+            ticket.deinit();
+            self.pty_ticket = null;
+        }
+        self.pty_forced_state = null;
     }
 
     fn loadWorkbenchSettings(self: *LinuxGuiState) void {
@@ -2496,6 +2705,7 @@ const LinuxGuiState = struct {
             .profile_publish => self.setLinuxLaunchProfile(.publish),
             .terminal => self.focusTerminalInput(),
             .queue_terminal => self.queueTerminalInput(),
+            .run_pty => self.startPtyFromQueue(),
             .tasks => self.openQuickPanel(.run_task),
             .preview => self.execute("task.preview_next", .command_palette),
             .seal => self.sealLinuxExecBoundary(),
@@ -4629,11 +4839,12 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
     try drawTaskPanelActions(x11, state);
 
     var header_buf: [300]u8 = undefined;
-    const header = std.fmt.bufPrint(header_buf[0..], "RUN / Linux policy profile:{s} queued:{d} history:{d} console:{s}", .{
+    const header = std.fmt.bufPrint(header_buf[0..], "RUN / Linux policy profile:{s} queued:{d} history:{d} console:{s} pty:{s}", .{
         linuxLaunchProfileLabel(state.linux_launch_profile),
         queue.queuedCount(),
         queue.history.items.len,
         if (state.app.process_console.running) "running" else "idle",
+        state.ptyStatusLabel(),
     }) catch "RUN / Linux policy profile";
     try x11.text(x11.gc.green, 18, bottom + 58, header);
 
@@ -4703,7 +4914,7 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
         var gate_ascii: [720]u8 = undefined;
         try x11.text(if (cwd_ok and network_ok and write_ok) x11.gc.muted else x11.gc.red, 18, bottom + 208, asciiInto(gate_ascii[0..], gate_line));
     } else {
-        try x11.text(x11.gc.muted, 18, bottom + 160, "No queued task. Type in TERM, pick TASKS, or Ctrl+R. Review PLAN/SEAL before RUN.");
+        try x11.text(x11.gc.muted, 18, bottom + 160, "No queued task. Type in TERM, pick TASKS, or Ctrl+R. Review PLAN/SEAL before PTY or RUN.");
         if (queue.latestHistory()) |entry| {
             var last_buf: [720]u8 = undefined;
             const last_line = std.fmt.bufPrint(last_buf[0..], "LAST {s} {s} lines:{d} sanitized:{d}  {s}", .{
@@ -4767,7 +4978,10 @@ fn drawTerminalInput(x11: *X11, state: *LinuxGuiState) !void {
     var prompt_ascii: [900]u8 = undefined;
     try x11.text(if (state.terminal_focused) x11.gc.green else x11.gc.cyan, rect.left + 10, rect.top + 19, asciiInto(prompt_ascii[0..], prompt));
 
-    const hint = "Enter queues / Up history / Ctrl+U clear / Esc blur";
+    const hint = if (state.pty_session != null)
+        "Enter sends / Ctrl+C interrupt / Ctrl+D EOF / Esc blur"
+    else
+        "Enter queues / Up history / Ctrl+U clear / Esc blur";
     const hint_x = @max(rect.left + 360, rect.right - 430);
     if (hint_x > rect.left + 220) try x11.text(x11.gc.muted, hint_x, rect.top + 19, hint);
 }
@@ -6589,7 +6803,7 @@ fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
 }
 
 const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
-const task_panel_actions = [_]TaskPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .terminal, .queue_terminal, .tasks, .preview, .seal, .run_next, .history };
+const task_panel_actions = [_]TaskPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .terminal, .queue_terminal, .run_pty, .tasks, .preview, .seal, .run_next, .history };
 const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .seal, .linux };
 const settings_panel_actions = [_]SettingsPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .tutorial_ja, .tutorial_en, .review, .trust, .lock, .seal };
 const extension_panel_actions = [_]ExtensionPanelAction{.scan};
@@ -6718,15 +6932,16 @@ fn taskPanelActionRect(state: *const LinuxGuiState, action: TaskPanelAction) Hit
         .profile_publish => 3,
         .terminal => 4,
         .queue_terminal => 5,
-        .tasks => 6,
-        .preview => 7,
-        .seal => 8,
-        .run_next => 9,
-        .history => 10,
+        .run_pty => 6,
+        .tasks => 7,
+        .preview => 8,
+        .seal => 9,
+        .run_next => 10,
+        .history => 11,
     };
-    const width: i16 = 52;
-    const gap: i16 = 6;
-    const right = state.window_width - 18 - (10 - index) * (width + gap);
+    const width: i16 = 49;
+    const gap: i16 = 5;
+    const right = state.window_width - 18 - (11 - index) * (width + gap);
     const bottom = state.bottomTop();
     return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
@@ -6835,6 +7050,7 @@ fn taskPanelActionLabel(action: TaskPanelAction) []const u8 {
         .profile_publish => "PUB",
         .terminal => "TERM",
         .queue_terminal => "QUE",
+        .run_pty => "PTY",
         .tasks => "TASKS",
         .preview => "PLAN",
         .seal => "SEAL",

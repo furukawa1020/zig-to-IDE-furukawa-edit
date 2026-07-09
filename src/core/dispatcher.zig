@@ -1041,9 +1041,9 @@ const WorkspaceEditApplyStatus = enum {
 
 fn applyLastLspWorkspaceEdit(app: *app_mod.App) !Result {
     const session = app.activeLspSession() orelse return .{ .blocked = "no LSP session for active document" };
-    const edit = session.last_workspace_edit orelse return .{ .blocked = "no cached LSP workspace edit to apply" };
+    const edit = if (session.last_workspace_edit) |*cached| cached else return .{ .blocked = "no cached LSP workspace edit to apply" };
 
-    const summary = try applyWorkspaceEdit(app, &edit);
+    const summary = try applyWorkspaceEdit(app, edit);
     try appendConsole(
         app,
         if (summary.ok()) .stdout else .stderr,
@@ -1072,7 +1072,7 @@ fn applyWorkspaceEdit(app: *app_mod.App, edit: *const lsp_responses.WorkspaceEdi
         }
     }
 
-    var indices = try app.allocator.alloc(usize, edit.edits.len);
+    const indices = try app.allocator.alloc(usize, edit.edits.len);
     defer app.allocator.free(indices);
     for (indices, 0..) |*slot, index| slot.* = index;
     std.mem.sort(usize, indices, edit.edits, workspaceEditIndexLess);
@@ -3412,6 +3412,51 @@ fn appendConsole(app: *app_mod.App, stream: @import("../tasks/console.zig").Stre
     try app.process_console.appendBytes(stream, text.written());
 }
 
+const TestWorkspaceEditSpec = struct {
+    path: []const u8,
+    start_line: usize,
+    start_column: usize,
+    end_line: usize,
+    end_column: usize,
+    new_text: []const u8,
+};
+
+fn makeTestWorkspaceEdit(allocator: std.mem.Allocator, specs: []const TestWorkspaceEditSpec) !lsp_responses.WorkspaceEdit {
+    var edits = try allocator.alloc(lsp_responses.TextEdit, specs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (edits[0..initialized]) |item| {
+            allocator.free(item.path);
+            allocator.free(item.new_text);
+        }
+        allocator.free(edits);
+    }
+
+    for (specs) |spec| {
+        edits[initialized] = try makeTestTextEdit(allocator, spec);
+        initialized += 1;
+    }
+
+    return .{
+        .allocator = allocator,
+        .edits = edits,
+    };
+}
+
+fn makeTestTextEdit(allocator: std.mem.Allocator, spec: TestWorkspaceEditSpec) !lsp_responses.TextEdit {
+    const path = try allocator.dupe(u8, spec.path);
+    errdefer allocator.free(path);
+    const new_text = try allocator.dupe(u8, spec.new_text);
+    return .{
+        .path = path,
+        .range = .{
+            .start = .{ .line = spec.start_line, .column = spec.start_column, .byte_offset = 0 },
+            .end = .{ .line = spec.end_line, .column = spec.end_column, .byte_offset = 0 },
+        },
+        .new_text = new_text,
+    };
+}
+
 test "dispatch opens command palette" {
     var app = try app_mod.App.init(std.testing.allocator, ".");
     defer app.deinit();
@@ -3798,6 +3843,63 @@ test "file new rejects workspace escape paths" {
     try std.testing.expect(validateNewWorkspaceFilePath("../outside.zig") != null);
     try std.testing.expect(validateNewWorkspaceFilePath(".git/hooks/pre-commit") != null);
     try std.testing.expect(validateNewWorkspaceFilePath("zig-out/generated.zig") != null);
+}
+
+test "workspace edit applies sorted LSP edits to editor buffers" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Options.debug_io, "src");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/main.zig", .data = "const old = 1;\nold;\n" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    var edit = try makeTestWorkspaceEdit(std.testing.allocator, &.{
+        .{ .path = "src/main.zig", .start_line = 0, .start_column = 6, .end_line = 0, .end_column = 9, .new_text = "new" },
+        .{ .path = "src/main.zig", .start_line = 1, .start_column = 0, .end_line = 1, .end_column = 3, .new_text = "new" },
+    });
+    defer edit.deinit();
+
+    const summary = try applyWorkspaceEdit(&app, &edit);
+    try std.testing.expectEqual(@as(usize, 2), summary.edits);
+    try std.testing.expectEqual(@as(usize, 2), summary.applied);
+    try std.testing.expectEqual(@as(usize, 1), summary.files);
+    try std.testing.expectEqual(@as(usize, 0), summary.blocked);
+    try std.testing.expectEqual(@as(usize, 0), summary.failed);
+
+    const doc = app.documents.active() orelse return error.ExpectedDocument;
+    try std.testing.expect(doc.dirty);
+    try std.testing.expectEqualStrings("const new = 1;\nnew;\n", doc.text.bytes);
+}
+
+test "workspace edit blocks files outside workspace" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    var edit = try makeTestWorkspaceEdit(std.testing.allocator, &.{
+        .{ .path = "../outside.zig", .start_line = 0, .start_column = 0, .end_line = 0, .end_column = 0, .new_text = "nope" },
+    });
+    defer edit.deinit();
+
+    const summary = try applyWorkspaceEdit(&app, &edit);
+    try std.testing.expectEqual(@as(usize, 1), summary.edits);
+    try std.testing.expectEqual(@as(usize, 0), summary.applied);
+    try std.testing.expectEqual(@as(usize, 0), summary.files);
+    try std.testing.expectEqual(@as(usize, 1), summary.blocked);
+    try std.testing.expectEqual(@as(usize, 0), summary.failed);
+    try std.testing.expectEqual(@as(usize, 0), app.documents.documents.items.len);
 }
 
 test "save blocks critical Zig security findings" {

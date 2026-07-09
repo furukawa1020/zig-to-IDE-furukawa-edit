@@ -892,10 +892,37 @@ fn notifyDocumentSavedToRunningLsp(app: *app_mod.App, doc: *document_mod.Documen
     });
 }
 
+pub fn requestActiveCompletionFromRunningLsp(app: *app_mod.App) !bool {
+    return try requestActivePositionFromRunningLsp(app, .completion, "completion");
+}
+
+pub fn requestActiveDefinitionFromRunningLsp(app: *app_mod.App) !bool {
+    return try requestActivePositionFromRunningLsp(app, .definition, "definition");
+}
+
+pub fn requestActiveReferencesFromRunningLsp(app: *app_mod.App) !bool {
+    return try requestActivePositionFromRunningLsp(app, .references, "references");
+}
+
+fn requestActivePositionFromRunningLsp(app: *app_mod.App, kind: lsp_session.RequestKind, label: []const u8) !bool {
+    if (app.lsp_transport == null) return false;
+    const doc = app.documents.active() orelse return false;
+    const path = doc.path orelse return false;
+    _ = try syncDocumentToRunningLsp(app, doc);
+    app.lsp_session.clearCachedResultForRequest(kind);
+    var outbound = try app.lsp_session.requestPosition(kind, path, doc.cursor.position);
+    defer outbound.deinit();
+    return try deliverLspOutboundWithOptions(app, label, &outbound, .{
+        .log_sent = false,
+        .emit_when_missing = false,
+    });
+}
+
 fn requestCurrentPositionLsp(app: *app_mod.App, kind: lsp_session.RequestKind, label: []const u8) !Result {
     const doc = app.documents.active() orelse return .no_active_document;
     const path = doc.path orelse return .{ .blocked = "scratch documents cannot request LSP features yet" };
 
+    app.lsp_session.clearCachedResultForRequest(kind);
     var outbound = try app.lsp_session.requestPosition(kind, path, doc.cursor.position);
     defer outbound.deinit();
     const sent = try deliverLspOutbound(app, label, &outbound);

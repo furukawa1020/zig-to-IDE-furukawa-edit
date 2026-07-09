@@ -98,6 +98,15 @@ pub const Session = struct {
         _ = self.takePending(id);
     }
 
+    pub fn clearCachedResultForRequest(self: *Session, kind: RequestKind) void {
+        switch (kind) {
+            .completion => self.clearLastCompletion(),
+            .hover => self.clearLastHover(),
+            .definition, .references, .implementation, .type_definition => self.clearLastLocations(),
+            else => {},
+        }
+    }
+
     pub fn documentVersion(self: *const Session, path: []const u8) ?i64 {
         for (self.opened_documents.items) |item| {
             if (pathEquals(item.path, path)) return item.version;

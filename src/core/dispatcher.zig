@@ -722,6 +722,7 @@ fn verifyRunAuditLog(app: *app_mod.App) !Result {
 }
 
 fn syncDiagnosticsFromConsole(app: *app_mod.App) !void {
+    app.diagnostics.clearSource(.compiler);
     for (app.process_console.lines.items) |line| {
         if (zig_output.parseLine(line.text)) |parsed| {
             try app.diagnostics.append(zig_output.toDiagnostic(parsed));
@@ -812,7 +813,7 @@ fn renderSaveSafetyCheck(app: *app_mod.App, path: []const u8, scan: *const secur
 }
 
 fn syncDiagnosticsFromSecurity(app: *app_mod.App) !void {
-    app.diagnostics.clear();
+    app.diagnostics.clearSource(.internal);
     for (app.security_findings.items.items) |item| {
         try app.diagnostics.append(.{
             .source = .internal,

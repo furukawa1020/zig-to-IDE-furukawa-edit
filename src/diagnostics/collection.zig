@@ -24,6 +24,21 @@ pub const Collection = struct {
         self.items.clearRetainingCapacity();
     }
 
+    pub fn clearSource(self: *Collection, source: model.DiagnosticSource) void {
+        var index: usize = 0;
+        while (index < self.items.items.len) {
+            const item = self.items.items[index];
+            if (item.source != source) {
+                index += 1;
+                continue;
+            }
+
+            const removed = self.items.orderedRemove(index);
+            self.allocator.free(removed.path);
+            self.allocator.free(removed.message);
+        }
+    }
+
     pub fn clearPathSource(self: *Collection, path: []const u8, source: ?model.DiagnosticSource) void {
         var index: usize = 0;
         while (index < self.items.items.len) {
@@ -115,4 +130,19 @@ test "collection clears diagnostics by path and source" {
     collection.clearPathSource("main.zig", .lsp);
     try std.testing.expectEqual(@as(usize, 1), collection.items.items.len);
     try std.testing.expectEqual(model.DiagnosticSource.compiler, collection.items.items[0].source);
+}
+
+test "collection clears diagnostics by source" {
+    var collection = Collection.init(std.testing.allocator);
+    defer collection.deinit();
+
+    const position = types.Position.start();
+    try collection.append(.{ .source = .internal, .severity = .warning, .path = "main.zig", .range = types.Range.empty(position), .message = "security" });
+    try collection.append(.{ .source = .lsp, .severity = .err, .path = "main.zig", .range = types.Range.empty(position), .message = "lsp" });
+    try collection.append(.{ .source = .compiler, .severity = .err, .path = "main.zig", .range = types.Range.empty(position), .message = "compiler" });
+
+    collection.clearSource(.internal);
+    try std.testing.expectEqual(@as(usize, 2), collection.items.items.len);
+    try std.testing.expectEqual(model.DiagnosticSource.lsp, collection.items.items[0].source);
+    try std.testing.expectEqual(model.DiagnosticSource.compiler, collection.items.items[1].source);
 }

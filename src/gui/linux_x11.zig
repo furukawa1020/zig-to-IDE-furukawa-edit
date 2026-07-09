@@ -11,6 +11,7 @@ const document_mod = @import("../editor/document.zig");
 const extension_registry = @import("../extensions/registry.zig");
 const navigation = @import("../editor/navigation.zig");
 const git_repository = @import("../git/repository.zig");
+const highlight = @import("../language/highlight.zig");
 const modes = @import("../language/modes.zig");
 const symbols_mod = @import("../language/symbols.zig");
 const findings_mod = @import("../security/findings.zig");
@@ -4834,14 +4835,20 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
     };
 
     const path = doc.path orelse "(scratch)";
-    var path_buf: [520]u8 = undefined;
-    const header = std.fmt.bufPrint(path_buf[0..], "{s}  lang={s}  newline={s}  encoding={s}", .{
+    const run_label = if (modes.runProfile(doc.language)) |profile| profile.label else "manual";
+    const comment_label = modes.lineComment(doc.language) orelse if (modes.blockComment(doc.language)) |block| block.start else "-";
+    var path_buf: [900]u8 = undefined;
+    const header = std.fmt.bufPrint(path_buf[0..], "{s}  lang={s}/{s}  run={s}  cmt={s}  sec={s}  newline={s}  encoding={s}", .{
         path,
         modes.label(doc.language),
+        @tagName(modes.family(doc.language)),
+        run_label,
+        comment_label,
+        modes.securityFocus(doc.language),
         doc.newlineLabel(),
         doc.encodingLabel(),
     }) catch path;
-    var header_ascii: [520]u8 = undefined;
+    var header_ascii: [900]u8 = undefined;
     try x11.text(x11.gc.green, EDITOR_LEFT, EDITOR_TOP, asciiInto(header_ascii[0..], header));
 
     const visible_rows: usize = @intCast(@max(@divTrunc(bottom - EDITOR_TEXT_TOP - 16, LINE_HEIGHT), 1));
@@ -4886,8 +4893,7 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
             try x11.text(marker_gc, EDITOR_LEFT + 36, line_y, marker_text);
         }
 
-        var line_buf: [720]u8 = undefined;
-        try x11.text(if (selected) x11.gc.text else x11.gc.muted, EDITOR_LEFT + 56, line_y, asciiInto(line_buf[0..], line));
+        try drawHighlightedEditorLine(x11, state, doc.language, EDITOR_LEFT + 56, line_y, line, if (selected) x11.gc.text else x11.gc.muted);
 
         if (selected and app.mode == .insert and app.focus == .editor) {
             const cursor_x: i16 = EDITOR_LEFT + 56 + @as(i16, @intCast(@min(doc.cursor.position.column, 120))) * 8;

@@ -9,6 +9,7 @@ const runtime = @import("runtime.zig");
 const console = @import("../tasks/console.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
 const lsp_session = @import("../lsp/session.zig");
+const lsp_transport = @import("../lsp/transport.zig");
 const workspace = @import("../workspace/workspace.zig");
 
 pub const Mode = enum {
@@ -38,6 +39,7 @@ pub const App = struct {
     security_findings: security_findings.Collection,
     process_console: console.ProcessConsole,
     lsp_session: lsp_session.Session,
+    lsp_transport: ?lsp_transport.Transport,
     pending_build_consent: ?build_consent.Preview,
     pending_build_source_id: ?[]u8,
     execution_queue: execution_queue.Queue,
@@ -73,6 +75,7 @@ pub const App = struct {
             .security_findings = security_findings.Collection.init(allocator),
             .process_console = console.ProcessConsole.init(allocator),
             .lsp_session = try lsp_session.Session.init(allocator, workspace_path),
+            .lsp_transport = null,
             .pending_build_consent = null,
             .pending_build_source_id = null,
             .execution_queue = execution_queue.Queue.init(allocator),
@@ -90,6 +93,10 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.clearPendingBuildConsent();
+        if (self.lsp_transport) |*transport| {
+            transport.deinit();
+            self.lsp_transport = null;
+        }
         self.lsp_session.deinit();
         self.execution_queue.deinit();
         self.process_console.deinit();

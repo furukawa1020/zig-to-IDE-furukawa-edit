@@ -546,6 +546,7 @@ const TaskPanelAction = enum {
     terminal,
     queue_terminal,
     run_pty,
+    stop_pty,
     tasks,
     preview,
     seal,
@@ -1059,7 +1060,7 @@ const LinuxGuiState = struct {
         if (self.pty_session != null) {
             self.message("pty terminal: Enter sends input, Ctrl+C sends interrupt", .{});
         } else {
-            self.message("terminal: type command, Enter queues with boundary checks", .{});
+            self.message("terminal: type command, or PTY opens a bounded workspace shell", .{});
         }
     }
 
@@ -1123,7 +1124,7 @@ const LinuxGuiState = struct {
         self.message("terminal history #{d}", .{index + 1});
     }
 
-    fn handleTerminalKey(self: *LinuxGuiState, key: event_mod.KeyEvent) bool {
+    fn handleTerminalKey(self: *LinuxGuiState, x11: *X11, key: event_mod.KeyEvent) bool {
         if (!self.terminal_focused) return false;
         switch (key.code) {
             .escape => {
@@ -1167,6 +1168,9 @@ const LinuxGuiState = struct {
                     }
                     if (char == 'd' or char == 'D') {
                         if (self.pty_session != null) self.writeBytesToPty("\x04");
+                    }
+                    if (char == 'v' or char == 'V') {
+                        self.pasteIntoTerminal(x11);
                     }
                     return true;
                 }
@@ -1243,7 +1247,11 @@ const LinuxGuiState = struct {
         if (self.pty_session != null) return self.message("pty already running", .{});
         if (!self.prepareLinuxLaunchBoundary()) return;
 
-        var ticket = self.app.execution_queue.takeNextQueued() orelse return self.message("pty: no queued command", .{});
+        var ticket = self.app.execution_queue.takeNextQueued() orelse self.makeInteractiveShellTicket() catch |err| {
+            self.message("pty shell failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "pty shell ticket failed: {s}\n", .{@errorName(err)});
+            return;
+        };
         errdefer ticket.deinit();
 
         if (terminal_pty.validateTicket(&ticket, self.app.workspace.root_path)) |reason| {
@@ -1257,6 +1265,9 @@ const LinuxGuiState = struct {
 
         self.app.process_console.begin();
         self.appendOutput(.stdout, "$ {s}\n", .{ticket.display_command});
+        if (std.mem.eql(u8, ticket.source_command_id, "terminal.shell")) {
+            self.appendOutput(.stdout, "pty shell: bounded to workspace, allowlisted env, network denied by default\n", .{});
+        }
         self.appendOutput(.stdout, "pty profile:{s} env:{s} fs:{s} net:{s} timeout:{s} output:{d}\n", .{
             linuxLaunchProfileLabel(self.linux_launch_profile),
             @tagName(ticket.env_policy),
@@ -1286,6 +1297,56 @@ const LinuxGuiState = struct {
         self.terminal_focused = true;
         self.bottom_panel = .tasks;
         self.message("pty running pid:{d}", .{session.pid});
+    }
+
+    fn makeInteractiveShellTicket(self: *LinuxGuiState) !execution_queue.Ticket {
+        const shell = self.defaultInteractiveShell();
+        return execution_queue.Ticket.init(self.allocator, "terminal.shell", .{
+            .command = .{
+                .executable = shell,
+                .args = &.{},
+                .cwd = self.app.workspace.root_path,
+            },
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .stdin = .inherit,
+        }, .{
+            .command = shell,
+            .cwd = self.app.workspace.root_path,
+            .env_policy = .allowlist,
+            .fs_policy = .workspace_only,
+            .network_policy = .deny,
+            .output_sanitized = true,
+            .timeout_ms = null,
+            .output_limit_bytes = 2 * 1024 * 1024,
+        });
+    }
+
+    fn defaultInteractiveShell(self: *const LinuxGuiState) []const u8 {
+        const shell = self.app.environ.getPosix("SHELL") orelse return "/bin/sh";
+        if (shell.len == 0) return "/bin/sh";
+        if (std.mem.indexOfScalar(u8, shell, 0) != null) return "/bin/sh";
+        if (!std.fs.path.isAbsolute(shell)) return "/bin/sh";
+        return shell;
+    }
+
+    fn stopPtySession(self: *LinuxGuiState) void {
+        if (self.pty_session) |*session| {
+            if (self.pty_forced_state) |state| {
+                if (state == .cancelled) {
+                    session.kill();
+                    self.appendOutput(.stderr, "pty kill requested\n", .{});
+                    self.message("pty kill requested", .{});
+                    return;
+                }
+            }
+            self.pty_forced_state = .cancelled;
+            session.terminate();
+            self.appendOutput(.stderr, "pty stop requested\n", .{});
+            self.message("pty stop requested", .{});
+            return;
+        }
+        self.message("pty: no active session", .{});
     }
 
     fn terminalPtySize(self: *const LinuxGuiState) terminal_pty.Size {
@@ -2092,6 +2153,83 @@ const LinuxGuiState = struct {
         self.message("pasted from ZIDE primary", .{});
     }
 
+    fn terminalAcceptPaste(self: *LinuxGuiState, bytes: []const u8, source: []const u8) void {
+        if (bytes.len == 0) return self.message("terminal paste: {s} empty", .{source});
+
+        if (self.pty_session != null) {
+            const max_pty_paste: usize = 64 * 1024;
+            const paste_len = @min(bytes.len, max_pty_paste);
+            self.writeBytesToPty(bytes[0..paste_len]);
+            if (paste_len < bytes.len) {
+                self.appendOutput(.stderr, "pty paste clipped: {d}/{d} byte(s) from {s}\n", .{ paste_len, bytes.len, source });
+                self.message("pty paste clipped: {d}/{d} byte(s)", .{ paste_len, bytes.len });
+            } else {
+                self.message("pty paste: {s} {d} byte(s)", .{ source, paste_len });
+            }
+            return;
+        }
+
+        const max_input: usize = 4096;
+        if (self.terminal_input.items.len >= max_input) return self.message("terminal paste limit reached", .{});
+        const remaining = max_input - self.terminal_input.items.len;
+        const paste_len = @min(bytes.len, remaining);
+        self.terminalInsertText(bytes[0..paste_len]);
+        if (paste_len < bytes.len) {
+            self.message("terminal paste clipped: {d}/{d} byte(s)", .{ paste_len, bytes.len });
+        } else {
+            self.message("terminal paste: {s} {d} byte(s)", .{ source, paste_len });
+        }
+    }
+
+    fn pasteIntoTerminal(self: *LinuxGuiState, x11: *X11) void {
+        if (!self.clipboard_owned) {
+            const external = x11.requestSelectionText(self.allocator, x11.atoms.clipboard) catch |clipboard_err| {
+                return self.pastePrimaryOrLocalIntoTerminal(x11, clipboard_err);
+            };
+            defer self.allocator.free(external);
+            self.terminalAcceptPaste(external, "X11 clipboard");
+            return;
+        }
+        if (self.clipboard.items.len == 0) return self.message("terminal clipboard is empty", .{});
+        self.terminalAcceptPaste(self.clipboard.items, "ZIDE clipboard");
+    }
+
+    fn pastePrimaryOrLocalIntoTerminal(self: *LinuxGuiState, x11: *X11, clipboard_err: anyerror) void {
+        if (!self.primary_owned) {
+            const primary = x11.requestSelectionText(self.allocator, x11.atoms.primary) catch |primary_err| {
+                if (self.clipboard.items.len == 0) {
+                    self.message("terminal paste failed: {s}", .{@errorName(clipboard_err)});
+                    self.appendOutput(.stderr, "terminal clipboard paste failed: {s}; primary failed: {s}\n", .{ @errorName(clipboard_err), @errorName(primary_err) });
+                    return;
+                }
+                self.terminalAcceptPaste(self.clipboard.items, "ZIDE clipboard");
+                return;
+            };
+            defer self.allocator.free(primary);
+            self.terminalAcceptPaste(primary, "X11 primary");
+            return;
+        }
+
+        if (self.primary_selection.items.len == 0) return self.message("terminal primary is empty", .{});
+        self.terminalAcceptPaste(self.primary_selection.items, "ZIDE primary");
+    }
+
+    fn pastePrimaryIntoTerminal(self: *LinuxGuiState, x11: *X11) void {
+        if (!self.primary_owned) {
+            const primary = x11.requestSelectionText(self.allocator, x11.atoms.primary) catch |err| {
+                if (self.clipboard.items.len == 0) return self.message("terminal primary paste failed: {s}", .{@errorName(err)});
+                self.terminalAcceptPaste(self.clipboard.items, "ZIDE clipboard");
+                return;
+            };
+            defer self.allocator.free(primary);
+            self.terminalAcceptPaste(primary, "X11 primary");
+            return;
+        }
+
+        if (self.primary_selection.items.len == 0) return self.message("terminal primary is empty", .{});
+        self.terminalAcceptPaste(self.primary_selection.items, "ZIDE primary");
+    }
+
     fn openContextMenu(self: *LinuxGuiState, x: i16, y: i16) void {
         const menu_w: i16 = 230;
         const menu_h = contextMenuHeight();
@@ -2706,6 +2844,7 @@ const LinuxGuiState = struct {
             .terminal => self.focusTerminalInput(),
             .queue_terminal => self.queueTerminalInput(),
             .run_pty => self.startPtyFromQueue(),
+            .stop_pty => self.stopPtySession(),
             .tasks => self.openQuickPanel(.run_task),
             .preview => self.execute("task.preview_next", .command_palette),
             .seal => self.sealLinuxExecBoundary(),
@@ -3426,7 +3565,7 @@ const LinuxGuiState = struct {
     fn handleKey(self: *LinuxGuiState, x11: *X11, key: event_mod.KeyEvent) void {
         if (self.handleContextMenuKey(x11, key)) return;
         if (self.handleQuickPanelKey(key)) return;
-        if (self.handleTerminalKey(key)) return;
+        if (self.handleTerminalKey(x11, key)) return;
         if (key.modifiers.ctrl and std.meta.activeTag(key.code) == .tab) {
             self.execute(if (key.modifiers.shift) "file.previous_editor" else "file.next_editor", .keybinding);
             return;
@@ -3928,6 +4067,11 @@ const LinuxGuiState = struct {
                 self.closeDocumentAt(index);
                 return;
             }
+        }
+        if (button == 2 and self.bottom_panel == .tasks and pointIn(terminalInputRect(self), x, y)) {
+            self.focusTerminalInput();
+            self.pastePrimaryIntoTerminal(x11);
+            return;
         }
         if (button == 2 and x >= FILE_WIDTH and y >= HEADER_HEIGHT and y < self.bottomTop()) {
             self.app.focus = .editor;
@@ -4988,7 +5132,7 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
         y += LINE_HEIGHT;
     }
     if (queue.history.items.len == 0) {
-        try x11.text(x11.gc.muted, 18, y, "No task history yet. RUN will record exit, output cap, and sanitizer counts.");
+        try x11.text(x11.gc.muted, 18, y, "No task history yet. PTY opens a bounded shell when queue is empty; RUN records captured tasks.");
     }
 }
 
@@ -5005,9 +5149,9 @@ fn drawTerminalInput(x11: *X11, state: *LinuxGuiState) !void {
     try x11.text(if (state.terminal_focused) x11.gc.green else x11.gc.cyan, rect.left + 10, rect.top + 19, asciiInto(prompt_ascii[0..], prompt));
 
     const hint = if (state.pty_session != null)
-        "Enter sends / Ctrl+C interrupt / Ctrl+D EOF / Esc blur"
+        "Enter sends / Ctrl+V paste / Ctrl+C interrupt / STOP ends"
     else
-        "Enter queues / Up history / Ctrl+U clear / Esc blur";
+        "Enter queues / PTY shell if empty / Ctrl+V paste / Up history";
     const hint_x = @max(rect.left + 360, rect.right - 430);
     if (hint_x > rect.left + 220) try x11.text(x11.gc.muted, hint_x, rect.top + 19, hint);
 }
@@ -6033,6 +6177,7 @@ fn tutorialLines(language: TutorialLanguage) []const []const u8 {
             "SEC: memory/exec/fs/net/deps/secret/text/path/git boundary wo miru panel.",
             "GIT: .git wo Zig de yomu. hooks/filters/fsmonitor/git status ha ugokasanai.",
             "EXT: manifest dake scan. extension code ha jikko shinai.",
+            "TERM: QUE de plan, PTY de pseudo-terminal/shell. Ctrl+V paste, Ctrl+C interrupt, STOP de terminate.",
             "SHIP: bundle/verify/preflight wo Zig dake de hash to path boundary made kakunin.",
             "LINUX: no_new_privs, dumpable off, caps, /proc maps wo SEC ni dasu.",
         },
@@ -6042,6 +6187,7 @@ fn tutorialLines(language: TutorialLanguage) []const []const u8 {
             "SEC shows Zig-owned boundary findings: memory, execution, filesystem, network, dependency, secret, text, path, git.",
             "GIT reads repository metadata directly; hooks, filters, fsmonitor, and git status are not executed for overview.",
             "EXT scans extension manifests only. Extension code is never executed during the baseline scan.",
+            "TERM queues plans and runs them in a pseudo-terminal. PTY opens a bounded shell if the queue is empty.",
             "SHIP verifies archives, paths, executable bits, and SHA-256 before release.",
             "LINUX exposes no_new_privs, dumpable, capabilities, and /proc maps as first-class IDE state.",
         },
@@ -6829,7 +6975,7 @@ fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
 }
 
 const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
-const task_panel_actions = [_]TaskPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .terminal, .queue_terminal, .run_pty, .tasks, .preview, .seal, .run_next, .history };
+const task_panel_actions = [_]TaskPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .terminal, .queue_terminal, .run_pty, .stop_pty, .tasks, .preview, .seal, .run_next, .history };
 const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .seal, .linux };
 const settings_panel_actions = [_]SettingsPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .tutorial_ja, .tutorial_en, .review, .trust, .lock, .seal };
 const extension_panel_actions = [_]ExtensionPanelAction{.scan};
@@ -6959,15 +7105,16 @@ fn taskPanelActionRect(state: *const LinuxGuiState, action: TaskPanelAction) Hit
         .terminal => 4,
         .queue_terminal => 5,
         .run_pty => 6,
-        .tasks => 7,
-        .preview => 8,
-        .seal => 9,
-        .run_next => 10,
-        .history => 11,
+        .stop_pty => 7,
+        .tasks => 8,
+        .preview => 9,
+        .seal => 10,
+        .run_next => 11,
+        .history => 12,
     };
     const width: i16 = 49;
     const gap: i16 = 5;
-    const right = state.window_width - 18 - (11 - index) * (width + gap);
+    const right = state.window_width - 18 - (12 - index) * (width + gap);
     const bottom = state.bottomTop();
     return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
@@ -7077,6 +7224,7 @@ fn taskPanelActionLabel(action: TaskPanelAction) []const u8 {
         .terminal => "TERM",
         .queue_terminal => "QUE",
         .run_pty => "PTY",
+        .stop_pty => "STOP",
         .tasks => "TASKS",
         .preview => "PLAN",
         .seal => "SEAL",

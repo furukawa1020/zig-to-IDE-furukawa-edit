@@ -104,15 +104,13 @@ fn collectGenericLine(allocator: std.mem.Allocator, line: []const u8, mode: mode
 }
 
 fn commentStart(line: []const u8, index: usize, mode: modes.LanguageMode) ?Role {
-    if (index + 1 < line.len and line[index] == '/' and line[index + 1] == '/') return .comment;
-    if (index + 1 < line.len and line[index] == '/' and line[index + 1] == '*') return .comment;
-    if (index + 3 < line.len and std.mem.eql(u8, line[index .. index + 4], "<!--")) return .comment;
-
-    return switch (mode) {
-        .shell, .powershell, .python, .ruby, .yaml, .toml, .hcl, .dockerfile, .makefile => if (line[index] == '#') .comment else null,
-        .sql => if (index + 1 < line.len and line[index] == '-' and line[index + 1] == '-') .comment else null,
-        else => null,
-    };
+    if (modes.blockComment(mode)) |block| {
+        if (startsAt(line, index, block.start)) return .comment;
+    }
+    if (modes.lineComment(mode)) |prefix| {
+        if (startsAtIgnoreCase(line, index, prefix)) return .comment;
+    }
+    return null;
 }
 
 fn scanQuoted(line: []const u8, start: usize) usize {
@@ -143,26 +141,30 @@ fn genericIdentifierRole(text: []const u8, mode: modes.LanguageMode) Role {
 fn isKeyword(text: []const u8, mode: modes.LanguageMode) bool {
     const family = modes.family(mode);
     if (family == .web) {
-        return inList(text, &.{ "async", "await", "break", "case", "catch", "class", "const", "continue", "default", "else", "export", "extends", "for", "from", "function", "if", "import", "let", "new", "return", "switch", "throw", "try", "type", "var", "while" });
+        return inList(text, &.{ "async", "await", "break", "case", "catch", "class", "const", "continue", "default", "else", "export", "extends", "for", "from", "function", "if", "import", "interface", "let", "new", "return", "switch", "throw", "try", "type", "var", "while" });
     }
     if (family == .native) {
-        return inList(text, &.{ "as", "break", "case", "class", "const", "continue", "defer", "else", "enum", "extern", "for", "fn", "func", "if", "impl", "import", "interface", "let", "match", "mut", "namespace", "package", "pub", "public", "return", "static", "struct", "switch", "type", "unsafe", "using", "var", "while" });
+        return inList(text, &.{ "as", "break", "case", "class", "const", "continue", "contract", "data", "defer", "else", "enum", "event", "extern", "for", "fn", "func", "function", "if", "impl", "import", "in", "interface", "let", "mapping", "match", "method", "modifier", "module", "mut", "namespace", "object", "package", "payable", "private", "pub", "public", "pure", "return", "static", "struct", "switch", "template", "type", "unsafe", "using", "var", "view", "where", "while" });
     }
     if (family == .script) {
-        return inList(text, &.{ "and", "begin", "break", "catch", "class", "def", "do", "else", "elseif", "end", "except", "finally", "for", "function", "if", "in", "local", "module", "not", "or", "return", "then", "try", "while", "yield" });
+        return inList(text, &.{ "and", "begin", "break", "catch", "class", "def", "defmodule", "do", "else", "elseif", "end", "except", "finally", "for", "fn", "function", "if", "in", "lambda", "let", "local", "module", "nil", "not", "or", "receive", "return", "then", "try", "unless", "when", "while", "yield" });
     }
     return switch (mode) {
         .json, .yaml, .toml, .hcl => inList(text, &.{ "true", "false", "null" }),
         .sql => inList(text, &.{ "select", "from", "where", "join", "insert", "update", "delete", "create", "drop", "alter", "table", "index", "into", "values", "and", "or", "not", "null" }),
+        .graphql => inList(text, &.{ "query", "mutation", "subscription", "fragment", "type", "interface", "union", "enum", "input", "schema" }),
+        .proto => inList(text, &.{ "syntax", "package", "message", "service", "rpc", "returns", "option", "repeated", "oneof", "reserved", "import" }),
+        .cmake => inList(text, &.{ "add_executable", "add_library", "add_subdirectory", "cmake_minimum_required", "execute_process", "find_package", "include", "project", "set" }),
         else => false,
     };
 }
 
 fn isDangerousGenericIdentifier(text: []const u8, mode: modes.LanguageMode) bool {
-    if (inList(text, &.{ "eval", "exec", "system", "subprocess", "child_process", "shell_exec", "popen", "pickle", "unsafe", "syscall", "Invoke-Expression" })) return true;
+    if (inList(text, &.{ "eval", "exec", "system", "subprocess", "child_process", "shell_exec", "popen", "pickle", "unsafe", "syscall", "Invoke-Expression", "ProcessBuilder", "Runtime", "DllImport", "Assembly", "dlopen", "delegatecall", "selfdestruct", "tx.origin", "loadstring", "unsafePerformIO", "Obj.magic" })) return true;
     return switch (mode) {
         .c, .cpp => inList(text, &.{ "gets", "strcpy", "sprintf" }),
         .rust => std.ascii.eqlIgnoreCase(text, "unsafe"),
+        .solidity => inList(text, &.{ "delegatecall", "selfdestruct" }),
         else => false,
     };
 }
@@ -198,6 +200,16 @@ fn isPunctuation(byte: u8) bool {
     };
 }
 
+fn startsAt(line: []const u8, index: usize, prefix: []const u8) bool {
+    if (index + prefix.len > line.len) return false;
+    return std.mem.eql(u8, line[index .. index + prefix.len], prefix);
+}
+
+fn startsAtIgnoreCase(line: []const u8, index: usize, prefix: []const u8) bool {
+    if (index + prefix.len > line.len) return false;
+    return std.ascii.eqlIgnoreCase(line[index .. index + prefix.len], prefix);
+}
+
 test "highlights Zig unsafe builtin" {
     const spans = try collectLine(std.testing.allocator, "const p = @ptrFromInt(x);", .zig);
     defer std.testing.allocator.free(spans);
@@ -216,4 +228,18 @@ test "highlights JS dynamic execution" {
     try std.testing.expect(spans.len >= 2);
     try std.testing.expectEqual(Role.unsafe_boundary, spans[0].role);
     try std.testing.expectEqual(Role.comment, spans[spans.len - 1].role);
+}
+
+test "highlights extended language comments and boundaries" {
+    const py = try collectLine(std.testing.allocator, "value = 1 # comment", .python);
+    defer std.testing.allocator.free(py);
+    try std.testing.expectEqual(Role.comment, py[py.len - 1].role);
+
+    const html = try collectLine(std.testing.allocator, "<!-- note -->", .html);
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqual(Role.comment, html[0].role);
+
+    const sol = try collectLine(std.testing.allocator, "delegatecall(payload);", .solidity);
+    defer std.testing.allocator.free(sol);
+    try std.testing.expectEqual(Role.unsafe_boundary, sol[0].role);
 }

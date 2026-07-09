@@ -10,7 +10,7 @@ pub const ScanOptions = struct {
 pub fn isInterestingPath(path: []const u8, language: modes.LanguageMode) bool {
     if (modes.isZigFamily(language)) return false;
     if (modes.isCode(language)) return true;
-    if (language == .env or language == .dockerfile or language == .makefile or language == .json or language == .yaml or language == .toml or language == .hcl) return true;
+    if (language == .env or language == .dockerfile or language == .makefile or language == .cmake or language == .ini or language == .properties or language == .json or language == .yaml or language == .toml or language == .hcl or language == .graphql or language == .proto) return true;
     if (isCiCdPath(path)) return true;
     const base = std.fs.path.basename(path);
     return std.mem.eql(u8, base, "package.json") or
@@ -84,11 +84,13 @@ fn scanLanguageLine(collection: *findings.Collection, options: ScanOptions, line
             try detect(collection, path, line, line_number, "Invoke-Expression", .high, "PowerShell dynamic execution boundary detected");
             try detect(collection, path, line, line_number, "iex ", .high, "PowerShell dynamic execution boundary detected");
         },
-        .c, .cpp => {
+        .c, .cpp, .objective_c, .objective_cpp => {
             try detect(collection, path, line, line_number, "system(", .high, "C/C++ shell execution boundary detected");
             try detect(collection, path, line, line_number, "popen(", .high, "C/C++ process pipe boundary detected");
             try detect(collection, path, line, line_number, "gets(", .critical, "unsafe C input function detected");
             try detect(collection, path, line, line_number, "strcpy(", .medium, "unchecked copy should be reviewed");
+            try detect(collection, path, line, line_number, "dlopen(", .high, "native dynamic library load boundary detected");
+            try detect(collection, path, line, line_number, "NSTask", .high, "Objective-C process execution boundary detected");
         },
         .rust => {
             try detect(collection, path, line, line_number, "unsafe", .medium, "Rust unsafe boundary detected");
@@ -98,6 +100,28 @@ fn scanLanguageLine(collection: *findings.Collection, options: ScanOptions, line
             try detect(collection, path, line, line_number, "os/exec", .high, "Go process execution package imported");
             try detect(collection, path, line, line_number, "syscall.", .medium, "Go syscall boundary detected");
             try detect(collection, path, line, line_number, "unsafe.", .medium, "Go unsafe package boundary detected");
+        },
+        .java, .kotlin, .scala => {
+            try detect(collection, path, line, line_number, "Runtime.getRuntime", .high, "JVM runtime process execution boundary detected");
+            try detect(collection, path, line, line_number, "ProcessBuilder", .high, "JVM process execution boundary detected");
+            try detect(collection, path, line, line_number, "System.loadLibrary", .high, "JVM native library load boundary detected");
+            try detect(collection, path, line, line_number, "JNI", .medium, "JVM native interface boundary detected");
+        },
+        .csharp, .fsharp => {
+            try detect(collection, path, line, line_number, "Process.Start", .high, ".NET process execution boundary detected");
+            try detect(collection, path, line, line_number, "DllImport", .high, ".NET native library boundary detected");
+            try detect(collection, path, line, line_number, "Assembly.Load", .high, ".NET dynamic assembly load boundary detected");
+            try detect(collection, path, line, line_number, "BinaryFormatter", .high, ".NET unsafe deserialization boundary detected");
+        },
+        .swift => {
+            try detect(collection, path, line, line_number, "Process()", .high, "Swift process execution boundary detected");
+            try detect(collection, path, line, line_number, "unsafeBitCast", .high, "Swift unsafe bit cast boundary detected");
+            try detect(collection, path, line, line_number, "dlopen", .high, "Swift dynamic library load boundary detected");
+        },
+        .dart => {
+            try detect(collection, path, line, line_number, "Process.run", .high, "Dart process execution boundary detected");
+            try detect(collection, path, line, line_number, "Process.start", .high, "Dart process execution boundary detected");
+            try detect(collection, path, line, line_number, "dart:ffi", .high, "Dart FFI boundary detected");
         },
         .php => {
             try detect(collection, path, line, line_number, "eval(", .high, "PHP eval boundary detected");
@@ -109,11 +133,71 @@ fn scanLanguageLine(collection: *findings.Collection, options: ScanOptions, line
             try detect(collection, path, line, line_number, "system(", .high, "Ruby shell execution boundary detected");
             try detect(collection, path, line, line_number, "Open3", .medium, "Ruby process boundary detected");
         },
+        .lua => {
+            try detect(collection, path, line, line_number, "os.execute", .high, "Lua shell execution boundary detected");
+            try detect(collection, path, line, line_number, "io.popen", .high, "Lua process pipe boundary detected");
+            try detect(collection, path, line, line_number, "loadstring", .high, "Lua dynamic code loading boundary detected");
+        },
         .groovy => {
             try detect(collection, path, line, line_number, "evaluate(", .high, "Groovy dynamic evaluation boundary detected");
             try detect(collection, path, line, line_number, "GroovyShell", .high, "Groovy shell evaluation boundary detected");
             try detect(collection, path, line, line_number, "ProcessBuilder", .high, "Groovy process execution boundary detected");
             try detect(collection, path, line, line_number, ".execute(", .high, "Groovy process execution boundary detected");
+        },
+        .r => {
+            try detect(collection, path, line, line_number, "system(", .high, "R shell execution boundary detected");
+            try detect(collection, path, line, line_number, "system2(", .high, "R shell execution boundary detected");
+            try detect(collection, path, line, line_number, "eval(parse(", .high, "R dynamic evaluation boundary detected");
+        },
+        .julia => {
+            try detect(collection, path, line, line_number, "run(", .medium, "Julia command execution boundary detected");
+            try detect(collection, path, line, line_number, "Cmd(", .medium, "Julia command construction boundary detected");
+            try detect(collection, path, line, line_number, "ccall", .high, "Julia native call boundary detected");
+            try detect(collection, path, line, line_number, "eval(", .high, "Julia dynamic evaluation boundary detected");
+        },
+        .perl => {
+            try detect(collection, path, line, line_number, "system(", .high, "Perl shell execution boundary detected");
+            try detect(collection, path, line, line_number, "exec(", .high, "Perl process replacement boundary detected");
+            try detect(collection, path, line, line_number, "eval(", .high, "Perl dynamic evaluation boundary detected");
+        },
+        .elixir => {
+            try detect(collection, path, line, line_number, "System.cmd", .high, "Elixir process execution boundary detected");
+            try detect(collection, path, line, line_number, "Code.eval", .high, "Elixir dynamic evaluation boundary detected");
+            try detect(collection, path, line, line_number, ":os.cmd", .high, "Erlang OS command boundary detected from Elixir");
+        },
+        .erlang => {
+            try detect(collection, path, line, line_number, "os:cmd", .high, "Erlang OS command boundary detected");
+            try detect(collection, path, line, line_number, "erl_eval", .high, "Erlang dynamic evaluation boundary detected");
+        },
+        .clojure => {
+            try detect(collection, path, line, line_number, "clojure.java.shell", .high, "Clojure shell execution boundary detected");
+            try detect(collection, path, line, line_number, "Runtime/getRuntime", .high, "Clojure JVM runtime execution boundary detected");
+            try detect(collection, path, line, line_number, "load-string", .high, "Clojure dynamic code loading boundary detected");
+        },
+        .haskell => {
+            try detect(collection, path, line, line_number, "System.Process", .high, "Haskell process execution boundary detected");
+            try detect(collection, path, line, line_number, "unsafePerformIO", .high, "Haskell unsafe IO boundary detected");
+            try detect(collection, path, line, line_number, "foreign import", .high, "Haskell FFI boundary detected");
+        },
+        .ocaml => {
+            try detect(collection, path, line, line_number, "Unix.system", .high, "OCaml shell execution boundary detected");
+            try detect(collection, path, line, line_number, "Unix.open_process", .high, "OCaml process pipe boundary detected");
+            try detect(collection, path, line, line_number, "Obj.magic", .high, "OCaml type safety escape boundary detected");
+        },
+        .nim => {
+            try detect(collection, path, line, line_number, "execShellCmd", .high, "Nim shell execution boundary detected");
+            try detect(collection, path, line, line_number, "gorge(", .medium, "Nim command capture boundary detected");
+            try detect(collection, path, line, line_number, "importc", .medium, "Nim C interop boundary detected");
+        },
+        .crystal => {
+            try detect(collection, path, line, line_number, "Process.run", .high, "Crystal process execution boundary detected");
+            try detect(collection, path, line, line_number, "LibC.system", .high, "Crystal libc shell execution boundary detected");
+        },
+        .solidity => {
+            try detect(collection, path, line, line_number, "delegatecall", .critical, "Solidity delegatecall can execute untrusted code in caller storage");
+            try detect(collection, path, line, line_number, "tx.origin", .high, "Solidity tx.origin authorization boundary detected");
+            try detect(collection, path, line, line_number, "selfdestruct", .high, "Solidity selfdestruct boundary detected");
+            try detect(collection, path, line, line_number, "call.value", .medium, "Solidity low-level value transfer boundary detected");
         },
         .dockerfile => {
             try detect(collection, path, line, line_number, "ADD http://", .high, "Dockerfile fetches remote content without TLS");
@@ -124,6 +208,24 @@ fn scanLanguageLine(collection: *findings.Collection, options: ScanOptions, line
             try detect(collection, path, line, line_number, "sudo ", .medium, "Makefile target invokes sudo");
             try detect(collection, path, line, line_number, "rm -rf", .high, "Makefile target performs recursive deletion");
             try detect(collection, path, line, line_number, "curl ", .medium, "Makefile target downloads remote content");
+        },
+        .cmake => {
+            try detect(collection, path, line, line_number, "execute_process", .high, "CMake executes a local process");
+            try detect(collection, path, line, line_number, "file(DOWNLOAD", .medium, "CMake downloads remote content");
+            try detect(collection, path, line, line_number, "ExternalProject_Add", .medium, "CMake external project expands dependency trust");
+        },
+        .batch => {
+            try detect(collection, path, line, line_number, "del /s", .high, "batch script performs recursive deletion");
+            try detect(collection, path, line, line_number, "powershell", .high, "batch script invokes PowerShell");
+            try detect(collection, path, line, line_number, "curl ", .medium, "batch script downloads remote content");
+        },
+        .graphql => {
+            try detect(collection, path, line, line_number, "__schema", .medium, "GraphQL introspection surface is exposed");
+            try detect(collection, path, line, line_number, "__type", .medium, "GraphQL introspection surface is exposed");
+        },
+        .proto => {
+            try detect(collection, path, line, line_number, "option java_package", .low, "protobuf generates JVM package surface");
+            try detect(collection, path, line, line_number, "option go_package", .low, "protobuf generates Go package surface");
         },
         .yaml => {
             if (indexOfIgnoreCase(path, ".github") != null) {
@@ -643,4 +745,44 @@ test "polyglot scanner detects CI provider trust edges" {
     try std.testing.expect(jenkins.countRiskAtLeast(.critical) >= 1);
     try std.testing.expect(jenkins.countRiskAtLeast(.high) >= 2);
     try std.testing.expect(jenkins.countRiskAtLeast(.medium) >= 1);
+}
+
+test "polyglot scanner detects extended language execution boundaries" {
+    var jvm = try scanSource(std.testing.allocator,
+        \\class Main {
+        \\  void run() throws Exception {
+        \\    new ProcessBuilder("sh", "-c", "id").start();
+        \\    System.loadLibrary("native");
+        \\  }
+        \\}
+        \\
+    , .{ .path = "Main.java", .language = .java });
+    defer jvm.deinit();
+    try std.testing.expect(jvm.countRiskAtLeast(.high) >= 2);
+
+    var dotnet = try scanSource(std.testing.allocator,
+        \\using System.Diagnostics;
+        \\Process.Start("cmd.exe");
+        \\[DllImport("kernel32")]
+        \\
+    , .{ .path = "Program.cs", .language = .csharp });
+    defer dotnet.deinit();
+    try std.testing.expect(dotnet.countRiskAtLeast(.high) >= 2);
+
+    var functional = try scanSource(std.testing.allocator,
+        \\System.cmd("sh", ["-c", "id"])
+        \\Code.eval_string("1 + 1")
+        \\
+    , .{ .path = "mix.exs", .language = .elixir });
+    defer functional.deinit();
+    try std.testing.expect(functional.countRiskAtLeast(.high) >= 2);
+
+    var contract = try scanSource(std.testing.allocator,
+        \\contract X {
+        \\  function f(address a) public { a.delegatecall(""); }
+        \\}
+        \\
+    , .{ .path = "Token.sol", .language = .solidity });
+    defer contract.deinit();
+    try std.testing.expect(contract.countRiskAtLeast(.critical) >= 1);
 }

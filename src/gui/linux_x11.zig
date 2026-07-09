@@ -939,6 +939,9 @@ const QuickPanel = struct {
                     .query_override = query,
                     .max_items = 80,
                 });
+                if (app.lsp_session.last_completion) |lsp_items| {
+                    self.completion_matches = try completion_mod.mergeLspItems(self.allocator, self.completion_matches.?, lsp_items.items, query, 120);
+                }
             },
             .language_mode => {
                 var matches = std.array_list.Managed(modes.LanguageMode).init(self.allocator);
@@ -3551,6 +3554,15 @@ const LinuxGuiState = struct {
     }
 
     fn gotoLocalDefinitionAtCursor(self: *LinuxGuiState) void {
+        if (self.app.lsp_session.last_locations) |locations| {
+            if (locations.items.len > 0) {
+                const location = locations.items[0];
+                self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
+                self.message("opened LSP definition", .{});
+                return;
+            }
+        }
+
         const doc = self.app.documents.active() orelse return self.message("no active document", .{});
         const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse return self.message("no identifier under cursor", .{});
         const path = doc.path orelse "(scratch)";
@@ -3571,6 +3583,19 @@ const LinuxGuiState = struct {
     }
 
     fn findReferencesAtCursor(self: *LinuxGuiState) void {
+        if (self.app.lsp_session.last_locations) |locations| {
+            if (locations.items.len > 0) {
+                self.bottom_panel = .output;
+                self.appendOutput(.stdout, "LSP locations: {d}\n", .{locations.items.len});
+                for (locations.items[0..@min(locations.items.len, @as(usize, 80))]) |location| {
+                    self.appendOutput(.stdout, "{s}:{d}:{d}\n", .{ location.path, location.range.start.line + 1, location.range.start.column + 1 });
+                }
+                if (locations.items.len > 80) self.appendOutput(.stdout, "... {d} more LSP location(s)\n", .{locations.items.len - 80});
+                self.message("showing {d} LSP location(s)", .{locations.items.len});
+                return;
+            }
+        }
+
         const doc = self.app.documents.active() orelse return self.message("no active document", .{});
         const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse return self.message("no identifier under cursor", .{});
         const owned_name = self.allocator.dupe(u8, name) catch |err| return self.message("reference search failed: {s}", .{@errorName(err)});

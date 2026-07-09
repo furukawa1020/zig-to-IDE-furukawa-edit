@@ -94,6 +94,45 @@ pub fn deinitItems(allocator: std.mem.Allocator, items: []Item) void {
     allocator.free(items);
 }
 
+pub fn mergeLspItems(
+    allocator: std.mem.Allocator,
+    base: []Item,
+    lsp_items: []const Item,
+    query: []const u8,
+    max_items: usize,
+) ![]Item {
+    var base_transferred = false;
+    errdefer if (!base_transferred) deinitItems(allocator, base);
+
+    var items = std.array_list.Managed(Item).init(allocator);
+    errdefer {
+        for (items.items) |*item| item.deinit(allocator);
+        items.deinit();
+    }
+
+    try items.appendSlice(base);
+    allocator.free(base);
+    base_transferred = true;
+
+    for (lsp_items) |item| {
+        if (containsLabel(items.items, item.label)) continue;
+        const item_score = score(query, item.label) orelse if (query.len == 0) @as(i32, 900) else continue;
+        try appendOwned(allocator, &items, item.label, item.insert_text, item.detail, item.kind, item_score + 90);
+    }
+
+    sortItems(items.items);
+    const limit = if (max_items == 0) items.items.len else max_items;
+    if (items.items.len > limit) {
+        var index = limit;
+        while (index < items.items.len) : (index += 1) {
+            items.items[index].deinit(allocator);
+        }
+        items.shrinkRetainingCapacity(limit);
+    }
+
+    return try items.toOwnedSlice();
+}
+
 fn appendSeeds(allocator: std.mem.Allocator, items: *std.array_list.Managed(Item), query: []const u8, seeds: []const Seed) !void {
     for (seeds) |seed| {
         const item_score = score(query, seed.label) orelse continue;
@@ -525,4 +564,28 @@ test "Python completion includes def keyword" {
     defer deinitItems(std.testing.allocator, items);
 
     try std.testing.expect(containsLabel(items, "def"));
+}
+
+test "merge LSP completion items into local items" {
+    const source = "std.Ar";
+    const local = try complete(std.testing.allocator, .{
+        .source = source,
+        .cursor_offset = source.len,
+        .language = .zig,
+        .query_override = "Ar",
+    });
+    const lsp = [_]Item{.{
+        .label = try std.testing.allocator.dupe(u8, "ArrayList"),
+        .insert_text = try std.testing.allocator.dupe(u8, "std.ArrayList"),
+        .detail = try std.testing.allocator.dupe(u8, "LSP type"),
+        .kind = .symbol,
+        .score = 950,
+    }};
+    var lsp_owned = lsp;
+    defer lsp_owned[0].deinit(std.testing.allocator);
+
+    const merged = try mergeLspItems(std.testing.allocator, local, lsp_owned[0..], "Ar", 16);
+    defer deinitItems(std.testing.allocator, merged);
+
+    try std.testing.expect(containsLabel(merged, "ArrayList"));
 }

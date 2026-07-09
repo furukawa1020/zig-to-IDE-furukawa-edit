@@ -40,6 +40,15 @@ pub const LspPumpResult = struct {
 
 const max_automatic_lsp_sync_bytes: usize = 4 * 1024 * 1024;
 
+fn commentToggleMessage(result: document_mod.CommentToggleResult) []const u8 {
+    return switch (result) {
+        .line_commented => "commented lines",
+        .line_uncommented => "uncommented lines",
+        .block_commented => "commented block",
+        .block_uncommented => "uncommented block",
+    };
+}
+
 pub const Result = union(enum) {
     completed: []const u8,
     blocked: []const u8,
@@ -123,6 +132,13 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         const doc = app.documents.active() orelse return .no_active_document;
         if (try doc.moveLineDown(doc.cursor.position.line)) return .{ .completed = "moved line down" };
         return .{ .blocked = "line is already at bottom" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "editor.toggle_comment")) {
+        const doc = app.documents.active() orelse return .no_active_document;
+        const offset = doc.cursor.position.byte_offset;
+        const result = (try doc.toggleComment(offset, offset)) orelse return .{ .blocked = "active language has no comment syntax" };
+        return .{ .completed = commentToggleMessage(result) };
     }
 
     if (std.mem.eql(u8, definition.id, "editor.move_left")) {

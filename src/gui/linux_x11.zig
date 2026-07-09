@@ -13,6 +13,7 @@ const navigation = @import("../editor/navigation.zig");
 const git_repository = @import("../git/repository.zig");
 const highlight = @import("../language/highlight.zig");
 const modes = @import("../language/modes.zig");
+const completion_mod = @import("../language/completion.zig");
 const symbols_mod = @import("../language/symbols.zig");
 const findings_mod = @import("../security/findings.zig");
 const text_integrity = @import("../security/text_integrity.zig");
@@ -613,6 +614,7 @@ const QuickPanelMode = enum {
     new_file,
     run_task,
     document_symbols,
+    completion,
 };
 
 const ReplaceRequest = struct {
@@ -684,6 +686,9 @@ const QuickPanel = struct {
     search_results: ?[]workspace_search.Result = null,
     task_matches: ?[]TaskMatch = null,
     symbol_matches: ?[]SymbolMatch = null,
+    completion_matches: ?[]completion_mod.Item = null,
+    completion_replace_start: usize = 0,
+    completion_replace_end: usize = 0,
 
     fn init(allocator: std.mem.Allocator) QuickPanel {
         return .{
@@ -754,6 +759,7 @@ const QuickPanel = struct {
             .new_file => if (self.query.items.len > 0) 1 else 0,
             .run_task => if (self.task_matches) |items| items.len else 0,
             .document_symbols => if (self.symbol_matches) |items| items.len else 0,
+            .completion => if (self.completion_matches) |items| items.len else 0,
         };
     }
 
@@ -783,6 +789,12 @@ const QuickPanel = struct {
 
     fn selectedSymbol(self: *const QuickPanel) ?*const SymbolMatch {
         const items = self.symbol_matches orelse return null;
+        if (items.len == 0) return null;
+        return &items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn selectedCompletion(self: *const QuickPanel) ?*const completion_mod.Item {
+        const items = self.completion_matches orelse return null;
         if (items.len == 0) return null;
         return &items[@min(self.selected_index, items.len - 1)];
     }
@@ -871,6 +883,22 @@ const QuickPanel = struct {
                 }
                 self.symbol_matches = try matches.toOwnedSlice();
             },
+            .completion => {
+                const active_index = app.documents.activeIndex() orelse return;
+                const doc = &app.documents.documents.items[active_index];
+                const prefix = completion_mod.prefixAt(doc.text.bytes, doc.cursor.position.byte_offset);
+                self.completion_replace_start = prefix.start;
+                self.completion_replace_end = prefix.end;
+                const query = if (self.query.items.len > 0) self.query.items else prefix.text;
+                self.completion_matches = try completion_mod.complete(self.allocator, .{
+                    .source = doc.text.bytes,
+                    .cursor_offset = doc.cursor.position.byte_offset,
+                    .file_path = doc.path orelse "(scratch)",
+                    .language = doc.language,
+                    .query_override = query,
+                    .max_items = 80,
+                });
+            },
         }
         if (self.selected_index >= self.itemCount()) self.selected_index = 0;
     }
@@ -899,6 +927,10 @@ const QuickPanel = struct {
             for (items) |*item| item.deinit(self.allocator);
             self.allocator.free(items);
             self.symbol_matches = null;
+        }
+        if (self.completion_matches) |items| {
+            completion_mod.deinitItems(self.allocator, items);
+            self.completion_matches = null;
         }
     }
 };
@@ -2572,6 +2604,10 @@ const LinuxGuiState = struct {
             self.openQuickPanel(.replace_document);
             return;
         }
+        if (std.mem.eql(u8, id, "editor.complete")) {
+            self.openQuickPanel(.completion);
+            return;
+        }
         if (std.mem.eql(u8, id, "editor.goto_line")) {
             self.openQuickPanel(.goto_line);
             return;
@@ -3194,6 +3230,18 @@ const LinuxGuiState = struct {
                 self.quick_panel.close();
                 self.jumpToActiveDocumentOffset(offset, "opened symbol");
             },
+            .completion => {
+                const item = self.quick_panel.selectedCompletion() orelse return self.message("no completion selected", .{});
+                const insert_text = self.allocator.dupe(u8, item.insert_text) catch |err| return self.message("completion failed: {s}", .{@errorName(err)});
+                defer self.allocator.free(insert_text);
+                const start = self.quick_panel.completion_replace_start;
+                const end = self.quick_panel.completion_replace_end;
+                self.quick_panel.close();
+                self.replaceActiveDocumentRange(start, end, insert_text);
+                self.app.mode = .insert;
+                self.app.focus = .editor;
+                self.message("completed: {s}", .{insert_text});
+            },
         }
     }
 
@@ -3570,6 +3618,17 @@ const LinuxGuiState = struct {
         if (key.modifiers.ctrl and std.meta.activeTag(key.code) == .tab) {
             self.execute(if (key.modifiers.shift) "file.previous_editor" else "file.next_editor", .keybinding);
             return;
+        }
+        if (key.modifiers.ctrl and self.app.focus == .editor) {
+            switch (key.code) {
+                .char => |char| {
+                    if (char == ' ') {
+                        self.execute("editor.complete", .keybinding);
+                        return;
+                    }
+                },
+                else => {},
+            }
         }
         if (key.modifiers.alt and self.app.focus == .editor) {
             switch (key.code) {
@@ -5749,6 +5808,15 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
             if (row >= items.len) break :blk "";
             break :blk std.fmt.bufPrint(text_buf[0..], "{s}  {s}:{d}:{d}", .{ items[row].name, @tagName(items[row].kind), items[row].line + 1, items[row].column + 1 }) catch items[row].name;
         },
+        .completion => blk: {
+            const items = state.quick_panel.completion_matches orelse break :blk "";
+            if (row >= items.len) break :blk "";
+            break :blk std.fmt.bufPrint(text_buf[0..], "{s}  {s}  {s}", .{
+                items[row].label,
+                @tagName(items[row].kind),
+                items[row].detail,
+            }) catch items[row].label;
+        },
     };
     var ascii_buf: [720]u8 = undefined;
     try x11.text(color, x, y, asciiInto(ascii_buf[0..], text));
@@ -6836,6 +6904,7 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .new_file => "NEW FILE",
         .run_task => "RUN TASK",
         .document_symbols => "SYMBOLS",
+        .completion => "COMPLETE  Enter inserts",
     };
 }
 

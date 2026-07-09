@@ -12,6 +12,7 @@ const git_repository = @import("../git/repository.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
 const highlight = @import("../language/highlight.zig");
 const modes = @import("../language/modes.zig");
+const completion_mod = @import("../language/completion.zig");
 const symbols_mod = @import("../language/symbols.zig");
 const file_finder = @import("../search/file_finder.zig");
 const literal_search = @import("../search/literal.zig");
@@ -31,6 +32,7 @@ const QuickPanelMode = enum {
     run_task,
     new_file,
     document_symbols,
+    completion,
 };
 
 const BottomPanel = enum {
@@ -149,6 +151,9 @@ const QuickPanel = struct {
     search_results: ?[]workspace_search.Result = null,
     task_matches: ?[]TaskMatch = null,
     symbol_matches: ?[]SymbolMatch = null,
+    completion_matches: ?[]completion_mod.Item = null,
+    completion_replace_start: usize = 0,
+    completion_replace_end: usize = 0,
 
     fn init(allocator: std.mem.Allocator) QuickPanel {
         return .{
@@ -217,6 +222,7 @@ const QuickPanel = struct {
             .run_task => if (self.task_matches) |items| items.len else 0,
             .new_file => if (self.query.items.len > 0) 1 else 0,
             .document_symbols => if (self.symbol_matches) |items| items.len else 0,
+            .completion => if (self.completion_matches) |items| items.len else 0,
         };
     }
 
@@ -246,6 +252,12 @@ const QuickPanel = struct {
 
     fn selectedSymbol(self: *const QuickPanel) ?*const SymbolMatch {
         const items = self.symbol_matches orelse return null;
+        if (items.len == 0) return null;
+        return &items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn selectedCompletion(self: *const QuickPanel) ?*const completion_mod.Item {
+        const items = self.completion_matches orelse return null;
         if (items.len == 0) return null;
         return &items[@min(self.selected_index, items.len - 1)];
     }
@@ -333,6 +345,22 @@ const QuickPanel = struct {
 
                 self.symbol_matches = try matches.toOwnedSlice();
             },
+            .completion => {
+                const active_index = app.documents.activeIndex() orelse return;
+                const doc = &app.documents.documents.items[active_index];
+                const prefix = completion_mod.prefixAt(doc.text.bytes, doc.cursor.position.byte_offset);
+                self.completion_replace_start = prefix.start;
+                self.completion_replace_end = prefix.end;
+                const query = if (self.query.items.len > 0) self.query.items else prefix.text;
+                self.completion_matches = try completion_mod.complete(self.allocator, .{
+                    .source = doc.text.bytes,
+                    .cursor_offset = doc.cursor.position.byte_offset,
+                    .file_path = doc.path orelse "(scratch)",
+                    .language = doc.language,
+                    .query_override = query,
+                    .max_items = 80,
+                });
+            },
         }
         if (self.selected_index >= self.itemCount()) self.selected_index = 0;
     }
@@ -361,6 +389,10 @@ const QuickPanel = struct {
             for (items) |*item| item.deinit(self.allocator);
             self.allocator.free(items);
             self.symbol_matches = null;
+        }
+        if (self.completion_matches) |items| {
+            completion_mod.deinitItems(self.allocator, items);
+            self.completion_matches = null;
         }
     }
 };
@@ -803,6 +835,10 @@ const GuiState = struct {
             self.openQuickPanel(.replace_document);
             return;
         }
+        if (std.mem.eql(u8, id, "editor.complete")) {
+            self.openQuickPanel(.completion);
+            return;
+        }
         if (std.mem.eql(u8, id, "editor.find_next")) {
             self.findLastDocumentSearch(.forward);
             return;
@@ -1127,6 +1163,7 @@ const GuiState = struct {
             .new_file => "New file",
             .document_symbols => "Document symbols",
             .rename_symbol => "Rename symbol",
+            .completion => "Complete symbol",
         }) catch {};
     }
 
@@ -1366,6 +1403,25 @@ const GuiState = struct {
                 const offset = item.byte_offset;
                 self.quick_panel.close();
                 self.jumpToActiveDocumentOffset(offset, "Opened symbol");
+            },
+            .completion => {
+                const item = self.quick_panel.selectedCompletion() orelse {
+                    self.setMessage("No completion selected") catch {};
+                    return;
+                };
+                const insert_text = self.allocator.dupe(u8, item.insert_text) catch |err| {
+                    self.setError(err) catch {};
+                    return;
+                };
+                defer self.allocator.free(insert_text);
+                const start = self.quick_panel.completion_replace_start;
+                const end = self.quick_panel.completion_replace_end;
+                self.quick_panel.close();
+                self.replaceActiveDocumentRange(start, end, insert_text);
+                self.app.mode = .insert;
+                self.app.focus = .editor;
+                self.ensureCursorVisible();
+                self.setMessage("Completed") catch {};
             },
         }
     }
@@ -2729,6 +2785,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (ctrl and shift and key == 'L') {
         state.openPublishPanel();
+        return;
+    }
+    if (ctrl and key == VK_SPACE) {
+        state.executeCommand("editor.complete");
         return;
     }
     if (ctrl and key == 'P') {
@@ -4336,6 +4396,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .run_task => "TASKS",
         .new_file => "NEW FILE",
         .document_symbols => "SYMBOLS",
+        .completion => "COMPLETE  Enter inserts",
     };
     drawText(hdc, panel.left + 16, panel.top + 14, rgb(79, 230, 226), title);
     if (isDocumentSearchMode(state.quick_panel.mode)) {
@@ -4410,6 +4471,13 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 drawTextClipped(hdc, panel.left + 18, y, panel.left + 240, color, item.name);
                 drawTextClipped(hdc, panel.left + 250, y, panel.left + 390, color, @tagName(item.kind));
                 drawTextClipped(hdc, panel.left + 400, y, panel.right - 16, color, location);
+            },
+            .completion => {
+                const items = state.quick_panel.completion_matches orelse break;
+                const item = items[row];
+                drawTextClipped(hdc, panel.left + 18, y, panel.left + 250, color, item.label);
+                drawTextClipped(hdc, panel.left + 260, y, panel.left + 370, color, @tagName(item.kind));
+                drawTextClipped(hdc, panel.left + 380, y, panel.right - 16, color, item.detail);
             },
         }
         y += ROW_HEIGHT;
@@ -5545,6 +5613,7 @@ const VK_SHIFT: c_int = 0x10;
 const VK_CONTROL: c_int = 0x11;
 const VK_MENU: c_int = 0x12;
 const VK_ESCAPE: WPARAM = 0x1B;
+const VK_SPACE: WPARAM = 0x20;
 const VK_PRIOR: WPARAM = 0x21;
 const VK_NEXT: WPARAM = 0x22;
 const VK_END: WPARAM = 0x23;

@@ -8,6 +8,7 @@ const render_view = @import("../ui/render.zig");
 const runtime = @import("runtime.zig");
 const console = @import("../tasks/console.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
+const lsp_session = @import("../lsp/session.zig");
 const workspace = @import("../workspace/workspace.zig");
 
 pub const Mode = enum {
@@ -36,6 +37,7 @@ pub const App = struct {
     diagnostics: diagnostics.Collection,
     security_findings: security_findings.Collection,
     process_console: console.ProcessConsole,
+    lsp_session: lsp_session.Session,
     pending_build_consent: ?build_consent.Preview,
     pending_build_source_id: ?[]u8,
     execution_queue: execution_queue.Queue,
@@ -70,6 +72,7 @@ pub const App = struct {
             .diagnostics = diagnostics.Collection.init(allocator),
             .security_findings = security_findings.Collection.init(allocator),
             .process_console = console.ProcessConsole.init(allocator),
+            .lsp_session = try lsp_session.Session.init(allocator, workspace_path),
             .pending_build_consent = null,
             .pending_build_source_id = null,
             .execution_queue = execution_queue.Queue.init(allocator),
@@ -87,6 +90,7 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.clearPendingBuildConsent();
+        self.lsp_session.deinit();
         self.execution_queue.deinit();
         self.process_console.deinit();
         self.security_findings.deinit();

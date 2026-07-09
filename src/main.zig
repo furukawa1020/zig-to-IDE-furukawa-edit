@@ -54,6 +54,7 @@ test {
     _ = @import("git/repository.zig");
     _ = @import("git/status.zig");
     _ = @import("github/client.zig");
+    _ = @import("gui/workbench_settings.zig");
     _ = @import("language/highlight.zig");
     _ = @import("language/modes.zig");
     _ = @import("language/semantic.zig");

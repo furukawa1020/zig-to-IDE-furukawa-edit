@@ -28,6 +28,7 @@ const task_registry = @import("../tasks/registry.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
 const permissions = @import("../security/permissions.zig");
 const types = @import("../core/types.zig");
+const workbench_settings = @import("workbench_settings.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("linux_x11.zig is Linux-only");
@@ -997,7 +998,7 @@ const LinuxGuiState = struct {
         const collapsed_dirs = try allocator.alloc(bool, app.workspace.entries.items.len);
         errdefer allocator.free(collapsed_dirs);
         @memset(collapsed_dirs, false);
-        return .{
+        var state = LinuxGuiState{
             .allocator = allocator,
             .app = app,
             .quick_panel = QuickPanel.init(allocator),
@@ -1006,6 +1007,8 @@ const LinuxGuiState = struct {
             .clipboard = std.array_list.Managed(u8).init(allocator),
             .primary_selection = std.array_list.Managed(u8).init(allocator),
         };
+        state.loadWorkbenchSettings();
+        return state;
     }
 
     fn deinit(self: *LinuxGuiState) void {
@@ -1030,6 +1033,114 @@ const LinuxGuiState = struct {
         defer text.deinit();
         text.writer.print(fmt, args) catch return;
         self.app.process_console.appendBytes(stream, text.written()) catch return;
+    }
+
+    fn loadWorkbenchSettings(self: *LinuxGuiState) void {
+        const path = self.allocWorkbenchSettingsPath() catch |err| {
+            self.appendOutput(.stderr, "workbench settings path failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(path);
+
+        const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, self.allocator, .limited(64 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => {
+                self.appendOutput(.stderr, "workbench settings load failed: {s}\n", .{@errorName(err)});
+                return;
+            },
+        };
+        defer self.allocator.free(bytes);
+
+        self.applyWorkbenchSettings(workbench_settings.parse(bytes));
+    }
+
+    fn saveWorkbenchSettings(self: *LinuxGuiState) void {
+        self.persistWorkbenchSettings() catch |err| {
+            self.appendOutput(.stderr, "workbench settings save failed: {s}\n", .{@errorName(err)});
+        };
+    }
+
+    fn persistWorkbenchSettings(self: *LinuxGuiState) !void {
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        try workbench_settings.write(&text.writer, self.currentWorkbenchSettings());
+
+        const dir_path = try self.allocWorkbenchSettingsDirPath();
+        defer self.allocator.free(dir_path);
+        try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir_path);
+
+        const path = try self.allocWorkbenchSettingsPath();
+        defer self.allocator.free(path);
+        var file = try createWorkbenchSettingsFile(path);
+        defer file.close(std.Options.debug_io);
+
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(std.Options.debug_io, &buffer);
+        try writer.interface.writeAll(text.written());
+        try writer.interface.flush();
+        try file.sync(std.Options.debug_io);
+    }
+
+    fn currentWorkbenchSettings(self: *const LinuxGuiState) workbench_settings.Settings {
+        return .{
+            .launch_profile = switch (self.linux_launch_profile) {
+                .read_only => .read_only,
+                .safe => .safe,
+                .network => .network,
+                .publish => .publish,
+            },
+            .tutorial_language = switch (self.tutorial_language) {
+                .ja => .ja,
+                .en => .en,
+            },
+            .bottom_panel = switch (self.bottom_panel) {
+                .output => .output,
+                .tasks => .tasks,
+                .git => .git,
+                .extensions => .extensions,
+                .diagnostics => .diagnostics,
+                .security => .security,
+                .settings => .settings,
+                .keybindings => .keybindings,
+                .tutorial => .tutorial,
+                .publish => .publish,
+            },
+        };
+    }
+
+    fn applyWorkbenchSettings(self: *LinuxGuiState, settings: workbench_settings.Settings) void {
+        self.linux_launch_profile = switch (settings.launch_profile) {
+            .read_only => .read_only,
+            .safe => .safe,
+            .network => .network,
+            .publish => .publish,
+        };
+        self.tutorial_language = switch (settings.tutorial_language) {
+            .ja => .ja,
+            .en => .en,
+        };
+        self.bottom_panel = switch (settings.bottom_panel) {
+            .output => .output,
+            .tasks => .tasks,
+            .git => .git,
+            .extensions => .extensions,
+            .diagnostics => .diagnostics,
+            .security => .security,
+            .settings => .settings,
+            .keybindings => .keybindings,
+            .tutorial => .tutorial,
+            .publish => .publish,
+        };
+    }
+
+    fn allocWorkbenchSettingsDirPath(self: *const LinuxGuiState) ![]u8 {
+        return std.fs.path.join(self.allocator, &.{ self.app.workspace.root_path, ".zide" });
+    }
+
+    fn allocWorkbenchSettingsPath(self: *const LinuxGuiState) ![]u8 {
+        const dir_path = try self.allocWorkbenchSettingsDirPath();
+        defer self.allocator.free(dir_path);
+        return std.fs.path.join(self.allocator, &.{ dir_path, "workbench.conf" });
     }
 
     fn enableLinuxSelfProtection(self: *LinuxGuiState) void {
@@ -1089,6 +1200,7 @@ const LinuxGuiState = struct {
 
     fn setLinuxLaunchProfile(self: *LinuxGuiState, profile: LinuxLaunchProfile) void {
         self.linux_launch_profile = profile;
+        self.saveWorkbenchSettings();
         if (self.applyLinuxLaunchProfileToLatestQueued("profile selected")) {
             self.message("launch profile: {s}", .{linuxLaunchProfileLabel(profile)});
         } else {
@@ -2004,11 +2116,13 @@ const LinuxGuiState = struct {
         }
         if (std.mem.eql(u8, id, "preferences.open_settings")) {
             self.bottom_panel = .settings;
+            self.saveWorkbenchSettings();
             self.message("settings", .{});
             return;
         }
         if (std.mem.eql(u8, id, "preferences.open_keybindings")) {
             self.bottom_panel = .keybindings;
+            self.saveWorkbenchSettings();
             self.message("keyboard shortcuts", .{});
             return;
         }
@@ -2131,6 +2245,7 @@ const LinuxGuiState = struct {
             .extensions => self.execute("extensions.scan", .keybinding),
             .tutorial => {
                 self.bottom_panel = .tutorial;
+                self.saveWorkbenchSettings();
                 self.message("help: tutorial opened", .{});
             },
             .publish => self.execute("release.checklist", .keybinding),
@@ -2139,11 +2254,13 @@ const LinuxGuiState = struct {
 
     fn openGitPanel(self: *LinuxGuiState) void {
         self.bottom_panel = .git;
+        self.saveWorkbenchSettings();
         self.refreshGitOverview();
     }
 
     fn openTasksPanel(self: *LinuxGuiState) void {
         self.bottom_panel = .tasks;
+        self.saveWorkbenchSettings();
         self.refreshLinuxSelfProtection();
         self.openQuickPanel(.run_task);
     }
@@ -2301,6 +2418,7 @@ const LinuxGuiState = struct {
             .en => .en,
         };
         self.bottom_panel = .tutorial;
+        self.saveWorkbenchSettings();
         self.message("tutorial language: {s}", .{@tagName(self.tutorial_language)});
     }
 
@@ -2909,6 +3027,7 @@ const LinuxGuiState = struct {
         self.appendOutput(.stdout, "opened workspace: {s}\n", .{self.app.workspace.root_path});
         self.refreshGitOverview();
         self.execute("security.audit_workspace", .startup);
+        self.loadWorkbenchSettings();
     }
 
     fn handleKey(self: *LinuxGuiState, x11: *X11, key: event_mod.KeyEvent) void {
@@ -3520,7 +3639,12 @@ const LinuxGuiState = struct {
         }
 
         if (y >= bottom and y < bottom + 34) {
-            if (bottomPanelAt(self, x, y)) |panel| self.bottom_panel = panel;
+            if (bottomPanelAt(self, x, y)) |panel| {
+                if (self.bottom_panel != panel) {
+                    self.bottom_panel = panel;
+                    self.saveWorkbenchSettings();
+                }
+            }
             return;
         }
 
@@ -3897,6 +4021,13 @@ const LinuxGuiState = struct {
     }
 };
 
+fn createWorkbenchSettingsFile(path: []const u8) !std.Io.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.Io.Dir.createFileAbsolute(std.Options.debug_io, path, .{ .truncate = true });
+    }
+    return std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{ .truncate = true });
+}
+
 pub fn run(
     allocator: std.mem.Allocator,
     root_path: []const u8,
@@ -3905,10 +4036,12 @@ pub fn run(
 ) !void {
     var state = try LinuxGuiState.init(allocator, root_path, environ);
     defer state.deinit();
+    defer state.saveWorkbenchSettings();
 
     state.enableLinuxSelfProtection();
     state.refreshGitOverview();
     state.execute("security.audit_workspace", .startup);
+    state.loadWorkbenchSettings();
 
     var x11 = try X11.connect(allocator, environ_map);
     defer x11.close();
@@ -5412,6 +5545,7 @@ fn settingsLines() []const []const u8 {
         "[zide] Extension discovery is manifest-only. Extension code stays inert until a future capability grant exists.",
         "[zide] Saves run through text integrity checks: hidden controls, mixed newlines, path boundaries, and security findings.",
         "[zide] Run output is sanitized and clipped before it reaches the IDE surface.",
+        "[zide] .zide/workbench.conf remembers UX state only; trust state is intentionally re-earned.",
         "[ux] Ctrl+, opens this panel. Ctrl+K opens keybindings. Ctrl+Shift+P opens the command palette.",
         "[ux] The keybindings panel doubles as a command launcher; click a row to execute it.",
     };

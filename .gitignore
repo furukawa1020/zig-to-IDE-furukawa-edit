@@ -5,6 +5,7 @@
 .zig-toolchain/
 .tools/
 .zide/audit/
+.zide/workbench.conf
 zig-cache/
 zig-out/
 zig-*.zip

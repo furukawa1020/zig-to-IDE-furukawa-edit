@@ -83,6 +83,7 @@ const definitions = [_]Definition{
     .{ .id = "editor.move_line_down", .title = "Move Line Down", .description = "Move the current editor line downward.", .default_key = "alt-down", .scope = .editor, .capability = .safe },
     .{ .id = "workspace.search", .title = "Search Workspace", .description = "Search text across workspace files.", .default_key = "ctrl-shift-f", .scope = .workspace, .capability = .safe },
     .{ .id = "workspace.find_file", .title = "Find File", .description = "Fuzzy-find a file in the workspace.", .default_key = "ctrl-p", .scope = .workspace, .capability = .safe },
+    .{ .id = "workspace.language_report", .title = "Workspace Language Report", .description = "Show recognized languages, LSP mappings, run profiles, and security focus without executing tools.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "workspace.previous_file", .title = "Previous File", .description = "Move the file-tree selection upward.", .default_key = "k", .scope = .workspace, .capability = .safe },
     .{ .id = "workspace.next_file", .title = "Next File", .description = "Move the file-tree selection downward.", .default_key = "j", .scope = .workspace, .capability = .safe },
     .{ .id = "workspace.open_selected", .title = "Open Selected File", .description = "Open the selected file-tree entry.", .default_key = "enter", .scope = .workspace, .capability = .safe },

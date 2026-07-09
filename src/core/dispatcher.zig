@@ -250,6 +250,11 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "workspace search complete" };
     }
 
+    if (std.mem.eql(u8, definition.id, "workspace.language_report")) {
+        try renderWorkspaceLanguageReport(app);
+        return .{ .completed = "workspace language report rendered" };
+    }
+
     if (std.mem.eql(u8, definition.id, "diagnostics.next")) {
         if (app.diagnostics.items.items.len == 0) return .{ .blocked = "no diagnostics available" };
         const index = findNextDiagnosticIndex(app) orelse return .{ .blocked = "no diagnostics available" };
@@ -1306,6 +1311,128 @@ fn renderWorkspaceSearch(app: *app_mod.App, query: []const u8) !void {
         }
         try writer.print("{s}:{d}:{d}: {s}\n", .{ item.path, item.line + 1, item.column + 1, item.preview });
     }
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+const LanguageRow = struct {
+    mode: modes.LanguageMode,
+    files: usize,
+};
+
+fn languageRowLess(_: void, left: LanguageRow, right: LanguageRow) bool {
+    if (left.files != right.files) return left.files > right.files;
+    return @intFromEnum(left.mode) < @intFromEnum(right.mode);
+}
+
+fn renderWorkspaceLanguageReport(app: *app_mod.App) !void {
+    try app.workspace.refresh();
+
+    const language_count_len = @typeInfo(modes.LanguageMode).@"enum".fields.len;
+    const family_count_len = @typeInfo(modes.LanguageFamily).@"enum".fields.len;
+    var language_counts = [_]usize{0} ** language_count_len;
+    var family_counts = [_]usize{0} ** family_count_len;
+    var total_files: usize = 0;
+    var total_dirs: usize = 0;
+    var other_entries: usize = 0;
+    var recognized_files: usize = 0;
+    var code_files: usize = 0;
+    var unknown_files: usize = 0;
+
+    for (app.workspace.entries.items) |entry| {
+        switch (entry.kind) {
+            .file => {
+                total_files += 1;
+                language_counts[@intFromEnum(entry.language)] += 1;
+                family_counts[@intFromEnum(modes.family(entry.language))] += 1;
+                if (modes.isRecognized(entry.language)) recognized_files += 1 else unknown_files += 1;
+                if (modes.isCode(entry.language)) code_files += 1;
+            },
+            .directory => total_dirs += 1,
+            .other => other_entries += 1,
+        }
+    }
+
+    var rows = std.array_list.Managed(LanguageRow).init(app.allocator);
+    defer rows.deinit();
+    for (modes.all()) |mode| {
+        const files = language_counts[@intFromEnum(mode)];
+        if (files > 0) try rows.append(.{ .mode = mode, .files = files });
+    }
+    std.mem.sort(LanguageRow, rows.items, {}, languageRowLess);
+
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("workspace language report\n");
+    try writer.print("root: {s}\n", .{app.workspace.root_path});
+    try writer.print("entries: files={d} dirs={d} other={d}\n", .{ total_files, total_dirs, other_entries });
+    try writer.print("recognized files: {d}/{d}\n", .{ recognized_files, total_files });
+    try writer.print("code files: {d}\n", .{code_files});
+    try writer.print("language modes present: {d}\n", .{rows.items.len});
+    try writer.writeAll("boundary: filename/language registry only; no hooks, plugins, package scripts, language servers, or shell commands were executed\n");
+
+    try writer.writeAll("\nfamilies\n");
+    inline for (@typeInfo(modes.LanguageFamily).@"enum".fields) |field| {
+        const family_value: modes.LanguageFamily = @enumFromInt(field.value);
+        const count = family_counts[@intFromEnum(family_value)];
+        if (count > 0) try writer.print("- {s}: {d}\n", .{ field.name, count });
+    }
+
+    try writer.writeAll("\nlanguages\n");
+    for (rows.items) |row| {
+        var plan = try lsp_launch_plan.forLanguage(app.allocator, row.mode);
+        defer plan.deinit(app.allocator);
+        const run_label = if (modes.runProfile(row.mode)) |profile| profile.label else "none";
+        try writer.print("- {s}: files={d} family={s} lsp={s} run={s} security={s}\n", .{
+            modes.label(row.mode),
+            row.files,
+            @tagName(modes.family(row.mode)),
+            if (plan.available) plan.label else "none",
+            run_label,
+            modes.securityFocus(row.mode),
+        });
+        if (plan.available and plan.command.len > 0) {
+            try writer.print("  lsp command: {s}\n", .{plan.command});
+        } else if (!plan.available and row.files > 0 and modes.isCode(row.mode)) {
+            try writer.print("  lsp hint: {s}\n", .{plan.install_hint});
+        }
+    }
+
+    if (unknown_files > 0) {
+        try writer.writeAll("\nunknown file examples\n");
+        var shown: usize = 0;
+        for (app.workspace.entries.items) |entry| {
+            if (entry.kind != .file or entry.language != .unknown) continue;
+            try writer.print("- {s}\n", .{entry.path});
+            shown += 1;
+            if (shown >= 8) break;
+        }
+        if (unknown_files > shown) try writer.print("... {d} more unknown file(s)\n", .{unknown_files - shown});
+    }
+
+    try writer.writeAll("\nopen editors\n");
+    try writer.print("tabs={d} dirty={d}\n", .{ app.documents.documents.items.len, app.documents.dirtyCount() });
+    for (app.documents.documents.items[0..@min(app.documents.documents.items.len, @as(usize, 12))]) |doc| {
+        try writer.print("- {s} [{s}]{s}\n", .{
+            doc.path orelse "(scratch)",
+            modes.label(doc.language),
+            if (doc.dirty) " dirty" else "",
+        });
+    }
+
+    try writer.writeAll("\nlsp runtime\n");
+    try writer.print("slots={d} running={d}\n", .{ app.lsp_manager.servers.items.len, app.lsp_manager.runningCount() });
+    for (app.lsp_manager.servers.items) |server| {
+        try writer.print("- {s}: state={s} opened={d} pending={d} transport={s}\n", .{
+            modes.label(server.language),
+            @tagName(server.session.state),
+            server.session.openedCount(),
+            server.session.pendingCount(),
+            if (server.transport != null) "running" else "stopped",
+        });
+    }
+
     try app.process_console.appendBytes(.stdout, text.written());
 }
 

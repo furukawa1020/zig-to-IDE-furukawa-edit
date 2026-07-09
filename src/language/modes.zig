@@ -62,6 +62,7 @@ pub const LanguageMode = enum {
     ini,
     properties,
     csv,
+    image,
     unknown,
 };
 
@@ -148,6 +149,7 @@ const all_modes = [_]LanguageMode{
     .ini,
     .properties,
     .csv,
+    .image,
     .unknown,
 };
 
@@ -200,6 +202,7 @@ pub fn detect(path: []const u8) LanguageMode {
     if (extEquals(ext, ".ini") or extEquals(ext, ".cfg") or extEquals(ext, ".conf")) return .ini;
     if (extEquals(ext, ".properties")) return .properties;
     if (extEquals(ext, ".csv")) return .csv;
+    if (extEquals(ext, ".png") or extEquals(ext, ".jpg") or extEquals(ext, ".jpeg") or extEquals(ext, ".gif") or extEquals(ext, ".webp") or extEquals(ext, ".bmp") or extEquals(ext, ".ico") or extEquals(ext, ".svg")) return .image;
     if (extEquals(ext, ".env")) return .env;
     if (extEquals(ext, ".sh") or extEquals(ext, ".bash") or extEquals(ext, ".zsh") or extEquals(ext, ".fish")) return .shell;
     if (extEquals(ext, ".ps1") or extEquals(ext, ".psm1")) return .powershell;
@@ -276,7 +279,7 @@ pub fn family(mode: LanguageMode) LanguageFamily {
         .c, .cpp, .objective_c, .objective_cpp, .assembly, .go, .rust, .java, .csharp, .fsharp, .swift, .kotlin, .scala, .haskell, .ocaml, .nim, .crystal, .solidity => .native,
         .shell, .powershell, .batch, .python, .php, .ruby, .lua, .groovy, .r, .julia, .perl, .elixir, .erlang, .clojure => .script,
         .javascript, .jsx, .typescript, .tsx, .html, .css, .dart, .vue, .svelte => .web,
-        .json, .yaml, .toml, .hcl, .xml, .sql, .graphql, .proto, .csv => .data,
+        .json, .yaml, .toml, .hcl, .xml, .sql, .graphql, .proto, .csv, .image => .data,
         .env, .gitignore, .makefile, .dockerfile, .cmake, .ini, .properties => .config,
         .markdown, .text => .prose,
         .unknown => .unknown,
@@ -346,6 +349,7 @@ pub fn label(mode: LanguageMode) []const u8 {
         .ini => "ini",
         .properties => "properties",
         .csv => "csv",
+        .image => "image",
         .unknown => "unknown",
     };
 }
@@ -477,6 +481,8 @@ test "detect extended polyglot workspaces" {
     try std.testing.expectEqual(LanguageMode.solidity, detect("Token.sol"));
     try std.testing.expectEqual(LanguageMode.cmake, detect("CMakeLists.txt"));
     try std.testing.expectEqual(LanguageMode.batch, detect("build.cmd"));
+    try std.testing.expectEqual(LanguageMode.image, detect("site/ogp.png"));
+    try std.testing.expectEqual(LanguageMode.image, detect("logo.svg"));
 }
 
 test "language profiles expose editor affordances" {

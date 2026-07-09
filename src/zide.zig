@@ -14,6 +14,7 @@ pub const loop_runner = @import("core/loop_runner.zig");
 pub const runtime = @import("core/runtime.zig");
 pub const types = @import("core/types.zig");
 pub const buffer = @import("editor/buffer.zig");
+pub const completion = @import("language/completion.zig");
 pub const modes = @import("language/modes.zig");
 pub const zig_tokenizer = @import("language/zig_tokenizer.zig");
 pub const render = @import("ui/render.zig");
@@ -74,6 +75,7 @@ pub const workspace_layer = struct {
 };
 
 pub const language = struct {
+    pub const completion = @import("language/completion.zig");
     pub const highlight = @import("language/highlight.zig");
     pub const modes = @import("language/modes.zig");
     pub const semantic = @import("language/semantic.zig");

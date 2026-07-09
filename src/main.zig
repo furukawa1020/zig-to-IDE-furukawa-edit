@@ -65,6 +65,7 @@ test {
     _ = @import("lsp/diagnostics.zig");
     _ = @import("lsp/framing.zig");
     _ = @import("lsp/launch_plan.zig");
+    _ = @import("lsp/manager.zig");
     _ = @import("lsp/protocol.zig");
     _ = @import("lsp/registry.zig");
     _ = @import("lsp/responses.zig");

@@ -1297,6 +1297,7 @@ const LinuxGuiState = struct {
             });
         }
         if (edit.edits.len > 80) self.appendOutput(.stdout, "... {d} more LSP edit(s)\n", .{edit.edits.len - 80});
+        self.appendOutput(.stdout, "run lsp.apply_workspace_edit to apply these edits to dirty editor buffers; save afterwards to write files\n", .{});
         self.message("showing LSP rename preview", .{});
     }
 

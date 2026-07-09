@@ -167,6 +167,17 @@ pub const Document = struct {
         return try self.moveAdjacentLines(line, line + 1, line + 1);
     }
 
+    pub fn toggleComment(self: *Document, start_offset: usize, end_offset: usize) !?CommentToggleResult {
+        if (modes.lineComment(self.language)) |prefix| {
+            const range = try self.lineRangeForOffsets(start_offset, end_offset);
+            return try self.toggleLineComment(prefix, range.start_line, range.end_line);
+        }
+        if (modes.blockComment(self.language)) |comment| {
+            return try self.toggleBlockComment(comment, start_offset, end_offset);
+        }
+        return null;
+    }
+
     pub fn undo(self: *Document) !bool {
         const changed = try self.undo_stack.undo(&self.text);
         if (changed) self.dirty = true;
@@ -203,6 +214,97 @@ pub const Document = struct {
         return true;
     }
 
+    fn lineRangeForOffsets(self: *const Document, start_offset: usize, end_offset: usize) !LineSelection {
+        const clamped_start = @min(start_offset, self.text.bytes.len);
+        const clamped_end = @min(end_offset, self.text.bytes.len);
+        const first = @min(clamped_start, clamped_end);
+        const last_raw = @max(clamped_start, clamped_end);
+        const last = if (last_raw > first) last_raw - 1 else first;
+        return .{
+            .start_line = try self.text.offsetToLine(first),
+            .end_line = try self.text.offsetToLine(last),
+        };
+    }
+
+    fn toggleLineComment(self: *Document, prefix: []const u8, start_line: usize, end_line: usize) !CommentToggleResult {
+        if (self.text.lineCount() == 0) return .line_commented;
+        const first_line = @min(start_line, self.text.lineCount() - 1);
+        const last_line = @min(@max(start_line, end_line), self.text.lineCount() - 1);
+        const first = self.lineRange(first_line) orelse return .line_commented;
+        const last = self.lineRange(last_line) orelse return .line_commented;
+
+        var non_empty: usize = 0;
+        var commented: usize = 0;
+        var line = first_line;
+        while (line <= last_line) : (line += 1) {
+            const range = self.lineRange(line) orelse continue;
+            const content = self.text.bytes[range.start..range.content_end];
+            if (trimmedIsEmpty(content)) continue;
+            non_empty += 1;
+            if (commentPrefixOffset(content, prefix) != null) commented += 1;
+        }
+        const should_uncomment = non_empty > 0 and commented == non_empty;
+
+        var replacement: std.Io.Writer.Allocating = .init(self.allocator);
+        defer replacement.deinit();
+
+        line = first_line;
+        while (line <= last_line) : (line += 1) {
+            const range = self.lineRange(line) orelse continue;
+            const content = self.text.bytes[range.start..range.content_end];
+            const ending = self.text.bytes[range.content_end..range.end];
+            if (should_uncomment) {
+                try writeUncommentedLine(&replacement.writer, content, prefix);
+            } else {
+                try writeCommentedLine(&replacement.writer, content, prefix);
+            }
+            try replacement.writer.writeAll(ending);
+        }
+
+        const cursor_line = self.cursor.position.line;
+        const cursor_column = self.cursor.position.column;
+        try self.replaceRange(first.start, last.end, replacement.written());
+        const target_line = @min(cursor_line, self.text.lineCount() - 1);
+        const target_column = @min(cursor_column, self.text.lineSlice(target_line).len);
+        const target_offset = try self.text.lineColumnToOffset(target_line, target_column);
+        self.cursor.position = try self.positionFromOffset(target_offset);
+        return if (should_uncomment) .line_uncommented else .line_commented;
+    }
+
+    fn toggleBlockComment(self: *Document, comment: modes.BlockComment, start_offset: usize, end_offset: usize) !CommentToggleResult {
+        var start = @min(start_offset, end_offset);
+        var end = @max(start_offset, end_offset);
+        start = @min(start, self.text.bytes.len);
+        end = @min(end, self.text.bytes.len);
+        if (start == end) {
+            const line = try self.text.offsetToLine(start);
+            const range = self.lineRange(line) orelse return .block_commented;
+            start = range.start;
+            end = range.content_end;
+        }
+
+        const content = self.text.bytes[start..end];
+        var replacement: std.Io.Writer.Allocating = .init(self.allocator);
+        defer replacement.deinit();
+
+        const existing = blockCommentBounds(content, comment);
+        if (existing) |bounds| {
+            try replacement.writer.writeAll(content[0..bounds.start_prefix]);
+            try replacement.writer.writeAll(content[bounds.inner_start..bounds.inner_end]);
+            try replacement.writer.writeAll(content[bounds.end_suffix..]);
+            try self.replaceRange(start, end, replacement.written());
+            return .block_uncommented;
+        }
+
+        try replacement.writer.writeAll(comment.start);
+        if (content.len > 0) try replacement.writer.writeByte(' ');
+        try replacement.writer.writeAll(content);
+        if (content.len > 0) try replacement.writer.writeByte(' ');
+        try replacement.writer.writeAll(comment.end);
+        try self.replaceRange(start, end, replacement.written());
+        return .block_commented;
+    }
+
     fn lineRange(self: *const Document, line: usize) ?LineRange {
         const start = self.text.lineStart(line) orelse return null;
         const content_end = start + self.text.lineSlice(line).len;
@@ -219,6 +321,83 @@ const LineRange = struct {
     content_end: usize,
     end: usize,
 };
+
+const LineSelection = struct {
+    start_line: usize,
+    end_line: usize,
+};
+
+pub const CommentToggleResult = enum {
+    line_commented,
+    line_uncommented,
+    block_commented,
+    block_uncommented,
+};
+
+const BlockBounds = struct {
+    start_prefix: usize,
+    inner_start: usize,
+    inner_end: usize,
+    end_suffix: usize,
+};
+
+fn trimmedIsEmpty(bytes: []const u8) bool {
+    return trimLineLeft(bytes).len == 0;
+}
+
+fn trimLineLeft(bytes: []const u8) []const u8 {
+    var index: usize = 0;
+    while (index < bytes.len and (bytes[index] == ' ' or bytes[index] == '\t')) : (index += 1) {}
+    return bytes[index..];
+}
+
+fn commentPrefixOffset(content: []const u8, prefix: []const u8) ?usize {
+    const trimmed = trimLineLeft(content);
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+    return content.len - trimmed.len;
+}
+
+fn writeCommentedLine(writer: *std.Io.Writer, content: []const u8, prefix: []const u8) !void {
+    const trimmed = trimLineLeft(content);
+    const indent_len = content.len - trimmed.len;
+    try writer.writeAll(content[0..indent_len]);
+    try writer.writeAll(prefix);
+    if (trimmed.len > 0) try writer.writeByte(' ');
+    try writer.writeAll(trimmed);
+}
+
+fn writeUncommentedLine(writer: *std.Io.Writer, content: []const u8, prefix: []const u8) !void {
+    const offset = commentPrefixOffset(content, prefix) orelse {
+        try writer.writeAll(content);
+        return;
+    };
+    try writer.writeAll(content[0..offset]);
+    var rest_start = offset + prefix.len;
+    if (rest_start < content.len and content[rest_start] == ' ') rest_start += 1;
+    try writer.writeAll(content[rest_start..]);
+}
+
+fn blockCommentBounds(content: []const u8, comment: modes.BlockComment) ?BlockBounds {
+    var left: usize = 0;
+    while (left < content.len and std.ascii.isWhitespace(content[left])) : (left += 1) {}
+    if (!std.mem.startsWith(u8, content[left..], comment.start)) return null;
+
+    var right: usize = content.len;
+    while (right > left and std.ascii.isWhitespace(content[right - 1])) : (right -= 1) {}
+    if (right < left + comment.start.len + comment.end.len) return null;
+    if (!std.mem.endsWith(u8, content[left..right], comment.end)) return null;
+
+    var inner_start = left + comment.start.len;
+    if (inner_start < right and content[inner_start] == ' ') inner_start += 1;
+    var inner_end = right - comment.end.len;
+    if (inner_end > inner_start and content[inner_end - 1] == ' ') inner_end -= 1;
+    return .{
+        .start_prefix = left,
+        .inner_start = inner_start,
+        .inner_end = inner_end,
+        .end_suffix = right,
+    };
+}
 
 pub fn newlineLabelFor(newline: Newline) []const u8 {
     return switch (newline) {
@@ -288,4 +467,26 @@ test "document normalizes mixed newlines explicitly" {
     try std.testing.expect(try doc.normalizeNewlines(.lf));
     try std.testing.expectEqualStrings("a\nb\nc\nd", doc.text.bytes);
     try std.testing.expectEqual(buffer.Newline.lf, doc.text.newline);
+}
+
+test "document toggles language line comments over selected lines" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.py", "alpha\n    beta\n\n");
+    defer doc.deinit();
+
+    try std.testing.expectEqual(CommentToggleResult.line_commented, (try doc.toggleComment(0, doc.text.bytes.len)).?);
+    try std.testing.expectEqualStrings("# alpha\n    # beta\n#\n", doc.text.bytes);
+
+    try std.testing.expectEqual(CommentToggleResult.line_uncommented, (try doc.toggleComment(0, doc.text.bytes.len)).?);
+    try std.testing.expectEqualStrings("alpha\n    beta\n\n", doc.text.bytes);
+}
+
+test "document toggles block comments for markup languages" {
+    var doc = try Document.fromBytes(std.testing.allocator, "index.html", "<main>Hi</main>");
+    defer doc.deinit();
+
+    try std.testing.expectEqual(CommentToggleResult.block_commented, (try doc.toggleComment(0, doc.text.bytes.len)).?);
+    try std.testing.expectEqualStrings("<!-- <main>Hi</main> -->", doc.text.bytes);
+
+    try std.testing.expectEqual(CommentToggleResult.block_uncommented, (try doc.toggleComment(0, doc.text.bytes.len)).?);
+    try std.testing.expectEqualStrings("<main>Hi</main>", doc.text.bytes);
 }

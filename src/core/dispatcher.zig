@@ -316,6 +316,11 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return try requestCurrentPositionLsp(app, .references, "references");
     }
 
+    if (std.mem.eql(u8, definition.id, "lsp.request_rename")) {
+        const new_name = request.argument orelse return .{ .unsupported = "lsp.request_rename requires a new symbol name" };
+        return try requestCurrentRenameLsp(app, new_name);
+    }
+
     if (std.mem.eql(u8, definition.id, "lsp.start")) {
         return try startLspTransport(app);
     }
@@ -857,6 +862,19 @@ fn renderLspStatus(app: *app_mod.App) !void {
                     try writer.print("- {s}:{d}:{d}\n", .{ location.path, location.range.start.line + 1, location.range.start.column + 1 });
                 }
             }
+            if (server.session.last_workspace_edit) |edit| {
+                try writer.print("last workspace edit: edits={d} skipped_resource_ops={d}\n", .{ edit.edits.len, edit.skipped_resource_ops });
+                for (edit.edits[0..@min(edit.edits.len, 6)]) |item| {
+                    try writer.print("- {s}:{d}:{d}-{d}:{d} bytes={d}\n", .{
+                        item.path,
+                        item.range.start.line + 1,
+                        item.range.start.column + 1,
+                        item.range.end.line + 1,
+                        item.range.end.column + 1,
+                        item.new_text.len,
+                    });
+                }
+            }
         } else {
             try writer.writeAll("lsp version: no language session\n");
         }
@@ -943,6 +961,21 @@ pub fn requestActiveReferencesFromRunningLsp(app: *app_mod.App) !bool {
     return try requestActivePositionFromRunningLsp(app, .references, "references");
 }
 
+pub fn requestActiveRenameFromRunningLsp(app: *app_mod.App, new_name: []const u8) !bool {
+    const doc = app.documents.active() orelse return false;
+    const server = app.lsp_manager.findServer(doc.language) orelse return false;
+    if (server.transport == null) return false;
+    const path = doc.path orelse return false;
+    _ = try syncDocumentToRunningLsp(app, doc);
+    server.session.clearCachedResultForRequest(.rename);
+    var outbound = try server.session.requestRename(path, doc.cursor.position, new_name);
+    defer outbound.deinit();
+    return try deliverLspOutboundWithOptions(app, server, "rename", &outbound, .{
+        .log_sent = false,
+        .emit_when_missing = false,
+    });
+}
+
 fn requestActivePositionFromRunningLsp(app: *app_mod.App, kind: lsp_session.RequestKind, label: []const u8) !bool {
     const doc = app.documents.active() orelse return false;
     const server = app.lsp_manager.findServer(doc.language) orelse return false;
@@ -968,6 +1001,18 @@ fn requestCurrentPositionLsp(app: *app_mod.App, kind: lsp_session.RequestKind, l
     defer outbound.deinit();
     const sent = try deliverLspOutbound(app, server, label, &outbound);
     return .{ .completed = if (sent) "LSP request sent" else "LSP request packet built" };
+}
+
+fn requestCurrentRenameLsp(app: *app_mod.App, new_name: []const u8) !Result {
+    const doc = app.documents.active() orelse return .no_active_document;
+    const path = doc.path orelse return .{ .blocked = "scratch documents cannot request LSP rename yet" };
+    const server = try app.lsp_manager.ensureServer(doc.language);
+
+    server.session.clearCachedResultForRequest(.rename);
+    var outbound = try server.session.requestRename(path, doc.cursor.position, new_name);
+    defer outbound.deinit();
+    const sent = try deliverLspOutbound(app, server, "rename", &outbound);
+    return .{ .completed = if (sent) "LSP rename request sent" else "LSP rename request packet built" };
 }
 
 fn startLspTransport(app: *app_mod.App) !Result {
@@ -1109,6 +1154,7 @@ fn renderLspIngestResult(app: *app_mod.App, result: lsp_session.IngestResult) !v
         .completion => |count| try appendConsole(app, .stdout, "lsp ingest: completion items {d}\n", .{count}),
         .hover => |bytes| try appendConsole(app, .stdout, "lsp ingest: hover bytes {d}\n", .{bytes}),
         .locations => |count| try appendConsole(app, .stdout, "lsp ingest: locations {d}\n", .{count}),
+        .workspace_edit => |count| try appendConsole(app, .stdout, "lsp ingest: workspace edit {d}\n", .{count}),
         .acknowledged => |kind| try appendConsole(app, .stdout, "lsp ingest: acknowledged {s}\n", .{@tagName(kind)}),
     }
 }

@@ -2818,6 +2818,10 @@ const LinuxGuiState = struct {
             self.sanitizeActiveDocumentHiddenControls();
             return;
         }
+        if (std.mem.eql(u8, id, "editor.toggle_comment")) {
+            self.toggleActiveDocumentComment();
+            return;
+        }
         if (std.mem.eql(u8, id, "editor.find_next")) {
             self.findLastDocumentSearch(.forward);
             return;
@@ -3518,6 +3522,20 @@ const LinuxGuiState = struct {
         }
     }
 
+    fn toggleActiveDocumentComment(self: *LinuxGuiState) void {
+        const doc = self.app.documents.active() orelse return self.message("no active document", .{});
+        const range = self.selectedRange(doc);
+        const start = if (range) |selected| selected.start else doc.cursor.position.byte_offset;
+        const end = if (range) |selected| selected.end else doc.cursor.position.byte_offset;
+        const result = (doc.toggleComment(start, end) catch |err| return self.message("comment toggle failed: {s}", .{@errorName(err)})) orelse {
+            return self.message("no comment syntax for language", .{});
+        };
+        self.selection_anchor = null;
+        self.ensureEditorCursorVisible();
+        self.syncActiveDocumentToLsp();
+        self.message("{s}", .{commentToggleMessage(result)});
+    }
+
     fn sanitizeActiveDocumentHiddenControls(self: *LinuxGuiState) void {
         const doc = self.app.documents.active() orelse return self.message("no active document", .{});
         var sanitized: std.Io.Writer.Allocating = .init(self.allocator);
@@ -3954,6 +3972,10 @@ const LinuxGuiState = struct {
                             self.openQuickPanel(.replace_document);
                             return;
                         }
+                        if (char == '/') {
+                            self.execute("editor.toggle_comment", .keybinding);
+                            return;
+                        }
                         if (char == 'p' or char == 'P') {
                             self.openQuickPanel(.find_file);
                             return;
@@ -4107,6 +4129,10 @@ const LinuxGuiState = struct {
                     }
                     if (char == ',') {
                         self.execute("preferences.open_settings", .keybinding);
+                        return;
+                    }
+                    if (char == '/') {
+                        self.execute("editor.toggle_comment", .keybinding);
                         return;
                     }
                     if (key.modifiers.shift and (char == 'd' or char == 'D')) {
@@ -6363,6 +6389,15 @@ fn pathEqualNormalizedX11(left: []const u8, right: []const u8) bool {
 
 fn normalizePathByteX11(byte: u8) u8 {
     return if (byte == '\\') '/' else byte;
+}
+
+fn commentToggleMessage(result: document_mod.CommentToggleResult) []const u8 {
+    return switch (result) {
+        .line_commented => "commented lines",
+        .line_uncommented => "uncommented lines",
+        .block_commented => "commented block",
+        .block_uncommented => "uncommented block",
+    };
 }
 
 fn riskMarkerLabel(risk: findings_mod.Risk) []const u8 {

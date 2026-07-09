@@ -847,7 +847,7 @@ const QuickPanel = struct {
                 const active_index = app.documents.activeIndex() orelse return;
                 const doc = &app.documents.documents.items[active_index];
                 const path = doc.path orelse "(scratch)";
-                var index = try symbols_mod.collectTopLevel(self.allocator, doc.text.bytes, path);
+                var index = try symbols_mod.collectDocument(self.allocator, doc.text.bytes, path, doc.language);
                 defer index.deinit();
 
                 var matches = std.array_list.Managed(SymbolMatch).init(self.allocator);
@@ -3381,7 +3381,7 @@ const LinuxGuiState = struct {
         const doc = self.app.documents.active() orelse return self.message("no active document", .{});
         const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse return self.message("no identifier under cursor", .{});
         const path = doc.path orelse "(scratch)";
-        var index = symbols_mod.collectTopLevel(self.allocator, doc.text.bytes, path) catch |err| return self.message("symbol scan failed: {s}", .{@errorName(err)});
+        var index = symbols_mod.collectDocument(self.allocator, doc.text.bytes, path, doc.language) catch |err| return self.message("symbol scan failed: {s}", .{@errorName(err)});
         defer index.deinit();
 
         for (index.symbols) |symbol| {

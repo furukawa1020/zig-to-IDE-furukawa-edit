@@ -1,4 +1,5 @@
 const std = @import("std");
+const modes = @import("modes.zig");
 const tokenizer = @import("zig_tokenizer.zig");
 const types = @import("../core/types.zig");
 
@@ -101,6 +102,178 @@ pub fn collectTopLevel(allocator: std.mem.Allocator, source: []const u8, file_pa
         .allocator = allocator,
         .symbols = try symbols.toOwnedSlice(),
     };
+}
+
+pub fn collectDocument(allocator: std.mem.Allocator, source: []const u8, file_path: []const u8, language: modes.LanguageMode) !OwnedIndex {
+    if (modes.isZigFamily(language)) return collectTopLevel(allocator, source, file_path);
+    return collectGenericTopLevel(allocator, source, file_path, language);
+}
+
+fn collectGenericTopLevel(allocator: std.mem.Allocator, source: []const u8, file_path: []const u8, language: modes.LanguageMode) !OwnedIndex {
+    var symbols = std.array_list.Managed(Symbol).init(allocator);
+    errdefer {
+        for (symbols.items) |symbol| {
+            allocator.free(symbol.name);
+            allocator.free(symbol.file_path);
+            if (symbol.doc_comment) |doc| allocator.free(doc);
+        }
+        symbols.deinit();
+    }
+
+    var line_start: usize = 0;
+    while (line_start <= source.len) {
+        var line_end = line_start;
+        while (line_end < source.len and source[line_end] != '\n') : (line_end += 1) {}
+        const raw_line = source[line_start..line_end];
+        const line = std.mem.trim(u8, raw_line, "\r");
+        try appendGenericSymbolsFromLine(allocator, source, file_path, language, line, line_start, &symbols);
+        if (line_end == source.len) break;
+        line_start = line_end + 1;
+        if (symbols.items.len >= 1024) break;
+    }
+
+    return .{
+        .allocator = allocator,
+        .symbols = try symbols.toOwnedSlice(),
+    };
+}
+
+const Word = struct {
+    text: []const u8,
+    start: usize,
+    end: usize,
+};
+
+fn appendGenericSymbolsFromLine(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    file_path: []const u8,
+    language: modes.LanguageMode,
+    line: []const u8,
+    line_start: usize,
+    symbols: *std.array_list.Managed(Symbol),
+) !void {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len == 0) return;
+    if (startsWithLineComment(trimmed, language)) return;
+
+    var words_buf: [24]Word = undefined;
+    const words = collectWords(line, words_buf[0..]);
+    if (words.len == 0) return;
+
+    for (words, 0..) |word, index| {
+        if (!isDeclarationKeyword(language, word.text)) continue;
+        const name_index = nextSymbolNameIndex(words, index + 1) orelse return;
+        const name = words[name_index];
+        if (!isUsableSymbolName(name.text)) return;
+        try appendNamedSymbol(allocator, source, file_path, name.text, line_start + name.start, line_start + name.end, symbolKindForKeyword(language, word.text), symbols);
+        return;
+    }
+
+    if (looksLikeCStyleFunction(language, line, words)) |name| {
+        try appendNamedSymbol(allocator, source, file_path, name.text, line_start + name.start, line_start + name.end, .function, symbols);
+    }
+}
+
+fn collectWords(line: []const u8, out: []Word) []const Word {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < line.len and count < out.len) {
+        if (!isIdentifierStart(line[index])) {
+            index += 1;
+            continue;
+        }
+        const start = index;
+        index += 1;
+        while (index < line.len and isIdentifierContinue(line[index])) : (index += 1) {}
+        out[count] = .{ .text = line[start..index], .start = start, .end = index };
+        count += 1;
+    }
+    return out[0..count];
+}
+
+fn startsWithLineComment(line: []const u8, language: modes.LanguageMode) bool {
+    const prefix = modes.lineComment(language) orelse return false;
+    if (line.len < prefix.len) return false;
+    return std.ascii.eqlIgnoreCase(line[0..prefix.len], prefix);
+}
+
+fn isDeclarationKeyword(language: modes.LanguageMode, word: []const u8) bool {
+    if (inList(word, &.{ "class", "interface", "struct", "enum", "type", "module", "namespace", "contract", "message", "service" })) return true;
+    if (inList(word, &.{ "fn", "func", "function", "def", "method", "sub", "lambda", "rpc" })) return true;
+    if (inList(word, &.{ "const", "let", "var" })) return true;
+    return switch (language) {
+        .elixir => inList(word, &.{ "defmodule", "defp" }),
+        .erlang => inList(word, &.{"-module"}),
+        .clojure => inList(word, &.{ "defn", "def", "defmacro" }),
+        .haskell => inList(word, &.{ "data", "newtype" }),
+        .ocaml => inList(word, &.{ "let", "module", "type" }),
+        else => false,
+    };
+}
+
+fn nextSymbolNameIndex(words: []const Word, start: usize) ?usize {
+    var index = start;
+    while (index < words.len) : (index += 1) {
+        if (isModifier(words[index].text)) continue;
+        return index;
+    }
+    return null;
+}
+
+fn symbolKindForKeyword(language: modes.LanguageMode, keyword: []const u8) SymbolKind {
+    _ = language;
+    if (inList(keyword, &.{ "fn", "func", "function", "def", "defn", "defp", "method", "sub", "lambda", "rpc" })) return .function;
+    if (inList(keyword, &.{ "class", "interface", "struct", "type", "contract", "message", "service", "module", "namespace", "defmodule", "data", "newtype" })) return .struct_type;
+    if (inList(keyword, &.{"-module"})) return .package;
+    if (inList(keyword, &.{"enum"})) return .enum_type;
+    if (inList(keyword, &.{"const"})) return .constant;
+    if (inList(keyword, &.{ "let", "var", "def" })) return .variable;
+    return .local;
+}
+
+fn looksLikeCStyleFunction(language: modes.LanguageMode, line: []const u8, words: []const Word) ?Word {
+    switch (modes.family(language)) {
+        .native, .web => {},
+        else => return null,
+    }
+    const open = std.mem.indexOfScalar(u8, line, '(') orelse return null;
+    if (std.mem.indexOfScalar(u8, line[open..], '{') == null and language != .c and language != .cpp and language != .objective_c and language != .objective_cpp) return null;
+    var best: ?Word = null;
+    for (words) |word| {
+        if (word.end <= open and !isControlWord(word.text)) best = word;
+    }
+    return best;
+}
+
+fn isModifier(word: []const u8) bool {
+    return inList(word, &.{ "pub", "public", "private", "protected", "static", "async", "export", "extern", "inline", "mut", "final", "override", "open", "internal" });
+}
+
+fn isControlWord(word: []const u8) bool {
+    return inList(word, &.{ "if", "for", "while", "switch", "catch", "return", "new", "sizeof", "typeof" });
+}
+
+fn isUsableSymbolName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (isControlWord(name)) return false;
+    if (isModifier(name)) return false;
+    return true;
+}
+
+fn isIdentifierStart(byte: u8) bool {
+    return std.ascii.isAlphabetic(byte) or byte == '_' or byte == '$' or byte == '-';
+}
+
+fn isIdentifierContinue(byte: u8) bool {
+    return isIdentifierStart(byte) or std.ascii.isDigit(byte);
+}
+
+fn inList(text: []const u8, list: []const []const u8) bool {
+    for (list) |item| {
+        if (std.ascii.eqlIgnoreCase(text, item)) return true;
+    }
+    return false;
 }
 
 fn parseDeclaration(
@@ -258,4 +431,29 @@ test "collects top level Zig declarations" {
     try std.testing.expectEqual(SymbolKind.function, index.symbols[2].kind);
     try std.testing.expectEqualStrings("main", index.symbols[2].name);
     try std.testing.expectEqual(SymbolKind.test_block, index.symbols[3].kind);
+}
+
+test "collects generic symbols for non-Zig languages" {
+    var python = try collectDocument(std.testing.allocator,
+        \\class App:
+        \\    pass
+        \\async def serve():
+        \\    pass
+        \\
+    , "app.py", .python);
+    defer python.deinit();
+    try std.testing.expectEqual(@as(usize, 2), python.symbols.len);
+    try std.testing.expectEqualStrings("App", python.symbols[0].name);
+    try std.testing.expectEqualStrings("serve", python.symbols[1].name);
+
+    var typescript = try collectDocument(std.testing.allocator,
+        \\export class Panel {}
+        \\export function render() {}
+        \\const answer = 42
+        \\
+    , "panel.ts", .typescript);
+    defer typescript.deinit();
+    try std.testing.expect(typescript.symbols.len >= 3);
+    try std.testing.expectEqualStrings("Panel", typescript.symbols[0].name);
+    try std.testing.expectEqualStrings("render", typescript.symbols[1].name);
 }

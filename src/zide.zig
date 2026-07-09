@@ -92,6 +92,7 @@ pub const lsp = struct {
     pub const launch_plan = @import("lsp/launch_plan.zig");
     pub const protocol = @import("lsp/protocol.zig");
     pub const registry = @import("lsp/registry.zig");
+    pub const responses = @import("lsp/responses.zig");
 };
 
 pub const diagnostics = struct {

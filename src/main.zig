@@ -62,6 +62,7 @@ test {
     _ = @import("language/zig_ast.zig");
     _ = @import("language/zig_parser.zig");
     _ = @import("language/zig_tokenizer.zig");
+    _ = @import("lsp/diagnostics.zig");
     _ = @import("lsp/framing.zig");
     _ = @import("lsp/launch_plan.zig");
     _ = @import("lsp/protocol.zig");

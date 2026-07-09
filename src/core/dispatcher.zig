@@ -786,27 +786,58 @@ fn renderLspStatus(app: *app_mod.App) !void {
     defer text.deinit();
     const writer = &text.writer;
 
-    try writer.writeAll("lsp session\n");
-    try writer.print("state: {s}\n", .{@tagName(app.lsp_session.state)});
-    try writer.print("workspace: {s}\n", .{app.lsp_session.workspace_root});
-    try writer.print("opened documents: {d}\n", .{app.lsp_session.openedCount()});
-    try writer.print("pending requests: {d}\n", .{app.lsp_session.pendingCount()});
-    if (app.lsp_transport) |transport| {
-        try writer.print("transport: running ({s})\n", .{transport.command_label});
+    try writer.writeAll("lsp servers\n");
+    try writer.print("workspace: {s}\n", .{app.lsp_manager.workspace_root});
+    try writer.print("slots: {d}\n", .{app.lsp_manager.servers.items.len});
+    try writer.print("running: {d}\n", .{app.lsp_manager.runningCount()});
+    if (app.lsp_manager.servers.items.len == 0) {
+        try writer.writeAll("servers: none\n");
     } else {
-        try writer.writeAll("transport: stopped\n");
+        for (app.lsp_manager.servers.items) |server| {
+            try writer.print("- {s}: state={s} opened={d} pending={d}", .{
+                modes.label(server.language),
+                @tagName(server.session.state),
+                server.session.openedCount(),
+                server.session.pendingCount(),
+            });
+            if (server.transport) |transport| {
+                try writer.print(" transport=running ({s})\n", .{transport.command_label});
+            } else {
+                try writer.writeAll(" transport=stopped\n");
+            }
+        }
     }
 
     if (app.documents.active()) |doc| {
         const path = doc.path orelse "(scratch)";
         try writer.print("\nactive document: {s}\n", .{path});
         try writer.print("language: {s}\n", .{modes.label(doc.language)});
-        if (doc.path) |real_path| {
-            if (app.lsp_session.documentVersion(real_path)) |version| {
-                try writer.print("lsp version: {d}\n", .{version});
+        if (app.lsp_manager.findServerConst(doc.language)) |server| {
+            if (doc.path) |real_path| {
+                if (server.session.documentVersion(real_path)) |version| {
+                    try writer.print("lsp version: {d}\n", .{version});
+                } else {
+                    try writer.writeAll("lsp version: not synced\n");
+                }
             } else {
-                try writer.writeAll("lsp version: not synced\n");
+                try writer.writeAll("lsp version: scratch\n");
             }
+            if (server.session.last_completion) |items| {
+                try writer.print("last completion items: {d}\n", .{items.items.len});
+            }
+            if (server.session.last_hover) |hover| {
+                const preview_len = @min(hover.text.len, 160);
+                try writer.print("last hover bytes: {d}\n", .{hover.text.len});
+                if (preview_len > 0) try writer.print("last hover preview: {s}\n", .{hover.text[0..preview_len]});
+            }
+            if (server.session.last_locations) |locations| {
+                try writer.print("last locations: {d}\n", .{locations.items.len});
+                for (locations.items[0..@min(locations.items.len, 6)]) |location| {
+                    try writer.print("- {s}:{d}:{d}\n", .{ location.path, location.range.start.line + 1, location.range.start.column + 1 });
+                }
+            }
+        } else {
+            try writer.writeAll("lsp version: no language session\n");
         }
 
         var plan = try lsp_launch_plan.forLanguage(app.allocator, doc.language);
@@ -817,77 +848,63 @@ fn renderLspStatus(app: *app_mod.App) !void {
         if (!plan.available) try writer.print("hint: {s}\n", .{plan.install_hint});
     }
 
-    if (app.lsp_session.last_completion) |items| {
-        try writer.print("\nlast completion items: {d}\n", .{items.items.len});
-    }
-    if (app.lsp_session.last_hover) |hover| {
-        const preview_len = @min(hover.text.len, 160);
-        try writer.print("last hover bytes: {d}\n", .{hover.text.len});
-        if (preview_len > 0) try writer.print("last hover preview: {s}\n", .{hover.text[0..preview_len]});
-    }
-    if (app.lsp_session.last_locations) |locations| {
-        try writer.print("last locations: {d}\n", .{locations.items.len});
-        for (locations.items[0..@min(locations.items.len, 6)]) |location| {
-            try writer.print("- {s}:{d}:{d}\n", .{ location.path, location.range.start.line + 1, location.range.start.column + 1 });
-        }
-    }
-
     try app.process_console.appendBytes(.stdout, text.written());
 }
 
 fn syncCurrentDocumentToLsp(app: *app_mod.App) !Result {
     const doc = app.documents.active() orelse return .no_active_document;
     const path = doc.path orelse return .{ .blocked = "scratch documents cannot be synced to LSP yet" };
-    const existing_version = app.lsp_session.documentVersion(path);
+    const server = try app.lsp_manager.ensureServer(doc.language);
+    const existing_version = server.session.documentVersion(path);
     const version = if (existing_version) |value| value + 1 else 1;
 
     var outbound = if (existing_version == null)
-        try app.lsp_session.makeDidOpen(path, doc.language, version, doc.text.bytes)
+        try server.session.makeDidOpen(path, doc.language, version, doc.text.bytes)
     else
-        try app.lsp_session.makeDidChange(path, version, doc.text.bytes);
+        try server.session.makeDidChange(path, version, doc.text.bytes);
     defer outbound.deinit();
 
-    const sent = try deliverLspOutbound(app, if (existing_version == null) "didOpen" else "didChange", &outbound);
+    const sent = try deliverLspOutbound(app, server, if (existing_version == null) "didOpen" else "didChange", &outbound);
     return .{ .completed = if (sent) "LSP document sync sent" else "LSP document sync packet built" };
 }
 
 pub fn syncActiveDocumentToRunningLsp(app: *app_mod.App) !bool {
-    if (app.lsp_transport == null) return false;
     const doc = app.documents.active() orelse return false;
     return try syncDocumentToRunningLsp(app, doc);
 }
 
 fn syncDocumentToRunningLsp(app: *app_mod.App, doc: *document_mod.Document) !bool {
-    if (app.lsp_transport == null) return false;
+    const server = app.lsp_manager.findServer(doc.language) orelse return false;
+    if (server.transport == null) return false;
     if (doc.text.bytes.len > max_automatic_lsp_sync_bytes) return false;
     const path = doc.path orelse return false;
-    const existing_version = app.lsp_session.documentVersion(path);
+    const existing_version = server.session.documentVersion(path);
     const version = if (existing_version) |value| value + 1 else 1;
 
     var outbound = if (existing_version == null)
-        try app.lsp_session.makeDidOpen(path, doc.language, version, doc.text.bytes)
+        try server.session.makeDidOpen(path, doc.language, version, doc.text.bytes)
     else
-        try app.lsp_session.makeDidChange(path, version, doc.text.bytes);
+        try server.session.makeDidChange(path, version, doc.text.bytes);
     defer outbound.deinit();
 
-    return try deliverLspOutboundWithOptions(app, if (existing_version == null) "didOpen" else "didChange", &outbound, .{
+    return try deliverLspOutboundWithOptions(app, server, if (existing_version == null) "didOpen" else "didChange", &outbound, .{
         .log_sent = false,
         .emit_when_missing = false,
     });
 }
 
 pub fn notifyActiveDocumentSavedToRunningLsp(app: *app_mod.App) !bool {
-    if (app.lsp_transport == null) return false;
     const doc = app.documents.active() orelse return false;
     return try notifyDocumentSavedToRunningLsp(app, doc);
 }
 
 fn notifyDocumentSavedToRunningLsp(app: *app_mod.App, doc: *document_mod.Document) !bool {
-    if (app.lsp_transport == null) return false;
+    const server = app.lsp_manager.findServer(doc.language) orelse return false;
+    if (server.transport == null) return false;
     const path = doc.path orelse return false;
-    var outbound = try app.lsp_session.makeDidSave(path, null);
+    var outbound = try server.session.makeDidSave(path, null);
     defer outbound.deinit();
-    return try deliverLspOutboundWithOptions(app, "didSave", &outbound, .{
+    return try deliverLspOutboundWithOptions(app, server, "didSave", &outbound, .{
         .log_sent = false,
         .emit_when_missing = false,
     });
@@ -906,14 +923,15 @@ pub fn requestActiveReferencesFromRunningLsp(app: *app_mod.App) !bool {
 }
 
 fn requestActivePositionFromRunningLsp(app: *app_mod.App, kind: lsp_session.RequestKind, label: []const u8) !bool {
-    if (app.lsp_transport == null) return false;
     const doc = app.documents.active() orelse return false;
+    const server = app.lsp_manager.findServer(doc.language) orelse return false;
+    if (server.transport == null) return false;
     const path = doc.path orelse return false;
     _ = try syncDocumentToRunningLsp(app, doc);
-    app.lsp_session.clearCachedResultForRequest(kind);
-    var outbound = try app.lsp_session.requestPosition(kind, path, doc.cursor.position);
+    server.session.clearCachedResultForRequest(kind);
+    var outbound = try server.session.requestPosition(kind, path, doc.cursor.position);
     defer outbound.deinit();
-    return try deliverLspOutboundWithOptions(app, label, &outbound, .{
+    return try deliverLspOutboundWithOptions(app, server, label, &outbound, .{
         .log_sent = false,
         .emit_when_missing = false,
     });
@@ -922,17 +940,19 @@ fn requestActivePositionFromRunningLsp(app: *app_mod.App, kind: lsp_session.Requ
 fn requestCurrentPositionLsp(app: *app_mod.App, kind: lsp_session.RequestKind, label: []const u8) !Result {
     const doc = app.documents.active() orelse return .no_active_document;
     const path = doc.path orelse return .{ .blocked = "scratch documents cannot request LSP features yet" };
+    const server = try app.lsp_manager.ensureServer(doc.language);
 
-    app.lsp_session.clearCachedResultForRequest(kind);
-    var outbound = try app.lsp_session.requestPosition(kind, path, doc.cursor.position);
+    server.session.clearCachedResultForRequest(kind);
+    var outbound = try server.session.requestPosition(kind, path, doc.cursor.position);
     defer outbound.deinit();
-    const sent = try deliverLspOutbound(app, label, &outbound);
+    const sent = try deliverLspOutbound(app, server, label, &outbound);
     return .{ .completed = if (sent) "LSP request sent" else "LSP request packet built" };
 }
 
 fn startLspTransport(app: *app_mod.App) !Result {
     const doc = app.documents.active() orelse return .no_active_document;
-    if (app.lsp_transport != null) return .{ .blocked = "LSP transport is already running" };
+    const server = try app.lsp_manager.ensureServer(doc.language);
+    if (server.transport != null) return .{ .blocked = "LSP transport is already running for active language" };
 
     var spec = (try lsp_transport.launchSpecForLanguage(app.allocator, doc.language, app.workspace.root_path)) orelse {
         return .{ .blocked = "no default LSP server mapping for active language" };
@@ -945,38 +965,38 @@ fn startLspTransport(app: *app_mod.App) !Result {
     };
     errdefer transport.deinit();
 
-    var initialize = try app.lsp_session.makeInitialize("zide");
+    var initialize = try server.session.makeInitialize("zide");
     defer initialize.deinit();
     transport.send(initialize.framed) catch |err| {
-        if (initialize.id) |id| app.lsp_session.cancelPending(id);
+        if (initialize.id) |id| server.session.cancelPending(id);
         try appendConsole(app, .stderr, "lsp initialize send failed: {s}\n", .{@errorName(err)});
         return .{ .blocked = "LSP initialize could not be sent" };
     };
 
-    try appendConsole(app, .stdout, "lsp started: {s}\ncommand: {s}\ninitialize id: {d}\nnote: {s}\n", .{
+    try appendConsole(app, .stdout, "lsp started: {s}\nlanguage: {s}\ncommand: {s}\ninitialize id: {d}\nnote: {s}\n", .{
         spec.label,
+        modes.label(doc.language),
         transport.command_label,
         initialize.id orelse 0,
         spec.security_note,
     });
-    app.lsp_transport = transport;
+    server.transport = transport;
     return .{ .completed = "LSP server started" };
 }
 
 fn stopLspTransport(app: *app_mod.App) !Result {
-    if (app.lsp_transport) |*transport| {
-        transport.stop();
-        transport.deinit();
-        app.lsp_transport = null;
-        app.lsp_session.state = .stopped;
-        try appendConsole(app, .stdout, "lsp stopped\n", .{});
+    const doc = app.documents.active() orelse return .no_active_document;
+    if (app.lsp_manager.stopServer(doc.language)) {
+        try appendConsole(app, .stdout, "lsp stopped: {s}\n", .{modes.label(doc.language)});
         return .{ .completed = "LSP server stopped" };
     }
-    return .{ .blocked = "no LSP transport is running" };
+    return .{ .blocked = "no LSP transport is running for active language" };
 }
 
 fn ingestLspPayload(app: *app_mod.App, payload: []const u8) !Result {
-    const result = try app.lsp_session.ingestPayload(payload, &app.diagnostics);
+    const doc = app.documents.active() orelse return .no_active_document;
+    const server = try app.lsp_manager.ensureServer(doc.language);
+    const result = try server.session.ingestPayload(payload, &app.diagnostics);
     try renderLspIngestResult(app, result);
     return switch (result) {
         .ignored => .{ .blocked = "LSP payload ignored" },
@@ -985,35 +1005,37 @@ fn ingestLspPayload(app: *app_mod.App, payload: []const u8) !Result {
 }
 
 fn drainLspFrames(app: *app_mod.App) !Result {
-    if (app.lsp_transport == null) return .{ .blocked = "no LSP transport is running" };
+    if (!app.lsp_manager.hasRunningServer()) return .{ .blocked = "no LSP transport is running" };
     const result = try pumpLsp(app);
     if (result.frames == 0 and result.stderr_bytes == 0) return .{ .blocked = "no complete LSP frames buffered" };
     return .{ .completed = "LSP frames drained" };
 }
 
 pub fn pumpLsp(app: *app_mod.App) !LspPumpResult {
-    const transport = if (app.lsp_transport) |*transport| transport else return .{};
     var result: LspPumpResult = .{};
-    while (true) {
-        var frame = (try transport.nextStdoutFrame()) orelse break;
-        const ingest_result = try app.lsp_session.ingestPayload(frame.body, &app.diagnostics);
-        try renderLspIngestResult(app, ingest_result);
-        frame.deinit();
-        result.frames += 1;
-    }
+    for (app.lsp_manager.servers.items) |*server| {
+        const transport = if (server.transport) |*transport| transport else continue;
+        while (true) {
+            var frame = (try transport.nextStdoutFrame()) orelse break;
+            const ingest_result = try server.session.ingestPayload(frame.body, &app.diagnostics);
+            try renderLspIngestResult(app, ingest_result);
+            frame.deinit();
+            result.frames += 1;
+        }
 
-    const preview = try transport.takeStderrPreview(app.allocator, 4096);
-    defer app.allocator.free(preview.bytes);
-    result.stderr_bytes = preview.total;
-    if (preview.total > 0) {
-        try appendConsole(app, .stderr, "lsp stderr ({d} bytes)\n{s}\n", .{ preview.total, preview.bytes });
+        const preview = try transport.takeStderrPreview(app.allocator, 4096);
+        defer app.allocator.free(preview.bytes);
+        result.stderr_bytes += preview.total;
+        if (preview.total > 0) {
+            try appendConsole(app, .stderr, "lsp stderr {s} ({d} bytes)\n{s}\n", .{ modes.label(server.language), preview.total, preview.bytes });
+        }
     }
 
     return result;
 }
 
-fn deliverLspOutbound(app: *app_mod.App, label: []const u8, outbound: *const lsp_session.Outbound) !bool {
-    return try deliverLspOutboundWithOptions(app, label, outbound, .{});
+fn deliverLspOutbound(app: *app_mod.App, server: *lsp_manager.Server, label: []const u8, outbound: *const lsp_session.Outbound) !bool {
+    return try deliverLspOutboundWithOptions(app, server, label, outbound, .{});
 }
 
 const LspDeliveryOptions = struct {
@@ -1021,20 +1043,20 @@ const LspDeliveryOptions = struct {
     emit_when_missing: bool = true,
 };
 
-fn deliverLspOutboundWithOptions(app: *app_mod.App, label: []const u8, outbound: *const lsp_session.Outbound, options: LspDeliveryOptions) !bool {
-    if (app.lsp_transport) |*transport| {
+fn deliverLspOutboundWithOptions(app: *app_mod.App, server: *lsp_manager.Server, label: []const u8, outbound: *const lsp_session.Outbound, options: LspDeliveryOptions) !bool {
+    if (server.transport) |*transport| {
         transport.send(outbound.framed) catch |err| {
-            if (outbound.id) |id| app.lsp_session.cancelPending(id);
+            if (outbound.id) |id| server.session.cancelPending(id);
             try appendConsole(app, .stderr, "lsp send failed ({s}): {s}\n", .{ label, @errorName(err) });
             return err;
         };
         if (options.log_sent) {
-            try appendConsole(app, .stdout, "lsp sent: {s} bytes:{d}\n", .{ label, outbound.framed.len });
+            try appendConsole(app, .stdout, "lsp sent: {s} {s} bytes:{d}\n", .{ modes.label(server.language), label, outbound.framed.len });
         }
         return true;
     }
 
-    if (outbound.id) |id| app.lsp_session.cancelPending(id);
+    if (outbound.id) |id| server.session.cancelPending(id);
     if (options.emit_when_missing) try emitLspOutbound(app, label, outbound);
     return false;
 }

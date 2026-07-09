@@ -62,6 +62,10 @@ test {
     _ = @import("language/zig_ast.zig");
     _ = @import("language/zig_parser.zig");
     _ = @import("language/zig_tokenizer.zig");
+    _ = @import("lsp/framing.zig");
+    _ = @import("lsp/launch_plan.zig");
+    _ = @import("lsp/protocol.zig");
+    _ = @import("lsp/registry.zig");
     _ = @import("observability/log.zig");
     _ = @import("persistence/journal.zig");
     _ = @import("persistence/paths.zig");
@@ -71,7 +75,9 @@ test {
     _ = @import("search/file_finder.zig");
     _ = @import("search/fuzzy.zig");
     _ = @import("search/literal.zig");
+    _ = @import("search/problems.zig");
     _ = @import("search/workspace_search.zig");
+    _ = @import("search/workspace_symbols.zig");
     _ = @import("security/findings.zig");
     _ = @import("security/build_consent.zig");
     _ = @import("security/build_firewall.zig");

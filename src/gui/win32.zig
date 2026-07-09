@@ -16,6 +16,7 @@ const completion_mod = @import("../language/completion.zig");
 const symbols_mod = @import("../language/symbols.zig");
 const file_finder = @import("../search/file_finder.zig");
 const literal_search = @import("../search/literal.zig");
+const problems_search = @import("../search/problems.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const workspace_symbols = @import("../search/workspace_symbols.zig");
 const build_consent = @import("../security/build_consent.zig");
@@ -34,6 +35,7 @@ const QuickPanelMode = enum {
     new_file,
     document_symbols,
     workspace_symbols,
+    problems,
     completion,
     language_mode,
 };
@@ -155,6 +157,7 @@ const QuickPanel = struct {
     task_matches: ?[]TaskMatch = null,
     symbol_matches: ?[]SymbolMatch = null,
     workspace_symbol_matches: ?[]workspace_symbols.Result = null,
+    problem_matches: ?[]problems_search.Result = null,
     completion_matches: ?[]completion_mod.Item = null,
     language_matches: ?[]modes.LanguageMode = null,
     completion_replace_start: usize = 0,
@@ -228,6 +231,7 @@ const QuickPanel = struct {
             .new_file => if (self.query.items.len > 0) 1 else 0,
             .document_symbols => if (self.symbol_matches) |items| items.len else 0,
             .workspace_symbols => if (self.workspace_symbol_matches) |items| items.len else 0,
+            .problems => if (self.problem_matches) |items| items.len else 0,
             .completion => if (self.completion_matches) |items| items.len else 0,
             .language_mode => if (self.language_matches) |items| items.len else 0,
         };
@@ -265,6 +269,12 @@ const QuickPanel = struct {
 
     fn selectedWorkspaceSymbol(self: *const QuickPanel) ?*const workspace_symbols.Result {
         const items = self.workspace_symbol_matches orelse return null;
+        if (items.len == 0) return null;
+        return &items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn selectedProblem(self: *const QuickPanel) ?*const problems_search.Result {
+        const items = self.problem_matches orelse return null;
         if (items.len == 0) return null;
         return &items[@min(self.selected_index, items.len - 1)];
     }
@@ -371,6 +381,11 @@ const QuickPanel = struct {
                     .max_results = 512,
                 });
             },
+            .problems => {
+                self.problem_matches = try problems_search.collect(self.allocator, &app.diagnostics, &app.security_findings, self.query.items, .{
+                    .max_results = 512,
+                });
+            },
             .completion => {
                 const active_index = app.documents.activeIndex() orelse return;
                 const doc = &app.documents.documents.items[active_index];
@@ -440,6 +455,10 @@ const QuickPanel = struct {
             for (items) |*item| item.deinit(self.allocator);
             self.allocator.free(items);
             self.workspace_symbol_matches = null;
+        }
+        if (self.problem_matches) |items| {
+            problems_search.deinitResults(self.allocator, items);
+            self.problem_matches = null;
         }
         if (self.completion_matches) |items| {
             completion_mod.deinitItems(self.allocator, items);
@@ -926,6 +945,10 @@ const GuiState = struct {
             self.openQuickPanel(.search_workspace);
             return;
         }
+        if (std.mem.eql(u8, id, "problems.open")) {
+            self.openQuickPanel(.problems);
+            return;
+        }
         if (std.mem.eql(u8, id, "git.overview") or std.mem.eql(u8, id, "github.overview")) {
             self.openGitPanel();
             return;
@@ -1226,6 +1249,7 @@ const GuiState = struct {
             .new_file => "New file",
             .document_symbols => "Document symbols",
             .workspace_symbols => "Workspace symbols",
+            .problems => "Problems",
             .rename_symbol => "Rename symbol",
             .completion => "Complete symbol",
             .language_mode => "Language mode",
@@ -1482,6 +1506,27 @@ const GuiState = struct {
                 const offset = item.byte_offset;
                 self.quick_panel.close();
                 self.openRelativeFile(path, offset);
+            },
+            .problems => {
+                const item = self.quick_panel.selectedProblem() orelse {
+                    self.setMessage("No problem selected") catch {};
+                    return;
+                };
+                if (item.path.len == 0) {
+                    self.setMessage(item.message) catch {};
+                    return;
+                }
+                const path = self.allocator.dupe(u8, item.path) catch |err| {
+                    self.setError(err) catch {};
+                    return;
+                };
+                defer self.allocator.free(path);
+                const line = item.line;
+                const column = item.column;
+                const kind = item.kind;
+                self.quick_panel.close();
+                self.openRelativeLocation(path, line, column);
+                self.bottom_panel = if (kind == .security) .security else .diagnostics;
             },
             .completion => {
                 const item = self.quick_panel.selectedCompletion() orelse {
@@ -2891,6 +2936,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (ctrl and shift and key == 'L') {
         state.openPublishPanel();
+        return;
+    }
+    if (ctrl and shift and key == 'M') {
+        state.openQuickPanel(.problems);
         return;
     }
     if (ctrl and key == VK_SPACE) {
@@ -4507,6 +4556,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .new_file => "NEW FILE",
         .document_symbols => "SYMBOLS",
         .workspace_symbols => "WORKSPACE SYMBOLS",
+        .problems => "PROBLEMS  diagnostics + security",
         .completion => "COMPLETE  Enter inserts",
         .language_mode => "LANGUAGE MODE",
     };
@@ -4593,6 +4643,21 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 drawTextClipped(hdc, panel.left + 230, y, panel.left + 350, color, @tagName(item.kind));
                 drawTextClipped(hdc, panel.left + 360, y, panel.left + 450, color, modes.label(item.language));
                 drawTextClipped(hdc, panel.left + 460, y, panel.right - 16, color, location);
+            },
+            .problems => {
+                const items = state.quick_panel.problem_matches orelse break;
+                const item = items[row];
+                var meta_buf: [320]u8 = undefined;
+                const meta = std.fmt.bufPrint(&meta_buf, "{s}/{s}", .{ @tagName(item.kind), item.level }) catch item.level;
+                var location_buf: [320]u8 = undefined;
+                const location = std.fmt.bufPrint(&location_buf, "{s}:{d}:{d}", .{
+                    if (item.path.len == 0) "(workspace)" else item.path,
+                    item.line + 1,
+                    item.column + 1,
+                }) catch item.path;
+                drawTextClipped(hdc, panel.left + 18, y, panel.left + 170, color, meta);
+                drawTextClipped(hdc, panel.left + 180, y, panel.left + 420, color, location);
+                drawTextClipped(hdc, panel.left + 430, y, panel.right - 16, color, item.message);
             },
             .completion => {
                 const items = state.quick_panel.completion_matches orelse break;

@@ -107,6 +107,8 @@ const definitions = [_]Definition{
     .{ .id = "symbol.find_references", .title = "Find References", .description = "Find references for the selected symbol.", .default_key = "shift-f12", .scope = .zig, .capability = .safe },
     .{ .id = "symbol.rename", .title = "Rename Symbol", .description = "Rename a symbol with preview and undo.", .default_key = "f2", .scope = .zig, .capability = .workspace_write },
     .{ .id = "diagnostics.next", .title = "Next Diagnostic", .description = "Jump to the next diagnostic.", .default_key = "f8", .scope = .workspace, .capability = .safe },
+    .{ .id = "problems.open", .title = "Open Problems", .description = "Search diagnostics and security findings without running external tools.", .default_key = "ctrl-shift-m", .scope = .workspace, .capability = .safe },
+    .{ .id = "lsp.plan", .title = "Show LSP Launch Plan", .description = "Render the language server plan for the active document without spawning it.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "security.scan_current", .title = "Scan Current File", .description = "Scan the current file for Zig and polyglot security boundaries.", .default_key = "ctrl-alt-s", .scope = .workspace, .capability = .safe },
     .{ .id = "security.audit_workspace", .title = "Audit Workspace", .description = "Run static Security Workbench audit for the workspace.", .default_key = "ctrl-alt-a", .scope = .workspace, .capability = .safe },
     .{ .id = "security.audit_log", .title = "Show Run Audit Log", .description = "Render persisted command launch audit JSONL without running external tools.", .default_key = "", .scope = .workspace, .capability = .safe },

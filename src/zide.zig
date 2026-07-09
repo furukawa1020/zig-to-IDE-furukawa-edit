@@ -16,6 +16,7 @@ pub const types = @import("core/types.zig");
 pub const buffer = @import("editor/buffer.zig");
 pub const completion = @import("language/completion.zig");
 pub const modes = @import("language/modes.zig");
+pub const lsp_protocol = @import("lsp/protocol.zig");
 pub const zig_tokenizer = @import("language/zig_tokenizer.zig");
 pub const render = @import("ui/render.zig");
 pub const workspace = @import("workspace/workspace.zig");
@@ -85,6 +86,13 @@ pub const language = struct {
     pub const zig_tokenizer = @import("language/zig_tokenizer.zig");
 };
 
+pub const lsp = struct {
+    pub const framing = @import("lsp/framing.zig");
+    pub const launch_plan = @import("lsp/launch_plan.zig");
+    pub const protocol = @import("lsp/protocol.zig");
+    pub const registry = @import("lsp/registry.zig");
+};
+
 pub const diagnostics = struct {
     pub const collection = @import("diagnostics/collection.zig");
     pub const model = @import("diagnostics/model.zig");
@@ -110,6 +118,7 @@ pub const search = struct {
     pub const file_finder = @import("search/file_finder.zig");
     pub const fuzzy = @import("search/fuzzy.zig");
     pub const literal = @import("search/literal.zig");
+    pub const problems = @import("search/problems.zig");
     pub const workspace_search = @import("search/workspace_search.zig");
     pub const workspace_symbols = @import("search/workspace_symbols.zig");
 };

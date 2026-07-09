@@ -28,6 +28,7 @@ const package_trust = @import("../security/package_trust.zig");
 const polyglot_scanner = @import("../security/polyglot_scanner.zig");
 const text_integrity = @import("../security/text_integrity.zig");
 const zig_scanner = @import("../security/zig_scanner.zig");
+const lsp_launch_plan = @import("../lsp/launch_plan.zig");
 
 pub const Result = union(enum) {
     completed: []const u8,
@@ -244,6 +245,17 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
             return .{ .blocked = "diagnostic target could not be opened" };
         }
         return .{ .completed = "jumped to diagnostic" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "lsp.plan")) {
+        const doc = app.documents.active() orelse return .no_active_document;
+        var plan = try lsp_launch_plan.forLanguage(app.allocator, doc.language);
+        defer plan.deinit(app.allocator);
+        const rendered = try lsp_launch_plan.render(app.allocator, plan);
+        defer app.allocator.free(rendered);
+        try app.process_console.appendBytes(.stdout, rendered);
+        try app.process_console.appendBytes(.stdout, "\n");
+        return .{ .completed = "LSP launch plan rendered" };
     }
 
     if (std.mem.eql(u8, definition.id, "security.scan_current")) {

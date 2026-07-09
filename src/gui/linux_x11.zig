@@ -24,6 +24,7 @@ const command_intent = @import("../security/command_intent.zig");
 const launch_audit = @import("../security/launch_audit.zig");
 const file_finder = @import("../search/file_finder.zig");
 const literal_search = @import("../search/literal.zig");
+const problems_search = @import("../search/problems.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const workspace_symbols = @import("../search/workspace_symbols.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
@@ -616,6 +617,7 @@ const QuickPanelMode = enum {
     run_task,
     document_symbols,
     workspace_symbols,
+    problems,
     completion,
     language_mode,
 };
@@ -690,6 +692,7 @@ const QuickPanel = struct {
     task_matches: ?[]TaskMatch = null,
     symbol_matches: ?[]SymbolMatch = null,
     workspace_symbol_matches: ?[]workspace_symbols.Result = null,
+    problem_matches: ?[]problems_search.Result = null,
     completion_matches: ?[]completion_mod.Item = null,
     language_matches: ?[]modes.LanguageMode = null,
     completion_replace_start: usize = 0,
@@ -765,6 +768,7 @@ const QuickPanel = struct {
             .run_task => if (self.task_matches) |items| items.len else 0,
             .document_symbols => if (self.symbol_matches) |items| items.len else 0,
             .workspace_symbols => if (self.workspace_symbol_matches) |items| items.len else 0,
+            .problems => if (self.problem_matches) |items| items.len else 0,
             .completion => if (self.completion_matches) |items| items.len else 0,
             .language_mode => if (self.language_matches) |items| items.len else 0,
         };
@@ -802,6 +806,12 @@ const QuickPanel = struct {
 
     fn selectedWorkspaceSymbol(self: *const QuickPanel) ?*const workspace_symbols.Result {
         const items = self.workspace_symbol_matches orelse return null;
+        if (items.len == 0) return null;
+        return &items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn selectedProblem(self: *const QuickPanel) ?*const problems_search.Result {
+        const items = self.problem_matches orelse return null;
         if (items.len == 0) return null;
         return &items[@min(self.selected_index, items.len - 1)];
     }
@@ -909,6 +919,11 @@ const QuickPanel = struct {
                     .max_results = 512,
                 });
             },
+            .problems => {
+                self.problem_matches = try problems_search.collect(self.allocator, &app.diagnostics, &app.security_findings, self.query.items, .{
+                    .max_results = 512,
+                });
+            },
             .completion => {
                 const active_index = app.documents.activeIndex() orelse return;
                 const doc = &app.documents.documents.items[active_index];
@@ -978,6 +993,10 @@ const QuickPanel = struct {
             for (items) |*item| item.deinit(self.allocator);
             self.allocator.free(items);
             self.workspace_symbol_matches = null;
+        }
+        if (self.problem_matches) |items| {
+            problems_search.deinitResults(self.allocator, items);
+            self.problem_matches = null;
         }
         if (self.completion_matches) |items| {
             completion_mod.deinitItems(self.allocator, items);
@@ -2707,6 +2726,10 @@ const LinuxGuiState = struct {
             self.openQuickPanel(.search_workspace);
             return;
         }
+        if (std.mem.eql(u8, id, "problems.open")) {
+            self.openQuickPanel(.problems);
+            return;
+        }
         if (std.mem.eql(u8, id, "git.overview") or std.mem.eql(u8, id, "github.overview")) {
             self.openGitPanel();
             return;
@@ -3302,6 +3325,18 @@ const LinuxGuiState = struct {
                 self.quick_panel.close();
                 self.openRelativeLocation(path, line, column);
             },
+            .problems => {
+                const item = self.quick_panel.selectedProblem() orelse return self.message("no problem selected", .{});
+                if (item.path.len == 0) return self.message("{s}: {s}", .{ item.level, item.message });
+                const path = self.allocator.dupe(u8, item.path) catch |err| return self.message("open failed: {s}", .{@errorName(err)});
+                defer self.allocator.free(path);
+                const line = item.line;
+                const column = item.column;
+                const kind = item.kind;
+                self.quick_panel.close();
+                self.openRelativeLocation(path, line, column);
+                self.bottom_panel = if (kind == .security) .security else .diagnostics;
+            },
             .completion => {
                 const item = self.quick_panel.selectedCompletion() orelse return self.message("no completion selected", .{});
                 const insert_text = self.allocator.dupe(u8, item.insert_text) catch |err| return self.message("completion failed: {s}", .{@errorName(err)});
@@ -3834,6 +3869,10 @@ const LinuxGuiState = struct {
                             self.runHeaderAction(.publish);
                             return;
                         }
+                        if (key.modifiers.shift and (char == 'm' or char == 'M')) {
+                            self.openQuickPanel(.problems);
+                            return;
+                        }
                         if (key.modifiers.shift and (char == 'd' or char == 'D')) {
                             self.execute("editor.duplicate_line", .keybinding);
                             return;
@@ -3939,6 +3978,10 @@ const LinuxGuiState = struct {
                     }
                     if (key.modifiers.shift and (char == 'k' or char == 'K')) {
                         self.execute("editor.delete_line", .keybinding);
+                        return;
+                    }
+                    if (key.modifiers.shift and (char == 'm' or char == 'M')) {
+                        self.openQuickPanel(.problems);
                         return;
                     }
                     if (!key.modifiers.shift and (char == 'k' or char == 'K')) {
@@ -5918,6 +5961,18 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
                 modes.label(items[row].language),
             }) catch items[row].name;
         },
+        .problems => blk: {
+            const items = state.quick_panel.problem_matches orelse break :blk "";
+            if (row >= items.len) break :blk "";
+            break :blk std.fmt.bufPrint(text_buf[0..], "{s}/{s}  {s}:{d}:{d}  {s}", .{
+                @tagName(items[row].kind),
+                items[row].level,
+                if (items[row].path.len == 0) "(workspace)" else items[row].path,
+                items[row].line + 1,
+                items[row].column + 1,
+                items[row].message,
+            }) catch items[row].message;
+        },
         .completion => blk: {
             const items = state.quick_panel.completion_matches orelse break :blk "";
             if (row >= items.len) break :blk "";
@@ -7025,6 +7080,7 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .run_task => "RUN TASK",
         .document_symbols => "SYMBOLS",
         .workspace_symbols => "WORKSPACE SYMBOLS",
+        .problems => "PROBLEMS  diagnostics + security",
         .completion => "COMPLETE  Enter inserts",
         .language_mode => "LANGUAGE MODE",
     };

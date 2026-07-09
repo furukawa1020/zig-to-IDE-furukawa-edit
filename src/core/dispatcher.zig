@@ -1099,7 +1099,7 @@ fn applyWorkspaceEdit(app: *app_mod.App, edit: *const lsp_responses.WorkspaceEdi
 fn workspaceEditIndexLess(edits: []const lsp_responses.TextEdit, left_index: usize, right_index: usize) bool {
     const left = edits[left_index];
     const right = edits[right_index];
-    const path_order = std.mem.order(u8, left.path, right.path);
+    const path_order = pathOrderIgnoreCaseAndSlash(left.path, right.path);
     if (path_order != .eq) return path_order == .lt;
     if (left.range.start.line != right.range.start.line) return left.range.start.line > right.range.start.line;
     if (left.range.start.column != right.range.start.column) return left.range.start.column > right.range.start.column;

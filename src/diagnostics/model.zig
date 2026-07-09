@@ -6,6 +6,7 @@ pub const DiagnosticSource = enum {
     build,
     test_runner,
     config,
+    lsp,
     internal,
 };
 
@@ -20,4 +21,3 @@ pub const Diagnostic = struct {
 pub const Collection = struct {
     items: []const Diagnostic = &.{},
 };
-

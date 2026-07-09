@@ -21,17 +21,36 @@ jobs:
     env:
       ZIG_VERSION: 0.16.0
       ZIG_SHA256: 68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e
+      HAS_PAGES_TOKEN: ${{ secrets.PAGES_TOKEN != '' }}
+    outputs:
+      deploy_ready: ${{ steps.configure_pages_with_token.outcome == 'success' || steps.configure_existing_pages.outcome == 'success' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
           persist-credentials: false
 
-      - name: Configure Pages
+      - name: Configure Pages with enablement token
+        id: configure_pages_with_token
+        if: env.HAS_PAGES_TOKEN == 'true'
         uses: actions/configure-pages@v6
         with:
           enablement: true
-          token: ${{ secrets.PAGES_TOKEN || github.token }}
+          token: ${{ secrets.PAGES_TOKEN }}
+
+      - name: Configure existing Pages site
+        id: configure_existing_pages
+        if: env.HAS_PAGES_TOKEN != 'true'
+        uses: actions/configure-pages@v6
+        continue-on-error: true
+        with:
+          token: ${{ github.token }}
+
+      - name: Pages deployment setup notice
+        if: env.HAS_PAGES_TOKEN != 'true' && steps.configure_existing_pages.outcome != 'success'
+        shell: pwsh
+        run: |
+          Write-Host "::warning title=GitHub Pages is not enabled::The site was built, but deployment was skipped because this repository is not configured for GitHub Pages Actions. Enable Settings > Pages > Build and deployment > Source: GitHub Actions, or add a PAGES_TOKEN secret with repository/Pages write permission so this workflow can enable Pages."
 
       - name: Download pinned Zig
         shell: pwsh
@@ -94,6 +113,7 @@ jobs:
           }
 
       - name: Upload Pages artifact
+        if: steps.configure_pages_with_token.outcome == 'success' || steps.configure_existing_pages.outcome == 'success'
         uses: actions/upload-pages-artifact@v4
         with:
           path: zig-out/site
@@ -101,6 +121,7 @@ jobs:
   deploy:
     name: Deploy Pages
     needs: build
+    if: needs.build.outputs.deploy_ready == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

@@ -479,6 +479,8 @@ const BottomPanel = enum {
     extensions,
     diagnostics,
     security,
+    settings,
+    keybindings,
     tutorial,
     publish,
 };
@@ -496,6 +498,19 @@ const HeaderAction = enum {
     extensions,
     tutorial,
     publish,
+};
+
+const SettingsPanelAction = enum {
+    profile_read_only,
+    profile_safe,
+    profile_network,
+    profile_publish,
+    tutorial_ja,
+    tutorial_en,
+    review,
+    trust,
+    lock,
+    seal,
 };
 
 const GitPanelAction = enum {
@@ -967,6 +982,8 @@ const LinuxGuiState = struct {
     extensions_scroll_line: usize = 0,
     diagnostics_scroll_line: usize = 0,
     security_scroll_line: usize = 0,
+    settings_scroll_line: usize = 0,
+    keybindings_scroll_line: usize = 0,
     tutorial_scroll_line: usize = 0,
     publish_scroll_line: usize = 0,
     message_buf: [240]u8 = [_]u8{0} ** 240,
@@ -1983,6 +2000,16 @@ const LinuxGuiState = struct {
             self.openRenamePanel();
             return;
         }
+        if (std.mem.eql(u8, id, "preferences.open_settings")) {
+            self.bottom_panel = .settings;
+            self.message("settings", .{});
+            return;
+        }
+        if (std.mem.eql(u8, id, "preferences.open_keybindings")) {
+            self.bottom_panel = .keybindings;
+            self.message("keyboard shortcuts", .{});
+            return;
+        }
 
         const result = dispatcher.dispatch(&self.app, .{ .id = id, .source = source }) catch |err| {
             self.message("{s} failed: {s}", .{ id, @errorName(err) });
@@ -2006,6 +2033,11 @@ const LinuxGuiState = struct {
             .completed => |message_text| {
                 self.message("{s}: {s}", .{ id, message_text });
                 self.appendOutput(.stdout, "{s}: {s}\n", .{ id, message_text });
+                if (isEditorLineCommand(id)) {
+                    self.clearSelection();
+                    self.app.focus = .editor;
+                    self.ensureEditorCursorVisible();
+                }
             },
             .blocked => |message_text| {
                 self.message("{s}: blocked", .{id});
@@ -2075,6 +2107,8 @@ const LinuxGuiState = struct {
         }
         if (std.mem.eql(u8, id, "view.extensions") or std.mem.eql(u8, id, "extensions.scan")) self.bottom_panel = .extensions;
         if (std.mem.eql(u8, id, "view.publish") or std.mem.eql(u8, id, "release.checklist")) self.bottom_panel = .publish;
+        if (std.mem.eql(u8, id, "preferences.open_settings")) self.bottom_panel = .settings;
+        if (std.mem.eql(u8, id, "preferences.open_keybindings")) self.bottom_panel = .keybindings;
         if (std.mem.eql(u8, id, "security.audit_workspace") or std.mem.eql(u8, id, "security.scan_current")) {
             self.refreshLinuxSelfProtection();
             self.bottom_panel = .security;
@@ -2173,6 +2207,23 @@ const LinuxGuiState = struct {
             },
             .history => self.execute("task.history", .command_palette),
         }
+    }
+
+    fn executeSettingsPanelAction(self: *LinuxGuiState, action: SettingsPanelAction) void {
+        self.bottom_panel = .settings;
+        switch (action) {
+            .profile_read_only => self.setLinuxLaunchProfile(.read_only),
+            .profile_safe => self.setLinuxLaunchProfile(.safe),
+            .profile_network => self.setLinuxLaunchProfile(.network),
+            .profile_publish => self.setLinuxLaunchProfile(.publish),
+            .tutorial_ja => self.executeTutorialPanelAction(.ja),
+            .tutorial_en => self.executeTutorialPanelAction(.en),
+            .review => self.execute("security.mark_reviewed", .command_palette),
+            .trust => self.execute("security.trust_workspace", .command_palette),
+            .lock => self.execute("security.lock_workspace", .command_palette),
+            .seal => self.sealLinuxExecBoundary(),
+        }
+        if (action == .tutorial_ja or action == .tutorial_en) self.bottom_panel = .settings;
     }
 
     fn executeSecurityPanelAction(self: *LinuxGuiState, action: SecurityPanelAction) void {
@@ -2826,6 +2877,8 @@ const LinuxGuiState = struct {
         self.extensions_scroll_line = 0;
         self.diagnostics_scroll_line = 0;
         self.security_scroll_line = 0;
+        self.settings_scroll_line = 0;
+        self.keybindings_scroll_line = 0;
         self.tutorial_scroll_line = 0;
         self.publish_scroll_line = 0;
         self.bottom_panel = .output;
@@ -2841,6 +2894,19 @@ const LinuxGuiState = struct {
         if (key.modifiers.ctrl and std.meta.activeTag(key.code) == .tab) {
             self.execute(if (key.modifiers.shift) "file.previous_editor" else "file.next_editor", .keybinding);
             return;
+        }
+        if (key.modifiers.alt and self.app.focus == .editor) {
+            switch (key.code) {
+                .arrow_up => {
+                    self.execute("editor.move_line_up", .keybinding);
+                    return;
+                },
+                .arrow_down => {
+                    self.execute("editor.move_line_down", .keybinding);
+                    return;
+                },
+                else => {},
+            }
         }
 
         if (self.app.mode == .insert and self.app.focus == .editor) {
@@ -2935,6 +3001,22 @@ const LinuxGuiState = struct {
                             self.runHeaderAction(.publish);
                             return;
                         }
+                        if (key.modifiers.shift and (char == 'd' or char == 'D')) {
+                            self.execute("editor.duplicate_line", .keybinding);
+                            return;
+                        }
+                        if (key.modifiers.shift and (char == 'k' or char == 'K')) {
+                            self.execute("editor.delete_line", .keybinding);
+                            return;
+                        }
+                        if (char == ',') {
+                            self.execute("preferences.open_settings", .keybinding);
+                            return;
+                        }
+                        if (!key.modifiers.shift and (char == 'k' or char == 'K')) {
+                            self.execute("preferences.open_keybindings", .keybinding);
+                            return;
+                        }
                         return;
                     },
                     else => {},
@@ -3012,6 +3094,22 @@ const LinuxGuiState = struct {
                     }
                     if (char == 'w' or char == 'W') {
                         self.execute("file.close", .keybinding);
+                        return;
+                    }
+                    if (char == ',') {
+                        self.execute("preferences.open_settings", .keybinding);
+                        return;
+                    }
+                    if (key.modifiers.shift and (char == 'd' or char == 'D')) {
+                        self.execute("editor.duplicate_line", .keybinding);
+                        return;
+                    }
+                    if (key.modifiers.shift and (char == 'k' or char == 'K')) {
+                        self.execute("editor.delete_line", .keybinding);
+                        return;
+                    }
+                    if (!key.modifiers.shift and (char == 'k' or char == 'K')) {
+                        self.execute("preferences.open_keybindings", .keybinding);
                         return;
                     }
                 },
@@ -3160,6 +3258,22 @@ const LinuxGuiState = struct {
                         self.runHeaderAction(.publish);
                         return;
                     }
+                    if (char == ',') {
+                        self.execute("preferences.open_settings", .keybinding);
+                        return;
+                    }
+                    if (key.modifiers.shift and (char == 'd' or char == 'D')) {
+                        self.execute("editor.duplicate_line", .keybinding);
+                        return;
+                    }
+                    if (key.modifiers.shift and (char == 'k' or char == 'K')) {
+                        self.execute("editor.delete_line", .keybinding);
+                        return;
+                    }
+                    if (!key.modifiers.shift and (char == 'k' or char == 'K')) {
+                        self.execute("preferences.open_keybindings", .keybinding);
+                        return;
+                    }
                     if (char == 'b' or char == 'B') {
                         self.runHeaderAction(.build);
                         return;
@@ -3196,7 +3310,7 @@ const LinuxGuiState = struct {
                         self.execute("file.close", .keybinding);
                         return;
                     }
-                    if (char == 'd' or char == 'D') {
+                    if (!key.modifiers.shift and (char == 'd' or char == 'D')) {
                         self.bottom_panel = .diagnostics;
                         self.message("diagnostics: {d} item(s)", .{self.app.diagnostics.items.items.len});
                         return;
@@ -3493,6 +3607,20 @@ const LinuxGuiState = struct {
                 }
                 return true;
             },
+            .settings => {
+                if (settingsPanelActionAt(self, x, y)) |action| {
+                    self.executeSettingsPanelAction(action);
+                    return true;
+                }
+                return true;
+            },
+            .keybindings => {
+                if (keybindingRowAt(self, y)) |index| {
+                    const definitions = command_mod.all();
+                    if (index < definitions.len) self.execute(definitions[index].id, .command_palette);
+                }
+                return true;
+            },
             .tutorial => {
                 if (tutorialPanelActionAt(self, x, y)) |action| {
                     self.executeTutorialPanelAction(action);
@@ -3700,6 +3828,18 @@ const LinuxGuiState = struct {
                 const visible = self.bottomRowsFrom(securityFindingsTop(self));
                 const max_start = if (total > visible) total - visible else 0;
                 self.security_scroll_line = scrollValue(self.security_scroll_line, max_start, delta);
+            },
+            .settings => {
+                const total = settingsLines().len;
+                const visible = self.bottomRowsFrom(self.bottomTop() + 118);
+                const max_start = if (total > visible) total - visible else 0;
+                self.settings_scroll_line = scrollValue(self.settings_scroll_line, max_start, delta);
+            },
+            .keybindings => {
+                const total = command_mod.all().len;
+                const visible = self.bottomRowsFrom(keybindingsTop(self));
+                const max_start = if (total > visible) total - visible else 0;
+                self.keybindings_scroll_line = scrollValue(self.keybindings_scroll_line, max_start, delta);
             },
             .tutorial => {
                 const total = tutorialLines(self.tutorial_language).len;
@@ -4014,8 +4154,10 @@ fn drawBottomPanel(x11: *X11, state: *LinuxGuiState) !void {
     try drawPanelTab(x11, bottom, state.bottom_panel == .extensions, 330, "EXT");
     try drawPanelTab(x11, bottom, state.bottom_panel == .diagnostics, 434, "DIAG");
     try drawPanelTab(x11, bottom, state.bottom_panel == .security, 538, "SEC");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .tutorial, 642, "HELP");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .publish, 746, "SHIP");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .settings, 642, "SET");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .keybindings, 746, "KEYS");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .tutorial, 850, "HELP");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .publish, 954, "SHIP");
 
     switch (state.bottom_panel) {
         .output => try drawOutputPanel(x11, state),
@@ -4024,6 +4166,8 @@ fn drawBottomPanel(x11: *X11, state: *LinuxGuiState) !void {
         .extensions => try drawExtensionsPanel(x11, state),
         .diagnostics => try drawDiagnosticsPanel(x11, state),
         .security => try drawSecurityPanel(x11, state),
+        .settings => try drawSettingsPanel(x11, state),
+        .keybindings => try drawKeybindingsPanel(x11, state),
         .tutorial => try drawTutorialPanel(x11, state),
         .publish => try drawPublishPanel(x11, state),
     }
@@ -4435,6 +4579,78 @@ fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
     }
     if (overview.changes.len == 0) {
         try x11.text(x11.gc.muted, 18, y, "No tracked or untracked changes found by the safe .git reader.");
+    }
+}
+
+fn drawSettingsPanel(x11: *X11, state: *LinuxGuiState) !void {
+    const bottom = state.bottomTop();
+    try drawSettingsPanelActions(x11, state);
+
+    var header_buf: [420]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "SETTINGS / profile:{s} trust:{s} tutorial:{s} linux:{s}", .{
+        linuxLaunchProfileLabel(state.linux_launch_profile),
+        @tagName(state.app.runtime.trust_state),
+        @tagName(state.tutorial_language),
+        linuxBoundaryGrade(&state.linux_security).label,
+    }) catch "SETTINGS";
+    try x11.text(x11.gc.green, 18, bottom + 58, header);
+
+    var safety_buf: [520]u8 = undefined;
+    const safety = std.fmt.bufPrint(safety_buf[0..], "safe defaults: save gate:{s} hidden-control scan:on hook-free-git:on extension-exec:off no_new_privs:{s} dumpable:{s} cap_eff:{s}", .{
+        @tagName(state.app.runtime.trust_state),
+        flagLabel(state.linux_security.no_new_privs),
+        flagLabel(state.linux_security.dumpable),
+        state.linuxSecurityCapEffLabel(),
+    }) catch "safe defaults";
+    var safety_ascii: [520]u8 = undefined;
+    try x11.text(x11.gc.cyan, 18, bottom + 82, asciiInto(safety_ascii[0..], safety));
+
+    var panel_buf: [520]u8 = undefined;
+    const panel = std.fmt.bufPrint(panel_buf[0..], "panels: Output/Run/Git/Ext/Diag/Sec/Set/Keys/Help/Ship  shortcuts: Ctrl+, settings  Ctrl+K keys  Ctrl+Shift+P command", .{}) catch "panels";
+    var panel_ascii: [520]u8 = undefined;
+    try x11.text(x11.gc.muted, 18, bottom + 106, asciiInto(panel_ascii[0..], panel));
+
+    const lines = settingsLines();
+    const top = bottom + 136;
+    const visible = state.bottomRowsFrom(top);
+    const start = @min(state.settings_scroll_line, lines.len);
+    const limit = @min(lines.len, start + visible);
+    try drawScrollHint(x11, state, lines.len, visible, start, top);
+    var y: i16 = top;
+    for (lines[start..limit]) |line| {
+        try x11.text(settingsLineGc(x11, line), 18, y, line);
+        y += LINE_HEIGHT;
+    }
+}
+
+fn drawKeybindingsPanel(x11: *X11, state: *LinuxGuiState) !void {
+    const bottom = state.bottomTop();
+    const definitions = command_mod.all();
+    var header_buf: [440]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "KEYBINDINGS / commands:{d} / click a row to run / Ctrl+Shift+P filters commands", .{definitions.len}) catch "KEYBINDINGS";
+    try x11.text(x11.gc.green, 18, bottom + 58, header);
+    try x11.text(x11.gc.muted, 18, bottom + 82, "key                 scope       capability        title / id");
+
+    const top = keybindingsTop(state);
+    const visible = state.bottomRowsFrom(top);
+    const start = @min(state.keybindings_scroll_line, definitions.len);
+    const limit = @min(definitions.len, start + visible);
+    try drawScrollHint(x11, state, definitions.len, visible, start, top);
+    var y: i16 = top;
+    for (definitions[start..limit], start..) |definition, index| {
+        var row_buf: [900]u8 = undefined;
+        const key = if (definition.default_key.len == 0) "-" else definition.default_key;
+        const row = std.fmt.bufPrint(row_buf[0..], "{d}. key:{s} scope:{s} cap:{s}  {s}  {s}", .{
+            index + 1,
+            key,
+            @tagName(definition.scope),
+            @tagName(definition.capability),
+            definition.title,
+            definition.id,
+        }) catch definition.id;
+        var ascii_buf: [900]u8 = undefined;
+        try x11.text(commandCapabilityGc(x11, definition.capability), 18, y, asciiInto(ascii_buf[0..], row));
+        y += LINE_HEIGHT;
     }
 }
 
@@ -5128,6 +5344,33 @@ fn extensionCapabilitiesLabel(buffer: []u8, extension: extension_registry.Extens
     return buffer[0..len];
 }
 
+fn settingsLines() []const []const u8 {
+    return &.{
+        "== WORKBENCH SETTINGS ==",
+        "[profile] RO: read-only tasks, no network, tiny output. SAFE: workspace write, no network, bounded output.",
+        "[profile] NET: explicit network-read tasks. PUB: release-sized output and publishing workflow.",
+        "[trust] REVIEW marks the current audit reviewed. TRUST only succeeds when high-risk findings allow it.",
+        "[trust] LOCK puts the workspace back into locked-down mode. Execution must be reviewed again.",
+        "[linux] SEAL marks inherited file descriptors close-on-exec and refreshes no_new_privs/dumpable/capability state.",
+        "[zide] Git overview reads .git directly; hooks, filters, fsmonitor, and git status are not executed.",
+        "[zide] Extension discovery is manifest-only. Extension code stays inert until a future capability grant exists.",
+        "[zide] Saves run through text integrity checks: hidden controls, mixed newlines, path boundaries, and security findings.",
+        "[zide] Run output is sanitized and clipped before it reaches the IDE surface.",
+        "[ux] Ctrl+, opens this panel. Ctrl+K opens keybindings. Ctrl+Shift+P opens the command palette.",
+        "[ux] The keybindings panel doubles as a command launcher; click a row to execute it.",
+    };
+}
+
+fn settingsLineGc(x11: *X11, line: []const u8) u32 {
+    if (std.mem.startsWith(u8, line, "==")) return x11.gc.amber;
+    if (std.mem.startsWith(u8, line, "[profile]")) return x11.gc.green;
+    if (std.mem.startsWith(u8, line, "[trust]")) return x11.gc.cyan;
+    if (std.mem.startsWith(u8, line, "[linux]")) return x11.gc.amber;
+    if (std.mem.startsWith(u8, line, "[zide]")) return x11.gc.cyan;
+    if (std.mem.startsWith(u8, line, "[ux]")) return x11.gc.muted;
+    return x11.gc.text;
+}
+
 fn appendBounded(buffer: []u8, len: *usize, text: []const u8) void {
     if (len.* >= buffer.len) return;
     const available = buffer.len - len.*;
@@ -5557,6 +5800,16 @@ fn taskStateGc(x11: *const X11, state: execution_queue.State) u32 {
     };
 }
 
+fn commandCapabilityGc(x11: *const X11, capability: command_mod.Capability) u32 {
+    return switch (capability) {
+        .safe => x11.gc.green,
+        .network_read => x11.gc.cyan,
+        .network_write => x11.gc.amber,
+        .workspace_write => x11.gc.amber,
+        .external_command => x11.gc.red,
+    };
+}
+
 fn seccompLabel(mode: ?u8) []const u8 {
     const value = mode orelse return "unknown";
     return switch (value) {
@@ -5682,6 +5935,13 @@ fn isValidIdentifierName(name: []const u8) bool {
         if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
     }
     return true;
+}
+
+fn isEditorLineCommand(id: []const u8) bool {
+    return std.mem.eql(u8, id, "editor.delete_line") or
+        std.mem.eql(u8, id, "editor.duplicate_line") or
+        std.mem.eql(u8, id, "editor.move_line_up") or
+        std.mem.eql(u8, id, "editor.move_line_down");
 }
 
 fn absI16(value: i16) u16 {
@@ -5901,7 +6161,7 @@ fn headerActionAt(x: i16, y: i16) ?HeaderAction {
 fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
     const bottom = state.bottomTop();
     if (y < bottom or y >= bottom + 34) return null;
-    const panels = [_]BottomPanel{ .output, .tasks, .git, .extensions, .diagnostics, .security, .tutorial, .publish };
+    const panels = [_]BottomPanel{ .output, .tasks, .git, .extensions, .diagnostics, .security, .settings, .keybindings, .tutorial, .publish };
     for (panels, 0..) |panel, index| {
         const left: i16 = 10 + @as(i16, @intCast(index)) * 104;
         const rect = HitRect{ .left = left, .top = bottom + 8, .right = left + 96, .bottom = bottom + 32 };
@@ -5913,6 +6173,7 @@ fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
 const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
 const task_panel_actions = [_]TaskPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .tasks, .preview, .seal, .run_next, .history };
 const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .seal, .linux };
+const settings_panel_actions = [_]SettingsPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .tutorial_ja, .tutorial_en, .review, .trust, .lock, .seal };
 const extension_panel_actions = [_]ExtensionPanelAction{.scan};
 const tutorial_panel_actions = [_]TutorialPanelAction{ .ja, .en };
 const publish_panel_actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle, .verify, .preflight };
@@ -5936,6 +6197,14 @@ fn drawTaskPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
 fn drawSecurityPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
     inline for (security_panel_actions) |action| {
         try drawActionButton(x11, securityPanelActionRect(state, action), securityPanelActionLabel(action));
+    }
+}
+
+fn drawSettingsPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
+    inline for (settings_panel_actions) |action| {
+        const active = settingsPanelActionActive(state, action);
+        const color = settingsPanelActionGc(x11, state, action);
+        try drawActionButtonState(x11, settingsPanelActionRect(state, action), settingsPanelActionLabel(action), active, color);
     }
 }
 
@@ -5974,6 +6243,13 @@ fn taskPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?TaskPanelActi
 fn securityPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?SecurityPanelAction {
     inline for (security_panel_actions) |action| {
         if (pointIn(securityPanelActionRect(state, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn settingsPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?SettingsPanelAction {
+    inline for (settings_panel_actions) |action| {
+        if (pointIn(settingsPanelActionRect(state, action), x, y)) return action;
     }
     return null;
 }
@@ -6049,6 +6325,26 @@ fn securityPanelActionRect(state: *const LinuxGuiState, action: SecurityPanelAct
     const width: i16 = 58;
     const gap: i16 = 7;
     const right = state.window_width - 18 - (7 - index) * (width + gap);
+    const bottom = state.bottomTop();
+    return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
+}
+
+fn settingsPanelActionRect(state: *const LinuxGuiState, action: SettingsPanelAction) HitRect {
+    const index: i16 = switch (action) {
+        .profile_read_only => 0,
+        .profile_safe => 1,
+        .profile_network => 2,
+        .profile_publish => 3,
+        .tutorial_ja => 4,
+        .tutorial_en => 5,
+        .review => 6,
+        .trust => 7,
+        .lock => 8,
+        .seal => 9,
+    };
+    const width: i16 = 56;
+    const gap: i16 = 7;
+    const right = state.window_width - 18 - (9 - index) * (width + gap);
     const bottom = state.bottomTop();
     return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
@@ -6145,6 +6441,53 @@ fn securityPanelActionLabel(action: SecurityPanelAction) []const u8 {
         .clean => "CLEAN",
         .seal => "SEAL",
         .linux => "LINUX",
+    };
+}
+
+fn settingsPanelActionLabel(action: SettingsPanelAction) []const u8 {
+    return switch (action) {
+        .profile_read_only => "RO",
+        .profile_safe => "SAFE",
+        .profile_network => "NET",
+        .profile_publish => "PUB",
+        .tutorial_ja => "JA",
+        .tutorial_en => "EN",
+        .review => "REV",
+        .trust => "TRUST",
+        .lock => "LOCK",
+        .seal => "SEAL",
+    };
+}
+
+fn settingsPanelActionActive(state: *const LinuxGuiState, action: SettingsPanelAction) bool {
+    return switch (action) {
+        .profile_read_only => state.linux_launch_profile == .read_only,
+        .profile_safe => state.linux_launch_profile == .safe,
+        .profile_network => state.linux_launch_profile == .network,
+        .profile_publish => state.linux_launch_profile == .publish,
+        .tutorial_ja => state.tutorial_language == .ja,
+        .tutorial_en => state.tutorial_language == .en,
+        .review => state.app.runtime.trust_state == .reviewed,
+        .trust => switch (state.app.runtime.trust_state) {
+            .trusted, .hardened, .paranoid => true,
+            else => false,
+        },
+        .lock => state.app.runtime.trust_state == .locked_down,
+        .seal => state.linux_security.fd_cloexec_sealed > 0 and state.linux_security.fd_cloexec_seal_failed == 0,
+    };
+}
+
+fn settingsPanelActionGc(x11: *const X11, state: *const LinuxGuiState, action: SettingsPanelAction) u32 {
+    return switch (action) {
+        .profile_read_only => linuxLaunchProfileGc(x11, .read_only),
+        .profile_safe => linuxLaunchProfileGc(x11, .safe),
+        .profile_network => linuxLaunchProfileGc(x11, .network),
+        .profile_publish => linuxLaunchProfileGc(x11, .publish),
+        .tutorial_ja, .tutorial_en => x11.gc.cyan,
+        .review => x11.gc.green,
+        .trust => if (settingsPanelActionActive(state, action)) x11.gc.green else x11.gc.amber,
+        .lock => x11.gc.red,
+        .seal => x11.gc.amber,
     };
 }
 
@@ -6299,6 +6642,18 @@ fn extensionRowAt(state: *const LinuxGuiState, y: i16) ?usize {
     const row = @divTrunc(@as(isize, y - top), LINE_HEIGHT);
     if (row < 0) return null;
     return state.extensions_scroll_line + @as(usize, @intCast(row));
+}
+
+fn keybindingsTop(state: *const LinuxGuiState) i16 {
+    return state.bottomTop() + 108;
+}
+
+fn keybindingRowAt(state: *const LinuxGuiState, y: i16) ?usize {
+    const top = keybindingsTop(state);
+    if (y < top) return null;
+    const row = @divTrunc(@as(isize, y - top), LINE_HEIGHT);
+    if (row < 0) return null;
+    return state.keybindings_scroll_line + @as(usize, @intCast(row));
 }
 
 fn securityFindingsTop(state: *const LinuxGuiState) i16 {

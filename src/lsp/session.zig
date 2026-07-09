@@ -94,6 +94,10 @@ pub const Session = struct {
         return self.opened_documents.items.len;
     }
 
+    pub fn cancelPending(self: *Session, id: i64) void {
+        _ = self.takePending(id);
+    }
+
     pub fn documentVersion(self: *const Session, path: []const u8) ?i64 {
         for (self.opened_documents.items) |item| {
             if (pathEquals(item.path, path)) return item.version;
@@ -192,9 +196,10 @@ pub const Session = struct {
     }
 
     pub fn ingestPayload(self: *Session, payload: []const u8, diagnostics: *diagnostics_collection.Collection) !IngestResult {
-        if (try lsp_diagnostics.parsePublishDiagnostics(self.allocator, payload, self.workspace_root)) |*publish| {
+        if (try lsp_diagnostics.parsePublishDiagnostics(self.allocator, payload, self.workspace_root)) |publish_value| {
+            var publish = publish_value;
             defer publish.deinit();
-            try lsp_diagnostics.applyPublishDiagnostics(diagnostics, publish);
+            try lsp_diagnostics.applyPublishDiagnostics(diagnostics, &publish);
             return .{ .diagnostics = publish.diagnostics.len };
         }
 

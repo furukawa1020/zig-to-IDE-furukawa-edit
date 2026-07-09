@@ -38,6 +38,7 @@ const QuickPanelMode = enum {
     workspace_symbols,
     problems,
     completion,
+    code_actions,
     language_mode,
 };
 
@@ -169,6 +170,7 @@ const QuickPanel = struct {
     problem_matches: ?[]problems_search.Result = null,
     completion_matches: ?[]completion_mod.Item = null,
     language_matches: ?[]modes.LanguageMode = null,
+    code_action_count: usize = 0,
     completion_replace_start: usize = 0,
     completion_replace_end: usize = 0,
 
@@ -242,6 +244,7 @@ const QuickPanel = struct {
             .workspace_symbols => if (self.workspace_symbol_matches) |items| items.len else 0,
             .problems => if (self.problem_matches) |items| items.len else 0,
             .completion => if (self.completion_matches) |items| items.len else 0,
+            .code_actions => self.code_action_count,
             .language_mode => if (self.language_matches) |items| items.len else 0,
         };
     }
@@ -416,6 +419,12 @@ const QuickPanel = struct {
                     }
                 }
             },
+            .code_actions => {
+                self.code_action_count = if (app.activeLspSessionConst()) |session|
+                    if (session.last_code_actions) |actions| actions.items.len else 0
+                else
+                    0;
+            },
             .language_mode => {
                 var matches = std.array_list.Managed(modes.LanguageMode).init(self.allocator);
                 errdefer matches.deinit();
@@ -478,6 +487,7 @@ const QuickPanel = struct {
             completion_mod.deinitItems(self.allocator, items);
             self.completion_matches = null;
         }
+        self.code_action_count = 0;
         if (self.language_matches) |items| {
             self.allocator.free(items);
             self.language_matches = null;
@@ -1279,6 +1289,7 @@ const GuiState = struct {
             .problems => "Problems",
             .rename_symbol => "Rename symbol",
             .completion => "Complete symbol",
+            .code_actions => "Quick Fix",
             .language_mode => "Language mode",
         }) catch {};
         if (mode == .completion) self.requestCompletionFromLsp();
@@ -1577,6 +1588,29 @@ const GuiState = struct {
                 self.app.focus = .editor;
                 self.ensureCursorVisible();
                 self.setMessage("Completed") catch {};
+            },
+            .code_actions => {
+                const count = self.quick_panel.itemCount();
+                if (count == 0) {
+                    self.setMessage("No code action selected") catch {};
+                    return;
+                }
+                const selected = @min(self.quick_panel.selected_index, count - 1);
+                var index_buf: [32]u8 = undefined;
+                const argument = std.fmt.bufPrint(&index_buf, "{d}", .{selected + 1}) catch return;
+                self.quick_panel.close();
+                const result = dispatcher.dispatch(&self.app, .{ .id = "lsp.apply_code_action", .argument = argument, .source = .command_palette }) catch |err| {
+                    self.setError(err) catch {};
+                    self.appendOutput(.stderr, "code action failed: {s}\n", .{@errorName(err)});
+                    return;
+                };
+                self.handleDispatchResult("lsp.apply_code_action", result);
+                if (std.meta.activeTag(result) == .completed) {
+                    self.clearSelection();
+                    self.syncActiveDocumentToLsp();
+                    self.app.focus = .editor;
+                    self.ensureCursorVisible();
+                }
             },
             .language_mode => {
                 const mode = self.quick_panel.selectedLanguageMode() orelse {
@@ -2368,6 +2402,11 @@ const GuiState = struct {
         if (actions.items.len > 40) self.appendOutput(.stdout, "... {d} more LSP code action(s)\n", .{actions.items.len - 40});
         self.appendOutput(.stdout, "run lsp.apply_first_code_action to apply the first editable action to dirty editor buffers\n", .{});
         self.setMessage("Showing LSP code actions") catch {};
+        if (actions.items.len > 0) {
+            self.openQuickPanel(.code_actions);
+            self.quick_panel.visible = true;
+            self.setMessage("Select a Quick Fix and press Enter") catch {};
+        }
     }
 
     fn setError(self: *GuiState, err: anyerror) !void {
@@ -4832,6 +4871,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .workspace_symbols => "WORKSPACE SYMBOLS",
         .problems => "PROBLEMS  diagnostics + security",
         .completion => "COMPLETE  Enter inserts",
+        .code_actions => "QUICK FIX  Enter applies",
         .language_mode => "LANGUAGE MODE",
     };
     drawText(hdc, panel.left + 16, panel.top + 14, rgb(79, 230, 226), title);
@@ -4939,6 +4979,20 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 drawTextClipped(hdc, panel.left + 18, y, panel.left + 250, color, item.label);
                 drawTextClipped(hdc, panel.left + 260, y, panel.left + 370, color, @tagName(item.kind));
                 drawTextClipped(hdc, panel.left + 380, y, panel.right - 16, color, item.detail);
+            },
+            .code_actions => {
+                const session = state.app.activeLspSessionConst() orelse break;
+                const actions = session.last_code_actions orelse break;
+                if (row >= actions.items.len) break;
+                const item = actions.items[row];
+                var meta_buf: [160]u8 = undefined;
+                const meta = std.fmt.bufPrint(&meta_buf, "{d}. {s}{s}", .{
+                    row + 1,
+                    item.kind,
+                    if (item.workspace_edit != null) " edit" else " command",
+                }) catch item.kind;
+                drawTextClipped(hdc, panel.left + 18, y, panel.left + 190, color, meta);
+                drawTextClipped(hdc, panel.left + 200, y, panel.right - 16, color, item.title);
             },
             .language_mode => {
                 const items = state.quick_panel.language_matches orelse break;

@@ -629,6 +629,7 @@ const QuickPanelMode = enum {
     workspace_symbols,
     problems,
     completion,
+    code_actions,
     language_mode,
 };
 
@@ -705,6 +706,7 @@ const QuickPanel = struct {
     problem_matches: ?[]problems_search.Result = null,
     completion_matches: ?[]completion_mod.Item = null,
     language_matches: ?[]modes.LanguageMode = null,
+    code_action_count: usize = 0,
     completion_replace_start: usize = 0,
     completion_replace_end: usize = 0,
 
@@ -780,6 +782,7 @@ const QuickPanel = struct {
             .workspace_symbols => if (self.workspace_symbol_matches) |items| items.len else 0,
             .problems => if (self.problem_matches) |items| items.len else 0,
             .completion => if (self.completion_matches) |items| items.len else 0,
+            .code_actions => self.code_action_count,
             .language_mode => if (self.language_matches) |items| items.len else 0,
         };
     }
@@ -955,6 +958,12 @@ const QuickPanel = struct {
                     }
                 }
             },
+            .code_actions => {
+                self.code_action_count = if (app.activeLspSessionConst()) |session|
+                    if (session.last_code_actions) |actions| actions.items.len else 0
+                else
+                    0;
+            },
             .language_mode => {
                 var matches = std.array_list.Managed(modes.LanguageMode).init(self.allocator);
                 errdefer matches.deinit();
@@ -1017,6 +1026,7 @@ const QuickPanel = struct {
             completion_mod.deinitItems(self.allocator, items);
             self.completion_matches = null;
         }
+        self.code_action_count = 0;
         if (self.language_matches) |items| {
             self.allocator.free(items);
             self.language_matches = null;
@@ -1334,6 +1344,11 @@ const LinuxGuiState = struct {
         if (actions.items.len > 40) self.appendOutput(.stdout, "... {d} more LSP code action(s)\n", .{actions.items.len - 40});
         self.appendOutput(.stdout, "run lsp.apply_first_code_action to apply the first editable action to dirty editor buffers\n", .{});
         self.message("showing LSP code actions", .{});
+        if (actions.items.len > 0) {
+            self.openQuickPanel(.code_actions);
+            self.quick_panel.visible = true;
+            self.message("select a Quick Fix and press Enter", .{});
+        }
     }
 
     fn focusTerminalInput(self: *LinuxGuiState) void {
@@ -3541,6 +3556,26 @@ const LinuxGuiState = struct {
                 self.app.mode = .insert;
                 self.app.focus = .editor;
                 self.message("completed: {s}", .{insert_text});
+            },
+            .code_actions => {
+                const count = self.quick_panel.itemCount();
+                if (count == 0) return self.message("no code action selected", .{});
+                const selected = @min(self.quick_panel.selected_index, count - 1);
+                var index_buf: [32]u8 = undefined;
+                const argument = std.fmt.bufPrint(&index_buf, "{d}", .{selected + 1}) catch return;
+                self.quick_panel.close();
+                const result = dispatcher.dispatch(&self.app, .{ .id = "lsp.apply_code_action", .argument = argument, .source = .command_palette }) catch |err| {
+                    self.message("code action failed: {s}", .{@errorName(err)});
+                    self.appendOutput(.stderr, "code action failed: {s}\n", .{@errorName(err)});
+                    return;
+                };
+                self.handleDispatchResult("lsp.apply_code_action", result);
+                if (std.meta.activeTag(result) == .completed) {
+                    self.clearSelection();
+                    self.syncActiveDocumentToLsp();
+                    self.app.focus = .editor;
+                    self.ensureEditorCursorVisible();
+                }
             },
             .language_mode => {
                 const mode = self.quick_panel.selectedLanguageMode() orelse return self.message("no language selected", .{});
@@ -6242,6 +6277,18 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
                 items[row].detail,
             }) catch items[row].label;
         },
+        .code_actions => blk: {
+            const session = state.app.activeLspSessionConst() orelse break :blk "";
+            const actions = session.last_code_actions orelse break :blk "";
+            if (row >= actions.items.len) break :blk "";
+            const item = actions.items[row];
+            break :blk std.fmt.bufPrint(text_buf[0..], "{d}. [{s}] {s}{s}", .{
+                row + 1,
+                item.kind,
+                item.title,
+                if (item.workspace_edit != null) "  edit" else "  command",
+            }) catch item.title;
+        },
         .language_mode => blk: {
             const items = state.quick_panel.language_matches orelse break :blk "";
             if (row >= items.len) break :blk "";
@@ -7351,6 +7398,7 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .workspace_symbols => "WORKSPACE SYMBOLS",
         .problems => "PROBLEMS  diagnostics + security",
         .completion => "COMPLETE  Enter inserts",
+        .code_actions => "QUICK FIX  Enter applies",
         .language_mode => "LANGUAGE MODE",
     };
 }

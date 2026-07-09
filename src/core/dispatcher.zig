@@ -330,6 +330,12 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return try applyLastLspWorkspaceEdit(app);
     }
 
+    if (std.mem.eql(u8, definition.id, "lsp.apply_code_action")) {
+        const argument = request.argument orelse return .{ .unsupported = "lsp.apply_code_action requires a one-based action index" };
+        const index = parseOneBasedIndex(argument) orelse return .{ .blocked = "code action index must be a positive integer" };
+        return try applyLspCodeAction(app, index - 1);
+    }
+
     if (std.mem.eql(u8, definition.id, "lsp.apply_first_code_action")) {
         return try applyFirstLspCodeAction(app);
     }
@@ -1113,29 +1119,40 @@ fn applyFirstLspCodeAction(app: *app_mod.App) !Result {
 
     for (actions.items, 0..) |*action, index| {
         if (action.workspace_edit) |*edit| {
-            const summary = try applyWorkspaceEdit(app, edit);
-            try appendConsole(
-                app,
-                if (summary.ok()) .stdout else .stderr,
-                "lsp code action apply: #{d} {s} edits={d} applied={d} files={d} blocked={d} failed={d} skipped_resource_ops={d}\n",
-                .{
-                    index + 1,
-                    action.title,
-                    summary.edits,
-                    summary.applied,
-                    summary.files,
-                    summary.blocked,
-                    summary.failed,
-                    summary.skipped_resource_ops,
-                },
-            );
-            if (summary.applied > 0) session.clearCachedResultForRequest(.code_action);
-            if (summary.ok()) return .{ .completed = "LSP code action applied to editor buffers" };
-            return .{ .blocked = "LSP code action partially applied; review output" };
+            _ = edit;
+            return try applyLspCodeAction(app, index);
         }
     }
 
     return .{ .blocked = "cached LSP code actions did not include an editable WorkspaceEdit" };
+}
+
+fn applyLspCodeAction(app: *app_mod.App, zero_based_index: usize) !Result {
+    const session = app.activeLspSession() orelse return .{ .blocked = "no LSP session for active document" };
+    const actions = if (session.last_code_actions) |*cached| cached else return .{ .blocked = "no cached LSP code actions to apply" };
+    if (zero_based_index >= actions.items.len) return .{ .blocked = "code action index is out of range" };
+    const action = &actions.items[zero_based_index];
+    const edit = if (action.workspace_edit) |*workspace_edit| workspace_edit else return .{ .blocked = "selected LSP code action has no editable WorkspaceEdit" };
+
+    const summary = try applyWorkspaceEdit(app, edit);
+    try appendConsole(
+        app,
+        if (summary.ok()) .stdout else .stderr,
+        "lsp code action apply: #{d} {s} edits={d} applied={d} files={d} blocked={d} failed={d} skipped_resource_ops={d}\n",
+        .{
+            zero_based_index + 1,
+            action.title,
+            summary.edits,
+            summary.applied,
+            summary.files,
+            summary.blocked,
+            summary.failed,
+            summary.skipped_resource_ops,
+        },
+    );
+    if (summary.applied > 0) session.clearCachedResultForRequest(.code_action);
+    if (summary.ok()) return .{ .completed = "LSP code action applied to editor buffers" };
+    return .{ .blocked = "LSP code action partially applied; review output" };
 }
 
 fn applyWorkspaceEdit(app: *app_mod.App, edit: *const lsp_responses.WorkspaceEdit) !WorkspaceEditApplySummary {
@@ -3557,6 +3574,14 @@ fn appendConsole(app: *app_mod.App, stream: @import("../tasks/console.zig").Stre
     defer text.deinit();
     try text.writer.print(fmt, args);
     try app.process_console.appendBytes(stream, text.written());
+}
+
+fn parseOneBasedIndex(argument: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, argument, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const value = std.fmt.parseUnsigned(usize, trimmed, 10) catch return null;
+    if (value == 0) return null;
+    return value;
 }
 
 const TestWorkspaceEditSpec = struct {

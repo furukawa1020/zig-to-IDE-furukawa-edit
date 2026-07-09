@@ -32,6 +32,11 @@ const lsp_launch_plan = @import("../lsp/launch_plan.zig");
 const lsp_session = @import("../lsp/session.zig");
 const lsp_transport = @import("../lsp/transport.zig");
 
+pub const LspPumpResult = struct {
+    frames: usize = 0,
+    stderr_bytes: usize = 0,
+};
+
 pub const Result = union(enum) {
     completed: []const u8,
     blocked: []const u8,
@@ -906,21 +911,31 @@ fn ingestLspPayload(app: *app_mod.App, payload: []const u8) !Result {
 }
 
 fn drainLspFrames(app: *app_mod.App) !Result {
-    const transport = if (app.lsp_transport) |*transport| transport else return .{ .blocked = "no LSP transport is running" };
-    var frames: usize = 0;
+    if (app.lsp_transport == null) return .{ .blocked = "no LSP transport is running" };
+    const result = try pumpLsp(app);
+    if (result.frames == 0 and result.stderr_bytes == 0) return .{ .blocked = "no complete LSP frames buffered" };
+    return .{ .completed = "LSP frames drained" };
+}
+
+pub fn pumpLsp(app: *app_mod.App) !LspPumpResult {
+    const transport = if (app.lsp_transport) |*transport| transport else return .{};
+    var result: LspPumpResult = .{};
     while (true) {
         var frame = (try transport.nextStdoutFrame()) orelse break;
-        const result = try app.lsp_session.ingestPayload(frame.body, &app.diagnostics);
-        try renderLspIngestResult(app, result);
+        const ingest_result = try app.lsp_session.ingestPayload(frame.body, &app.diagnostics);
+        try renderLspIngestResult(app, ingest_result);
         frame.deinit();
-        frames += 1;
+        result.frames += 1;
     }
-    if (transport.stderrText().len > 0) {
-        const preview_len = @min(transport.stderrText().len, 4096);
-        try appendConsole(app, .stderr, "lsp stderr buffered ({d} bytes)\n{s}\n", .{ transport.stderrText().len, transport.stderrText()[0..preview_len] });
+
+    const preview = try transport.takeStderrPreview(app.allocator, 4096);
+    defer app.allocator.free(preview.bytes);
+    result.stderr_bytes = preview.total;
+    if (preview.total > 0) {
+        try appendConsole(app, .stderr, "lsp stderr ({d} bytes)\n{s}\n", .{ preview.total, preview.bytes });
     }
-    if (frames == 0) return .{ .blocked = "no complete LSP frames buffered" };
-    return .{ .completed = "LSP frames drained" };
+
+    return result;
 }
 
 fn deliverLspOutbound(app: *app_mod.App, label: []const u8, outbound: *const lsp_session.Outbound) !bool {

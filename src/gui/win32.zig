@@ -592,6 +592,7 @@ pub fn run(allocator: std.mem.Allocator, root_path: []const u8) !void {
     state.hwnd = hwnd;
     state.text_font = createTextFont();
 
+    _ = SetTimer(hwnd, LSP_PUMP_TIMER_ID, 120, null);
     _ = SetWindowTextW(hwnd, title.ptr);
     _ = ShowWindow(hwnd, SW_SHOW);
     _ = UpdateWindow(hwnd);
@@ -2169,6 +2170,20 @@ const GuiState = struct {
         self.app.process_console.appendBytes(stream, text.written()) catch return;
     }
 
+    fn pumpLsp(self: *GuiState) bool {
+        const result = dispatcher.pumpLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp pump failed: {s}\n", .{@errorName(err)});
+            return true;
+        };
+        if (result.frames == 0 and result.stderr_bytes == 0) return false;
+        if (self.quick_panel.visible) {
+            self.quick_panel.rebuild(&self.app) catch |err| {
+                self.appendOutput(.stderr, "quick panel refresh failed after lsp update: {s}\n", .{@errorName(err)});
+            };
+        }
+        return true;
+    }
+
     fn setError(self: *GuiState, err: anyerror) !void {
         var buffer: [160]u8 = undefined;
         const message = try std.fmt.bufPrint(&buffer, "error: {s}", .{@errorName(err)});
@@ -2900,11 +2915,21 @@ fn windowProc(hwnd: windows.HWND, msg: windows.UINT, wparam: WPARAM, lparam: win
             _ = InvalidateRect(hwnd, null, .FALSE);
             return 0;
         },
+        WM_TIMER => {
+            if (wparam == LSP_PUMP_TIMER_ID) {
+                if (global_state) |state| {
+                    if (state.pumpLsp()) _ = InvalidateRect(hwnd, null, .FALSE);
+                }
+                return 0;
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         WM_PAINT => {
             paint(hwnd);
             return 0;
         },
         WM_DESTROY => {
+            _ = KillTimer(hwnd, LSP_PUMP_TIMER_ID);
             PostQuitMessage(0);
             return 0;
         },
@@ -5747,6 +5772,7 @@ const PAINTSTRUCT = extern struct {
 };
 
 const WNDPROC = *const fn (windows.HWND, windows.UINT, WPARAM, windows.LPARAM) callconv(.winapi) LRESULT;
+const TIMERPROC = ?*const fn (windows.HWND, windows.UINT, WPARAM, windows.DWORD) callconv(.winapi) void;
 
 const WNDCLASSEXW = extern struct {
     cbSize: windows.UINT,
@@ -5820,6 +5846,7 @@ const CF_UNICODETEXT: windows.UINT = 13;
 const WM_DESTROY: windows.UINT = 0x0002;
 const WM_SIZE: windows.UINT = 0x0005;
 const WM_PAINT: windows.UINT = 0x000F;
+const WM_TIMER: windows.UINT = 0x0113;
 const WM_KEYDOWN: windows.UINT = 0x0100;
 const WM_CHAR: windows.UINT = 0x0102;
 const WM_LBUTTONDOWN: windows.UINT = 0x0201;
@@ -5850,6 +5877,7 @@ const VK_F6: WPARAM = 0x75;
 const VK_F7: WPARAM = 0x76;
 const VK_F8: WPARAM = 0x77;
 const VK_F12: WPARAM = 0x7B;
+const LSP_PUMP_TIMER_ID: WPARAM = 29;
 
 extern "kernel32" fn GetModuleHandleW(lpModuleName: ?windows.LPCWSTR) callconv(.winapi) ?windows.HMODULE;
 extern "kernel32" fn GlobalAlloc(uFlags: windows.UINT, dwBytes: usize) callconv(.winapi) ?HGLOBAL;
@@ -5900,6 +5928,8 @@ extern "user32" fn GetMessageW(lpMsg: *MSG, hWnd: ?windows.HWND, wMsgFilterMin: 
 extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) windows.BOOL;
 extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
 extern "user32" fn PostQuitMessage(nExitCode: c_int) callconv(.winapi) void;
+extern "user32" fn SetTimer(hWnd: windows.HWND, nIDEvent: WPARAM, uElapse: windows.UINT, lpTimerFunc: TIMERPROC) callconv(.winapi) WPARAM;
+extern "user32" fn KillTimer(hWnd: windows.HWND, uIDEvent: WPARAM) callconv(.winapi) windows.BOOL;
 extern "user32" fn BeginPaint(hWnd: windows.HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) windows.HDC;
 extern "user32" fn EndPaint(hWnd: windows.HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) windows.BOOL;
 extern "user32" fn InvalidateRect(hWnd: windows.HWND, lpRect: ?*const RECT, bErase: windows.BOOL) callconv(.winapi) windows.BOOL;

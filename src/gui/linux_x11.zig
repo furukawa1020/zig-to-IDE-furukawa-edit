@@ -1162,6 +1162,20 @@ const LinuxGuiState = struct {
         self.app.process_console.appendBytes(stream, text.written()) catch return;
     }
 
+    fn pumpLsp(self: *LinuxGuiState) bool {
+        const result = dispatcher.pumpLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp pump failed: {s}\n", .{@errorName(err)});
+            return true;
+        };
+        if (result.frames == 0 and result.stderr_bytes == 0) return false;
+        if (self.quick_panel.visible) {
+            self.quick_panel.rebuild(&self.app) catch |err| {
+                self.appendOutput(.stderr, "quick panel refresh failed after lsp update: {s}\n", .{@errorName(err)});
+            };
+        }
+        return true;
+    }
+
     fn focusTerminalInput(self: *LinuxGuiState) void {
         self.bottom_panel = .tasks;
         self.terminal_focused = true;
@@ -4838,10 +4852,11 @@ pub fn run(
             fd_count += 1;
         }
 
-        const timeout_ms: i32 = if (pty_poll_index != null) 100 else -1;
+        const timeout_ms: i32 = if (pty_poll_index != null or state.app.lsp_transport != null) 100 else -1;
         _ = try std.posix.poll(fds[0..fd_count], timeout_ms);
 
         var needs_draw = state.pumpPtySession();
+        needs_draw = state.pumpLsp() or needs_draw;
         const pty_ready_mask: i16 = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR;
         if (pty_poll_index) |index| {
             if ((fds[index].revents & pty_ready_mask) != 0) {

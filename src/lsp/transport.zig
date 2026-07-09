@@ -26,7 +26,12 @@ pub const LaunchSpec = struct {
 pub const StartError = error{
     NoServerForLanguage,
     MissingPipe,
-} || std.mem.Allocator.Error || std.Io.Writer.Error || std.process.SpawnError;
+} || std.mem.Allocator.Error || std.Io.Writer.Error || std.process.SpawnError || std.Thread.SpawnError;
+
+pub const StderrPreview = struct {
+    total: usize,
+    bytes: []u8,
+};
 
 pub const Transport = struct {
     allocator: std.mem.Allocator,
@@ -35,6 +40,9 @@ pub const Transport = struct {
     command_label: []u8,
     stdout_buffer: std.array_list.Managed(u8),
     stderr_buffer: std.array_list.Managed(u8),
+    reader_state: ?*ReaderState = null,
+    stdout_thread: ?std.Thread = null,
+    stderr_thread: ?std.Thread = null,
     alive: bool = true,
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, spec: LaunchSpec, environ_map: ?*const std.process.Environ.Map) StartError!Transport {
@@ -50,19 +58,49 @@ pub const Transport = struct {
         errdefer child.kill(io);
 
         if (child.stdin == null or child.stdout == null or child.stderr == null) return error.MissingPipe;
+        const command_label = try joinArgv(allocator, spec.argv);
+        errdefer allocator.free(command_label);
+
+        const reader_state = try ReaderState.create(allocator, io, child.stdout.?, child.stderr.?);
+        errdefer {
+            reader_state.deinit();
+            allocator.destroy(reader_state);
+        }
+
+        var stdout_thread = try std.Thread.spawn(.{}, readerThread, .{ reader_state, Stream.stdout });
+        errdefer {
+            reader_state.requestStop();
+            child.kill(io);
+            stdout_thread.join();
+        }
+
+        var stderr_thread = try std.Thread.spawn(.{}, readerThread, .{ reader_state, Stream.stderr });
+        errdefer {
+            reader_state.requestStop();
+            child.kill(io);
+            stderr_thread.join();
+        }
 
         return .{
             .allocator = allocator,
             .io = io,
             .child = child,
-            .command_label = try joinArgv(allocator, spec.argv),
+            .command_label = command_label,
             .stdout_buffer = std.array_list.Managed(u8).init(allocator),
             .stderr_buffer = std.array_list.Managed(u8).init(allocator),
+            .reader_state = reader_state,
+            .stdout_thread = stdout_thread,
+            .stderr_thread = stderr_thread,
         };
     }
 
     pub fn deinit(self: *Transport) void {
-        if (self.alive) self.child.kill(self.io);
+        self.stop();
+        if (self.reader_state) |state| {
+            state.deinit();
+            self.allocator.destroy(state);
+            self.reader_state = null;
+        }
         self.stderr_buffer.deinit();
         self.stdout_buffer.deinit();
         self.allocator.free(self.command_label);
@@ -75,37 +113,42 @@ pub const Transport = struct {
     }
 
     pub fn readStdoutChunk(self: *Transport, max_bytes: usize) !usize {
+        if (self.reader_state != null) return 0;
         const stdout = self.child.stdout orelse return error.MissingPipe;
         return try self.readInto(&self.stdout_buffer, stdout, max_bytes);
     }
 
     pub fn readStderrChunk(self: *Transport, max_bytes: usize) !usize {
+        if (self.reader_state != null) return 0;
         const stderr = self.child.stderr orelse return error.MissingPipe;
         return try self.readInto(&self.stderr_buffer, stderr, max_bytes);
     }
 
     pub fn nextStdoutFrame(self: *Transport) !?lsp_framing.OwnedFrame {
-        const frame = lsp_framing.parse(self.stdout_buffer.items) catch |err| switch (err) {
-            error.IncompleteFrame => return null,
-            else => return err,
-        };
-        const owned = lsp_framing.OwnedFrame{
-            .allocator = self.allocator,
-            .content_length = frame.content_length,
-            .body = try self.allocator.dupe(u8, frame.body),
-        };
-        self.stdout_buffer.replaceRange(0, frame.header_bytes + frame.content_length, &.{}) catch unreachable;
-        return owned;
+        if (self.reader_state) |state| {
+            state.lock();
+            defer state.unlock();
+            return try self.nextFrameFromBuffer(&state.stdout_buffer);
+        }
+        return try self.nextFrameFromBuffer(&self.stdout_buffer);
     }
 
-    pub fn stderrText(self: *const Transport) []const u8 {
-        return self.stderr_buffer.items;
+    pub fn takeStderrPreview(self: *Transport, allocator: std.mem.Allocator, max_bytes: usize) !StderrPreview {
+        if (self.reader_state) |state| {
+            state.lock();
+            defer state.unlock();
+            return try takePreviewFromBuffer(allocator, &state.stderr_buffer, max_bytes);
+        }
+        return try takePreviewFromBuffer(allocator, &self.stderr_buffer, max_bytes);
     }
 
     pub fn stop(self: *Transport) void {
-        if (!self.alive) return;
-        self.child.kill(self.io);
-        self.alive = false;
+        if (self.reader_state) |state| state.requestStop();
+        if (self.alive) {
+            self.child.kill(self.io);
+            self.alive = false;
+        }
+        self.joinReaders();
     }
 
     fn readInto(self: *Transport, target: *std.array_list.Managed(u8), file: std.Io.File, max_bytes: usize) !usize {
@@ -123,7 +166,142 @@ pub const Transport = struct {
         try target.resize(previous_len + read_len);
         return read_len;
     }
+
+    fn joinReaders(self: *Transport) void {
+        if (self.stdout_thread) |thread| {
+            self.stdout_thread = null;
+            thread.join();
+        }
+        if (self.stderr_thread) |thread| {
+            self.stderr_thread = null;
+            thread.join();
+        }
+    }
+
+    fn nextFrameFromBuffer(self: *Transport, buffer: *std.array_list.Managed(u8)) !?lsp_framing.OwnedFrame {
+        const frame = lsp_framing.parse(buffer.items) catch |err| switch (err) {
+            error.IncompleteFrame => return null,
+            else => return err,
+        };
+        const owned = lsp_framing.OwnedFrame{
+            .allocator = self.allocator,
+            .content_length = frame.content_length,
+            .body = try self.allocator.dupe(u8, frame.body),
+        };
+        buffer.replaceRange(0, frame.header_bytes + frame.content_length, &.{}) catch unreachable;
+        return owned;
+    }
 };
+
+const Stream = enum { stdout, stderr };
+
+const ReaderState = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdout: std.Io.File,
+    stderr: std.Io.File,
+    mutex: std.Io.Mutex = .init,
+    stdout_buffer: std.array_list.Managed(u8),
+    stderr_buffer: std.array_list.Managed(u8),
+    stop_requested: std.atomic.Value(bool) = .init(false),
+    stdout_closed: std.atomic.Value(bool) = .init(false),
+    stderr_closed: std.atomic.Value(bool) = .init(false),
+
+    fn create(allocator: std.mem.Allocator, io: std.Io, stdout: std.Io.File, stderr: std.Io.File) !*ReaderState {
+        const state = try allocator.create(ReaderState);
+        state.* = .{
+            .allocator = allocator,
+            .io = io,
+            .stdout = stdout,
+            .stderr = stderr,
+            .stdout_buffer = std.array_list.Managed(u8).init(allocator),
+            .stderr_buffer = std.array_list.Managed(u8).init(allocator),
+        };
+        return state;
+    }
+
+    fn deinit(self: *ReaderState) void {
+        self.stderr_buffer.deinit();
+        self.stdout_buffer.deinit();
+        self.* = undefined;
+    }
+
+    fn requestStop(self: *ReaderState) void {
+        self.stop_requested.store(true, .release);
+    }
+
+    fn shouldStop(self: *ReaderState) bool {
+        return self.stop_requested.load(.acquire);
+    }
+
+    fn lock(self: *ReaderState) void {
+        self.mutex.lockUncancelable(self.io);
+    }
+
+    fn unlock(self: *ReaderState) void {
+        self.mutex.unlock(self.io);
+    }
+
+    fn bufferFor(self: *ReaderState, stream: Stream) *std.array_list.Managed(u8) {
+        return switch (stream) {
+            .stdout => &self.stdout_buffer,
+            .stderr => &self.stderr_buffer,
+        };
+    }
+
+    fn fileFor(self: *ReaderState, stream: Stream) std.Io.File {
+        return switch (stream) {
+            .stdout => self.stdout,
+            .stderr => self.stderr,
+        };
+    }
+
+    fn markClosed(self: *ReaderState, stream: Stream) void {
+        switch (stream) {
+            .stdout => self.stdout_closed.store(true, .release),
+            .stderr => self.stderr_closed.store(true, .release),
+        }
+    }
+};
+
+fn readerThread(state: *ReaderState, stream: Stream) void {
+    var buffer: [4096]u8 = undefined;
+    while (!state.shouldStop()) {
+        const file = state.fileFor(stream);
+        const read_len = std.Io.File.readStreaming(file, state.io, &.{buffer[0..]}) catch |err| switch (err) {
+            error.EndOfStream, error.NotOpenForReading => {
+                state.markClosed(stream);
+                return;
+            },
+            error.WouldBlock => {
+                std.Io.sleep(state.io, std.Io.Duration.fromMilliseconds(8), .awake) catch {};
+                continue;
+            },
+            else => {
+                state.markClosed(stream);
+                return;
+            },
+        };
+        if (read_len == 0) {
+            std.Io.sleep(state.io, std.Io.Duration.fromMilliseconds(8), .awake) catch {};
+            continue;
+        }
+        state.lock();
+        state.bufferFor(stream).appendSlice(buffer[0..read_len]) catch {};
+        state.unlock();
+    }
+}
+
+fn takePreviewFromBuffer(allocator: std.mem.Allocator, buffer: *std.array_list.Managed(u8), max_bytes: usize) !StderrPreview {
+    const total = buffer.items.len;
+    const preview_len = @min(total, max_bytes);
+    const bytes = try allocator.dupe(u8, buffer.items[0..preview_len]);
+    buffer.clearRetainingCapacity();
+    return .{
+        .total = total,
+        .bytes = bytes,
+    };
+}
 
 pub fn launchSpecForLanguage(allocator: std.mem.Allocator, language: modes.LanguageMode, workspace_root: []const u8) !?LaunchSpec {
     const server = lsp_registry.serverForLanguage(language) orelse return null;
@@ -215,6 +393,9 @@ test "extract multiple stdout frames from buffer" {
         .command_label = try std.testing.allocator.dupe(u8, "test"),
         .stdout_buffer = std.array_list.Managed(u8).init(std.testing.allocator),
         .stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator),
+        .reader_state = null,
+        .stdout_thread = null,
+        .stderr_thread = null,
         .alive = false,
     };
     defer transport.deinit();

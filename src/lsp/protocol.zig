@@ -19,12 +19,31 @@ pub const TextDocument = struct {
     text: []const u8,
 };
 
+pub const TextDocumentChange = struct {
+    uri: []const u8,
+    version: i64,
+    text: []const u8,
+};
+
 pub const RequestMethod = enum {
     initialize,
     shutdown,
     completion,
     hover,
     definition,
+    references,
+    implementation,
+    type_definition,
+    document_highlight,
+    signature_help,
+};
+
+pub const DocumentRequestMethod = enum {
+    document_symbol,
+};
+
+pub const WorkspaceRequestMethod = enum {
+    workspace_symbol,
 };
 
 pub fn makeInitializeRequest(allocator: std.mem.Allocator, id: RequestId, root_uri: []const u8, client_name: []const u8) ![]u8 {
@@ -103,6 +122,49 @@ pub fn makeDidOpenNotification(allocator: std.mem.Allocator, document: TextDocum
     return try out.toOwnedSlice();
 }
 
+pub fn makeDidChangeNotification(allocator: std.mem.Allocator, change: TextDocumentChange) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginNotification(&json, "textDocument/didChange");
+        try json.objectField("params");
+        try json.beginObject();
+        try json.objectField("textDocument");
+        try writeVersionedTextDocumentIdentifier(&json, change.uri, change.version);
+        try json.objectField("contentChanges");
+        try json.beginArray();
+        try json.beginObject();
+        try json.objectField("text");
+        try json.write(change.text);
+        try json.endObject();
+        try json.endArray();
+        try json.endObject();
+        try json.endObject();
+    }
+    return try out.toOwnedSlice();
+}
+
+pub fn makeDidSaveNotification(allocator: std.mem.Allocator, uri: []const u8, text: ?[]const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginNotification(&json, "textDocument/didSave");
+        try json.objectField("params");
+        try json.beginObject();
+        try json.objectField("textDocument");
+        try writeTextDocumentIdentifier(&json, uri);
+        if (text) |body| {
+            try json.objectField("text");
+            try json.write(body);
+        }
+        try json.endObject();
+        try json.endObject();
+    }
+    return try out.toOwnedSlice();
+}
+
 pub fn makePositionRequest(
     allocator: std.mem.Allocator,
     id: RequestId,
@@ -114,6 +176,11 @@ pub fn makePositionRequest(
         .completion => "textDocument/completion",
         .hover => "textDocument/hover",
         .definition => "textDocument/definition",
+        .references => "textDocument/references",
+        .implementation => "textDocument/implementation",
+        .type_definition => "textDocument/typeDefinition",
+        .document_highlight => "textDocument/documentHighlight",
+        .signature_help => "textDocument/signatureHelp",
         .initialize, .shutdown => return error.NotPositionRequest,
     };
 
@@ -131,6 +198,72 @@ pub fn makePositionRequest(
         try json.endObject();
         try json.objectField("position");
         try writePosition(&json, position);
+        try json.endObject();
+        try json.endObject();
+    }
+    return try out.toOwnedSlice();
+}
+
+pub fn makeDocumentRequest(allocator: std.mem.Allocator, id: RequestId, method: DocumentRequestMethod, uri: []const u8) ![]u8 {
+    const method_name = switch (method) {
+        .document_symbol => "textDocument/documentSymbol",
+    };
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, id, method_name);
+        try json.objectField("params");
+        try json.beginObject();
+        try json.objectField("textDocument");
+        try writeTextDocumentIdentifier(&json, uri);
+        try json.endObject();
+        try json.endObject();
+    }
+    return try out.toOwnedSlice();
+}
+
+pub fn makeWorkspaceRequest(allocator: std.mem.Allocator, id: RequestId, method: WorkspaceRequestMethod, query: []const u8) ![]u8 {
+    const method_name = switch (method) {
+        .workspace_symbol => "workspace/symbol",
+    };
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, id, method_name);
+        try json.objectField("params");
+        try json.beginObject();
+        try json.objectField("query");
+        try json.write(query);
+        try json.endObject();
+        try json.endObject();
+    }
+    return try out.toOwnedSlice();
+}
+
+pub fn makeRenameRequest(
+    allocator: std.mem.Allocator,
+    id: RequestId,
+    uri: []const u8,
+    position: TextPosition,
+    new_name: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, id, "textDocument/rename");
+        try json.objectField("params");
+        try json.beginObject();
+        try json.objectField("textDocument");
+        try writeTextDocumentIdentifier(&json, uri);
+        try json.objectField("position");
+        try writePosition(&json, position);
+        try json.objectField("newName");
+        try json.write(new_name);
         try json.endObject();
         try json.endObject();
     }
@@ -239,6 +372,8 @@ fn writeClientCapabilities(json: *std.json.Stringify) !void {
     try json.beginObject();
     try json.objectField("synchronization");
     try json.beginObject();
+    try json.objectField("dynamicRegistration");
+    try json.write(false);
     try json.objectField("didSave");
     try json.write(true);
     try json.objectField("willSave");
@@ -258,6 +393,31 @@ fn writeClientCapabilities(json: *std.json.Stringify) !void {
     try json.objectField("definition");
     try json.beginObject();
     try json.endObject();
+    try json.objectField("references");
+    try json.beginObject();
+    try json.endObject();
+    try json.objectField("implementation");
+    try json.beginObject();
+    try json.endObject();
+    try json.objectField("typeDefinition");
+    try json.beginObject();
+    try json.endObject();
+    try json.objectField("documentHighlight");
+    try json.beginObject();
+    try json.endObject();
+    try json.objectField("signatureHelp");
+    try json.beginObject();
+    try json.endObject();
+    try json.objectField("rename");
+    try json.beginObject();
+    try json.objectField("prepareSupport");
+    try json.write(false);
+    try json.endObject();
+    try json.objectField("documentSymbol");
+    try json.beginObject();
+    try json.objectField("hierarchicalDocumentSymbolSupport");
+    try json.write(false);
+    try json.endObject();
     try json.objectField("publishDiagnostics");
     try json.beginObject();
     try json.endObject();
@@ -266,6 +426,9 @@ fn writeClientCapabilities(json: *std.json.Stringify) !void {
     try json.beginObject();
     try json.objectField("workspaceFolders");
     try json.write(false);
+    try json.objectField("symbol");
+    try json.beginObject();
+    try json.endObject();
     try json.endObject();
     try json.endObject();
 }
@@ -276,6 +439,22 @@ fn writePosition(json: *std.json.Stringify, position: TextPosition) !void {
     try json.write(position.line);
     try json.objectField("character");
     try json.write(position.character);
+    try json.endObject();
+}
+
+fn writeTextDocumentIdentifier(json: *std.json.Stringify, uri: []const u8) !void {
+    try json.beginObject();
+    try json.objectField("uri");
+    try json.write(uri);
+    try json.endObject();
+}
+
+fn writeVersionedTextDocumentIdentifier(json: *std.json.Stringify, uri: []const u8, version: i64) !void {
+    try json.beginObject();
+    try json.objectField("uri");
+    try json.write(uri);
+    try json.objectField("version");
+    try json.write(version);
     try json.endObject();
 }
 
@@ -303,6 +482,43 @@ test "build completion request and frame" {
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "textDocument/completion") != null);
     try std.testing.expect(std.mem.startsWith(u8, framed, "Content-Length: "));
+}
+
+test "build references document symbol workspace symbol and rename requests" {
+    const references = try makePositionRequest(std.testing.allocator, .{ .number = 8 }, .references, "file:///tmp/main.zig", .{ .line = 3, .character = 9 });
+    defer std.testing.allocator.free(references);
+    try std.testing.expect(std.mem.indexOf(u8, references, "textDocument/references") != null);
+
+    const document_symbols = try makeDocumentRequest(std.testing.allocator, .{ .number = 9 }, .document_symbol, "file:///tmp/main.zig");
+    defer std.testing.allocator.free(document_symbols);
+    try std.testing.expect(std.mem.indexOf(u8, document_symbols, "textDocument/documentSymbol") != null);
+
+    const workspace_symbols = try makeWorkspaceRequest(std.testing.allocator, .{ .number = 10 }, .workspace_symbol, "App");
+    defer std.testing.allocator.free(workspace_symbols);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_symbols, "workspace/symbol") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_symbols, "\"query\":\"App\"") != null);
+
+    const rename = try makeRenameRequest(std.testing.allocator, .{ .number = 11 }, "file:///tmp/main.zig", .{ .line = 1, .character = 2 }, "Renamed");
+    defer std.testing.allocator.free(rename);
+    try std.testing.expect(std.mem.indexOf(u8, rename, "textDocument/rename") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rename, "\"newName\":\"Renamed\"") != null);
+}
+
+test "build didChange and didSave notifications" {
+    const change = try makeDidChangeNotification(std.testing.allocator, .{
+        .uri = "file:///tmp/main.zig",
+        .version = 3,
+        .text = "pub fn main() void {}",
+    });
+    defer std.testing.allocator.free(change);
+    try std.testing.expect(std.mem.indexOf(u8, change, "textDocument/didChange") != null);
+    try std.testing.expect(std.mem.indexOf(u8, change, "\"version\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, change, "\"contentChanges\"") != null);
+
+    const save = try makeDidSaveNotification(std.testing.allocator, "file:///tmp/main.zig", null);
+    defer std.testing.allocator.free(save);
+    try std.testing.expect(std.mem.indexOf(u8, save, "textDocument/didSave") != null);
+    try std.testing.expect(std.mem.indexOf(u8, save, "\"text\"") == null);
 }
 
 test "path to file URI normalizes Windows paths" {

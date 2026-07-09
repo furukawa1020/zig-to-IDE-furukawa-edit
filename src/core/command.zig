@@ -115,6 +115,8 @@ const definitions = [_]Definition{
     .{ .id = "lsp.request_hover", .title = "Build LSP Hover Request", .description = "Build a textDocument/hover packet for the active cursor.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "lsp.request_definition", .title = "Build LSP Definition Request", .description = "Build a textDocument/definition packet for the active cursor.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "lsp.request_references", .title = "Build LSP References Request", .description = "Build a textDocument/references packet for the active cursor.", .default_key = "", .scope = .workspace, .capability = .safe },
+    .{ .id = "lsp.start", .title = "Start LSP Server", .description = "Start the mapped language server for the active document using stdio after trust approval.", .default_key = "", .scope = .workspace, .capability = .external_command },
+    .{ .id = "lsp.stop", .title = "Stop LSP Server", .description = "Stop the active language server transport.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "security.scan_current", .title = "Scan Current File", .description = "Scan the current file for Zig and polyglot security boundaries.", .default_key = "ctrl-alt-s", .scope = .workspace, .capability = .safe },
     .{ .id = "security.audit_workspace", .title = "Audit Workspace", .description = "Run static Security Workbench audit for the workspace.", .default_key = "ctrl-alt-a", .scope = .workspace, .capability = .safe },
     .{ .id = "security.audit_log", .title = "Show Run Audit Log", .description = "Render persisted command launch audit JSONL without running external tools.", .default_key = "", .scope = .workspace, .capability = .safe },

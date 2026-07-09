@@ -8,8 +8,9 @@ const render_view = @import("../ui/render.zig");
 const runtime = @import("runtime.zig");
 const console = @import("../tasks/console.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
+const modes = @import("../language/modes.zig");
+const lsp_manager = @import("../lsp/manager.zig");
 const lsp_session = @import("../lsp/session.zig");
-const lsp_transport = @import("../lsp/transport.zig");
 const workspace = @import("../workspace/workspace.zig");
 
 pub const Mode = enum {
@@ -38,8 +39,7 @@ pub const App = struct {
     diagnostics: diagnostics.Collection,
     security_findings: security_findings.Collection,
     process_console: console.ProcessConsole,
-    lsp_session: lsp_session.Session,
-    lsp_transport: ?lsp_transport.Transport,
+    lsp_manager: lsp_manager.Manager,
     pending_build_consent: ?build_consent.Preview,
     pending_build_source_id: ?[]u8,
     execution_queue: execution_queue.Queue,
@@ -74,8 +74,7 @@ pub const App = struct {
             .diagnostics = diagnostics.Collection.init(allocator),
             .security_findings = security_findings.Collection.init(allocator),
             .process_console = console.ProcessConsole.init(allocator),
-            .lsp_session = try lsp_session.Session.init(allocator, workspace_path),
-            .lsp_transport = null,
+            .lsp_manager = try lsp_manager.Manager.init(allocator, workspace_path),
             .pending_build_consent = null,
             .pending_build_source_id = null,
             .execution_queue = execution_queue.Queue.init(allocator),
@@ -93,11 +92,7 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.clearPendingBuildConsent();
-        if (self.lsp_transport) |*transport| {
-            transport.deinit();
-            self.lsp_transport = null;
-        }
-        self.lsp_session.deinit();
+        self.lsp_manager.deinit();
         self.execution_queue.deinit();
         self.process_console.deinit();
         self.security_findings.deinit();
@@ -160,6 +155,33 @@ pub const App = struct {
         _ = try self.documents.openFile(path);
         self.focus = .editor;
         return true;
+    }
+
+    pub fn activeLanguage(self: *const App) ?modes.LanguageMode {
+        const index = self.documents.activeIndex() orelse return null;
+        return self.documents.documents.items[index].language;
+    }
+
+    pub fn activeLspSession(self: *App) ?*lsp_session.Session {
+        const language = self.activeLanguage() orelse return null;
+        const server = self.lsp_manager.findServer(language) orelse return null;
+        return &server.session;
+    }
+
+    pub fn activeLspSessionConst(self: *const App) ?*const lsp_session.Session {
+        const language = self.activeLanguage() orelse return null;
+        const server = self.lsp_manager.findServerConst(language) orelse return null;
+        return &server.session;
+    }
+
+    pub fn hasRunningLspForActiveDocument(self: *const App) bool {
+        const language = self.activeLanguage() orelse return false;
+        const server = self.lsp_manager.findServerConst(language) orelse return false;
+        return server.isRunning();
+    }
+
+    pub fn hasAnyRunningLsp(self: *const App) bool {
+        return self.lsp_manager.hasRunningServer();
     }
 
     fn firstFileEntryIndex(self: *const App) ?usize {

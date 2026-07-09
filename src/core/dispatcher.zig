@@ -29,6 +29,7 @@ const polyglot_scanner = @import("../security/polyglot_scanner.zig");
 const text_integrity = @import("../security/text_integrity.zig");
 const zig_scanner = @import("../security/zig_scanner.zig");
 const lsp_launch_plan = @import("../lsp/launch_plan.zig");
+const lsp_manager = @import("../lsp/manager.zig");
 const lsp_session = @import("../lsp/session.zig");
 const lsp_transport = @import("../lsp/transport.zig");
 

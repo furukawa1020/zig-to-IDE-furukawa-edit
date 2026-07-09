@@ -407,8 +407,10 @@ const QuickPanel = struct {
                     .query_override = query,
                     .max_items = 80,
                 });
-                if (app.lsp_session.last_completion) |lsp_items| {
-                    self.completion_matches = try completion_mod.mergeLspItems(self.allocator, self.completion_matches.?, lsp_items.items, query, 120);
+                if (app.activeLspSessionConst()) |session| {
+                    if (session.last_completion) |lsp_items| {
+                        self.completion_matches = try completion_mod.mergeLspItems(self.allocator, self.completion_matches.?, lsp_items.items, query, 120);
+                    }
                 }
             },
             .language_mode => {
@@ -1830,12 +1832,14 @@ const GuiState = struct {
 
     fn gotoLocalDefinitionAtCursor(self: *GuiState) void {
         if (self.requestDefinitionFromLsp()) return;
-        if (self.app.lsp_session.last_locations) |locations| {
-            if (locations.items.len > 0) {
-                const location = locations.items[0];
-                self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
-                self.setMessage("Opened LSP definition") catch {};
-                return;
+        if (self.app.activeLspSessionConst()) |session| {
+            if (session.last_locations) |locations| {
+                if (locations.items.len > 0) {
+                    const location = locations.items[0];
+                    self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
+                    self.setMessage("Opened LSP definition") catch {};
+                    return;
+                }
             }
         }
 
@@ -1870,10 +1874,12 @@ const GuiState = struct {
 
     fn findReferencesAtCursor(self: *GuiState) void {
         if (self.requestReferencesFromLsp()) return;
-        if (self.app.lsp_session.last_locations) |locations| {
-            if (locations.items.len > 0) {
-                self.showLspLocations("LSP locations");
-                return;
+        if (self.app.activeLspSessionConst()) |session| {
+            if (session.last_locations) |locations| {
+                if (locations.items.len > 0) {
+                    self.showLspLocations("LSP locations");
+                    return;
+                }
             }
         }
 
@@ -2238,32 +2244,37 @@ const GuiState = struct {
         switch (self.pending_lsp_action) {
             .none => {},
             .goto_definition => {
-                if (self.app.lsp_session.last_locations) |locations| {
-                    self.pending_lsp_action = .none;
-                    if (locations.items.len == 0) {
-                        self.setMessage("No LSP definition") catch {};
-                        return;
+                if (self.app.activeLspSessionConst()) |session| {
+                    if (session.last_locations) |locations| {
+                        self.pending_lsp_action = .none;
+                        if (locations.items.len == 0) {
+                            self.setMessage("No LSP definition") catch {};
+                            return;
+                        }
+                        const location = locations.items[0];
+                        self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
+                        self.setMessage("Opened LSP definition") catch {};
                     }
-                    const location = locations.items[0];
-                    self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
-                    self.setMessage("Opened LSP definition") catch {};
                 }
             },
             .find_references => {
-                if (self.app.lsp_session.last_locations) |locations| {
-                    self.pending_lsp_action = .none;
-                    if (locations.items.len == 0) {
-                        self.setMessage("No LSP references") catch {};
-                        return;
+                if (self.app.activeLspSessionConst()) |session| {
+                    if (session.last_locations) |locations| {
+                        self.pending_lsp_action = .none;
+                        if (locations.items.len == 0) {
+                            self.setMessage("No LSP references") catch {};
+                            return;
+                        }
+                        self.showLspLocations("LSP references");
                     }
-                    self.showLspLocations("LSP references");
                 }
             },
         }
     }
 
     fn showLspLocations(self: *GuiState, label: []const u8) void {
-        const locations = self.app.lsp_session.last_locations orelse return;
+        const session = self.app.activeLspSessionConst() orelse return;
+        const locations = session.last_locations orelse return;
         self.show_output = true;
         self.bottom_panel = .output;
         self.appendOutput(.stdout, "{s}: {d}\n", .{ label, locations.items.len });

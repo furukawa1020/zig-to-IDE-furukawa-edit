@@ -93,10 +93,10 @@ pub fn fileUriToPath(allocator: std.mem.Allocator, uri: []const u8, workspace_ro
         const normalized_root = try allocator.dupe(u8, root);
         defer allocator.free(normalized_root);
         normalizeSlashes(normalized_root);
-        trimTrailingSlash(normalized_root);
+        const normalized_root_trimmed = trimTrailingSlash(normalized_root);
 
-        if (pathStartsWith(decoded, normalized_root)) {
-            var relative_start = normalized_root.len;
+        if (pathStartsWith(decoded, normalized_root_trimmed)) {
+            var relative_start = normalized_root_trimmed.len;
             if (relative_start < decoded.len and decoded[relative_start] == '/') relative_start += 1;
             const relative = try allocator.dupe(u8, decoded[relative_start..]);
             allocator.free(decoded);
@@ -203,10 +203,12 @@ fn normalizeSlashes(path: []u8) void {
     }
 }
 
-fn trimTrailingSlash(path: []u8) void {
-    while (path.len > 1 and path[path.len - 1] == '/') {
-        path.len -= 1;
+fn trimTrailingSlash(path: []u8) []u8 {
+    var end = path.len;
+    while (end > 1 and path[end - 1] == '/') {
+        end -= 1;
     }
+    return path[0..end];
 }
 
 fn pathStartsWith(path: []const u8, root: []const u8) bool {

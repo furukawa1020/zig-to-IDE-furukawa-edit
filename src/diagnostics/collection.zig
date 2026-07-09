@@ -33,7 +33,7 @@ pub const Collection = struct {
                 continue;
             }
 
-            var removed = self.items.orderedRemove(index);
+            const removed = self.items.orderedRemove(index);
             self.allocator.free(removed.path);
             self.allocator.free(removed.message);
         }

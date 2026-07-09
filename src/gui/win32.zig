@@ -33,6 +33,7 @@ const QuickPanelMode = enum {
     new_file,
     document_symbols,
     completion,
+    language_mode,
 };
 
 const BottomPanel = enum {
@@ -152,6 +153,7 @@ const QuickPanel = struct {
     task_matches: ?[]TaskMatch = null,
     symbol_matches: ?[]SymbolMatch = null,
     completion_matches: ?[]completion_mod.Item = null,
+    language_matches: ?[]modes.LanguageMode = null,
     completion_replace_start: usize = 0,
     completion_replace_end: usize = 0,
 
@@ -223,6 +225,7 @@ const QuickPanel = struct {
             .new_file => if (self.query.items.len > 0) 1 else 0,
             .document_symbols => if (self.symbol_matches) |items| items.len else 0,
             .completion => if (self.completion_matches) |items| items.len else 0,
+            .language_mode => if (self.language_matches) |items| items.len else 0,
         };
     }
 
@@ -260,6 +263,12 @@ const QuickPanel = struct {
         const items = self.completion_matches orelse return null;
         if (items.len == 0) return null;
         return &items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn selectedLanguageMode(self: *const QuickPanel) ?modes.LanguageMode {
+        const items = self.language_matches orelse return null;
+        if (items.len == 0) return null;
+        return items[@min(self.selected_index, items.len - 1)];
     }
 
     fn rebuild(self: *QuickPanel, app: *const app_mod.App) !void {
@@ -361,6 +370,26 @@ const QuickPanel = struct {
                     .max_items = 80,
                 });
             },
+            .language_mode => {
+                var matches = std.array_list.Managed(modes.LanguageMode).init(self.allocator);
+                errdefer matches.deinit();
+
+                for (modes.all()) |mode| {
+                    const label = modes.label(mode);
+                    const family = @tagName(modes.family(mode));
+                    const focus = modes.securityFocus(mode);
+                    const query = self.query.items;
+                    if (query.len != 0 and
+                        command_mod.fuzzyScore(query, label) == null and
+                        command_mod.fuzzyScore(query, family) == null and
+                        command_mod.fuzzyScore(query, focus) == null)
+                    {
+                        continue;
+                    }
+                    try matches.append(mode);
+                }
+                self.language_matches = try matches.toOwnedSlice();
+            },
         }
         if (self.selected_index >= self.itemCount()) self.selected_index = 0;
     }
@@ -393,6 +422,10 @@ const QuickPanel = struct {
         if (self.completion_matches) |items| {
             completion_mod.deinitItems(self.allocator, items);
             self.completion_matches = null;
+        }
+        if (self.language_matches) |items| {
+            self.allocator.free(items);
+            self.language_matches = null;
         }
     }
 };
@@ -839,6 +872,10 @@ const GuiState = struct {
             self.openQuickPanel(.completion);
             return;
         }
+        if (std.mem.eql(u8, id, "editor.set_language")) {
+            self.openQuickPanel(.language_mode);
+            return;
+        }
         if (std.mem.eql(u8, id, "editor.find_next")) {
             self.findLastDocumentSearch(.forward);
             return;
@@ -1164,6 +1201,7 @@ const GuiState = struct {
             .document_symbols => "Document symbols",
             .rename_symbol => "Rename symbol",
             .completion => "Complete symbol",
+            .language_mode => "Language mode",
         }) catch {};
     }
 
@@ -1423,7 +1461,34 @@ const GuiState = struct {
                 self.ensureCursorVisible();
                 self.setMessage("Completed") catch {};
             },
+            .language_mode => {
+                const mode = self.quick_panel.selectedLanguageMode() orelse {
+                    self.setMessage("No language selected") catch {};
+                    return;
+                };
+                self.quick_panel.close();
+                self.setActiveDocumentLanguage(mode);
+            },
         }
+    }
+
+    fn setActiveDocumentLanguage(self: *GuiState, mode: modes.LanguageMode) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("No active document") catch {};
+            return;
+        };
+        doc.language = mode;
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureCursorVisible();
+        self.refreshActiveSecurityFindings("Language mode changed");
+        var message_buf: [160]u8 = undefined;
+        const message = std.fmt.bufPrint(&message_buf, "Language: {s}  family:{s}  security:{s}", .{
+            modes.label(mode),
+            @tagName(modes.family(mode)),
+            modes.securityFocus(mode),
+        }) catch "Language mode changed";
+        self.setMessage(message) catch {};
     }
 
     fn openSelectedSearchPanelItem(self: *GuiState) void {

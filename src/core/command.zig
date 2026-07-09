@@ -71,6 +71,7 @@ const definitions = [_]Definition{
     .{ .id = "editor.goto_line", .title = "Go To Line", .description = "Jump to a line and optional column in the current editor document.", .default_key = "ctrl-g", .scope = .editor, .capability = .safe },
     .{ .id = "editor.replace", .title = "Replace in File", .description = "Replace the selected current-document match.", .default_key = "ctrl-h", .scope = .editor, .capability = .safe },
     .{ .id = "editor.complete", .title = "Complete Symbol", .description = "Open language-aware completions for the current cursor without executing plugins.", .default_key = "ctrl-space", .scope = .editor, .capability = .safe },
+    .{ .id = "editor.set_language", .title = "Change Language Mode", .description = "Set the active document language for highlighting, completions, symbols, and security scanning.", .default_key = "", .scope = .editor, .capability = .safe },
     .{ .id = "editor.find_next", .title = "Find Next", .description = "Jump to the next current-document match.", .default_key = "f3", .scope = .editor, .capability = .safe },
     .{ .id = "editor.find_previous", .title = "Find Previous", .description = "Jump to the previous current-document match.", .default_key = "shift-f3", .scope = .editor, .capability = .safe },
     .{ .id = "editor.normalize_newlines_lf", .title = "Normalize Line Endings: LF", .description = "Convert current buffer line endings to LF without saving automatically.", .default_key = "", .scope = .editor, .capability = .safe },

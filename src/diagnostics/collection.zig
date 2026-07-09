@@ -24,6 +24,21 @@ pub const Collection = struct {
         self.items.clearRetainingCapacity();
     }
 
+    pub fn clearPathSource(self: *Collection, path: []const u8, source: ?model.DiagnosticSource) void {
+        var index: usize = 0;
+        while (index < self.items.items.len) {
+            const item = self.items.items[index];
+            if (!pathMatches(item.path, path) or (source != null and item.source != source.?)) {
+                index += 1;
+                continue;
+            }
+
+            var removed = self.items.orderedRemove(index);
+            self.allocator.free(removed.path);
+            self.allocator.free(removed.message);
+        }
+    }
+
     pub fn append(self: *Collection, diagnostic: model.Diagnostic) !void {
         const path = try self.allocator.dupe(u8, diagnostic.path);
         errdefer self.allocator.free(path);
@@ -67,6 +82,12 @@ pub const Collection = struct {
     }
 };
 
+fn pathMatches(left: []const u8, right: []const u8) bool {
+    if (std.mem.eql(u8, left, right)) return true;
+    if (std.fs.path.sep == '\\') return std.ascii.eqlIgnoreCase(left, right);
+    return false;
+}
+
 test "collection counts severity" {
     var collection = Collection.init(std.testing.allocator);
     defer collection.deinit();
@@ -81,4 +102,17 @@ test "collection counts severity" {
     });
 
     try std.testing.expectEqual(@as(usize, 1), collection.countBySeverity(.err));
+}
+
+test "collection clears diagnostics by path and source" {
+    var collection = Collection.init(std.testing.allocator);
+    defer collection.deinit();
+
+    const position = types.Position.start();
+    try collection.append(.{ .source = .lsp, .severity = .err, .path = "main.zig", .range = types.Range.empty(position), .message = "lsp" });
+    try collection.append(.{ .source = .compiler, .severity = .err, .path = "main.zig", .range = types.Range.empty(position), .message = "compiler" });
+
+    collection.clearPathSource("main.zig", .lsp);
+    try std.testing.expectEqual(@as(usize, 1), collection.items.items.len);
+    try std.testing.expectEqual(model.DiagnosticSource.compiler, collection.items.items[0].source);
 }

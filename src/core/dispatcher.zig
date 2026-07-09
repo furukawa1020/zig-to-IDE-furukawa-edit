@@ -30,6 +30,7 @@ const text_integrity = @import("../security/text_integrity.zig");
 const zig_scanner = @import("../security/zig_scanner.zig");
 const lsp_launch_plan = @import("../lsp/launch_plan.zig");
 const lsp_session = @import("../lsp/session.zig");
+const lsp_transport = @import("../lsp/transport.zig");
 
 pub const Result = union(enum) {
     completed: []const u8,
@@ -282,6 +283,14 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
 
     if (std.mem.eql(u8, definition.id, "lsp.request_references")) {
         return try requestCurrentPositionLsp(app, .references, "references");
+    }
+
+    if (std.mem.eql(u8, definition.id, "lsp.start")) {
+        return try startLspTransport(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "lsp.stop")) {
+        return try stopLspTransport(app);
     }
 
     if (std.mem.eql(u8, definition.id, "security.scan_current")) {
@@ -548,7 +557,13 @@ fn externalCommandPreviewById(app: *app_mod.App, id: []const u8) ?process.SpawnS
     if (std.mem.eql(u8, id, "zig.build")) return zigCommand(app, .build);
     if (std.mem.eql(u8, id, "zig.test")) return zigCommand(app, .test_step);
     if (std.mem.eql(u8, id, "zig.fmt")) return zigCommand(app, .fmt);
+    if (std.mem.eql(u8, id, "lsp.start")) return lspStartPreview(app);
     return null;
+}
+
+fn lspStartPreview(app: *app_mod.App) ?process.SpawnSpec {
+    const doc = app.documents.active() orelse return null;
+    return lsp_transport.spawnPreviewForLanguage(doc.language, app.workspace.root_path);
 }
 
 fn hasWorkspaceAudit(collection: *const security_findings.Collection) bool {
@@ -757,6 +772,11 @@ fn renderLspStatus(app: *app_mod.App) !void {
     try writer.print("workspace: {s}\n", .{app.lsp_session.workspace_root});
     try writer.print("opened documents: {d}\n", .{app.lsp_session.openedCount()});
     try writer.print("pending requests: {d}\n", .{app.lsp_session.pendingCount()});
+    if (app.lsp_transport) |transport| {
+        try writer.print("transport: running ({s})\n", .{transport.command_label});
+    } else {
+        try writer.writeAll("transport: stopped\n");
+    }
 
     if (app.documents.active()) |doc| {
         const path = doc.path orelse "(scratch)";
@@ -820,6 +840,51 @@ fn requestCurrentPositionLsp(app: *app_mod.App, kind: lsp_session.RequestKind, l
     defer outbound.deinit();
     try emitLspOutbound(app, label, &outbound);
     return .{ .completed = "LSP request packet built" };
+}
+
+fn startLspTransport(app: *app_mod.App) !Result {
+    const doc = app.documents.active() orelse return .no_active_document;
+    if (app.lsp_transport != null) return .{ .blocked = "LSP transport is already running" };
+
+    var spec = (try lsp_transport.launchSpecForLanguage(app.allocator, doc.language, app.workspace.root_path)) orelse {
+        return .{ .blocked = "no default LSP server mapping for active language" };
+    };
+    defer spec.deinit();
+
+    var transport = lsp_transport.Transport.start(app.allocator, app.io, spec, null) catch |err| {
+        try appendConsole(app, .stderr, "lsp start failed: {s}\nhint: {s}\n", .{ @errorName(err), spec.install_hint });
+        return .{ .blocked = "LSP server could not be started" };
+    };
+    errdefer transport.deinit();
+
+    var initialize = try app.lsp_session.makeInitialize("zide");
+    defer initialize.deinit();
+    transport.send(initialize.framed) catch |err| {
+        if (initialize.id) |id| app.lsp_session.cancelPending(id);
+        try appendConsole(app, .stderr, "lsp initialize send failed: {s}\n", .{@errorName(err)});
+        return .{ .blocked = "LSP initialize could not be sent" };
+    };
+
+    try appendConsole(app, .stdout, "lsp started: {s}\ncommand: {s}\ninitialize id: {d}\nnote: {s}\n", .{
+        spec.label,
+        transport.command_label,
+        initialize.id orelse 0,
+        spec.security_note,
+    });
+    app.lsp_transport = transport;
+    return .{ .completed = "LSP server started" };
+}
+
+fn stopLspTransport(app: *app_mod.App) !Result {
+    if (app.lsp_transport) |*transport| {
+        transport.stop();
+        transport.deinit();
+        app.lsp_transport = null;
+        app.lsp_session.state = .stopped;
+        try appendConsole(app, .stdout, "lsp stopped\n", .{});
+        return .{ .completed = "LSP server stopped" };
+    }
+    return .{ .blocked = "no LSP transport is running" };
 }
 
 fn emitLspOutbound(app: *app_mod.App, label: []const u8, outbound: *const lsp_session.Outbound) !void {

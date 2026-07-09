@@ -93,6 +93,7 @@ pub const lsp = struct {
     pub const protocol = @import("lsp/protocol.zig");
     pub const registry = @import("lsp/registry.zig");
     pub const responses = @import("lsp/responses.zig");
+    pub const session = @import("lsp/session.zig");
 };
 
 pub const diagnostics = struct {

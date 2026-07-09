@@ -603,6 +603,7 @@ const ContextAction = enum {
     scan,
     scan_selection,
     boundary_lens,
+    comment,
     references,
     rename,
     goto_line,
@@ -2523,6 +2524,7 @@ const LinuxGuiState = struct {
             .scan => self.execute("security.scan_current", .command_palette),
             .scan_selection => self.scanSelectedRangeSecurity(),
             .boundary_lens => self.explainBoundaryLens(),
+            .comment => self.execute("editor.toggle_comment", .command_palette),
             .references => self.findReferencesAtCursor(),
             .rename => self.openRenamePanel(),
             .goto_line => self.execute("editor.goto_line", .command_palette),
@@ -7454,7 +7456,7 @@ const settings_panel_actions = [_]SettingsPanelAction{ .profile_read_only, .prof
 const extension_panel_actions = [_]ExtensionPanelAction{.scan};
 const tutorial_panel_actions = [_]TutorialPanelAction{ .ja, .en };
 const publish_panel_actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle, .verify, .preflight };
-const context_actions = [_]ContextAction{ .copy, .cut, .paste, .select_all, .find, .goto_line, .scan, .scan_selection, .boundary_lens, .references, .rename, .close_editor, .task_queue, .palette };
+const context_actions = [_]ContextAction{ .copy, .cut, .paste, .select_all, .find, .goto_line, .scan, .scan_selection, .boundary_lens, .comment, .references, .rename, .close_editor, .task_queue, .palette };
 
 fn drawGitPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
     inline for (git_panel_actions) |action| {
@@ -7834,11 +7836,12 @@ fn contextActionIndex(action: ContextAction) usize {
         .scan => 6,
         .scan_selection => 7,
         .boundary_lens => 8,
-        .references => 9,
-        .rename => 10,
-        .close_editor => 11,
-        .task_queue => 12,
-        .palette => 13,
+        .comment => 9,
+        .references => 10,
+        .rename => 11,
+        .close_editor => 12,
+        .task_queue => 13,
+        .palette => 14,
     };
 }
 
@@ -7858,7 +7861,7 @@ fn contextActionEnabled(state: *const LinuxGuiState, action: ContextAction) bool
             break :blk state.selectedRange(doc) != null;
         },
         .paste => true,
-        .select_all, .find, .goto_line, .scan, .boundary_lens, .references, .rename, .close_editor => state.app.documents.activeIndex() != null,
+        .select_all, .find, .goto_line, .scan, .boundary_lens, .comment, .references, .rename, .close_editor => state.app.documents.activeIndex() != null,
         .task_queue, .palette => true,
     };
 }
@@ -7874,6 +7877,7 @@ fn contextActionLabel(action: ContextAction) []const u8 {
         .scan => "Scan current file",
         .scan_selection => "Scan selection",
         .boundary_lens => "Boundary lens",
+        .comment => "Toggle comment",
         .references => "Find references",
         .rename => "Rename symbol",
         .close_editor => "Close editor",
@@ -7893,6 +7897,7 @@ fn contextActionHint(action: ContextAction) []const u8 {
         .scan => "Alt+S",
         .scan_selection => "SEL",
         .boundary_lens => "LENS",
+        .comment => "Ctrl+/",
         .references => "F12+S",
         .rename => "F2",
         .close_editor => "Ctrl+W",

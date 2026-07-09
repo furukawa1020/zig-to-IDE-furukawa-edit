@@ -946,6 +946,10 @@ const GuiState = struct {
             self.findLastDocumentSearch(.backward);
             return;
         }
+        if (std.mem.eql(u8, id, "editor.toggle_comment")) {
+            self.toggleActiveDocumentComment();
+            return;
+        }
         if (std.mem.eql(u8, id, "editor.normalize_newlines_lf")) {
             self.normalizeActiveDocumentNewlines(.lf);
             return;
@@ -2362,6 +2366,27 @@ const GuiState = struct {
         }
     }
 
+    fn toggleActiveDocumentComment(self: *GuiState) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("No active document") catch {};
+            return;
+        };
+        const range = self.selectedRange(doc);
+        const start = if (range) |selected| selected.start else doc.cursor.position.byte_offset;
+        const end = if (range) |selected| selected.end else doc.cursor.position.byte_offset;
+        const result = (doc.toggleComment(start, end) catch |err| {
+            self.setError(err) catch {};
+            return;
+        }) orelse {
+            self.setMessage("No comment syntax for language") catch {};
+            return;
+        };
+        self.clearSelection();
+        self.ensureCursorVisible();
+        self.syncActiveDocumentToLsp();
+        self.setMessage(commentToggleMessage(result)) catch {};
+    }
+
     fn sanitizeActiveDocumentHiddenControls(self: *GuiState) void {
         const doc = self.app.documents.active() orelse {
             self.setMessage("No active document") catch {};
@@ -3148,6 +3173,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (ctrl and shift and key == 'K') {
         state.executeCommand("editor.delete_line");
+        return;
+    }
+    if (ctrl and key == VK_OEM_2) {
+        state.executeCommand("editor.toggle_comment");
         return;
     }
     if (ctrl and key == 'D') {
@@ -5789,6 +5818,15 @@ fn normalizePathByteGui(byte: u8) u8 {
     return if (byte == '\\') '/' else std.ascii.toLower(byte);
 }
 
+fn commentToggleMessage(result: document_mod.CommentToggleResult) []const u8 {
+    return switch (result) {
+        .line_commented => "Commented lines",
+        .line_uncommented => "Uncommented lines",
+        .block_commented => "Commented block",
+        .block_uncommented => "Uncommented block",
+    };
+}
+
 fn workspaceFileExistsGui(app: *const app_mod.App, relative: []const u8) bool {
     const path = std.fs.path.join(app.allocator, &.{ app.workspace.root_path, relative }) catch return false;
     defer app.allocator.free(path);
@@ -5970,6 +6008,7 @@ const VK_CONTROL: c_int = 0x11;
 const VK_MENU: c_int = 0x12;
 const VK_ESCAPE: WPARAM = 0x1B;
 const VK_SPACE: WPARAM = 0x20;
+const VK_OEM_2: WPARAM = 0xBF;
 const VK_PRIOR: WPARAM = 0x21;
 const VK_NEXT: WPARAM = 0x22;
 const VK_END: WPARAM = 0x23;

@@ -1281,7 +1281,7 @@ const LinuxGuiState = struct {
         self.pty_ticket = ticket;
         self.pty_session = session;
         self.pty_forced_state = null;
-        self.pty_started_ms = std.time.milliTimestamp();
+        self.pty_started_ms = monotonicMillis();
         self.pty_output_bytes = 0;
         self.terminal_focused = true;
         self.bottom_panel = .tasks;
@@ -1334,7 +1334,7 @@ const LinuxGuiState = struct {
 
             if (self.pty_ticket) |ticket| {
                 if (ticket.timeout_ms) |timeout_ms| {
-                    const elapsed: u64 = @intCast(@max(std.time.milliTimestamp() - self.pty_started_ms, 0));
+                    const elapsed: u64 = @intCast(@max(monotonicMillis() - self.pty_started_ms, 0));
                     if (elapsed > timeout_ms and self.pty_forced_state == null) {
                         self.pty_forced_state = .timed_out;
                         self.appendOutput(.stderr, "pty timeout after {d}ms; terminating\n", .{timeout_ms});
@@ -3394,6 +3394,7 @@ const LinuxGuiState = struct {
             return;
         };
         @memset(next_collapsed, false);
+        self.closePtySession();
         self.app.deinit();
         self.allocator.free(self.collapsed_dirs);
         self.app = next;
@@ -4456,48 +4457,73 @@ pub fn run(
     defer x11.close();
 
     try draw(&x11, &state);
-    while (true) {
-        var event: [32]u8 = undefined;
-        try readExact(x11.fd, event[0..]);
-        const event_type = event[0] & 0x7f;
-        switch (event_type) {
-            2 => {
-                if (keyEventFromX(event[0..])) |key| {
-                    if (std.meta.activeTag(key.code) == .escape and state.app.mode == .normal and !state.app.palette.visible) break;
-                    state.handleKey(&x11, key);
-                    try draw(&x11, &state);
-                }
-            },
-            4 => {
-                state.handlePointer(&x11, event[1], @bitCast(readLe16(event[24..26])), @bitCast(readLe16(event[26..28])), readLe32(event[4..8]), readLe16(event[28..30]));
-                try draw(&x11, &state);
-            },
-            5 => {
-                state.handlePointerRelease(&x11, event[1]);
-                try draw(&x11, &state);
-            },
-            6 => {
-                state.handlePointerMotion(@bitCast(readLe16(event[24..26])), @bitCast(readLe16(event[26..28])));
-                try draw(&x11, &state);
-            },
-            12 => try draw(&x11, &state),
-            22 => {
-                state.resize(readLe16(event[20..22]), readLe16(event[22..24]));
-                try draw(&x11, &state);
-            },
-            29 => {
-                state.handleSelectionClear(readLe32(event[12..16]), &x11);
-            },
-            30 => {
-                state.handleSelectionRequest(&x11, event[0..]);
-            },
-            33 => {
-                const message_type = readLe32(event[8..12]);
-                const data0 = readLe32(event[12..16]);
-                if (message_type == x11.atoms.wm_protocols and data0 == x11.atoms.wm_delete_window) break;
-            },
-            else => {},
+    main_loop: while (true) {
+        var fds: [2]std.posix.pollfd = undefined;
+        fds[0] = .{ .fd = x11.fd, .events = std.posix.POLL.IN, .revents = 0 };
+        var fd_count: usize = 1;
+        var pty_poll_index: ?usize = null;
+        if (state.activePtyFd()) |pty_fd| {
+            pty_poll_index = fd_count;
+            fds[fd_count] = .{ .fd = pty_fd, .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR, .revents = 0 };
+            fd_count += 1;
         }
+
+        const timeout_ms: i32 = if (pty_poll_index != null) 100 else -1;
+        _ = try std.posix.poll(fds[0..fd_count], timeout_ms);
+
+        var needs_draw = state.pumpPtySession();
+        const pty_ready_mask: i16 = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR;
+        if (pty_poll_index) |index| {
+            if ((fds[index].revents & pty_ready_mask) != 0) {
+                needs_draw = state.pumpPtySession() or needs_draw;
+            }
+        }
+
+        if ((fds[0].revents & std.posix.POLL.IN) != 0) {
+            var event: [32]u8 = undefined;
+            try readExact(x11.fd, event[0..]);
+            const event_type = event[0] & 0x7f;
+            switch (event_type) {
+                2 => {
+                    if (keyEventFromX(event[0..])) |key| {
+                        if (std.meta.activeTag(key.code) == .escape and state.app.mode == .normal and !state.app.palette.visible) break :main_loop;
+                        state.handleKey(&x11, key);
+                        needs_draw = true;
+                    }
+                },
+                4 => {
+                    state.handlePointer(&x11, event[1], @bitCast(readLe16(event[24..26])), @bitCast(readLe16(event[26..28])), readLe32(event[4..8]), readLe16(event[28..30]));
+                    needs_draw = true;
+                },
+                5 => {
+                    state.handlePointerRelease(&x11, event[1]);
+                    needs_draw = true;
+                },
+                6 => {
+                    state.handlePointerMotion(@bitCast(readLe16(event[24..26])), @bitCast(readLe16(event[26..28])));
+                    needs_draw = true;
+                },
+                12 => needs_draw = true,
+                22 => {
+                    state.resize(readLe16(event[20..22]), readLe16(event[22..24]));
+                    needs_draw = true;
+                },
+                29 => {
+                    state.handleSelectionClear(readLe32(event[12..16]), &x11);
+                },
+                30 => {
+                    state.handleSelectionRequest(&x11, event[0..]);
+                },
+                33 => {
+                    const message_type = readLe32(event[8..12]);
+                    const data0 = readLe32(event[12..16]);
+                    if (message_type == x11.atoms.wm_protocols and data0 == x11.atoms.wm_delete_window) break :main_loop;
+                },
+                else => {},
+            }
+        }
+
+        if (needs_draw) try draw(&x11, &state);
     }
 }
 
@@ -7377,6 +7403,13 @@ fn scrollValue(current: usize, max_value: usize, delta: isize) usize {
 
 fn toU16(value: i16) u16 {
     return @intCast(@max(value, 0));
+}
+
+fn monotonicMillis() i64 {
+    var ts: linux.timespec = undefined;
+    const rc = linux.clock_gettime(.MONOTONIC, &ts);
+    if (linux.errno(rc) != .SUCCESS) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
 }
 
 fn connectUnix(path: []const u8) !i32 {

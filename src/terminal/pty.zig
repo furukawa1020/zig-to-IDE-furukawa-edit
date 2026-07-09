@@ -208,7 +208,7 @@ fn childExec(
 
 fn exitCodeFromStatus(status: u32) i32 {
     if (linux.W.IFEXITED(status)) return linux.W.EXITSTATUS(status);
-    return 128 + @intFromEnum(linux.W.TERMSIG(status));
+    return 128 + @as(i32, @intCast(@intFromEnum(linux.W.TERMSIG(status))));
 }
 
 const ArgvZ = struct {

@@ -4903,6 +4903,50 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
     }
 }
 
+fn drawHighlightedEditorLine(x11: *X11, state: *LinuxGuiState, mode: modes.LanguageMode, x: i16, y: i16, line: []const u8, fallback_gc: u32) !void {
+    if (!modes.isHighlightable(mode)) {
+        var line_buf: [720]u8 = undefined;
+        try x11.text(fallback_gc, x, y, asciiInto(line_buf[0..], line));
+        return;
+    }
+
+    const spans = highlight.collectLine(state.allocator, line, mode) catch {
+        var line_buf: [720]u8 = undefined;
+        try x11.text(fallback_gc, x, y, asciiInto(line_buf[0..], line));
+        return;
+    };
+    defer state.allocator.free(spans);
+
+    if (spans.len == 0) {
+        var line_buf: [720]u8 = undefined;
+        try x11.text(fallback_gc, x, y, asciiInto(line_buf[0..], line));
+        return;
+    }
+
+    for (spans) |span| {
+        if (span.end <= span.start or span.start >= line.len) continue;
+        const end = @min(span.end, line.len);
+        const segment = line[span.start..end];
+        const segment_x = x + @as(i16, @intCast(@min(span.start, @as(usize, 140)))) * 8;
+        var segment_buf: [360]u8 = undefined;
+        try x11.text(highlightGc(x11, span.role, fallback_gc), segment_x, y, asciiInto(segment_buf[0..], segment));
+    }
+}
+
+fn highlightGc(x11: *X11, role: highlight.Role, fallback_gc: u32) u32 {
+    return switch (role) {
+        .plain => fallback_gc,
+        .keyword => x11.gc.cyan,
+        .type_name => x11.gc.amber,
+        .string => x11.gc.green,
+        .number => x11.gc.amber,
+        .comment, .doc_comment => x11.gc.muted,
+        .builtin => x11.gc.cyan,
+        .operator, .punctuation => x11.gc.text,
+        .unsafe_boundary => x11.gc.red,
+    };
+}
+
 fn drawBottomPanel(x11: *X11, state: *LinuxGuiState) !void {
     const bottom = state.bottomTop();
     try x11.fillRect(x11.gc.line, 0, bottom, toU16(state.window_width), 1);

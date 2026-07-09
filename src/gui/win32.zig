@@ -3372,7 +3372,7 @@ fn markerBackgroundColor(marker: EditorLineMarker) windows.COLORREF {
 
 fn drawHighlightedLine(hdc: windows.HDC, state: *GuiState, mode: modes.LanguageMode, x: c_int, y: c_int, right: c_int, line: []const u8) void {
     if (right <= x) return;
-    if (!modes.isCode(mode) and mode != .json and mode != .yaml and mode != .toml and mode != .hcl and mode != .xml and mode != .sql) {
+    if (!modes.isHighlightable(mode)) {
         drawTextClipped(hdc, x, y, right, rgb(224, 229, 235), line);
         return;
     }

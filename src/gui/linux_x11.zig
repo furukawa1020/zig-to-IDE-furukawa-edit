@@ -27,6 +27,7 @@ const zig_output = @import("../diagnostics/zig_output.zig");
 const task_registry = @import("../tasks/registry.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
 const permissions = @import("../security/permissions.zig");
+const terminal_command_line = @import("../terminal/command_line.zig");
 const types = @import("../core/types.zig");
 const workbench_settings = @import("workbench_settings.zig");
 
@@ -541,6 +542,8 @@ const TaskPanelAction = enum {
     profile_safe,
     profile_network,
     profile_publish,
+    terminal,
+    queue_terminal,
     tasks,
     preview,
     seal,
@@ -972,6 +975,9 @@ const LinuxGuiState = struct {
     primary_selection: std.array_list.Managed(u8),
     clipboard_owned: bool = false,
     primary_owned: bool = false,
+    terminal_input: std.array_list.Managed(u8),
+    terminal_focused: bool = false,
+    terminal_history_cursor: ?usize = null,
     bottom_panel: BottomPanel = .output,
     window_width: i16 = WIDTH,
     window_height: i16 = HEIGHT,
@@ -1006,6 +1012,7 @@ const LinuxGuiState = struct {
             .last_document_search_query = std.array_list.Managed(u8).init(allocator),
             .clipboard = std.array_list.Managed(u8).init(allocator),
             .primary_selection = std.array_list.Managed(u8).init(allocator),
+            .terminal_input = std.array_list.Managed(u8).init(allocator),
         };
         state.loadWorkbenchSettings();
         return state;
@@ -1014,6 +1021,7 @@ const LinuxGuiState = struct {
     fn deinit(self: *LinuxGuiState) void {
         self.clearExtensionsRegistry();
         self.clearGitOverview();
+        self.terminal_input.deinit();
         self.primary_selection.deinit();
         self.clipboard.deinit();
         self.last_document_search_query.deinit();
@@ -1033,6 +1041,176 @@ const LinuxGuiState = struct {
         defer text.deinit();
         text.writer.print(fmt, args) catch return;
         self.app.process_console.appendBytes(stream, text.written()) catch return;
+    }
+
+    fn focusTerminalInput(self: *LinuxGuiState) void {
+        self.bottom_panel = .tasks;
+        self.terminal_focused = true;
+        self.app.mode = .command;
+        self.saveWorkbenchSettings();
+        self.message("terminal: type command, Enter queues with boundary checks", .{});
+    }
+
+    fn blurTerminalInput(self: *LinuxGuiState) void {
+        self.terminal_focused = false;
+        self.terminal_history_cursor = null;
+        self.app.mode = .normal;
+        self.message("terminal input blurred", .{});
+    }
+
+    fn terminalInsertText(self: *LinuxGuiState, bytes: []const u8) void {
+        if (self.terminal_input.items.len + bytes.len > 4096) {
+            self.message("terminal input limit reached", .{});
+            return;
+        }
+        self.terminal_input.appendSlice(bytes) catch |err| return self.message("terminal input failed: {s}", .{@errorName(err)});
+        self.terminal_history_cursor = null;
+    }
+
+    fn terminalDeleteBackward(self: *LinuxGuiState) void {
+        if (self.terminal_input.items.len == 0) return;
+        var end = self.terminal_input.items.len - 1;
+        while (end > 0 and isUtf8Continuation(self.terminal_input.items[end])) : (end -= 1) {}
+        self.terminal_input.shrinkRetainingCapacity(end);
+        self.terminal_history_cursor = null;
+    }
+
+    fn terminalSetInput(self: *LinuxGuiState, bytes: []const u8) void {
+        self.terminal_input.clearRetainingCapacity();
+        self.terminal_input.appendSlice(bytes[0..@min(bytes.len, 4096)]) catch |err| return self.message("terminal input failed: {s}", .{@errorName(err)});
+    }
+
+    fn terminalClearInput(self: *LinuxGuiState) void {
+        self.terminal_input.clearRetainingCapacity();
+        self.terminal_history_cursor = null;
+        self.message("terminal input cleared", .{});
+    }
+
+    fn terminalLoadHistory(self: *LinuxGuiState, delta: isize) void {
+        const total = self.app.execution_queue.history.items.len;
+        if (total == 0) return self.message("terminal history empty", .{});
+
+        var index = self.terminal_history_cursor orelse total;
+        if (delta < 0) {
+            if (index == 0) return;
+            index -= 1;
+        } else {
+            if (index >= total) return;
+            index += 1;
+            if (index >= total) {
+                self.terminal_history_cursor = null;
+                self.terminal_input.clearRetainingCapacity();
+                self.message("terminal history: newest", .{});
+                return;
+            }
+        }
+
+        self.terminal_history_cursor = index;
+        const entry = self.app.execution_queue.history.items[index];
+        self.terminalSetInput(entry.display_command);
+        self.message("terminal history #{d}", .{index + 1});
+    }
+
+    fn handleTerminalKey(self: *LinuxGuiState, key: event_mod.KeyEvent) bool {
+        if (!self.terminal_focused) return false;
+        switch (key.code) {
+            .escape => {
+                self.blurTerminalInput();
+                return true;
+            },
+            .enter => {
+                self.queueTerminalInput();
+                return true;
+            },
+            .backspace => {
+                self.terminalDeleteBackward();
+                return true;
+            },
+            .delete => {
+                self.terminalClearInput();
+                return true;
+            },
+            .arrow_up => {
+                self.terminalLoadHistory(-1);
+                return true;
+            },
+            .arrow_down => {
+                self.terminalLoadHistory(1);
+                return true;
+            },
+            .char => |char| {
+                if (key.modifiers.ctrl) {
+                    if (char == 'u' or char == 'U') self.terminalClearInput();
+                    if (char == 'c' or char == 'C') self.blurTerminalInput();
+                    return true;
+                }
+                if (key.modifiers.alt) return true;
+                var bytes: [4]u8 = undefined;
+                const len = encodeUtf8(char, &bytes) catch return true;
+                self.terminalInsertText(bytes[0..len]);
+                return true;
+            },
+            else => return true,
+        }
+    }
+
+    fn queueTerminalInput(self: *LinuxGuiState) void {
+        const line = std.mem.trim(u8, self.terminal_input.items, " \t\r\n");
+        if (line.len == 0) return self.message("terminal: type a command first", .{});
+
+        var parsed = terminal_command_line.parse(self.allocator, line) catch |err| {
+            self.message("terminal parse failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "terminal parse failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer parsed.deinit();
+
+        const spec: @import("../platform/process.zig").SpawnSpec = .{
+            .command = .{
+                .executable = parsed.executable,
+                .args = parsed.args,
+                .cwd = self.app.workspace.root_path,
+            },
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .stdin = .ignore,
+        };
+
+        var preview = build_consent.makePreview(self.allocator, spec, self.app.runtime.trust_state) catch |err| {
+            self.message("terminal preview failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer preview.deinit();
+
+        self.app.execution_queue.enqueueSpec("terminal.run", spec, preview.consent) catch |err| {
+            self.message("terminal queue failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "terminal queue failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        _ = self.applyLinuxLaunchProfileToLatestQueued("terminal command queued");
+
+        self.appendOutput(.stdout, "terminal queued: {s}\n", .{preview.command});
+        self.appendOutput(.stdout, "terminal intent: network={} mutating={} shell={} destructive={} package={} reason={s}\n", .{
+            preview.intent.network,
+            preview.intent.mutating,
+            preview.intent.shell,
+            preview.intent.destructive,
+            preview.intent.package_manager,
+            preview.intent.reason,
+        });
+        for (preview.warnings) |warning| {
+            self.appendOutput(.stdout, "terminal warning: {s}\n", .{warning});
+        }
+
+        self.terminal_input.clearRetainingCapacity();
+        self.terminal_history_cursor = null;
+        self.bottom_panel = .tasks;
+        const preview_result = dispatcher.dispatch(&self.app, .{ .id = "task.preview_next", .source = .task }) catch |err| {
+            self.message("terminal preview failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult("task.preview_next", preview_result);
+        self.message("terminal queued; review PLAN, then RUN", .{});
     }
 
     fn loadWorkbenchSettings(self: *LinuxGuiState) void {
@@ -2316,6 +2494,8 @@ const LinuxGuiState = struct {
             .profile_safe => self.setLinuxLaunchProfile(.safe),
             .profile_network => self.setLinuxLaunchProfile(.network),
             .profile_publish => self.setLinuxLaunchProfile(.publish),
+            .terminal => self.focusTerminalInput(),
+            .queue_terminal => self.queueTerminalInput(),
             .tasks => self.openQuickPanel(.run_task),
             .preview => self.execute("task.preview_next", .command_palette),
             .seal => self.sealLinuxExecBoundary(),
@@ -2345,7 +2525,9 @@ const LinuxGuiState = struct {
             entry.cwd,
         });
         self.appendOutput(.stdout, "command: {s}\n", .{entry.display_command});
-        self.message("history #{d}: {s} {s}", .{ index + 1, @tagName(entry.state), exitCodeLabel(entry.exit_code) });
+        self.terminalSetInput(entry.display_command);
+        self.focusTerminalInput();
+        self.message("history #{d} loaded: {s} {s}", .{ index + 1, @tagName(entry.state), exitCodeLabel(entry.exit_code) });
     }
 
     fn executeSettingsPanelAction(self: *LinuxGuiState, action: SettingsPanelAction) void {
@@ -3033,6 +3215,7 @@ const LinuxGuiState = struct {
     fn handleKey(self: *LinuxGuiState, x11: *X11, key: event_mod.KeyEvent) void {
         if (self.handleContextMenuKey(x11, key)) return;
         if (self.handleQuickPanelKey(key)) return;
+        if (self.handleTerminalKey(key)) return;
         if (key.modifiers.ctrl and std.meta.activeTag(key.code) == .tab) {
             self.execute(if (key.modifiers.shift) "file.previous_editor" else "file.next_editor", .keybinding);
             return;
@@ -3113,6 +3296,10 @@ const LinuxGuiState = struct {
                         }
                         if (char == 'r' or char == 'R') {
                             self.openQuickPanel(.run_task);
+                            return;
+                        }
+                        if (char == '`') {
+                            self.focusTerminalInput();
                             return;
                         }
                         if (char == 's' or char == 'S') {
@@ -3392,6 +3579,10 @@ const LinuxGuiState = struct {
                         self.openQuickPanel(.run_task);
                         return;
                     }
+                    if (char == '`') {
+                        self.focusTerminalInput();
+                        return;
+                    }
                     if (key.modifiers.shift and (char == 'x' or char == 'X')) {
                         self.runHeaderAction(.extensions);
                         return;
@@ -3603,6 +3794,7 @@ const LinuxGuiState = struct {
         }
 
         if (documentTabAt(self, x, y)) |index| {
+            self.terminal_focused = false;
             self.app.documents.switchTo(index) catch |err| {
                 self.message("tab switch failed: {s}", .{@errorName(err)});
                 return;
@@ -3614,6 +3806,7 @@ const LinuxGuiState = struct {
 
         const bottom = self.bottomTop();
         if (y >= 78 and y < bottom and x < FILE_WIDTH) {
+            self.terminal_focused = false;
             const row = @divTrunc(@as(isize, y - 98), LINE_HEIGHT);
             if (row >= 0) {
                 if (self.entryIndexAtVisibleRank(self.file_scroll_line + @as(usize, @intCast(row)))) |index| {
@@ -3626,6 +3819,7 @@ const LinuxGuiState = struct {
         }
 
         if (y >= HEADER_HEIGHT and y < bottom and x >= FILE_WIDTH) {
+            self.terminal_focused = false;
             self.app.focus = .editor;
             if (self.handleBoundaryGutterClick(x, y)) return;
             const extend_selection = (state_mask & X11_SHIFT_MASK) != 0;
@@ -3642,6 +3836,7 @@ const LinuxGuiState = struct {
             if (bottomPanelAt(self, x, y)) |panel| {
                 if (self.bottom_panel != panel) {
                     self.bottom_panel = panel;
+                    if (panel != .tasks) self.terminal_focused = false;
                     self.saveWorkbenchSettings();
                 }
             }
@@ -3719,6 +3914,10 @@ const LinuxGuiState = struct {
             .tasks => {
                 if (taskPanelActionAt(self, x, y)) |action| {
                     self.executeTaskPanelAction(action);
+                    return true;
+                }
+                if (pointIn(terminalInputRect(self), x, y)) {
+                    self.focusTerminalInput();
                     return true;
                 }
                 if (taskHistoryRowAt(self, y)) |index| {
@@ -4461,16 +4660,20 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
     const linux_gc = if (state.linux_security.no_new_privs == .on and state.linux_security.maps_writable_executable == 0) x11.gc.cyan else x11.gc.amber;
     try x11.text(linux_gc, 18, bottom + 106, linux_line);
 
+    try drawTerminalInput(x11, state);
+
     if (queue.latest()) |ticket| {
         var command_ascii: [900]u8 = undefined;
         var command_buf: [900]u8 = undefined;
-        const command_line = std.fmt.bufPrint(command_buf[0..], "QUEUED {s} state:{s} argv:{d}  {s}", .{
+        const fingerprint = launchAuditFingerprint(ticket, state.app.workspace.root_path);
+        const command_line = std.fmt.bufPrint(command_buf[0..], "QUEUED {s} state:{s} argv:{d} audit:{s}  {s}", .{
             ticket.source_command_id,
             @tagName(ticket.state),
             ticket.args.items.len + 1,
+            fingerprint[0..12],
             ticket.display_command,
         }) catch ticket.display_command;
-        try x11.text(x11.gc.text, 18, bottom + 132, asciiInto(command_ascii[0..], command_line));
+        try x11.text(x11.gc.text, 18, bottom + 160, asciiInto(command_ascii[0..], command_line));
 
         var policy_buf: [520]u8 = undefined;
         const policy_line = std.fmt.bufPrint(policy_buf[0..], "policy env:{s} fs:{s} net:{s} sanitized:{s} timeout:{s} output:{d}", .{
@@ -4481,12 +4684,7 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
             timeoutLabel(ticket.timeout_ms),
             ticket.output_limit_bytes,
         }) catch "policy";
-        try x11.text(x11.gc.muted, 18, bottom + 156, policy_line);
-
-        const fingerprint = launchAuditFingerprint(ticket, state.app.workspace.root_path);
-        var fingerprint_buf: [120]u8 = undefined;
-        const fingerprint_line = std.fmt.bufPrint(fingerprint_buf[0..], "audit sha256:{s}", .{fingerprint[0..32]}) catch "audit";
-        try x11.text(x11.gc.cyan, 18, bottom + 180, fingerprint_line);
+        try x11.text(x11.gc.muted, 18, bottom + 184, policy_line);
 
         var gate_buf: [720]u8 = undefined;
         const cwd_ok = permissions.allowsWorkspacePath(ticket.fs_policy, state.app.workspace.root_path, ticket.cwd);
@@ -4503,9 +4701,9 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
             ticket.cwd,
         }) catch "gate";
         var gate_ascii: [720]u8 = undefined;
-        try x11.text(if (cwd_ok and network_ok and write_ok) x11.gc.muted else x11.gc.red, 18, bottom + 204, asciiInto(gate_ascii[0..], gate_line));
+        try x11.text(if (cwd_ok and network_ok and write_ok) x11.gc.muted else x11.gc.red, 18, bottom + 208, asciiInto(gate_ascii[0..], gate_line));
     } else {
-        try x11.text(x11.gc.muted, 18, bottom + 132, "No queued task. Pick RO/SAFE/NET/PUB, press TASKS or Ctrl+R, then review PLAN/SEAL before RUN.");
+        try x11.text(x11.gc.muted, 18, bottom + 160, "No queued task. Type in TERM, pick TASKS, or Ctrl+R. Review PLAN/SEAL before RUN.");
         if (queue.latestHistory()) |entry| {
             var last_buf: [720]u8 = undefined;
             const last_line = std.fmt.bufPrint(last_buf[0..], "LAST {s} {s} lines:{d} sanitized:{d}  {s}", .{
@@ -4516,7 +4714,7 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
                 entry.display_command,
             }) catch entry.display_command;
             var last_ascii: [720]u8 = undefined;
-            try x11.text(x11.gc.cyan, 18, bottom + 156, asciiInto(last_ascii[0..], last_line));
+            try x11.text(x11.gc.cyan, 18, bottom + 184, asciiInto(last_ascii[0..], last_line));
         }
     }
 
@@ -4555,6 +4753,23 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
     if (queue.history.items.len == 0) {
         try x11.text(x11.gc.muted, 18, y, "No task history yet. RUN will record exit, output cap, and sanitizer counts.");
     }
+}
+
+fn drawTerminalInput(x11: *X11, state: *LinuxGuiState) !void {
+    const rect = terminalInputRect(state);
+    try x11.fillRect(if (state.terminal_focused) x11.gc.panel_2 else x11.gc.bg, rect.left, rect.top, @intCast(rect.right - rect.left), @intCast(rect.bottom - rect.top));
+    try x11.fillRect(if (state.terminal_focused) x11.gc.cyan else x11.gc.line, rect.left, rect.top, @intCast(rect.right - rect.left), 1);
+    try x11.fillRect(x11.gc.line, rect.left, rect.bottom - 1, @intCast(rect.right - rect.left), 1);
+
+    var prompt_buf: [900]u8 = undefined;
+    const cursor = if (state.terminal_focused) "_" else "";
+    const prompt = std.fmt.bufPrint(prompt_buf[0..], "TERM > {s}{s}", .{ state.terminal_input.items, cursor }) catch "TERM >";
+    var prompt_ascii: [900]u8 = undefined;
+    try x11.text(if (state.terminal_focused) x11.gc.green else x11.gc.cyan, rect.left + 10, rect.top + 19, asciiInto(prompt_ascii[0..], prompt));
+
+    const hint = "Enter queues / Up history / Ctrl+U clear / Esc blur";
+    const hint_x = @max(rect.left + 360, rect.right - 430);
+    if (hint_x > rect.left + 220) try x11.text(x11.gc.muted, hint_x, rect.top + 19, hint);
 }
 
 fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
@@ -6374,7 +6589,7 @@ fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
 }
 
 const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
-const task_panel_actions = [_]TaskPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .tasks, .preview, .seal, .run_next, .history };
+const task_panel_actions = [_]TaskPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .terminal, .queue_terminal, .tasks, .preview, .seal, .run_next, .history };
 const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .seal, .linux };
 const settings_panel_actions = [_]SettingsPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .tutorial_ja, .tutorial_en, .review, .trust, .lock, .seal };
 const extension_panel_actions = [_]ExtensionPanelAction{.scan};
@@ -6501,15 +6716,17 @@ fn taskPanelActionRect(state: *const LinuxGuiState, action: TaskPanelAction) Hit
         .profile_safe => 1,
         .profile_network => 2,
         .profile_publish => 3,
-        .tasks => 4,
-        .preview => 5,
-        .seal => 6,
-        .run_next => 7,
-        .history => 8,
+        .terminal => 4,
+        .queue_terminal => 5,
+        .tasks => 6,
+        .preview => 7,
+        .seal => 8,
+        .run_next => 9,
+        .history => 10,
     };
-    const width: i16 = 56;
-    const gap: i16 = 7;
-    const right = state.window_width - 18 - (8 - index) * (width + gap);
+    const width: i16 = 52;
+    const gap: i16 = 6;
+    const right = state.window_width - 18 - (10 - index) * (width + gap);
     const bottom = state.bottomTop();
     return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
@@ -6616,6 +6833,8 @@ fn taskPanelActionLabel(action: TaskPanelAction) []const u8 {
         .profile_safe => "SAFE",
         .profile_network => "NET",
         .profile_publish => "PUB",
+        .terminal => "TERM",
+        .queue_terminal => "QUE",
         .tasks => "TASKS",
         .preview => "PLAN",
         .seal => "SEAL",
@@ -6900,6 +7119,11 @@ fn securityFindingsTop(state: *const LinuxGuiState) i16 {
 
 fn taskHistoryTop(state: *const LinuxGuiState) i16 {
     return state.bottomTop() + 238;
+}
+
+fn terminalInputRect(state: *const LinuxGuiState) HitRect {
+    const bottom = state.bottomTop();
+    return .{ .left = 18, .top = bottom + 116, .right = state.window_width - 18, .bottom = bottom + 142 };
 }
 
 fn taskHistoryRowAt(state: *const LinuxGuiState, y: i16) ?usize {

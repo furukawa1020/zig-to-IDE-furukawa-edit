@@ -89,6 +89,7 @@ test {
     _ = @import("tasks/executor.zig");
     _ = @import("tasks/registry.zig");
     _ = @import("terminal/ansi.zig");
+    _ = @import("terminal/command_line.zig");
     _ = @import("terminal/input.zig");
     _ = @import("terminal/renderer.zig");
     _ = @import("terminal/session.zig");

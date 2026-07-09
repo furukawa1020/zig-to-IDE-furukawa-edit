@@ -23,6 +23,7 @@ const launch_audit = @import("../security/launch_audit.zig");
 const file_finder = @import("../search/file_finder.zig");
 const literal_search = @import("../search/literal.zig");
 const workspace_search = @import("../search/workspace_search.zig");
+const zig_output = @import("../diagnostics/zig_output.zig");
 const task_registry = @import("../tasks/registry.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
 const permissions = @import("../security/permissions.zig");
@@ -978,6 +979,7 @@ const LinuxGuiState = struct {
     editor_scroll_line: usize = 0,
     output_scroll_line: usize = 0,
     task_scroll_line: usize = 0,
+    task_history_selected: ?usize = null,
     git_scroll_line: usize = 0,
     extensions_scroll_line: usize = 0,
     diagnostics_scroll_line: usize = 0,
@@ -2209,6 +2211,26 @@ const LinuxGuiState = struct {
         }
     }
 
+    fn selectTaskHistoryEntry(self: *LinuxGuiState, index: usize) void {
+        if (index >= self.app.execution_queue.history.items.len) return;
+        self.task_history_selected = index;
+        const entry = self.app.execution_queue.history.items[index];
+        self.appendOutput(.stdout, "run history #{d}: {s} {s} audit:{s} lines:{d} clean:{d} env:{s} fs:{s} net:{s} cwd:{s}\n", .{
+            index + 1,
+            @tagName(entry.state),
+            exitCodeLabel(entry.exit_code),
+            entry.audit_id[0..12],
+            entry.output_lines,
+            entry.sanitized_controls,
+            @tagName(entry.env_policy),
+            @tagName(entry.fs_policy),
+            @tagName(entry.network_policy),
+            entry.cwd,
+        });
+        self.appendOutput(.stdout, "command: {s}\n", .{entry.display_command});
+        self.message("history #{d}: {s} {s}", .{ index + 1, @tagName(entry.state), exitCodeLabel(entry.exit_code) });
+    }
+
     fn executeSettingsPanelAction(self: *LinuxGuiState, action: SettingsPanelAction) void {
         self.bottom_panel = .settings;
         switch (action) {
@@ -2873,6 +2895,7 @@ const LinuxGuiState = struct {
         self.editor_scroll_line = 0;
         self.output_scroll_line = 0;
         self.task_scroll_line = 0;
+        self.task_history_selected = null;
         self.git_scroll_line = 0;
         self.extensions_scroll_line = 0;
         self.diagnostics_scroll_line = 0;
@@ -3546,7 +3569,6 @@ const LinuxGuiState = struct {
     }
 
     fn handleBottomPanelContentClick(self: *LinuxGuiState, x: i16, y: i16) bool {
-        const bottom = self.bottomTop();
         switch (self.bottom_panel) {
             .security => {
                 if (securityPanelActionAt(self, x, y)) |action| {
@@ -3562,18 +3584,35 @@ const LinuxGuiState = struct {
                 return true;
             },
             .diagnostics => {
-                const row = @divTrunc(@as(isize, y - (bottom + 72)), LINE_HEIGHT);
-                if (row < 0) return true;
-                const index = self.diagnostics_scroll_line + @as(usize, @intCast(row));
-                if (index >= self.app.diagnostics.items.items.len) return true;
-                const item = self.app.diagnostics.items.items[index];
-                self.openRelativeLocation(item.path, item.range.start.line, item.range.start.column);
+                if (diagnosticRowAt(self, y)) |index| {
+                    if (index < self.app.diagnostics.items.items.len) {
+                        const item = self.app.diagnostics.items.items[index];
+                        self.openRelativeLocation(item.path, item.range.start.line, item.range.start.column);
+                    }
+                }
                 return true;
             },
             .tasks => {
                 if (taskPanelActionAt(self, x, y)) |action| {
                     self.executeTaskPanelAction(action);
                     return true;
+                }
+                if (taskHistoryRowAt(self, y)) |index| {
+                    self.selectTaskHistoryEntry(index);
+                    return true;
+                }
+                return true;
+            },
+            .output => {
+                if (outputLineRowAt(self, y)) |index| {
+                    if (index < self.app.process_console.lines.items.len) {
+                        const line = self.app.process_console.lines.items[index];
+                        if (zig_output.parseLine(line.text)) |parsed| {
+                            self.openRelativeLocation(parsed.path, parsed.line, parsed.column);
+                        } else {
+                            self.message("output line has no source location", .{});
+                        }
+                    }
                 }
                 return true;
             },
@@ -3635,7 +3674,6 @@ const LinuxGuiState = struct {
                 }
                 return true;
             },
-            else => return true,
         }
     }
 
@@ -3655,8 +3693,10 @@ const LinuxGuiState = struct {
         const safe_column = @min(column, doc.text.lineSlice(safe_line).len);
         const offset = doc.text.lineColumnToOffset(safe_line, safe_column) catch 0;
         navigation.setCursor(doc, doc.positionFromOffset(offset) catch doc.cursor.position);
+        self.clearSelection();
         self.app.focus = .editor;
         self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
         self.message("opened {s}:{d}:{d}", .{ relative, safe_line + 1, safe_column + 1 });
     }
 
@@ -3792,7 +3832,7 @@ const LinuxGuiState = struct {
     fn scrollBottomPanel(self: *LinuxGuiState, delta: isize) void {
         switch (self.bottom_panel) {
             .output => {
-                const visible = self.bottomRowsFrom(self.bottomTop() + 58);
+                const visible = outputVisibleRows(self);
                 const total = self.app.process_console.lines.items.len;
                 const max_start = if (total > visible) total - visible else 0;
                 var start = if (self.output_scroll_line == 0) max_start else @min(self.output_scroll_line - 1, max_start);
@@ -3813,7 +3853,7 @@ const LinuxGuiState = struct {
             },
             .diagnostics => {
                 const total = self.app.diagnostics.items.items.len;
-                const visible = self.bottomRowsFrom(self.bottomTop() + 86);
+                const visible = self.bottomRowsFrom(diagnosticsTop(self));
                 const max_start = if (total > visible) total - visible else 0;
                 self.diagnostics_scroll_line = scrollValue(self.diagnostics_scroll_line, max_start, delta);
             },
@@ -4225,15 +4265,24 @@ fn drawScrollHint(x11: *X11, state: *const LinuxGuiState, total: usize, visible:
 fn drawOutputPanel(x11: *X11, state: *LinuxGuiState) !void {
     const app = &state.app;
     const bottom = state.bottomTop();
-    var y: i16 = bottom + 58;
-    const max_lines: usize = @intCast(@max(@divTrunc(state.window_height - bottom - STATUS_HEIGHT - 64, LINE_HEIGHT), 1));
-    const max_start = if (app.process_console.lines.items.len > max_lines) app.process_console.lines.items.len - max_lines else 0;
-    const start = if (state.output_scroll_line == 0) max_start else @min(state.output_scroll_line - 1, max_start);
+    var header_buf: [360]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "OUTPUT lines:{d} status:{s} sanitizer:csi={d} osc={d} ctrl={d}  click source lines to jump", .{
+        app.process_console.lines.items.len,
+        if (app.process_console.running) "running" else exitCodeLabel(app.process_console.exit_code),
+        app.process_console.sanitized_stats.stripped_csi,
+        app.process_console.sanitized_stats.stripped_osc,
+        app.process_console.sanitized_stats.stripped_control,
+    }) catch "OUTPUT";
+    try x11.text(x11.gc.green, 18, bottom + 58, header);
+
+    var y: i16 = outputLinesTop(state);
+    const max_lines = outputVisibleRows(state);
+    const start = outputVisibleStart(state);
     const limit = @min(app.process_console.lines.items.len, start + max_lines);
-    try drawScrollHint(x11, state, app.process_console.lines.items.len, max_lines, start, bottom + 58);
+    try drawScrollHint(x11, state, app.process_console.lines.items.len, max_lines, start, y);
     for (app.process_console.lines.items[start..limit]) |line| {
         var text_buf: [900]u8 = undefined;
-        const color = if (line.stream == .stderr) x11.gc.red else x11.gc.muted;
+        const color = outputLineGc(x11, line);
         try x11.text(color, 18, y, asciiInto(text_buf[0..], line.text));
         y += LINE_HEIGHT;
     }
@@ -4365,7 +4414,9 @@ fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {
             entry.display_command,
         }) catch entry.display_command;
         var ascii_buf: [900]u8 = undefined;
-        try x11.text(taskStateGc(x11, entry.state), 18, y, asciiInto(ascii_buf[0..], row));
+        const selected = if (state.task_history_selected) |selected_index| selected_index == index else false;
+        if (selected) try x11.fillRect(x11.gc.panel_2, 10, y - 14, toU16(state.window_width - 20), LINE_HEIGHT);
+        try x11.text(if (selected) x11.gc.text else taskStateGc(x11, entry.state), 18, y, asciiInto(ascii_buf[0..], row));
         y += LINE_HEIGHT;
     }
     if (queue.history.items.len == 0) {
@@ -4707,10 +4758,15 @@ fn drawExtensionsPanel(x11: *X11, state: *LinuxGuiState) !void {
 fn drawDiagnosticsPanel(x11: *X11, state: *LinuxGuiState) !void {
     const app = &state.app;
     const bottom = state.bottomTop();
-    var header_buf: [160]u8 = undefined;
-    const header = std.fmt.bufPrint(header_buf[0..], "DIAGNOSTICS total:{d}", .{app.diagnostics.items.items.len}) catch "DIAGNOSTICS";
+    var header_buf: [260]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "DIAGNOSTICS total:{d} err:{d} warn:{d} info:{d}  click row to jump", .{
+        app.diagnostics.items.items.len,
+        app.diagnostics.countBySeverity(.err),
+        app.diagnostics.countBySeverity(.warning),
+        app.diagnostics.countBySeverity(.info),
+    }) catch "DIAGNOSTICS";
     try x11.text(x11.gc.green, 18, bottom + 58, header);
-    var y: i16 = bottom + 86;
+    var y: i16 = diagnosticsTop(state);
     const visible = state.bottomRowsFrom(y);
     const start = @min(state.diagnostics_scroll_line, app.diagnostics.items.items.len);
     const limit = @min(app.diagnostics.items.items.len, start + visible);
@@ -4725,7 +4781,7 @@ fn drawDiagnosticsPanel(x11: *X11, state: *LinuxGuiState) !void {
             item.message,
         }) catch item.message;
         var ascii_buf: [900]u8 = undefined;
-        try x11.text(x11.gc.muted, 18, y, asciiInto(ascii_buf[0..], row));
+        try x11.text(severityGc(x11, item.severity), 18, y, asciiInto(ascii_buf[0..], row));
         y += LINE_HEIGHT;
     }
     if (app.diagnostics.items.items.len == 0) {
@@ -5800,6 +5856,19 @@ fn taskStateGc(x11: *const X11, state: execution_queue.State) u32 {
     };
 }
 
+fn severityGc(x11: *const X11, severity: types.Severity) u32 {
+    return switch (severity) {
+        .err => x11.gc.red,
+        .warning => x11.gc.amber,
+        .info => x11.gc.cyan,
+    };
+}
+
+fn outputLineGc(x11: *const X11, line: @import("../tasks/console.zig").Line) u32 {
+    if (zig_output.parseLine(line.text)) |parsed| return severityGc(x11, parsed.severity);
+    return if (line.stream == .stderr) x11.gc.red else x11.gc.muted;
+}
+
 fn commandCapabilityGc(x11: *const X11, capability: command_mod.Capability) u32 {
     return switch (capability) {
         .safe => x11.gc.green,
@@ -6622,6 +6691,29 @@ fn appendSecurityFindings(target: *findings_mod.Collection, source: *const findi
     }
 }
 
+fn outputLinesTop(state: *const LinuxGuiState) i16 {
+    return state.bottomTop() + 86;
+}
+
+fn outputVisibleRows(state: *const LinuxGuiState) usize {
+    return state.bottomRowsFrom(outputLinesTop(state));
+}
+
+fn outputVisibleStart(state: *const LinuxGuiState) usize {
+    const total = state.app.process_console.lines.items.len;
+    const visible = outputVisibleRows(state);
+    const max_start = if (total > visible) total - visible else 0;
+    return if (state.output_scroll_line == 0) max_start else @min(state.output_scroll_line - 1, max_start);
+}
+
+fn outputLineRowAt(state: *const LinuxGuiState, y: i16) ?usize {
+    const top = outputLinesTop(state);
+    if (y < top) return null;
+    const row = @divTrunc(@as(isize, y - top), LINE_HEIGHT);
+    if (row < 0) return null;
+    return outputVisibleStart(state) + @as(usize, @intCast(row));
+}
+
 fn gitChangesTop(state: *const LinuxGuiState) i16 {
     const bottom = state.bottomTop();
     const remote_rows: usize = if (state.git_overview) |overview| @max(@min(overview.remotes.len, @as(usize, 2)), 1) else 1;
@@ -6656,12 +6748,32 @@ fn keybindingRowAt(state: *const LinuxGuiState, y: i16) ?usize {
     return state.keybindings_scroll_line + @as(usize, @intCast(row));
 }
 
+fn diagnosticsTop(state: *const LinuxGuiState) i16 {
+    return state.bottomTop() + 86;
+}
+
+fn diagnosticRowAt(state: *const LinuxGuiState, y: i16) ?usize {
+    const top = diagnosticsTop(state);
+    if (y < top) return null;
+    const row = @divTrunc(@as(isize, y - top), LINE_HEIGHT);
+    if (row < 0) return null;
+    return state.diagnostics_scroll_line + @as(usize, @intCast(row));
+}
+
 fn securityFindingsTop(state: *const LinuxGuiState) i16 {
     return state.bottomTop() + 230;
 }
 
 fn taskHistoryTop(state: *const LinuxGuiState) i16 {
     return state.bottomTop() + 238;
+}
+
+fn taskHistoryRowAt(state: *const LinuxGuiState, y: i16) ?usize {
+    const top = taskHistoryTop(state);
+    if (y < top) return null;
+    const row = @divTrunc(@as(isize, y - top), LINE_HEIGHT);
+    if (row < 0) return null;
+    return state.task_scroll_line + @as(usize, @intCast(row));
 }
 
 fn documentTabAt(state: *const LinuxGuiState, x: i16, y: i16) ?usize {

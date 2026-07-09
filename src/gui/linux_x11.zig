@@ -3818,8 +3818,12 @@ const LinuxGuiState = struct {
                             self.runHeaderAction(.build);
                             return;
                         }
-                        if (char == 't' or char == 'T') {
+                        if (key.modifiers.alt and (char == 't' or char == 'T')) {
                             self.runHeaderAction(.test_run);
+                            return;
+                        }
+                        if (char == 't' or char == 'T') {
+                            self.openQuickPanel(.workspace_symbols);
                             return;
                         }
                         if (key.modifiers.shift and (char == 'x' or char == 'X')) {
@@ -4111,8 +4115,12 @@ const LinuxGuiState = struct {
                         self.runHeaderAction(.build);
                         return;
                     }
-                    if (char == 't' or char == 'T') {
+                    if (key.modifiers.alt and (char == 't' or char == 'T')) {
                         self.runHeaderAction(.test_run);
+                        return;
+                    }
+                    if (char == 't' or char == 'T') {
+                        self.openQuickPanel(.workspace_symbols);
                         return;
                     }
                     if (char == 'z' or char == 'Z') {
@@ -4906,7 +4914,7 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
     const linux_grade = linuxBoundaryGrade(&state.linux_security);
     const status = std.fmt.bufPrint(
         status_buf[0..],
-        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} linux:{s} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+S Ctrl+G Ctrl+Tab | {s}",
+        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} linux:{s} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+T Ctrl+S Ctrl+G | {s}",
         .{
             @tagName(app.mode),
             @tagName(app.focus),
@@ -5897,6 +5905,18 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
             const items = state.quick_panel.symbol_matches orelse break :blk "";
             if (row >= items.len) break :blk "";
             break :blk std.fmt.bufPrint(text_buf[0..], "{s}  {s}:{d}:{d}", .{ items[row].name, @tagName(items[row].kind), items[row].line + 1, items[row].column + 1 }) catch items[row].name;
+        },
+        .workspace_symbols => blk: {
+            const items = state.quick_panel.workspace_symbol_matches orelse break :blk "";
+            if (row >= items.len) break :blk "";
+            break :blk std.fmt.bufPrint(text_buf[0..], "{s}  {s}  {s}:{d}:{d}  {s}", .{
+                items[row].name,
+                @tagName(items[row].kind),
+                items[row].path,
+                items[row].line + 1,
+                items[row].column + 1,
+                modes.label(items[row].language),
+            }) catch items[row].name;
         },
         .completion => blk: {
             const items = state.quick_panel.completion_matches orelse break :blk "";
@@ -7004,6 +7024,7 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .new_file => "NEW FILE",
         .run_task => "RUN TASK",
         .document_symbols => "SYMBOLS",
+        .workspace_symbols => "WORKSPACE SYMBOLS",
         .completion => "COMPLETE  Enter inserts",
         .language_mode => "LANGUAGE MODE",
     };

@@ -111,6 +111,7 @@ pub const search = struct {
     pub const fuzzy = @import("search/fuzzy.zig");
     pub const literal = @import("search/literal.zig");
     pub const workspace_search = @import("search/workspace_search.zig");
+    pub const workspace_symbols = @import("search/workspace_symbols.zig");
 };
 
 pub const config = struct {

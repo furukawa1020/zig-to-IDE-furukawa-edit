@@ -17,6 +17,7 @@ const symbols_mod = @import("../language/symbols.zig");
 const file_finder = @import("../search/file_finder.zig");
 const literal_search = @import("../search/literal.zig");
 const workspace_search = @import("../search/workspace_search.zig");
+const workspace_symbols = @import("../search/workspace_symbols.zig");
 const build_consent = @import("../security/build_consent.zig");
 const findings_mod = @import("../security/findings.zig");
 const text_integrity = @import("../security/text_integrity.zig");
@@ -32,6 +33,7 @@ const QuickPanelMode = enum {
     run_task,
     new_file,
     document_symbols,
+    workspace_symbols,
     completion,
     language_mode,
 };
@@ -152,6 +154,7 @@ const QuickPanel = struct {
     search_results: ?[]workspace_search.Result = null,
     task_matches: ?[]TaskMatch = null,
     symbol_matches: ?[]SymbolMatch = null,
+    workspace_symbol_matches: ?[]workspace_symbols.Result = null,
     completion_matches: ?[]completion_mod.Item = null,
     language_matches: ?[]modes.LanguageMode = null,
     completion_replace_start: usize = 0,
@@ -224,6 +227,7 @@ const QuickPanel = struct {
             .run_task => if (self.task_matches) |items| items.len else 0,
             .new_file => if (self.query.items.len > 0) 1 else 0,
             .document_symbols => if (self.symbol_matches) |items| items.len else 0,
+            .workspace_symbols => if (self.workspace_symbol_matches) |items| items.len else 0,
             .completion => if (self.completion_matches) |items| items.len else 0,
             .language_mode => if (self.language_matches) |items| items.len else 0,
         };
@@ -255,6 +259,12 @@ const QuickPanel = struct {
 
     fn selectedSymbol(self: *const QuickPanel) ?*const SymbolMatch {
         const items = self.symbol_matches orelse return null;
+        if (items.len == 0) return null;
+        return &items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn selectedWorkspaceSymbol(self: *const QuickPanel) ?*const workspace_symbols.Result {
+        const items = self.workspace_symbol_matches orelse return null;
         if (items.len == 0) return null;
         return &items[@min(self.selected_index, items.len - 1)];
     }
@@ -354,6 +364,13 @@ const QuickPanel = struct {
 
                 self.symbol_matches = try matches.toOwnedSlice();
             },
+            .workspace_symbols => {
+                self.workspace_symbol_matches = try workspace_symbols.search(self.allocator, &app.workspace, self.query.items, .{
+                    .max_file_bytes = 512 * 1024,
+                    .max_files = 600,
+                    .max_results = 512,
+                });
+            },
             .completion => {
                 const active_index = app.documents.activeIndex() orelse return;
                 const doc = &app.documents.documents.items[active_index];
@@ -418,6 +435,11 @@ const QuickPanel = struct {
             for (items) |*item| item.deinit(self.allocator);
             self.allocator.free(items);
             self.symbol_matches = null;
+        }
+        if (self.workspace_symbol_matches) |items| {
+            for (items) |*item| item.deinit(self.allocator);
+            self.allocator.free(items);
+            self.workspace_symbol_matches = null;
         }
         if (self.completion_matches) |items| {
             completion_mod.deinitItems(self.allocator, items);
@@ -844,6 +866,10 @@ const GuiState = struct {
             self.openSymbolPanel();
             return;
         }
+        if (std.mem.eql(u8, id, "symbol.workspace_symbols")) {
+            self.openQuickPanel(.workspace_symbols);
+            return;
+        }
         if (std.mem.eql(u8, id, "symbol.goto_definition")) {
             self.gotoLocalDefinitionAtCursor();
             return;
@@ -1199,6 +1225,7 @@ const GuiState = struct {
             .run_task => "Run task",
             .new_file => "New file",
             .document_symbols => "Document symbols",
+            .workspace_symbols => "Workspace symbols",
             .rename_symbol => "Rename symbol",
             .completion => "Complete symbol",
             .language_mode => "Language mode",
@@ -1441,6 +1468,20 @@ const GuiState = struct {
                 const offset = item.byte_offset;
                 self.quick_panel.close();
                 self.jumpToActiveDocumentOffset(offset, "Opened symbol");
+            },
+            .workspace_symbols => {
+                const item = self.quick_panel.selectedWorkspaceSymbol() orelse {
+                    self.setMessage("No workspace symbol selected") catch {};
+                    return;
+                };
+                const path = self.allocator.dupe(u8, item.path) catch |err| {
+                    self.setError(err) catch {};
+                    return;
+                };
+                defer self.allocator.free(path);
+                const offset = item.byte_offset;
+                self.quick_panel.close();
+                self.openRelativeFile(path, offset);
             },
             .completion => {
                 const item = self.quick_panel.selectedCompletion() orelse {
@@ -2904,8 +2945,12 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         state.openDiagnosticsPanel();
         return;
     }
-    if (ctrl and key == 'T') {
+    if (ctrl and alt and key == 'T') {
         state.runTaskByName("test");
+        return;
+    }
+    if (ctrl and key == 'T') {
+        state.openQuickPanel(.workspace_symbols);
         return;
     }
     if (ctrl and key == 'R') {
@@ -4461,6 +4506,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .run_task => "TASKS",
         .new_file => "NEW FILE",
         .document_symbols => "SYMBOLS",
+        .workspace_symbols => "WORKSPACE SYMBOLS",
         .completion => "COMPLETE  Enter inserts",
         .language_mode => "LANGUAGE MODE",
     };
@@ -4537,6 +4583,16 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 drawTextClipped(hdc, panel.left + 18, y, panel.left + 240, color, item.name);
                 drawTextClipped(hdc, panel.left + 250, y, panel.left + 390, color, @tagName(item.kind));
                 drawTextClipped(hdc, panel.left + 400, y, panel.right - 16, color, location);
+            },
+            .workspace_symbols => {
+                const items = state.quick_panel.workspace_symbol_matches orelse break;
+                const item = items[row];
+                var location_buf: [320]u8 = undefined;
+                const location = std.fmt.bufPrint(&location_buf, "{s}:{d}:{d}", .{ item.path, item.line + 1, item.column + 1 }) catch item.path;
+                drawTextClipped(hdc, panel.left + 18, y, panel.left + 220, color, item.name);
+                drawTextClipped(hdc, panel.left + 230, y, panel.left + 350, color, @tagName(item.kind));
+                drawTextClipped(hdc, panel.left + 360, y, panel.left + 450, color, modes.label(item.language));
+                drawTextClipped(hdc, panel.left + 460, y, panel.right - 16, color, location);
             },
             .completion => {
                 const items = state.quick_panel.completion_matches orelse break;

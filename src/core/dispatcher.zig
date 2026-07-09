@@ -29,6 +29,7 @@ const polyglot_scanner = @import("../security/polyglot_scanner.zig");
 const text_integrity = @import("../security/text_integrity.zig");
 const zig_scanner = @import("../security/zig_scanner.zig");
 const lsp_launch_plan = @import("../lsp/launch_plan.zig");
+const lsp_session = @import("../lsp/session.zig");
 
 pub const Result = union(enum) {
     completed: []const u8,
@@ -256,6 +257,31 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         try app.process_console.appendBytes(.stdout, rendered);
         try app.process_console.appendBytes(.stdout, "\n");
         return .{ .completed = "LSP launch plan rendered" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "lsp.status")) {
+        try renderLspStatus(app);
+        return .{ .completed = "LSP status rendered" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "lsp.sync_current")) {
+        return try syncCurrentDocumentToLsp(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "lsp.request_completion")) {
+        return try requestCurrentPositionLsp(app, .completion, "completion");
+    }
+
+    if (std.mem.eql(u8, definition.id, "lsp.request_hover")) {
+        return try requestCurrentPositionLsp(app, .hover, "hover");
+    }
+
+    if (std.mem.eql(u8, definition.id, "lsp.request_definition")) {
+        return try requestCurrentPositionLsp(app, .definition, "definition");
+    }
+
+    if (std.mem.eql(u8, definition.id, "lsp.request_references")) {
+        return try requestCurrentPositionLsp(app, .references, "references");
     }
 
     if (std.mem.eql(u8, definition.id, "security.scan_current")) {
@@ -719,6 +745,101 @@ fn verifyRunAuditLog(app: *app_mod.App) !Result {
 
     if (!stats.ok()) return .{ .blocked = "run audit chain verification failed" };
     return .{ .completed = "run audit chain verified" };
+}
+
+fn renderLspStatus(app: *app_mod.App) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.writeAll("lsp session\n");
+    try writer.print("state: {s}\n", .{@tagName(app.lsp_session.state)});
+    try writer.print("workspace: {s}\n", .{app.lsp_session.workspace_root});
+    try writer.print("opened documents: {d}\n", .{app.lsp_session.openedCount()});
+    try writer.print("pending requests: {d}\n", .{app.lsp_session.pendingCount()});
+
+    if (app.documents.active()) |doc| {
+        const path = doc.path orelse "(scratch)";
+        try writer.print("\nactive document: {s}\n", .{path});
+        try writer.print("language: {s}\n", .{modes.label(doc.language)});
+        if (doc.path) |real_path| {
+            if (app.lsp_session.documentVersion(real_path)) |version| {
+                try writer.print("lsp version: {d}\n", .{version});
+            } else {
+                try writer.writeAll("lsp version: not synced\n");
+            }
+        }
+
+        var plan = try lsp_launch_plan.forLanguage(app.allocator, doc.language);
+        defer plan.deinit(app.allocator);
+        try writer.print("server: {s}\n", .{plan.label});
+        try writer.print("command: {s}\n", .{if (plan.command.len == 0) "(none)" else plan.command});
+        try writer.print("security: {s}\n", .{plan.security_note});
+        if (!plan.available) try writer.print("hint: {s}\n", .{plan.install_hint});
+    }
+
+    if (app.lsp_session.last_completion) |items| {
+        try writer.print("\nlast completion items: {d}\n", .{items.items.len});
+    }
+    if (app.lsp_session.last_hover) |hover| {
+        const preview_len = @min(hover.text.len, 160);
+        try writer.print("last hover bytes: {d}\n", .{hover.text.len});
+        if (preview_len > 0) try writer.print("last hover preview: {s}\n", .{hover.text[0..preview_len]});
+    }
+    if (app.lsp_session.last_locations) |locations| {
+        try writer.print("last locations: {d}\n", .{locations.items.len});
+        for (locations.items[0..@min(locations.items.len, 6)]) |location| {
+            try writer.print("- {s}:{d}:{d}\n", .{ location.path, location.range.start.line + 1, location.range.start.column + 1 });
+        }
+    }
+
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn syncCurrentDocumentToLsp(app: *app_mod.App) !Result {
+    const doc = app.documents.active() orelse return .no_active_document;
+    const path = doc.path orelse return .{ .blocked = "scratch documents cannot be synced to LSP yet" };
+    const existing_version = app.lsp_session.documentVersion(path);
+    const version = if (existing_version) |value| value + 1 else 1;
+
+    var outbound = if (existing_version == null)
+        try app.lsp_session.makeDidOpen(path, doc.language, version, doc.text.bytes)
+    else
+        try app.lsp_session.makeDidChange(path, version, doc.text.bytes);
+    defer outbound.deinit();
+
+    try emitLspOutbound(app, if (existing_version == null) "didOpen" else "didChange", &outbound);
+    return .{ .completed = if (existing_version == null) "LSP didOpen packet built" else "LSP didChange packet built" };
+}
+
+fn requestCurrentPositionLsp(app: *app_mod.App, kind: lsp_session.RequestKind, label: []const u8) !Result {
+    const doc = app.documents.active() orelse return .no_active_document;
+    const path = doc.path orelse return .{ .blocked = "scratch documents cannot request LSP features yet" };
+
+    var outbound = try app.lsp_session.requestPosition(kind, path, doc.cursor.position);
+    defer outbound.deinit();
+    try emitLspOutbound(app, label, &outbound);
+    return .{ .completed = "LSP request packet built" };
+}
+
+fn emitLspOutbound(app: *app_mod.App, label: []const u8, outbound: *const lsp_session.Outbound) !void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+
+    try writer.print("lsp outbound: {s}\n", .{label});
+    if (outbound.id) |id| try writer.print("id: {d}\n", .{id});
+    if (outbound.kind) |kind| try writer.print("kind: {s}\n", .{@tagName(kind)});
+    try writer.print("payload bytes: {d}\n", .{outbound.payload.len});
+    try writer.print("framed bytes: {d}\n", .{outbound.framed.len});
+    try writer.writeAll("--- payload preview ---\n");
+    const preview_len = @min(outbound.payload.len, 4096);
+    try writer.writeAll(outbound.payload[0..preview_len]);
+    if (preview_len < outbound.payload.len) {
+        try writer.print("\n... truncated {d} byte(s)\n", .{outbound.payload.len - preview_len});
+    }
+    try writer.writeAll("\n--- end ---\n");
+    try app.process_console.appendBytes(.stdout, text.written());
 }
 
 fn syncDiagnosticsFromConsole(app: *app_mod.App) !void {

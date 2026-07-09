@@ -825,6 +825,7 @@ const GuiState = struct {
         self.app.mode = .insert;
         self.app.focus = .editor;
         self.ensureCursorVisible();
+        self.syncActiveDocumentToLsp();
         self.setMessage("Opened file") catch {};
     }
 
@@ -869,6 +870,7 @@ const GuiState = struct {
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureCursorVisible();
+        self.syncActiveDocumentToLsp();
         self.setMessage("Switched document") catch {};
     }
 
@@ -877,6 +879,7 @@ const GuiState = struct {
         self.clearSelection();
         self.app.focus = .editor;
         self.ensureCursorVisible();
+        self.syncActiveDocumentToLsp();
         self.setMessage("Switched document") catch {};
     }
 
@@ -1571,6 +1574,7 @@ const GuiState = struct {
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureCursorVisible();
+        self.syncActiveDocumentToLsp();
         self.refreshActiveSecurityFindings("Language mode changed");
         var message_buf: [160]u8 = undefined;
         const message = std.fmt.bufPrint(&message_buf, "Language: {s}  family:{s}  security:{s}", .{
@@ -1616,6 +1620,7 @@ const GuiState = struct {
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureCursorVisible();
+        self.syncActiveDocumentToLsp();
         self.setMessage("Opened file") catch {};
     }
 
@@ -1645,6 +1650,7 @@ const GuiState = struct {
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureCursorVisible();
+        self.syncActiveDocumentToLsp();
         self.setMessage("Opened diagnostic") catch {};
     }
 
@@ -2118,6 +2124,7 @@ const GuiState = struct {
                 if (isEditorLineCommand(id)) {
                     self.clearSelection();
                     self.ensureCursorVisible();
+                    self.syncActiveDocumentToLsp();
                 }
             },
             .blocked => |message| {
@@ -2184,6 +2191,13 @@ const GuiState = struct {
         return true;
     }
 
+    fn syncActiveDocumentToLsp(self: *GuiState) void {
+        _ = dispatcher.syncActiveDocumentToRunningLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp sync failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+    }
+
     fn setError(self: *GuiState, err: anyerror) !void {
         var buffer: [160]u8 = undefined;
         const message = try std.fmt.bufPrint(&buffer, "error: {s}", .{@errorName(err)});
@@ -2222,6 +2236,7 @@ const GuiState = struct {
         self.app.mode = .insert;
         self.app.focus = .editor;
         self.ensureCursorVisible();
+        self.syncActiveDocumentToLsp();
     }
 
     fn insertNewline(self: *GuiState) void {
@@ -2254,6 +2269,7 @@ const GuiState = struct {
                 .crlf => "Normalized line endings to CRLF",
                 else => "Normalized line endings",
             });
+            self.syncActiveDocumentToLsp();
         } else {
             self.setMessage("Line endings already normalized") catch {};
         }
@@ -2299,6 +2315,7 @@ const GuiState = struct {
         doc.cursor.position = doc.positionFromOffset(target_offset) catch doc.cursor.position;
         self.clearSelection();
         self.ensureCursorVisible();
+        self.syncActiveDocumentToLsp();
 
         var message_buf: [96]u8 = undefined;
         const message = std.fmt.bufPrint(&message_buf, "Removed {d} hidden control marker{s}", .{ removed, if (removed == 1) "" else "s" }) catch "Removed hidden controls";
@@ -2334,6 +2351,7 @@ const GuiState = struct {
             const offset = @min(doc.cursor.position.byte_offset, doc.text.bytes.len);
             doc.cursor.position = doc.positionFromOffset(offset) catch doc.cursor.position;
             self.ensureCursorVisible();
+            self.syncActiveDocumentToLsp();
             self.setMessage("Undo") catch {};
         } else {
             self.setMessage("Nothing to undo") catch {};
@@ -2351,6 +2369,7 @@ const GuiState = struct {
             const offset = @min(doc.cursor.position.byte_offset, doc.text.bytes.len);
             doc.cursor.position = doc.positionFromOffset(offset) catch doc.cursor.position;
             self.ensureCursorVisible();
+            self.syncActiveDocumentToLsp();
             self.setMessage("Redo") catch {};
         } else {
             self.setMessage("Nothing to redo") catch {};
@@ -2384,6 +2403,7 @@ const GuiState = struct {
             return;
         };
         self.ensureCursorVisible();
+        self.syncActiveDocumentToLsp();
     }
 
     fn deleteForward(self: *GuiState) void {
@@ -2400,6 +2420,7 @@ const GuiState = struct {
             return;
         };
         self.ensureCursorVisible();
+        self.syncActiveDocumentToLsp();
     }
 
     fn moveCursor(self: *GuiState, move: navigation.Move, extend_selection: bool) void {
@@ -2514,6 +2535,7 @@ const GuiState = struct {
             return false;
         };
         self.clearSelection();
+        self.syncActiveDocumentToLsp();
         return true;
     }
 

@@ -1176,6 +1176,13 @@ const LinuxGuiState = struct {
         return true;
     }
 
+    fn syncActiveDocumentToLsp(self: *LinuxGuiState) void {
+        _ = dispatcher.syncActiveDocumentToRunningLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp sync failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+    }
+
     fn focusTerminalInput(self: *LinuxGuiState) void {
         self.bottom_panel = .tasks;
         self.terminal_focused = true;
@@ -1923,6 +1930,7 @@ const LinuxGuiState = struct {
         if (opened) {
             self.app.mode = .insert;
             self.app.focus = .editor;
+            self.syncActiveDocumentToLsp();
             self.message("opened selected file", .{});
         } else {
             self.message("select a file to open", .{});
@@ -2120,6 +2128,7 @@ const LinuxGuiState = struct {
         };
         self.clearSelection();
         self.ensureEditorCursorVisible();
+        self.syncActiveDocumentToLsp();
         return true;
     }
 
@@ -2143,6 +2152,7 @@ const LinuxGuiState = struct {
         self.app.mode = .insert;
         self.app.focus = .editor;
         self.ensureEditorCursorVisible();
+        self.syncActiveDocumentToLsp();
     }
 
     fn insertNewline(self: *LinuxGuiState) void {
@@ -2818,6 +2828,7 @@ const LinuxGuiState = struct {
                     self.clearSelection();
                     self.app.focus = .editor;
                     self.ensureEditorCursorVisible();
+                    self.syncActiveDocumentToLsp();
                 }
             },
             .blocked => |message_text| {
@@ -3380,6 +3391,7 @@ const LinuxGuiState = struct {
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.refreshActiveSecurityFindings("language mode changed");
+        self.syncActiveDocumentToLsp();
         self.message("language: {s}  family:{s}  security:{s}", .{
             modes.label(mode),
             @tagName(modes.family(mode)),
@@ -3420,6 +3432,7 @@ const LinuxGuiState = struct {
                 else => "normalized line endings",
             };
             self.refreshActiveSecurityFindings(result_message);
+            self.syncActiveDocumentToLsp();
         } else {
             self.message("line endings already normalized", .{});
         }
@@ -3452,6 +3465,7 @@ const LinuxGuiState = struct {
         doc.cursor.position = doc.positionFromOffset(target_offset) catch doc.cursor.position;
         self.selection_anchor = null;
         self.ensureEditorCursorVisible();
+        self.syncActiveDocumentToLsp();
         self.refreshActiveSecurityFindings("removed hidden control markers");
     }
 
@@ -3506,6 +3520,7 @@ const LinuxGuiState = struct {
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureEditorCursorVisible();
+        self.syncActiveDocumentToLsp();
         self.message("replaced match", .{});
     }
 
@@ -3545,6 +3560,7 @@ const LinuxGuiState = struct {
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureEditorCursorVisible();
+        self.syncActiveDocumentToLsp();
         self.message("replaced all {d} match(es)", .{matches.len});
     }
 
@@ -3725,6 +3741,7 @@ const LinuxGuiState = struct {
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureEditorCursorVisible();
+        self.syncActiveDocumentToLsp();
         if (self.app.documents.active()) |doc| {
             const label = if (doc.path) |path| std.fs.path.basename(path) else "(scratch)";
             self.message("editor: {s}", .{label});
@@ -4267,6 +4284,7 @@ const LinuxGuiState = struct {
             self.message("delete failed: {s}", .{@errorName(err)});
             return;
         };
+        self.syncActiveDocumentToLsp();
         self.message("deleted backward", .{});
     }
 
@@ -4283,6 +4301,7 @@ const LinuxGuiState = struct {
             self.message("delete failed: {s}", .{@errorName(err)});
             return;
         };
+        self.syncActiveDocumentToLsp();
         self.message("deleted forward", .{});
     }
 
@@ -4615,6 +4634,7 @@ const LinuxGuiState = struct {
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureEditorCursorVisible();
+        self.syncActiveDocumentToLsp();
         self.message("opened {s}:{d}:{d}", .{ relative, safe_line + 1, safe_column + 1 });
     }
 

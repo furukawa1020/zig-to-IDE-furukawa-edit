@@ -12,6 +12,18 @@ pub const TextPosition = struct {
     character: usize,
 };
 
+pub const TextRange = struct {
+    start: TextPosition,
+    end: TextPosition,
+};
+
+pub const CodeActionDiagnostic = struct {
+    range: TextRange,
+    severity: ?usize = null,
+    source: ?[]const u8 = null,
+    message: []const u8,
+};
+
 pub const TextDocument = struct {
     uri: []const u8,
     language_id: []const u8,
@@ -270,6 +282,41 @@ pub fn makeRenameRequest(
     return try out.toOwnedSlice();
 }
 
+pub fn makeCodeActionRequest(
+    allocator: std.mem.Allocator,
+    id: RequestId,
+    uri: []const u8,
+    range: TextRange,
+    diagnostics: []const CodeActionDiagnostic,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, id, "textDocument/codeAction");
+        try json.objectField("params");
+        try json.beginObject();
+        try json.objectField("textDocument");
+        try writeTextDocumentIdentifier(&json, uri);
+        try json.objectField("range");
+        try writeRange(&json, range);
+        try json.objectField("context");
+        try json.beginObject();
+        try json.objectField("diagnostics");
+        try json.beginArray();
+        for (diagnostics) |diagnostic| try writeDiagnostic(&json, diagnostic);
+        try json.endArray();
+        try json.objectField("only");
+        try json.beginArray();
+        try json.write("quickfix");
+        try json.endArray();
+        try json.endObject();
+        try json.endObject();
+        try json.endObject();
+    }
+    return try out.toOwnedSlice();
+}
+
 pub fn makeFramed(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
     return framing.encode(allocator, payload);
 }
@@ -413,6 +460,24 @@ fn writeClientCapabilities(json: *std.json.Stringify) !void {
     try json.objectField("prepareSupport");
     try json.write(false);
     try json.endObject();
+    try json.objectField("codeAction");
+    try json.beginObject();
+    try json.objectField("dynamicRegistration");
+    try json.write(false);
+    try json.objectField("codeActionLiteralSupport");
+    try json.beginObject();
+    try json.objectField("codeActionKind");
+    try json.beginObject();
+    try json.objectField("valueSet");
+    try json.beginArray();
+    try json.write("quickfix");
+    try json.write("refactor");
+    try json.write("source");
+    try json.write("source.fixAll");
+    try json.endArray();
+    try json.endObject();
+    try json.endObject();
+    try json.endObject();
     try json.objectField("documentSymbol");
     try json.beginObject();
     try json.objectField("hierarchicalDocumentSymbolSupport");
@@ -439,6 +504,32 @@ fn writePosition(json: *std.json.Stringify, position: TextPosition) !void {
     try json.write(position.line);
     try json.objectField("character");
     try json.write(position.character);
+    try json.endObject();
+}
+
+fn writeRange(json: *std.json.Stringify, range: TextRange) !void {
+    try json.beginObject();
+    try json.objectField("start");
+    try writePosition(json, range.start);
+    try json.objectField("end");
+    try writePosition(json, range.end);
+    try json.endObject();
+}
+
+fn writeDiagnostic(json: *std.json.Stringify, diagnostic: CodeActionDiagnostic) !void {
+    try json.beginObject();
+    try json.objectField("range");
+    try writeRange(json, diagnostic.range);
+    if (diagnostic.severity) |severity| {
+        try json.objectField("severity");
+        try json.write(severity);
+    }
+    if (diagnostic.source) |source| {
+        try json.objectField("source");
+        try json.write(source);
+    }
+    try json.objectField("message");
+    try json.write(diagnostic.message);
     try json.endObject();
 }
 
@@ -502,6 +593,28 @@ test "build references document symbol workspace symbol and rename requests" {
     defer std.testing.allocator.free(rename);
     try std.testing.expect(std.mem.indexOf(u8, rename, "textDocument/rename") != null);
     try std.testing.expect(std.mem.indexOf(u8, rename, "\"newName\":\"Renamed\"") != null);
+}
+
+test "build code action request with diagnostics context" {
+    const payload = try makeCodeActionRequest(std.testing.allocator, .{ .number = 12 }, "file:///tmp/main.zig", .{
+        .start = .{ .line = 2, .character = 1 },
+        .end = .{ .line = 2, .character = 4 },
+    }, &.{
+        .{
+            .range = .{
+                .start = .{ .line = 2, .character = 1 },
+                .end = .{ .line = 2, .character = 4 },
+            },
+            .severity = 1,
+            .source = "zls",
+            .message = "unused local constant",
+        },
+    });
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "textDocument/codeAction") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"only\":[\"quickfix\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "unused local constant") != null);
 }
 
 test "build didChange and didSave notifications" {

@@ -56,6 +56,7 @@ const PendingLspAction = enum {
     goto_definition,
     find_references,
     rename_preview,
+    code_actions,
 };
 
 const GitPanelAction = enum {
@@ -919,6 +920,9 @@ const GuiState = struct {
         if (std.mem.eql(u8, id, "symbol.rename")) {
             self.openRenamePanel();
             return;
+        }
+        if (std.mem.eql(u8, id, "lsp.request_code_action")) {
+            if (self.requestCodeActionsFromLsp()) return;
         }
         if (std.mem.eql(u8, id, "workspace.find_file")) {
             self.openQuickPanel(.find_file);
@@ -2247,6 +2251,17 @@ const GuiState = struct {
         return true;
     }
 
+    fn requestCodeActionsFromLsp(self: *GuiState) bool {
+        const sent = dispatcher.requestActiveCodeActionsFromRunningLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp code action request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.pending_lsp_action = .code_actions;
+        self.setMessage("LSP code actions requested") catch {};
+        return true;
+    }
+
     fn requestRenameFromLsp(self: *GuiState, new_name: []const u8) bool {
         const sent = dispatcher.requestActiveRenameFromRunningLsp(&self.app, new_name) catch |err| {
             self.appendOutput(.stderr, "lsp rename request failed: {s}\n", .{@errorName(err)});
@@ -2295,6 +2310,14 @@ const GuiState = struct {
                     }
                 }
             },
+            .code_actions => {
+                if (self.app.activeLspSessionConst()) |session| {
+                    if (session.last_code_actions) |actions| {
+                        self.pending_lsp_action = .none;
+                        self.showLspCodeActions("LSP code actions", &actions);
+                    }
+                }
+            },
         }
     }
 
@@ -2329,6 +2352,22 @@ const GuiState = struct {
         if (edit.edits.len > 80) self.appendOutput(.stdout, "... {d} more LSP edit(s)\n", .{edit.edits.len - 80});
         self.appendOutput(.stdout, "run lsp.apply_workspace_edit to apply these edits to dirty editor buffers; save afterwards to write files\n", .{});
         self.setMessage("Showing LSP rename preview") catch {};
+    }
+
+    fn showLspCodeActions(self: *GuiState, label: []const u8, actions: *const lsp_responses.CodeActions) void {
+        self.show_output = true;
+        self.bottom_panel = .output;
+        self.appendOutput(.stdout, "{s}: {d}\n", .{ label, actions.items.len });
+        for (actions.items[0..@min(actions.items.len, @as(usize, 40))], 0..) |item, index| {
+            self.appendOutput(.stdout, "{d}. [{s}] {s}", .{ index + 1, item.kind, item.title });
+            if (item.workspace_edit) |edit| self.appendOutput(.stdout, " edits={d}", .{edit.edits.len});
+            if (item.command_title.len > 0) self.appendOutput(.stdout, " command={s}", .{item.command_title});
+            if (item.diagnostics > 0) self.appendOutput(.stdout, " diagnostics={d}", .{item.diagnostics});
+            self.appendOutput(.stdout, "\n", .{});
+        }
+        if (actions.items.len > 40) self.appendOutput(.stdout, "... {d} more LSP code action(s)\n", .{actions.items.len - 40});
+        self.appendOutput(.stdout, "run lsp.apply_first_code_action to apply the first editable action to dirty editor buffers\n", .{});
+        self.setMessage("Showing LSP code actions") catch {};
     }
 
     fn setError(self: *GuiState, err: anyerror) !void {
@@ -3171,6 +3210,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (ctrl and key == VK_SPACE) {
         state.executeCommand("editor.complete");
+        return;
+    }
+    if (ctrl and key == VK_OEM_PERIOD) {
+        state.executeCommand("lsp.request_code_action");
         return;
     }
     if (ctrl and key == 'P') {
@@ -6050,6 +6093,7 @@ const VK_CONTROL: c_int = 0x11;
 const VK_MENU: c_int = 0x12;
 const VK_ESCAPE: WPARAM = 0x1B;
 const VK_SPACE: WPARAM = 0x20;
+const VK_OEM_PERIOD: WPARAM = 0xBE;
 const VK_OEM_2: WPARAM = 0xBF;
 const VK_PRIOR: WPARAM = 0x21;
 const VK_NEXT: WPARAM = 0x22;

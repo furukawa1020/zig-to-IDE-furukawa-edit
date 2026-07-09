@@ -25,6 +25,7 @@ pub const RequestKind = enum {
     document_highlight,
     signature_help,
     rename,
+    code_action,
     document_symbol,
     workspace_symbol,
 };
@@ -55,8 +56,11 @@ pub const IngestResult = union(enum) {
     hover: usize,
     locations: usize,
     workspace_edit: usize,
+    code_actions: usize,
     acknowledged: RequestKind,
 };
+
+pub const CodeActionDiagnostic = protocol.CodeActionDiagnostic;
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
@@ -69,6 +73,7 @@ pub const Session = struct {
     last_hover: ?responses.Hover = null,
     last_locations: ?responses.Locations = null,
     last_workspace_edit: ?responses.WorkspaceEdit = null,
+    last_code_actions: ?responses.CodeActions = null,
 
     pub fn init(allocator: std.mem.Allocator, workspace_root: []const u8) !Session {
         return .{
@@ -106,6 +111,7 @@ pub const Session = struct {
             .hover => self.clearLastHover(),
             .definition, .references, .implementation, .type_definition => self.clearLastLocations(),
             .rename => self.clearLastWorkspaceEdit(),
+            .code_action => self.clearLastCodeActions(),
             else => {},
         }
     }
@@ -193,6 +199,17 @@ pub const Session = struct {
         return try self.wrapRequest(payload, id, .rename);
     }
 
+    pub fn requestCodeActions(self: *Session, path: []const u8, range: types.Range, diagnostics: []const CodeActionDiagnostic) !Outbound {
+        const id = self.nextId();
+        const uri = try self.uriForPath(path);
+        defer self.allocator.free(uri);
+        const payload = try protocol.makeCodeActionRequest(self.allocator, .{ .number = id }, uri, .{
+            .start = .{ .line = range.start.line, .character = range.start.column },
+            .end = .{ .line = range.end.line, .character = range.end.column },
+        }, diagnostics);
+        return try self.wrapRequest(payload, id, .code_action);
+    }
+
     pub fn requestDocumentSymbols(self: *Session, path: []const u8) !Outbound {
         const id = self.nextId();
         const uri = try self.uriForPath(path);
@@ -255,6 +272,14 @@ pub const Session = struct {
                     self.clearLastWorkspaceEdit();
                     self.last_workspace_edit = edit;
                     return .{ .workspace_edit = edit.edits.len };
+                }
+                return .ignored;
+            },
+            .code_action => {
+                if (try responses.parseCodeActionResponse(self.allocator, payload, self.workspace_root)) |actions| {
+                    self.clearLastCodeActions();
+                    self.last_code_actions = actions;
+                    return .{ .code_actions = actions.items.len };
                 }
                 return .ignored;
             },
@@ -328,6 +353,7 @@ pub const Session = struct {
         self.clearLastHover();
         self.clearLastLocations();
         self.clearLastWorkspaceEdit();
+        self.clearLastCodeActions();
     }
 
     fn clearLastCompletion(self: *Session) void {
@@ -348,6 +374,11 @@ pub const Session = struct {
     fn clearLastWorkspaceEdit(self: *Session) void {
         if (self.last_workspace_edit) |*edit| edit.deinit();
         self.last_workspace_edit = null;
+    }
+
+    fn clearLastCodeActions(self: *Session) void {
+        if (self.last_code_actions) |*actions| actions.deinit();
+        self.last_code_actions = null;
     }
 };
 
@@ -492,4 +523,36 @@ test "session routes rename workspace edit by pending id" {
     try std.testing.expect(session.last_workspace_edit != null);
     try std.testing.expectEqualStrings("src/main.zig", session.last_workspace_edit.?.edits[0].path);
     try std.testing.expectEqualStrings("renamed", session.last_workspace_edit.?.edits[0].new_text);
+}
+
+test "session routes code actions by pending id" {
+    var session = try Session.init(std.testing.allocator, "/tmp/project");
+    defer session.deinit();
+
+    var outbound = try session.requestCodeActions("src/main.zig", .{
+        .start = .{ .line = 0, .column = 4, .byte_offset = 4 },
+        .end = .{ .line = 0, .column = 8, .byte_offset = 8 },
+    }, &.{
+        .{
+            .range = .{
+                .start = .{ .line = 0, .character = 4 },
+                .end = .{ .line = 0, .character = 8 },
+            },
+            .severity = 1,
+            .message = "unused",
+        },
+    });
+    defer outbound.deinit();
+
+    var collection = diagnostics_collection.Collection.init(std.testing.allocator);
+    defer collection.deinit();
+    const payload =
+        \\{"jsonrpc":"2.0","id":1,"result":[{"title":"Remove unused","kind":"quickfix","edit":{"changes":{"file:///tmp/project/src/main.zig":[{"range":{"start":{"line":0,"character":4},"end":{"line":0,"character":8}},"newText":""}]}}}]}
+    ;
+    const result = try session.ingestPayload(payload, &collection);
+    try std.testing.expectEqual(IngestResult{ .code_actions = 1 }, result);
+    try std.testing.expectEqual(@as(usize, 0), session.pendingCount());
+    try std.testing.expect(session.last_code_actions != null);
+    try std.testing.expectEqualStrings("Remove unused", session.last_code_actions.?.items[0].title);
+    try std.testing.expect(session.last_code_actions.?.items[0].workspace_edit != null);
 }

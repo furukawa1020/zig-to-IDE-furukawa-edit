@@ -499,6 +499,7 @@ const PendingLspAction = enum {
     goto_definition,
     find_references,
     rename_preview,
+    code_actions,
 };
 
 const HeaderAction = enum {
@@ -1225,6 +1226,17 @@ const LinuxGuiState = struct {
         return true;
     }
 
+    fn requestCodeActionsFromLsp(self: *LinuxGuiState) bool {
+        const sent = dispatcher.requestActiveCodeActionsFromRunningLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp code action request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.pending_lsp_action = .code_actions;
+        self.message("LSP code actions requested", .{});
+        return true;
+    }
+
     fn requestRenameFromLsp(self: *LinuxGuiState, new_name: []const u8) bool {
         const sent = dispatcher.requestActiveRenameFromRunningLsp(&self.app, new_name) catch |err| {
             self.appendOutput(.stderr, "lsp rename request failed: {s}\n", .{@errorName(err)});
@@ -1267,6 +1279,14 @@ const LinuxGuiState = struct {
                     }
                 }
             },
+            .code_actions => {
+                if (self.app.activeLspSessionConst()) |session| {
+                    if (session.last_code_actions) |actions| {
+                        self.pending_lsp_action = .none;
+                        self.showLspCodeActions("LSP code actions", &actions);
+                    }
+                }
+            },
         }
     }
 
@@ -1299,6 +1319,21 @@ const LinuxGuiState = struct {
         if (edit.edits.len > 80) self.appendOutput(.stdout, "... {d} more LSP edit(s)\n", .{edit.edits.len - 80});
         self.appendOutput(.stdout, "run lsp.apply_workspace_edit to apply these edits to dirty editor buffers; save afterwards to write files\n", .{});
         self.message("showing LSP rename preview", .{});
+    }
+
+    fn showLspCodeActions(self: *LinuxGuiState, label: []const u8, actions: *const lsp_responses.CodeActions) void {
+        self.bottom_panel = .output;
+        self.appendOutput(.stdout, "{s}: {d}\n", .{ label, actions.items.len });
+        for (actions.items[0..@min(actions.items.len, @as(usize, 40))], 0..) |item, index| {
+            self.appendOutput(.stdout, "{d}. [{s}] {s}", .{ index + 1, item.kind, item.title });
+            if (item.workspace_edit) |edit| self.appendOutput(.stdout, " edits={d}", .{edit.edits.len});
+            if (item.command_title.len > 0) self.appendOutput(.stdout, " command={s}", .{item.command_title});
+            if (item.diagnostics > 0) self.appendOutput(.stdout, " diagnostics={d}", .{item.diagnostics});
+            self.appendOutput(.stdout, "\n", .{});
+        }
+        if (actions.items.len > 40) self.appendOutput(.stdout, "... {d} more LSP code action(s)\n", .{actions.items.len - 40});
+        self.appendOutput(.stdout, "run lsp.apply_first_code_action to apply the first editable action to dirty editor buffers\n", .{});
+        self.message("showing LSP code actions", .{});
     }
 
     fn focusTerminalInput(self: *LinuxGuiState) void {
@@ -2912,6 +2947,9 @@ const LinuxGuiState = struct {
             self.openRenamePanel();
             return;
         }
+        if (std.mem.eql(u8, id, "lsp.request_code_action")) {
+            if (self.requestCodeActionsFromLsp()) return;
+        }
         if (std.mem.eql(u8, id, "preferences.open_settings")) {
             self.bottom_panel = .settings;
             self.saveWorkbenchSettings();
@@ -3949,6 +3987,10 @@ const LinuxGuiState = struct {
                         self.execute("editor.complete", .keybinding);
                         return;
                     }
+                    if (char == '.') {
+                        self.execute("lsp.request_code_action", .keybinding);
+                        return;
+                    }
                 },
                 else => {},
             }
@@ -4017,6 +4059,10 @@ const LinuxGuiState = struct {
                         }
                         if (char == '/') {
                             self.execute("editor.toggle_comment", .keybinding);
+                            return;
+                        }
+                        if (char == '.') {
+                            self.execute("lsp.request_code_action", .keybinding);
                             return;
                         }
                         if (char == 'p' or char == 'P') {
@@ -4176,6 +4222,10 @@ const LinuxGuiState = struct {
                     }
                     if (char == '/') {
                         self.execute("editor.toggle_comment", .keybinding);
+                        return;
+                    }
+                    if (char == '.') {
+                        self.execute("lsp.request_code_action", .keybinding);
                         return;
                     }
                     if (key.modifiers.shift and (char == 'd' or char == 'D')) {

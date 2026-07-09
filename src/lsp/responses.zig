@@ -60,6 +60,34 @@ pub const WorkspaceEdit = struct {
     }
 };
 
+pub const CodeAction = struct {
+    allocator: std.mem.Allocator,
+    title: []u8,
+    kind: []u8,
+    command_title: []u8,
+    diagnostics: usize = 0,
+    workspace_edit: ?WorkspaceEdit = null,
+
+    pub fn deinit(self: *CodeAction) void {
+        if (self.workspace_edit) |*edit| edit.deinit();
+        self.allocator.free(self.command_title);
+        self.allocator.free(self.kind);
+        self.allocator.free(self.title);
+        self.* = undefined;
+    }
+};
+
+pub const CodeActions = struct {
+    allocator: std.mem.Allocator,
+    items: []CodeAction,
+
+    pub fn deinit(self: *CodeActions) void {
+        for (self.items) |*item| item.deinit();
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
 pub fn parseCompletionResponse(allocator: std.mem.Allocator, payload: []const u8) !?CompletionItems {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
     defer parsed.deinit();
@@ -162,6 +190,39 @@ pub fn parseWorkspaceEditResponse(allocator: std.mem.Allocator, payload: []const
         else => return error.InvalidWorkspaceEditResult,
     };
 
+    return try parseWorkspaceEditObject(allocator, object, workspace_root);
+}
+
+pub fn parseCodeActionResponse(allocator: std.mem.Allocator, payload: []const u8, workspace_root: ?[]const u8) !?CodeActions {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const result = resultValue(parsed.value) orelse return null;
+    if (result == .null) return null;
+    const array = switch (result) {
+        .array => |array| array,
+        else => return error.InvalidCodeActionResult,
+    };
+
+    var actions = std.array_list.Managed(CodeAction).init(allocator);
+    errdefer {
+        for (actions.items) |*item| item.deinit();
+        actions.deinit();
+    }
+
+    for (array.items) |item| {
+        if (try parseCodeAction(allocator, item, workspace_root)) |action| {
+            try actions.append(action);
+        }
+    }
+
+    return .{
+        .allocator = allocator,
+        .items = try actions.toOwnedSlice(),
+    };
+}
+
+fn parseWorkspaceEditObject(allocator: std.mem.Allocator, object: std.json.ObjectMap, workspace_root: ?[]const u8) !WorkspaceEdit {
     var edits = std.array_list.Managed(TextEdit).init(allocator);
     errdefer {
         for (edits.items) |edit| {
@@ -223,6 +284,61 @@ pub fn parseWorkspaceEditResponse(allocator: std.mem.Allocator, payload: []const
         .allocator = allocator,
         .edits = try edits.toOwnedSlice(),
         .skipped_resource_ops = skipped_resource_ops,
+    };
+}
+
+fn parseCodeAction(allocator: std.mem.Allocator, value: std.json.Value, workspace_root: ?[]const u8) !?CodeAction {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+
+    const command_title_source = codeActionCommandTitle(object);
+    const title_source = stringField(object, "title") orelse command_title_source orelse return null;
+    const kind_source = stringField(object, "kind") orelse if (object.get("edit") != null) "quickfix" else "command";
+    const command_source = command_title_source orelse "";
+
+    const title = try allocator.dupe(u8, title_source);
+    errdefer allocator.free(title);
+    const kind = try allocator.dupe(u8, kind_source);
+    errdefer allocator.free(kind);
+    const command_title = try allocator.dupe(u8, command_source);
+    errdefer allocator.free(command_title);
+
+    var workspace_edit: ?WorkspaceEdit = null;
+    errdefer if (workspace_edit) |*edit| edit.deinit();
+    if (object.get("edit")) |edit_value| {
+        const edit_object = switch (edit_value) {
+            .object => |edit_object| edit_object,
+            else => return error.InvalidCodeActionEdit,
+        };
+        workspace_edit = try parseWorkspaceEditObject(allocator, edit_object, workspace_root);
+    }
+
+    return .{
+        .allocator = allocator,
+        .title = title,
+        .kind = kind,
+        .command_title = command_title,
+        .diagnostics = codeActionDiagnosticCount(object),
+        .workspace_edit = workspace_edit,
+    };
+}
+
+fn codeActionCommandTitle(object: std.json.ObjectMap) ?[]const u8 {
+    const command_value = object.get("command") orelse return null;
+    return switch (command_value) {
+        .string => |command| command,
+        .object => |command_object| stringField(command_object, "title") orelse stringField(command_object, "command"),
+        else => null,
+    };
+}
+
+fn codeActionDiagnosticCount(object: std.json.ObjectMap) usize {
+    const value = object.get("diagnostics") orelse return 0;
+    return switch (value) {
+        .array => |array| array.items.len,
+        else => 0,
     };
 }
 
@@ -422,4 +538,23 @@ test "parse workspace edit response document changes" {
     try std.testing.expectEqual(@as(usize, 1), edit.skipped_resource_ops);
     try std.testing.expectEqualStrings("src/main.zig", edit.edits[0].path);
     try std.testing.expectEqualStrings("pub", edit.edits[0].new_text);
+}
+
+test "parse code action response with workspace edit and command action" {
+    const payload =
+        \\{"jsonrpc":"2.0","id":12,"result":[{"title":"Remove unused local","kind":"quickfix","diagnostics":[{"message":"unused"}],"edit":{"changes":{"file:///tmp/project/src/main.zig":[{"range":{"start":{"line":2,"character":4},"end":{"line":2,"character":12}},"newText":""}]}}},{"title":"Organize Imports","kind":"source.organizeImports","command":{"title":"Organize Imports","command":"source.organizeImports"}}]}
+    ;
+    var actions = (try parseCodeActionResponse(std.testing.allocator, payload, "/tmp/project")).?;
+    defer actions.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), actions.items.len);
+    try std.testing.expectEqualStrings("Remove unused local", actions.items[0].title);
+    try std.testing.expectEqualStrings("quickfix", actions.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), actions.items[0].diagnostics);
+    try std.testing.expect(actions.items[0].workspace_edit != null);
+    try std.testing.expectEqualStrings("src/main.zig", actions.items[0].workspace_edit.?.edits[0].path);
+    try std.testing.expectEqualStrings("", actions.items[0].workspace_edit.?.edits[0].new_text);
+    try std.testing.expectEqualStrings("Organize Imports", actions.items[1].title);
+    try std.testing.expectEqualStrings("Organize Imports", actions.items[1].command_title);
+    try std.testing.expect(actions.items[1].workspace_edit == null);
 }

@@ -322,8 +322,16 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return try requestCurrentRenameLsp(app, new_name);
     }
 
+    if (std.mem.eql(u8, definition.id, "lsp.request_code_action")) {
+        return try requestCurrentCodeActionsLsp(app);
+    }
+
     if (std.mem.eql(u8, definition.id, "lsp.apply_workspace_edit")) {
         return try applyLastLspWorkspaceEdit(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "lsp.apply_first_code_action")) {
+        return try applyFirstLspCodeAction(app);
     }
 
     if (std.mem.eql(u8, definition.id, "lsp.start")) {
@@ -880,6 +888,16 @@ fn renderLspStatus(app: *app_mod.App) !void {
                     });
                 }
             }
+            if (server.session.last_code_actions) |actions| {
+                try writer.print("last code actions: {d}\n", .{actions.items.len});
+                for (actions.items[0..@min(actions.items.len, 6)], 0..) |item, index| {
+                    try writer.print("- {d}. [{s}] {s}", .{ index + 1, item.kind, item.title });
+                    if (item.workspace_edit) |workspace_edit| try writer.print(" edits={d}", .{workspace_edit.edits.len});
+                    if (item.command_title.len > 0) try writer.print(" command={s}", .{item.command_title});
+                    if (item.diagnostics > 0) try writer.print(" diagnostics={d}", .{item.diagnostics});
+                    try writer.writeByte('\n');
+                }
+            }
         } else {
             try writer.writeAll("lsp version: no language session\n");
         }
@@ -966,6 +984,23 @@ pub fn requestActiveReferencesFromRunningLsp(app: *app_mod.App) !bool {
     return try requestActivePositionFromRunningLsp(app, .references, "references");
 }
 
+pub fn requestActiveCodeActionsFromRunningLsp(app: *app_mod.App) !bool {
+    const doc = app.documents.active() orelse return false;
+    const server = app.lsp_manager.findServer(doc.language) orelse return false;
+    if (server.transport == null) return false;
+    const path = doc.path orelse return false;
+    _ = try syncDocumentToRunningLsp(app, doc);
+    const range = codeActionRangeForActiveDocument(app, doc);
+    const diagnostics = collectCodeActionDiagnostics(app, path, range);
+    server.session.clearCachedResultForRequest(.code_action);
+    var outbound = try server.session.requestCodeActions(path, range, diagnostics.items[0..diagnostics.len]);
+    defer outbound.deinit();
+    return try deliverLspOutboundWithOptions(app, server, "codeAction", &outbound, .{
+        .log_sent = false,
+        .emit_when_missing = false,
+    });
+}
+
 pub fn requestActiveRenameFromRunningLsp(app: *app_mod.App, new_name: []const u8) !bool {
     const doc = app.documents.active() orelse return false;
     const server = app.lsp_manager.findServer(doc.language) orelse return false;
@@ -1020,6 +1055,20 @@ fn requestCurrentRenameLsp(app: *app_mod.App, new_name: []const u8) !Result {
     return .{ .completed = if (sent) "LSP rename request sent" else "LSP rename request packet built" };
 }
 
+fn requestCurrentCodeActionsLsp(app: *app_mod.App) !Result {
+    const doc = app.documents.active() orelse return .no_active_document;
+    const path = doc.path orelse return .{ .blocked = "scratch documents cannot request LSP code actions yet" };
+    const server = try app.lsp_manager.ensureServer(doc.language);
+    const range = codeActionRangeForActiveDocument(app, doc);
+    const diagnostics = collectCodeActionDiagnostics(app, path, range);
+
+    server.session.clearCachedResultForRequest(.code_action);
+    var outbound = try server.session.requestCodeActions(path, range, diagnostics.items[0..diagnostics.len]);
+    defer outbound.deinit();
+    const sent = try deliverLspOutbound(app, server, "codeAction", &outbound);
+    return .{ .completed = if (sent) "LSP code action request sent" else "LSP code action request packet built" };
+}
+
 const WorkspaceEditApplySummary = struct {
     edits: usize = 0,
     applied: usize = 0,
@@ -1056,6 +1105,37 @@ fn applyLastLspWorkspaceEdit(app: *app_mod.App) !Result {
     }
     if (summary.ok()) return .{ .completed = "LSP workspace edit applied to editor buffers" };
     return .{ .blocked = "LSP workspace edit partially applied; review output" };
+}
+
+fn applyFirstLspCodeAction(app: *app_mod.App) !Result {
+    const session = app.activeLspSession() orelse return .{ .blocked = "no LSP session for active document" };
+    const actions = if (session.last_code_actions) |*cached| cached else return .{ .blocked = "no cached LSP code actions to apply" };
+
+    for (actions.items, 0..) |*action, index| {
+        if (action.workspace_edit) |*edit| {
+            const summary = try applyWorkspaceEdit(app, edit);
+            try appendConsole(
+                app,
+                if (summary.ok()) .stdout else .stderr,
+                "lsp code action apply: #{d} {s} edits={d} applied={d} files={d} blocked={d} failed={d} skipped_resource_ops={d}\n",
+                .{
+                    index + 1,
+                    action.title,
+                    summary.edits,
+                    summary.applied,
+                    summary.files,
+                    summary.blocked,
+                    summary.failed,
+                    summary.skipped_resource_ops,
+                },
+            );
+            if (summary.applied > 0) session.clearCachedResultForRequest(.code_action);
+            if (summary.ok()) return .{ .completed = "LSP code action applied to editor buffers" };
+            return .{ .blocked = "LSP code action partially applied; review output" };
+        }
+    }
+
+    return .{ .blocked = "cached LSP code actions did not include an editable WorkspaceEdit" };
 }
 
 fn applyWorkspaceEdit(app: *app_mod.App, edit: *const lsp_responses.WorkspaceEdit) !WorkspaceEditApplySummary {
@@ -1164,6 +1244,72 @@ fn applyWorkspaceTextEdit(app: *app_mod.App, edit: lsp_responses.TextEdit) !Work
         return .failed;
     };
     return .applied;
+}
+
+const max_code_action_diagnostics = 8;
+
+const CodeActionDiagnostics = struct {
+    items: [max_code_action_diagnostics]lsp_session.CodeActionDiagnostic = undefined,
+    len: usize = 0,
+
+    fn append(self: *CodeActionDiagnostics, item: lsp_session.CodeActionDiagnostic) void {
+        if (self.len >= self.items.len) return;
+        self.items[self.len] = item;
+        self.len += 1;
+    }
+};
+
+fn codeActionRangeForActiveDocument(app: *const app_mod.App, doc: *const document_mod.Document) types.Range {
+    const path = doc.path orelse return types.Range.empty(doc.cursor.position);
+    for (app.diagnostics.items.items) |item| {
+        if (!pathMatchesDiagnostic(path, item.path)) continue;
+        if (rangeTouchesLine(item.range, doc.cursor.position.line)) return item.range;
+    }
+    return types.Range.empty(doc.cursor.position);
+}
+
+fn collectCodeActionDiagnostics(app: *const app_mod.App, path: []const u8, range: types.Range) CodeActionDiagnostics {
+    var diagnostics: CodeActionDiagnostics = .{};
+    for (app.diagnostics.items.items) |item| {
+        if (!pathMatchesDiagnostic(path, item.path)) continue;
+        if (!rangesTouchLines(item.range, range)) continue;
+        diagnostics.append(.{
+            .range = lspRange(item.range),
+            .severity = lspSeverity(item.severity),
+            .source = @tagName(item.source),
+            .message = item.message,
+        });
+    }
+    return diagnostics;
+}
+
+fn lspRange(range: types.Range) @import("../lsp/protocol.zig").TextRange {
+    return .{
+        .start = .{ .line = range.start.line, .character = range.start.column },
+        .end = .{ .line = range.end.line, .character = range.end.column },
+    };
+}
+
+fn lspSeverity(severity: types.Severity) usize {
+    return switch (severity) {
+        .err => 1,
+        .warning => 2,
+        .info => 3,
+    };
+}
+
+fn rangeTouchesLine(range: types.Range, line: usize) bool {
+    const start = @min(range.start.line, range.end.line);
+    const end = @max(range.start.line, range.end.line);
+    return line >= start and line <= end;
+}
+
+fn rangesTouchLines(left: types.Range, right: types.Range) bool {
+    const left_start = @min(left.start.line, left.end.line);
+    const left_end = @max(left.start.line, left.end.line);
+    const right_start = @min(right.start.line, right.end.line);
+    const right_end = @max(right.start.line, right.end.line);
+    return left_end >= right_start and right_end >= left_start;
 }
 
 fn startLspTransport(app: *app_mod.App) !Result {
@@ -1306,6 +1452,7 @@ fn renderLspIngestResult(app: *app_mod.App, result: lsp_session.IngestResult) !v
         .hover => |bytes| try appendConsole(app, .stdout, "lsp ingest: hover bytes {d}\n", .{bytes}),
         .locations => |count| try appendConsole(app, .stdout, "lsp ingest: locations {d}\n", .{count}),
         .workspace_edit => |count| try appendConsole(app, .stdout, "lsp ingest: workspace edit {d}\n", .{count}),
+        .code_actions => |count| try appendConsole(app, .stdout, "lsp ingest: code actions {d}\n", .{count}),
         .acknowledged => |kind| try appendConsole(app, .stdout, "lsp ingest: acknowledged {s}\n", .{@tagName(kind)}),
     }
 }
@@ -3900,6 +4047,90 @@ test "workspace edit blocks files outside workspace" {
     try std.testing.expectEqual(@as(usize, 1), summary.blocked);
     try std.testing.expectEqual(@as(usize, 0), summary.failed);
     try std.testing.expectEqual(@as(usize, 0), app.documents.documents.items.len);
+}
+
+test "code action request includes active diagnostic context" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Options.debug_io, "src");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/main.zig", .data = "const unused = 1;\n" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "src/main.zig" });
+    defer std.testing.allocator.free(path);
+    _ = try app.documents.openFile(path);
+    try app.diagnostics.append(.{
+        .source = .lsp,
+        .severity = .warning,
+        .path = "src/main.zig",
+        .range = .{
+            .start = .{ .line = 0, .column = 6, .byte_offset = 6 },
+            .end = .{ .line = 0, .column = 12, .byte_offset = 12 },
+        },
+        .message = "unused local constant",
+    });
+
+    const result = try dispatch(&app, .{ .id = "lsp.request_code_action" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+
+    var saw_method = false;
+    var saw_diagnostic = false;
+    for (app.process_console.lines.items) |line| {
+        if (std.mem.indexOf(u8, line.text, "textDocument/codeAction") != null) saw_method = true;
+        if (std.mem.indexOf(u8, line.text, "unused local constant") != null) saw_diagnostic = true;
+    }
+    try std.testing.expect(saw_method);
+    try std.testing.expect(saw_diagnostic);
+}
+
+test "first editable code action applies through workspace edit safety" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Options.debug_io, "src");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/main.zig", .data = "const old = 1;\n" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "src/main.zig" });
+    defer std.testing.allocator.free(path);
+    _ = try app.documents.openFile(path);
+
+    const server = try app.lsp_manager.ensureServer(.zig);
+    const items = try std.testing.allocator.alloc(lsp_responses.CodeAction, 1);
+    errdefer std.testing.allocator.free(items);
+    items[0] = .{
+        .allocator = std.testing.allocator,
+        .title = try std.testing.allocator.dupe(u8, "Rename old to new"),
+        .kind = try std.testing.allocator.dupe(u8, "quickfix"),
+        .command_title = try std.testing.allocator.dupe(u8, ""),
+        .workspace_edit = try makeTestWorkspaceEdit(std.testing.allocator, &.{
+            .{ .path = "src/main.zig", .start_line = 0, .start_column = 6, .end_line = 0, .end_column = 9, .new_text = "new" },
+        }),
+    };
+    server.session.last_code_actions = .{
+        .allocator = std.testing.allocator,
+        .items = items,
+    };
+
+    const result = try dispatch(&app, .{ .id = "lsp.apply_first_code_action" });
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    const doc = app.documents.active() orelse return error.ExpectedDocument;
+    try std.testing.expect(doc.dirty);
+    try std.testing.expectEqualStrings("const new = 1;\n", doc.text.bytes);
+    try std.testing.expect(server.session.last_code_actions == null);
 }
 
 test "save blocks critical Zig security findings" {

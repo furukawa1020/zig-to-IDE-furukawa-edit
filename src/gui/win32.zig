@@ -4462,6 +4462,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .new_file => "NEW FILE",
         .document_symbols => "SYMBOLS",
         .completion => "COMPLETE  Enter inserts",
+        .language_mode => "LANGUAGE MODE",
     };
     drawText(hdc, panel.left + 16, panel.top + 14, rgb(79, 230, 226), title);
     if (isDocumentSearchMode(state.quick_panel.mode)) {
@@ -4543,6 +4544,13 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 drawTextClipped(hdc, panel.left + 18, y, panel.left + 250, color, item.label);
                 drawTextClipped(hdc, panel.left + 260, y, panel.left + 370, color, @tagName(item.kind));
                 drawTextClipped(hdc, panel.left + 380, y, panel.right - 16, color, item.detail);
+            },
+            .language_mode => {
+                const items = state.quick_panel.language_matches orelse break;
+                const mode = items[row];
+                drawTextClipped(hdc, panel.left + 18, y, panel.left + 180, color, modes.label(mode));
+                drawTextClipped(hdc, panel.left + 190, y, panel.left + 310, color, @tagName(modes.family(mode)));
+                drawTextClipped(hdc, panel.left + 320, y, panel.right - 16, color, modes.securityFocus(mode));
             },
         }
         y += ROW_HEIGHT;

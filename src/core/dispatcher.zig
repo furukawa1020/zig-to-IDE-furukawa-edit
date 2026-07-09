@@ -322,6 +322,10 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return try requestCurrentRenameLsp(app, new_name);
     }
 
+    if (std.mem.eql(u8, definition.id, "lsp.apply_workspace_edit")) {
+        return try applyLastLspWorkspaceEdit(app);
+    }
+
     if (std.mem.eql(u8, definition.id, "lsp.start")) {
         return try startLspTransport(app);
     }

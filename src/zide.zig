@@ -94,6 +94,7 @@ pub const lsp = struct {
     pub const registry = @import("lsp/registry.zig");
     pub const responses = @import("lsp/responses.zig");
     pub const session = @import("lsp/session.zig");
+    pub const transport = @import("lsp/transport.zig");
 };
 
 pub const diagnostics = struct {

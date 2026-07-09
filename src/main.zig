@@ -69,6 +69,7 @@ test {
     _ = @import("lsp/registry.zig");
     _ = @import("lsp/responses.zig");
     _ = @import("lsp/session.zig");
+    _ = @import("lsp/transport.zig");
     _ = @import("observability/log.zig");
     _ = @import("persistence/journal.zig");
     _ = @import("persistence/paths.zig");

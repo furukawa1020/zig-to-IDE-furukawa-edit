@@ -87,6 +87,7 @@ pub const language = struct {
 };
 
 pub const lsp = struct {
+    pub const diagnostics = @import("lsp/diagnostics.zig");
     pub const framing = @import("lsp/framing.zig");
     pub const launch_plan = @import("lsp/launch_plan.zig");
     pub const protocol = @import("lsp/protocol.zig");

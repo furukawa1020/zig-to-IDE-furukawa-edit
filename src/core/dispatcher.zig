@@ -3005,6 +3005,19 @@ fn pathStartsWithIgnoreCaseAndSlash(value: []const u8, prefix: []const u8) bool 
     return pathEqualIgnoreCaseAndSlash(value[0..prefix.len], prefix);
 }
 
+fn pathOrderIgnoreCaseAndSlash(a: []const u8, b: []const u8) std.math.Order {
+    const min_len = @min(a.len, b.len);
+    for (a[0..min_len], b[0..min_len]) |left, right| {
+        const normalized_left = normalizePathByte(left);
+        const normalized_right = normalizePathByte(right);
+        if (normalized_left < normalized_right) return .lt;
+        if (normalized_left > normalized_right) return .gt;
+    }
+    if (a.len < b.len) return .lt;
+    if (a.len > b.len) return .gt;
+    return .eq;
+}
+
 fn normalizePathByte(byte: u8) u8 {
     return if (byte == '\\') '/' else std.ascii.toLower(byte);
 }

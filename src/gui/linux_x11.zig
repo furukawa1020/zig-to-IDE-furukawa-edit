@@ -498,6 +498,7 @@ const PendingLspAction = enum {
     none,
     goto_definition,
     find_references,
+    hover,
     rename_preview,
     code_actions,
 };
@@ -630,6 +631,7 @@ const QuickPanelMode = enum {
     lsp_locations,
     problems,
     completion,
+    lsp_hover,
     code_actions,
     language_mode,
 };
@@ -708,6 +710,7 @@ const QuickPanel = struct {
     completion_matches: ?[]completion_mod.Item = null,
     language_matches: ?[]modes.LanguageMode = null,
     lsp_location_count: usize = 0,
+    lsp_hover_line_count: usize = 0,
     code_action_count: usize = 0,
     completion_replace_start: usize = 0,
     completion_replace_end: usize = 0,
@@ -785,6 +788,7 @@ const QuickPanel = struct {
             .lsp_locations => self.lsp_location_count,
             .problems => if (self.problem_matches) |items| items.len else 0,
             .completion => if (self.completion_matches) |items| items.len else 0,
+            .lsp_hover => self.lsp_hover_line_count,
             .code_actions => self.code_action_count,
             .language_mode => if (self.language_matches) |items| items.len else 0,
         };
@@ -967,6 +971,12 @@ const QuickPanel = struct {
                     }
                 }
             },
+            .lsp_hover => {
+                self.lsp_hover_line_count = if (app.activeLspSessionConst()) |session|
+                    if (session.last_hover) |hover| hoverDisplayLineCount(hover.text) else 0
+                else
+                    0;
+            },
             .code_actions => {
                 self.code_action_count = if (app.activeLspSessionConst()) |session|
                     if (session.last_code_actions) |actions| actions.items.len else 0
@@ -1036,6 +1046,7 @@ const QuickPanel = struct {
             self.completion_matches = null;
         }
         self.lsp_location_count = 0;
+        self.lsp_hover_line_count = 0;
         self.code_action_count = 0;
         if (self.language_matches) |items| {
             self.allocator.free(items);
@@ -1246,6 +1257,17 @@ const LinuxGuiState = struct {
         return true;
     }
 
+    fn requestHoverFromLsp(self: *LinuxGuiState) bool {
+        const sent = dispatcher.requestActiveHoverFromRunningLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp hover request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.pending_lsp_action = .hover;
+        self.message("LSP hover requested", .{});
+        return true;
+    }
+
     fn requestCodeActionsFromLsp(self: *LinuxGuiState) bool {
         const sent = dispatcher.requestActiveCodeActionsFromRunningLsp(&self.app) catch |err| {
             self.appendOutput(.stderr, "lsp code action request failed: {s}\n", .{@errorName(err)});
@@ -1295,6 +1317,14 @@ const LinuxGuiState = struct {
                     }
                 }
             },
+            .hover => {
+                if (self.app.activeLspSessionConst()) |session| {
+                    if (session.last_hover) |hover| {
+                        self.pending_lsp_action = .none;
+                        self.showLspHover("LSP hover", &hover);
+                    }
+                }
+            },
             .rename_preview => {
                 if (self.app.activeLspSessionConst()) |session| {
                     if (session.last_workspace_edit) |edit| {
@@ -1329,6 +1359,15 @@ const LinuxGuiState = struct {
             self.quick_panel.visible = true;
             self.message("select an LSP location and press Enter", .{});
         }
+    }
+
+    fn showLspHover(self: *LinuxGuiState, label: []const u8, hover: *const lsp_responses.Hover) void {
+        self.bottom_panel = .output;
+        self.appendOutput(.stdout, "{s}: {d} bytes\n{s}\n", .{ label, hover.text.len, hover.text });
+        if (hover.text.len == 0) return self.message("empty LSP hover", .{});
+        self.openQuickPanel(.lsp_hover);
+        self.quick_panel.visible = true;
+        self.message("LSP hover", .{});
     }
 
     fn showLspWorkspaceEdit(self: *LinuxGuiState, label: []const u8, edit: *const lsp_responses.WorkspaceEdit) void {
@@ -2984,6 +3023,9 @@ const LinuxGuiState = struct {
         if (std.mem.eql(u8, id, "lsp.request_code_action")) {
             if (self.requestCodeActionsFromLsp()) return;
         }
+        if (std.mem.eql(u8, id, "lsp.request_hover")) {
+            if (self.requestHoverFromLsp()) return;
+        }
         if (std.mem.eql(u8, id, "preferences.open_settings")) {
             self.bottom_panel = .settings;
             self.saveWorkbenchSettings();
@@ -3589,6 +3631,11 @@ const LinuxGuiState = struct {
                 self.app.mode = .insert;
                 self.app.focus = .editor;
                 self.message("completed: {s}", .{insert_text});
+            },
+            .lsp_hover => {
+                self.quick_panel.close();
+                self.app.focus = .editor;
+                self.message("closed LSP hover", .{});
             },
             .code_actions => {
                 const count = self.quick_panel.itemCount();
@@ -6322,6 +6369,11 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
                 items[row].detail,
             }) catch items[row].label;
         },
+        .lsp_hover => blk: {
+            const session = state.app.activeLspSessionConst() orelse break :blk "";
+            const hover = session.last_hover orelse break :blk "";
+            break :blk hoverLineAt(hover.text, row) orelse "";
+        },
         .code_actions => blk: {
             const session = state.app.activeLspSessionConst() orelse break :blk "";
             const actions = session.last_code_actions orelse break :blk "";
@@ -7333,6 +7385,32 @@ fn isDocumentSearchMode(mode: QuickPanelMode) bool {
     return mode == .find_document or mode == .replace_document;
 }
 
+fn hoverDisplayLineCount(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    var count: usize = 1;
+    for (text) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    return count;
+}
+
+fn hoverLineAt(text: []const u8, target: usize) ?[]const u8 {
+    var line: usize = 0;
+    var start: usize = 0;
+    var index: usize = 0;
+    while (index <= text.len) : (index += 1) {
+        if (index < text.len and text[index] != '\n') continue;
+        if (line == target) {
+            var end = index;
+            if (end > start and text[end - 1] == '\r') end -= 1;
+            return text[start..end];
+        }
+        line += 1;
+        start = index + 1;
+    }
+    return null;
+}
+
 fn findNextMatchIndex(matches: []const literal_search.Match, pivot: usize) usize {
     for (matches, 0..) |match, index| {
         if (match.start >= pivot) return index;
@@ -7444,6 +7522,7 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .lsp_locations => "LSP LOCATIONS  Enter opens",
         .problems => "PROBLEMS  diagnostics + security",
         .completion => "COMPLETE  Enter inserts",
+        .lsp_hover => "HOVER  Enter closes",
         .code_actions => "QUICK FIX  Enter applies",
         .language_mode => "LANGUAGE MODE",
     };

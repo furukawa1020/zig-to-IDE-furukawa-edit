@@ -5231,6 +5231,32 @@ fn isDocumentSearchMode(mode: QuickPanelMode) bool {
     return mode == .find_document or mode == .replace_document;
 }
 
+fn hoverDisplayLineCount(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    var count: usize = 1;
+    for (text) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    return count;
+}
+
+fn hoverLineAt(text: []const u8, target: usize) ?[]const u8 {
+    var line: usize = 0;
+    var start: usize = 0;
+    var index: usize = 0;
+    while (index <= text.len) : (index += 1) {
+        if (index < text.len and text[index] != '\n') continue;
+        if (line == target) {
+            var end = index;
+            if (end > start and text[end - 1] == '\r') end -= 1;
+            return text[start..end];
+        }
+        line += 1;
+        start = index + 1;
+    }
+    return null;
+}
+
 fn findNextMatchIndex(matches: []const literal_search.Match, pivot: usize) usize {
     for (matches, 0..) |match, index| {
         if (match.start >= pivot) return index;

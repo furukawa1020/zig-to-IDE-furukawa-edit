@@ -322,6 +322,10 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return try requestCurrentRenameLsp(app, new_name);
     }
 
+    if (std.mem.eql(u8, definition.id, "editor.format_document") or std.mem.eql(u8, definition.id, "lsp.request_formatting")) {
+        return try requestCurrentFormattingLsp(app);
+    }
+
     if (std.mem.eql(u8, definition.id, "lsp.request_code_action")) {
         return try requestCurrentCodeActionsLsp(app);
     }
@@ -986,6 +990,21 @@ pub fn requestActiveHoverFromRunningLsp(app: *app_mod.App) !bool {
     return try requestActivePositionFromRunningLsp(app, .hover, "hover");
 }
 
+pub fn requestActiveFormattingFromRunningLsp(app: *app_mod.App) !bool {
+    const doc = app.documents.active() orelse return false;
+    const server = app.lsp_manager.findServer(doc.language) orelse return false;
+    if (server.transport == null) return false;
+    const path = doc.path orelse return false;
+    _ = try syncDocumentToRunningLsp(app, doc);
+    server.session.clearCachedResultForRequest(.formatting);
+    var outbound = try server.session.requestFormatting(path, 4, true);
+    defer outbound.deinit();
+    return try deliverLspOutboundWithOptions(app, server, "formatting", &outbound, .{
+        .log_sent = false,
+        .emit_when_missing = false,
+    });
+}
+
 pub fn requestActiveDefinitionFromRunningLsp(app: *app_mod.App) !bool {
     return try requestActivePositionFromRunningLsp(app, .definition, "definition");
 }
@@ -1063,6 +1082,18 @@ fn requestCurrentRenameLsp(app: *app_mod.App, new_name: []const u8) !Result {
     defer outbound.deinit();
     const sent = try deliverLspOutbound(app, server, "rename", &outbound);
     return .{ .completed = if (sent) "LSP rename request sent" else "LSP rename request packet built" };
+}
+
+fn requestCurrentFormattingLsp(app: *app_mod.App) !Result {
+    const doc = app.documents.active() orelse return .no_active_document;
+    const path = doc.path orelse return .{ .blocked = "scratch documents cannot request LSP formatting yet" };
+    const server = try app.lsp_manager.ensureServer(doc.language);
+
+    server.session.clearCachedResultForRequest(.formatting);
+    var outbound = try server.session.requestFormatting(path, 4, true);
+    defer outbound.deinit();
+    const sent = try deliverLspOutbound(app, server, "formatting", &outbound);
+    return .{ .completed = if (sent) "LSP formatting request sent" else "LSP formatting request packet built" };
 }
 
 fn requestCurrentCodeActionsLsp(app: *app_mod.App) !Result {

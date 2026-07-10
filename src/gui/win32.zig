@@ -60,6 +60,7 @@ const PendingLspAction = enum {
     find_references,
     hover,
     rename_preview,
+    formatting_preview,
     code_actions,
 };
 
@@ -957,6 +958,9 @@ const GuiState = struct {
         }
         if (std.mem.eql(u8, id, "lsp.request_hover")) {
             if (self.requestHoverFromLsp()) return;
+        }
+        if (std.mem.eql(u8, id, "editor.format_document") or std.mem.eql(u8, id, "lsp.request_formatting")) {
+            if (self.requestFormattingFromLsp()) return;
         }
         if (std.mem.eql(u8, id, "workspace.find_file")) {
             self.openQuickPanel(.find_file);
@@ -2342,6 +2346,17 @@ const GuiState = struct {
         return true;
     }
 
+    fn requestFormattingFromLsp(self: *GuiState) bool {
+        const sent = dispatcher.requestActiveFormattingFromRunningLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp formatting request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.pending_lsp_action = .formatting_preview;
+        self.setMessage("LSP formatting requested") catch {};
+        return true;
+    }
+
     fn requestReferencesFromLsp(self: *GuiState) bool {
         const sent = dispatcher.requestActiveReferencesFromRunningLsp(&self.app) catch |err| {
             self.appendOutput(.stderr, "lsp references request failed: {s}\n", .{@errorName(err)});
@@ -2424,6 +2439,14 @@ const GuiState = struct {
                     }
                 }
             },
+            .formatting_preview => {
+                if (self.app.activeLspSessionConst()) |session| {
+                    if (session.last_workspace_edit) |edit| {
+                        self.pending_lsp_action = .none;
+                        self.showLspWorkspaceEdit("LSP formatting preview", &edit);
+                    }
+                }
+            },
             .code_actions => {
                 if (self.app.activeLspSessionConst()) |session| {
                     if (session.last_code_actions) |actions| {
@@ -2483,7 +2506,7 @@ const GuiState = struct {
         }
         if (edit.edits.len > 80) self.appendOutput(.stdout, "... {d} more LSP edit(s)\n", .{edit.edits.len - 80});
         self.appendOutput(.stdout, "run lsp.apply_workspace_edit to apply these edits to dirty editor buffers; save afterwards to write files\n", .{});
-        self.setMessage("Showing LSP rename preview") catch {};
+        self.setMessage(label) catch {};
     }
 
     fn showLspCodeActions(self: *GuiState, label: []const u8, actions: *const lsp_responses.CodeActions) void {

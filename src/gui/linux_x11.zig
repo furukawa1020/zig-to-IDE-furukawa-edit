@@ -500,6 +500,7 @@ const PendingLspAction = enum {
     find_references,
     hover,
     rename_preview,
+    formatting_preview,
     code_actions,
 };
 
@@ -1268,6 +1269,17 @@ const LinuxGuiState = struct {
         return true;
     }
 
+    fn requestFormattingFromLsp(self: *LinuxGuiState) bool {
+        const sent = dispatcher.requestActiveFormattingFromRunningLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp formatting request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.pending_lsp_action = .formatting_preview;
+        self.message("LSP formatting requested", .{});
+        return true;
+    }
+
     fn requestCodeActionsFromLsp(self: *LinuxGuiState) bool {
         const sent = dispatcher.requestActiveCodeActionsFromRunningLsp(&self.app) catch |err| {
             self.appendOutput(.stderr, "lsp code action request failed: {s}\n", .{@errorName(err)});
@@ -1333,6 +1345,14 @@ const LinuxGuiState = struct {
                     }
                 }
             },
+            .formatting_preview => {
+                if (self.app.activeLspSessionConst()) |session| {
+                    if (session.last_workspace_edit) |edit| {
+                        self.pending_lsp_action = .none;
+                        self.showLspWorkspaceEdit("LSP formatting preview", &edit);
+                    }
+                }
+            },
             .code_actions => {
                 if (self.app.activeLspSessionConst()) |session| {
                     if (session.last_code_actions) |actions| {
@@ -1386,7 +1406,7 @@ const LinuxGuiState = struct {
         }
         if (edit.edits.len > 80) self.appendOutput(.stdout, "... {d} more LSP edit(s)\n", .{edit.edits.len - 80});
         self.appendOutput(.stdout, "run lsp.apply_workspace_edit to apply these edits to dirty editor buffers; save afterwards to write files\n", .{});
-        self.message("showing LSP rename preview", .{});
+        self.message("{s}", .{label});
     }
 
     fn showLspCodeActions(self: *LinuxGuiState, label: []const u8, actions: *const lsp_responses.CodeActions) void {
@@ -3025,6 +3045,9 @@ const LinuxGuiState = struct {
         }
         if (std.mem.eql(u8, id, "lsp.request_hover")) {
             if (self.requestHoverFromLsp()) return;
+        }
+        if (std.mem.eql(u8, id, "editor.format_document") or std.mem.eql(u8, id, "lsp.request_formatting")) {
+            if (self.requestFormattingFromLsp()) return;
         }
         if (std.mem.eql(u8, id, "preferences.open_settings")) {
             self.bottom_panel = .settings;

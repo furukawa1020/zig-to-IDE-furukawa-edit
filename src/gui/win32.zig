@@ -39,6 +39,7 @@ const QuickPanelMode = enum {
     lsp_locations,
     problems,
     completion,
+    lsp_hover,
     code_actions,
     language_mode,
 };
@@ -57,6 +58,7 @@ const PendingLspAction = enum {
     none,
     goto_definition,
     find_references,
+    hover,
     rename_preview,
     code_actions,
 };
@@ -172,6 +174,7 @@ const QuickPanel = struct {
     completion_matches: ?[]completion_mod.Item = null,
     language_matches: ?[]modes.LanguageMode = null,
     lsp_location_count: usize = 0,
+    lsp_hover_line_count: usize = 0,
     code_action_count: usize = 0,
     completion_replace_start: usize = 0,
     completion_replace_end: usize = 0,
@@ -247,6 +250,7 @@ const QuickPanel = struct {
             .lsp_locations => self.lsp_location_count,
             .problems => if (self.problem_matches) |items| items.len else 0,
             .completion => if (self.completion_matches) |items| items.len else 0,
+            .lsp_hover => self.lsp_hover_line_count,
             .code_actions => self.code_action_count,
             .language_mode => if (self.language_matches) |items| items.len else 0,
         };
@@ -428,6 +432,12 @@ const QuickPanel = struct {
                     }
                 }
             },
+            .lsp_hover => {
+                self.lsp_hover_line_count = if (app.activeLspSessionConst()) |session|
+                    if (session.last_hover) |hover| hoverDisplayLineCount(hover.text) else 0
+                else
+                    0;
+            },
             .code_actions => {
                 self.code_action_count = if (app.activeLspSessionConst()) |session|
                     if (session.last_code_actions) |actions| actions.items.len else 0
@@ -497,6 +507,7 @@ const QuickPanel = struct {
             self.completion_matches = null;
         }
         self.lsp_location_count = 0;
+        self.lsp_hover_line_count = 0;
         self.code_action_count = 0;
         if (self.language_matches) |items| {
             self.allocator.free(items);

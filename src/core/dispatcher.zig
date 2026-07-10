@@ -982,6 +982,10 @@ pub fn requestActiveCompletionFromRunningLsp(app: *app_mod.App) !bool {
     return try requestActivePositionFromRunningLsp(app, .completion, "completion");
 }
 
+pub fn requestActiveHoverFromRunningLsp(app: *app_mod.App) !bool {
+    return try requestActivePositionFromRunningLsp(app, .hover, "hover");
+}
+
 pub fn requestActiveDefinitionFromRunningLsp(app: *app_mod.App) !bool {
     return try requestActivePositionFromRunningLsp(app, .definition, "definition");
 }

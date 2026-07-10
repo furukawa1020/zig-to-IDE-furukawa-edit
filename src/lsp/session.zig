@@ -26,6 +26,7 @@ pub const RequestKind = enum {
     signature_help,
     rename,
     code_action,
+    formatting,
     document_symbol,
     workspace_symbol,
 };
@@ -33,6 +34,12 @@ pub const RequestKind = enum {
 pub const Pending = struct {
     id: i64,
     kind: RequestKind,
+    path: ?[]u8 = null,
+
+    fn deinit(self: *Pending, allocator: std.mem.Allocator) void {
+        if (self.path) |path| allocator.free(path);
+        self.* = undefined;
+    }
 };
 
 pub const Outbound = struct {
@@ -88,6 +95,7 @@ pub const Session = struct {
         self.clearLastResults();
         for (self.opened_documents.items) |item| self.allocator.free(item.path);
         self.opened_documents.deinit();
+        for (self.pending.items) |*pending| pending.deinit(self.allocator);
         self.pending.deinit();
         self.allocator.free(self.workspace_root);
         self.* = undefined;
@@ -102,7 +110,10 @@ pub const Session = struct {
     }
 
     pub fn cancelPending(self: *Session, id: i64) void {
-        _ = self.takePending(id);
+        if (self.takePending(id)) |pending_value| {
+            var pending = pending_value;
+            pending.deinit(self.allocator);
+        }
     }
 
     pub fn clearCachedResultForRequest(self: *Session, kind: RequestKind) void {
@@ -110,7 +121,7 @@ pub const Session = struct {
             .completion => self.clearLastCompletion(),
             .hover => self.clearLastHover(),
             .definition, .references, .implementation, .type_definition => self.clearLastLocations(),
-            .rename => self.clearLastWorkspaceEdit(),
+            .rename, .formatting => self.clearLastWorkspaceEdit(),
             .code_action => self.clearLastCodeActions(),
             else => {},
         }
@@ -210,6 +221,14 @@ pub const Session = struct {
         return try self.wrapRequest(payload, id, .code_action);
     }
 
+    pub fn requestFormatting(self: *Session, path: []const u8, tab_size: usize, insert_spaces: bool) !Outbound {
+        const id = self.nextId();
+        const uri = try self.uriForPath(path);
+        defer self.allocator.free(uri);
+        const payload = try protocol.makeFormattingRequest(self.allocator, .{ .number = id }, uri, tab_size, insert_spaces);
+        return try self.wrapRequestWithPath(payload, id, .formatting, path);
+    }
+
     pub fn requestDocumentSymbols(self: *Session, path: []const u8) !Outbound {
         const id = self.nextId();
         const uri = try self.uriForPath(path);
@@ -233,7 +252,8 @@ pub const Session = struct {
         }
 
         const id = try responseId(self.allocator, payload) orelse return .ignored;
-        const pending = self.takePending(id) orelse return .ignored;
+        var pending = self.takePending(id) orelse return .ignored;
+        defer pending.deinit(self.allocator);
         switch (pending.kind) {
             .initialize => {
                 self.state = .initialized;
@@ -275,6 +295,15 @@ pub const Session = struct {
                 }
                 return .ignored;
             },
+            .formatting => {
+                const path = pending.path orelse return .ignored;
+                if (try responses.parseFormattingResponse(self.allocator, payload, path)) |edit| {
+                    self.clearLastWorkspaceEdit();
+                    self.last_workspace_edit = edit;
+                    return .{ .workspace_edit = edit.edits.len };
+                }
+                return .ignored;
+            },
             .code_action => {
                 if (try responses.parseCodeActionResponse(self.allocator, payload, self.workspace_root)) |actions| {
                     self.clearLastCodeActions();
@@ -296,10 +325,16 @@ pub const Session = struct {
     }
 
     fn wrapRequest(self: *Session, payload: []u8, id: i64, kind: RequestKind) !Outbound {
+        return try self.wrapRequestWithPath(payload, id, kind, null);
+    }
+
+    fn wrapRequestWithPath(self: *Session, payload: []u8, id: i64, kind: RequestKind, path: ?[]const u8) !Outbound {
         errdefer self.allocator.free(payload);
         const framed = try protocol.makeFramed(self.allocator, payload);
         errdefer self.allocator.free(framed);
-        try self.pending.append(.{ .id = id, .kind = kind });
+        const pending_path = if (path) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (pending_path) |value| self.allocator.free(value);
+        try self.pending.append(.{ .id = id, .kind = kind, .path = pending_path });
         return .{
             .allocator = self.allocator,
             .id = id,
@@ -523,6 +558,26 @@ test "session routes rename workspace edit by pending id" {
     try std.testing.expect(session.last_workspace_edit != null);
     try std.testing.expectEqualStrings("src/main.zig", session.last_workspace_edit.?.edits[0].path);
     try std.testing.expectEqualStrings("renamed", session.last_workspace_edit.?.edits[0].new_text);
+}
+
+test "session routes formatting edits by pending id" {
+    var session = try Session.init(std.testing.allocator, "/tmp/project");
+    defer session.deinit();
+
+    var outbound = try session.requestFormatting("src/main.zig", 4, true);
+    defer outbound.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "textDocument/formatting") != null);
+
+    var collection = diagnostics_collection.Collection.init(std.testing.allocator);
+    defer collection.deinit();
+    const payload =
+        \\{"jsonrpc":"2.0","id":1,"result":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}},"newText":"const x = 1;"}]}
+    ;
+    const result = try session.ingestPayload(payload, &collection);
+    try std.testing.expectEqual(IngestResult{ .workspace_edit = 1 }, result);
+    try std.testing.expect(session.last_workspace_edit != null);
+    try std.testing.expectEqualStrings("src/main.zig", session.last_workspace_edit.?.edits[0].path);
+    try std.testing.expectEqualStrings("const x = 1;", session.last_workspace_edit.?.edits[0].new_text);
 }
 
 test "session routes code actions by pending id" {

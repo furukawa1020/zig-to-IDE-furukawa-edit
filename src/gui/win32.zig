@@ -36,6 +36,7 @@ const QuickPanelMode = enum {
     new_file,
     document_symbols,
     workspace_symbols,
+    lsp_locations,
     problems,
     completion,
     code_actions,
@@ -170,6 +171,7 @@ const QuickPanel = struct {
     problem_matches: ?[]problems_search.Result = null,
     completion_matches: ?[]completion_mod.Item = null,
     language_matches: ?[]modes.LanguageMode = null,
+    lsp_location_count: usize = 0,
     code_action_count: usize = 0,
     completion_replace_start: usize = 0,
     completion_replace_end: usize = 0,
@@ -242,6 +244,7 @@ const QuickPanel = struct {
             .new_file => if (self.query.items.len > 0) 1 else 0,
             .document_symbols => if (self.symbol_matches) |items| items.len else 0,
             .workspace_symbols => if (self.workspace_symbol_matches) |items| items.len else 0,
+            .lsp_locations => self.lsp_location_count,
             .problems => if (self.problem_matches) |items| items.len else 0,
             .completion => if (self.completion_matches) |items| items.len else 0,
             .code_actions => self.code_action_count,
@@ -393,6 +396,12 @@ const QuickPanel = struct {
                     .max_results = 512,
                 });
             },
+            .lsp_locations => {
+                self.lsp_location_count = if (app.activeLspSessionConst()) |session|
+                    if (session.last_locations) |locations| locations.items.len else 0
+                else
+                    0;
+            },
             .problems => {
                 self.problem_matches = try problems_search.collect(self.allocator, &app.diagnostics, &app.security_findings, self.query.items, .{
                     .max_results = 512,
@@ -487,6 +496,7 @@ const QuickPanel = struct {
             completion_mod.deinitItems(self.allocator, items);
             self.completion_matches = null;
         }
+        self.lsp_location_count = 0;
         self.code_action_count = 0;
         if (self.language_matches) |items| {
             self.allocator.free(items);
@@ -1286,6 +1296,7 @@ const GuiState = struct {
             .new_file => "New file",
             .document_symbols => "Document symbols",
             .workspace_symbols => "Workspace symbols",
+            .lsp_locations => "LSP locations",
             .problems => "Problems",
             .rename_symbol => "Rename symbol",
             .completion => "Complete symbol",
@@ -1548,6 +1559,32 @@ const GuiState = struct {
                 const offset = item.byte_offset;
                 self.quick_panel.close();
                 self.openRelativeFile(path, offset);
+            },
+            .lsp_locations => {
+                const session = self.app.activeLspSessionConst() orelse {
+                    self.setMessage("No LSP session") catch {};
+                    return;
+                };
+                const locations = session.last_locations orelse {
+                    self.setMessage("No LSP locations") catch {};
+                    return;
+                };
+                if (locations.items.len == 0) {
+                    self.setMessage("No LSP locations") catch {};
+                    return;
+                }
+                const selected = @min(self.quick_panel.selected_index, locations.items.len - 1);
+                const location = locations.items[selected];
+                const path = self.allocator.dupe(u8, location.path) catch |err| {
+                    self.setError(err) catch {};
+                    return;
+                };
+                defer self.allocator.free(path);
+                const line = location.range.start.line;
+                const column = location.range.start.column;
+                self.quick_panel.close();
+                self.openRelativeLocation(path, line, column);
+                self.setMessage("Opened LSP location") catch {};
             },
             .problems => {
                 const item = self.quick_panel.selectedProblem() orelse {
@@ -2318,6 +2355,10 @@ const GuiState = struct {
                             self.setMessage("No LSP definition") catch {};
                             return;
                         }
+                        if (locations.items.len > 1) {
+                            self.showLspLocations("LSP definitions");
+                            return;
+                        }
                         const location = locations.items[0];
                         self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
                         self.setMessage("Opened LSP definition") catch {};
@@ -2366,6 +2407,11 @@ const GuiState = struct {
         }
         if (locations.items.len > 80) self.appendOutput(.stdout, "... {d} more LSP location(s)\n", .{locations.items.len - 80});
         self.setMessage("Showing LSP locations") catch {};
+        if (locations.items.len > 0) {
+            self.openQuickPanel(.lsp_locations);
+            self.quick_panel.visible = true;
+            self.setMessage("Select an LSP location and press Enter") catch {};
+        }
     }
 
     fn showLspWorkspaceEdit(self: *GuiState, label: []const u8, edit: *const lsp_responses.WorkspaceEdit) void {
@@ -4869,6 +4915,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .new_file => "NEW FILE",
         .document_symbols => "SYMBOLS",
         .workspace_symbols => "WORKSPACE SYMBOLS",
+        .lsp_locations => "LSP LOCATIONS  Enter opens",
         .problems => "PROBLEMS  diagnostics + security",
         .completion => "COMPLETE  Enter inserts",
         .code_actions => "QUICK FIX  Enter applies",
@@ -4957,6 +5004,20 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 drawTextClipped(hdc, panel.left + 230, y, panel.left + 350, color, @tagName(item.kind));
                 drawTextClipped(hdc, panel.left + 360, y, panel.left + 450, color, modes.label(item.language));
                 drawTextClipped(hdc, panel.left + 460, y, panel.right - 16, color, location);
+            },
+            .lsp_locations => {
+                const session = state.app.activeLspSessionConst() orelse break;
+                const locations = session.last_locations orelse break;
+                if (row >= locations.items.len) break;
+                const item = locations.items[row];
+                var meta_buf: [96]u8 = undefined;
+                const meta = std.fmt.bufPrint(&meta_buf, "{d}. {d}:{d}", .{
+                    row + 1,
+                    item.range.start.line + 1,
+                    item.range.start.column + 1,
+                }) catch "";
+                drawTextClipped(hdc, panel.left + 18, y, panel.left + 120, color, meta);
+                drawTextClipped(hdc, panel.left + 130, y, panel.right - 16, color, item.path);
             },
             .problems => {
                 const items = state.quick_panel.problem_matches orelse break;

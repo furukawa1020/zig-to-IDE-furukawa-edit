@@ -193,6 +193,33 @@ pub fn parseWorkspaceEditResponse(allocator: std.mem.Allocator, payload: []const
     return try parseWorkspaceEditObject(allocator, object, workspace_root);
 }
 
+pub fn parseFormattingResponse(allocator: std.mem.Allocator, payload: []const u8, path: []const u8) !?WorkspaceEdit {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const result = resultValue(parsed.value) orelse return null;
+    if (result == .null) return null;
+    const edit_array = switch (result) {
+        .array => |array| array,
+        else => return error.InvalidFormattingResult,
+    };
+
+    var edits = std.array_list.Managed(TextEdit).init(allocator);
+    errdefer {
+        for (edits.items) |edit| {
+            allocator.free(edit.path);
+            allocator.free(edit.new_text);
+        }
+        edits.deinit();
+    }
+
+    try appendTextEditsForPath(allocator, &edits, path, edit_array);
+    return .{
+        .allocator = allocator,
+        .edits = try edits.toOwnedSlice(),
+    };
+}
+
 pub fn parseCodeActionResponse(allocator: std.mem.Allocator, payload: []const u8, workspace_root: ?[]const u8) !?CodeActions {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
     defer parsed.deinit();
@@ -393,6 +420,26 @@ fn appendTextEditsForUri(allocator: std.mem.Allocator, edits: *std.array_list.Ma
     }
 }
 
+fn appendTextEditsForPath(allocator: std.mem.Allocator, edits: *std.array_list.Managed(TextEdit), path: []const u8, edit_array: std.json.Array) !void {
+    for (edit_array.items) |edit_value| {
+        const edit_object = switch (edit_value) {
+            .object => |object| object,
+            else => continue,
+        };
+        const range_value = edit_object.get("range") orelse return error.MissingWorkspaceEditRange;
+        const new_text = stringField(edit_object, "newText") orelse return error.MissingWorkspaceEditNewText;
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        const owned_text = try allocator.dupe(u8, new_text);
+        errdefer allocator.free(owned_text);
+        try edits.append(.{
+            .path = owned_path,
+            .range = try parseRange(range_value),
+            .new_text = owned_text,
+        });
+    }
+}
+
 fn parseLocation(allocator: std.mem.Allocator, value: std.json.Value, workspace_root: ?[]const u8) !?Location {
     const object = switch (value) {
         .object => |object| object,
@@ -538,6 +585,20 @@ test "parse workspace edit response document changes" {
     try std.testing.expectEqual(@as(usize, 1), edit.skipped_resource_ops);
     try std.testing.expectEqualStrings("src/main.zig", edit.edits[0].path);
     try std.testing.expectEqualStrings("pub", edit.edits[0].new_text);
+}
+
+test "parse formatting response into workspace edit" {
+    const payload =
+        \\{"jsonrpc":"2.0","id":11,"result":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}},"newText":"const x = 1;"}]}
+    ;
+    var edit = (try parseFormattingResponse(std.testing.allocator, payload, "src/main.zig")).?;
+    defer edit.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), edit.edits.len);
+    try std.testing.expectEqualStrings("src/main.zig", edit.edits[0].path);
+    try std.testing.expectEqual(@as(usize, 0), edit.edits[0].range.start.line);
+    try std.testing.expectEqual(@as(usize, 8), edit.edits[0].range.end.column);
+    try std.testing.expectEqualStrings("const x = 1;", edit.edits[0].new_text);
 }
 
 test "parse code action response with workspace edit and command action" {

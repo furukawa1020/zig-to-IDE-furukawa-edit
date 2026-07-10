@@ -236,6 +236,35 @@ pub fn makeDocumentRequest(allocator: std.mem.Allocator, id: RequestId, method: 
     return try out.toOwnedSlice();
 }
 
+pub fn makeFormattingRequest(
+    allocator: std.mem.Allocator,
+    id: RequestId,
+    uri: []const u8,
+    tab_size: usize,
+    insert_spaces: bool,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, id, "textDocument/formatting");
+        try json.objectField("params");
+        try json.beginObject();
+        try json.objectField("textDocument");
+        try writeTextDocumentIdentifier(&json, uri);
+        try json.objectField("options");
+        try json.beginObject();
+        try json.objectField("tabSize");
+        try json.write(tab_size);
+        try json.objectField("insertSpaces");
+        try json.write(insert_spaces);
+        try json.endObject();
+        try json.endObject();
+        try json.endObject();
+    }
+    return try out.toOwnedSlice();
+}
+
 pub fn makeWorkspaceRequest(allocator: std.mem.Allocator, id: RequestId, method: WorkspaceRequestMethod, query: []const u8) ![]u8 {
     const method_name = switch (method) {
         .workspace_symbol => "workspace/symbol",
@@ -483,6 +512,11 @@ fn writeClientCapabilities(json: *std.json.Stringify) !void {
     try json.objectField("hierarchicalDocumentSymbolSupport");
     try json.write(false);
     try json.endObject();
+    try json.objectField("formatting");
+    try json.beginObject();
+    try json.objectField("dynamicRegistration");
+    try json.write(false);
+    try json.endObject();
     try json.objectField("publishDiagnostics");
     try json.beginObject();
     try json.endObject();
@@ -593,6 +627,12 @@ test "build references document symbol workspace symbol and rename requests" {
     defer std.testing.allocator.free(rename);
     try std.testing.expect(std.mem.indexOf(u8, rename, "textDocument/rename") != null);
     try std.testing.expect(std.mem.indexOf(u8, rename, "\"newName\":\"Renamed\"") != null);
+
+    const formatting = try makeFormattingRequest(std.testing.allocator, .{ .number = 12 }, "file:///tmp/main.zig", 4, true);
+    defer std.testing.allocator.free(formatting);
+    try std.testing.expect(std.mem.indexOf(u8, formatting, "textDocument/formatting") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatting, "\"tabSize\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatting, "\"insertSpaces\":true") != null);
 }
 
 test "build code action request with diagnostics context" {

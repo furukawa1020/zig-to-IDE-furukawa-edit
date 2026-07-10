@@ -82,6 +82,7 @@ const LspPanelAction = struct {
 };
 
 const lsp_panel_actions = [_]LspPanelAction{
+    .{ .id = "lsp.ensure_active", .label = "Ensure active", .hint = "start when trusted, otherwise show launch/install guidance" },
     .{ .id = "lsp.status", .label = "Status", .hint = "session, pending requests, cached results" },
     .{ .id = "lsp.plan", .label = "Launch plan", .hint = "show server command without spawning it" },
     .{ .id = "lsp.start", .label = "Start server", .hint = "trust-gated language server process" },
@@ -3437,6 +3438,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (ctrl and alt and key == 'L') {
         state.executeCommand("lsp.actions");
+        return;
+    }
+    if (ctrl and alt and key == 'I') {
+        state.executeCommand("lsp.ensure_active");
         return;
     }
     if (ctrl and shift and key == 'M') {

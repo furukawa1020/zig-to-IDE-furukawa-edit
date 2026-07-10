@@ -702,6 +702,7 @@ const LspPanelAction = struct {
 };
 
 const lsp_panel_actions = [_]LspPanelAction{
+    .{ .id = "lsp.ensure_active", .label = "Ensure active", .hint = "start when trusted, otherwise show launch/install guidance" },
     .{ .id = "lsp.status", .label = "Status", .hint = "session, pending requests, cached results" },
     .{ .id = "lsp.plan", .label = "Launch plan", .hint = "show server command without spawning it" },
     .{ .id = "lsp.start", .label = "Start server", .hint = "trust-gated language server process" },
@@ -3187,6 +3188,7 @@ const LinuxGuiState = struct {
 
         if (std.mem.eql(u8, id, "git.overview") or std.mem.eql(u8, id, "github.overview")) self.bottom_panel = .git;
         if (std.mem.startsWith(u8, id, "github.") and !std.mem.eql(u8, id, "github.overview")) self.bottom_panel = .output;
+        if (std.mem.startsWith(u8, id, "lsp.")) self.bottom_panel = .output;
         if (std.mem.startsWith(u8, id, "task.")) {
             self.refreshLinuxSelfProtection();
             self.bottom_panel = .tasks;
@@ -4319,6 +4321,10 @@ const LinuxGuiState = struct {
                             self.execute("lsp.actions", .keybinding);
                             return;
                         }
+                        if (key.modifiers.alt and (char == 'i' or char == 'I')) {
+                            self.execute("lsp.ensure_active", .keybinding);
+                            return;
+                        }
                         if (key.modifiers.shift and (char == 'l' or char == 'L')) {
                             self.runHeaderAction(.publish);
                             return;
@@ -5429,7 +5435,7 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
     const linux_grade = linuxBoundaryGrade(&state.linux_security);
     const status = std.fmt.bufPrint(
         status_buf[0..],
-        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} lsp:{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} linux:{s} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+T Ctrl+S Ctrl+G Ctrl+Alt+L | {s}",
+        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} lsp:{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} linux:{s} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+T Ctrl+S Ctrl+G Ctrl+Alt+L/I | {s}",
         .{
             @tagName(app.mode),
             @tagName(app.focus),

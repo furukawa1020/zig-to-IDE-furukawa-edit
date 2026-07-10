@@ -60,6 +60,10 @@ pub const Result = union(enum) {
 };
 
 pub fn dispatch(app: *app_mod.App, request: command.Request) !Result {
+    if (std.mem.eql(u8, request.id, "lsp.ensure_active")) {
+        return try ensureActiveLsp(app, request.source);
+    }
+
     const check = app.runtime.checkCommand(request);
     switch (check) {
         .unknown_command => return .unknown_command,
@@ -630,6 +634,7 @@ fn externalCommandPreviewById(app: *app_mod.App, id: []const u8) ?process.SpawnS
     if (std.mem.eql(u8, id, "zig.build")) return zigCommand(app, .build);
     if (std.mem.eql(u8, id, "zig.test")) return zigCommand(app, .test_step);
     if (std.mem.eql(u8, id, "zig.fmt")) return zigCommand(app, .fmt);
+    if (std.mem.eql(u8, id, "lsp.ensure_active")) return lspStartPreview(app);
     if (std.mem.eql(u8, id, "lsp.start")) return lspStartPreview(app);
     return null;
 }
@@ -1367,6 +1372,46 @@ fn rangesTouchLines(left: types.Range, right: types.Range) bool {
     const right_start = @min(right.start.line, right.end.line);
     const right_end = @max(right.start.line, right.end.line);
     return left_end >= right_start and right_end >= left_start;
+}
+
+fn ensureActiveLsp(app: *app_mod.App, source: command.Source) !Result {
+    const doc = app.documents.active() orelse return .no_active_document;
+
+    if (app.hasRunningLspForActiveDocument()) {
+        return try syncCurrentDocumentToLsp(app);
+    }
+
+    var plan = try lsp_launch_plan.forLanguage(app.allocator, doc.language);
+    defer plan.deinit(app.allocator);
+    try appendConsole(app, .stdout, "lsp ensure\nlanguage: {s}\nserver: {s}\ncommand: {s}\nnote: {s}\nhint: {s}\n", .{
+        modes.label(doc.language),
+        plan.label,
+        if (plan.command.len == 0) "(none)" else plan.command,
+        plan.security_note,
+        plan.install_hint,
+    });
+    if (!plan.available) {
+        return .{ .blocked = "no default LSP server mapping for active language" };
+    }
+
+    switch (app.runtime.checkCommand(.{ .id = "lsp.start", .source = source })) {
+        .unknown_command => return .unknown_command,
+        .allowed => {},
+        .blocked => |message| return .{ .blocked = message },
+        .confirmation_required => |message| return .{ .blocked = message },
+    }
+
+    const started = try startLspTransport(app);
+    switch (started) {
+        .completed => {},
+        else => return started,
+    }
+
+    const synced = try syncCurrentDocumentToLsp(app);
+    return switch (synced) {
+        .completed => .{ .completed = "LSP server ready and document synced" },
+        else => synced,
+    };
 }
 
 fn startLspTransport(app: *app_mod.App) !Result {
@@ -4153,6 +4198,39 @@ test "code action request includes active diagnostic context" {
     }
     try std.testing.expect(saw_method);
     try std.testing.expect(saw_diagnostic);
+}
+
+test "lsp ensure renders launch guidance without starting in untrusted workspace" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Options.debug_io, "src");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/main.zig", .data = "const answer = 42;\n" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "src/main.zig" });
+    defer std.testing.allocator.free(path);
+    _ = try app.documents.openFile(path);
+
+    const result = try dispatch(&app, .{ .id = "lsp.ensure_active" });
+    try std.testing.expect(std.meta.activeTag(result) == .blocked);
+    try std.testing.expect(!app.hasRunningLspForActiveDocument());
+    try std.testing.expect(app.pending_build_consent == null);
+
+    var saw_ensure = false;
+    var saw_zls = false;
+    for (app.process_console.lines.items) |line| {
+        if (std.mem.indexOf(u8, line.text, "lsp ensure") != null) saw_ensure = true;
+        if (std.mem.indexOf(u8, line.text, "zls") != null or std.mem.indexOf(u8, line.text, "ZLS") != null) saw_zls = true;
+    }
+    try std.testing.expect(saw_ensure);
+    try std.testing.expect(saw_zls);
 }
 
 test "first editable code action applies through workspace edit safety" {

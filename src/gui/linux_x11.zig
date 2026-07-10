@@ -627,6 +627,7 @@ const QuickPanelMode = enum {
     run_task,
     document_symbols,
     workspace_symbols,
+    lsp_locations,
     problems,
     completion,
     code_actions,
@@ -706,6 +707,7 @@ const QuickPanel = struct {
     problem_matches: ?[]problems_search.Result = null,
     completion_matches: ?[]completion_mod.Item = null,
     language_matches: ?[]modes.LanguageMode = null,
+    lsp_location_count: usize = 0,
     code_action_count: usize = 0,
     completion_replace_start: usize = 0,
     completion_replace_end: usize = 0,
@@ -780,6 +782,7 @@ const QuickPanel = struct {
             .run_task => if (self.task_matches) |items| items.len else 0,
             .document_symbols => if (self.symbol_matches) |items| items.len else 0,
             .workspace_symbols => if (self.workspace_symbol_matches) |items| items.len else 0,
+            .lsp_locations => self.lsp_location_count,
             .problems => if (self.problem_matches) |items| items.len else 0,
             .completion => if (self.completion_matches) |items| items.len else 0,
             .code_actions => self.code_action_count,
@@ -932,6 +935,12 @@ const QuickPanel = struct {
                     .max_results = 512,
                 });
             },
+            .lsp_locations => {
+                self.lsp_location_count = if (app.activeLspSessionConst()) |session|
+                    if (session.last_locations) |locations| locations.items.len else 0
+                else
+                    0;
+            },
             .problems => {
                 self.problem_matches = try problems_search.collect(self.allocator, &app.diagnostics, &app.security_findings, self.query.items, .{
                     .max_results = 512,
@@ -1026,6 +1035,7 @@ const QuickPanel = struct {
             completion_mod.deinitItems(self.allocator, items);
             self.completion_matches = null;
         }
+        self.lsp_location_count = 0;
         self.code_action_count = 0;
         if (self.language_matches) |items| {
             self.allocator.free(items);
@@ -1266,6 +1276,10 @@ const LinuxGuiState = struct {
                     if (session.last_locations) |locations| {
                         self.pending_lsp_action = .none;
                         if (locations.items.len == 0) return self.message("no LSP definition", .{});
+                        if (locations.items.len > 1) {
+                            self.showLspLocations("LSP definitions");
+                            return;
+                        }
                         const location = locations.items[0];
                         self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
                         self.message("opened LSP definition", .{});
@@ -1310,6 +1324,11 @@ const LinuxGuiState = struct {
         }
         if (locations.items.len > 80) self.appendOutput(.stdout, "... {d} more LSP location(s)\n", .{locations.items.len - 80});
         self.message("showing {d} LSP location(s)", .{locations.items.len});
+        if (locations.items.len > 0) {
+            self.openQuickPanel(.lsp_locations);
+            self.quick_panel.visible = true;
+            self.message("select an LSP location and press Enter", .{});
+        }
     }
 
     fn showLspWorkspaceEdit(self: *LinuxGuiState, label: []const u8, edit: *const lsp_responses.WorkspaceEdit) void {
@@ -3532,6 +3551,20 @@ const LinuxGuiState = struct {
                 const column = item.column;
                 self.quick_panel.close();
                 self.openRelativeLocation(path, line, column);
+            },
+            .lsp_locations => {
+                const session = self.app.activeLspSessionConst() orelse return self.message("no LSP session", .{});
+                const locations = session.last_locations orelse return self.message("no LSP locations", .{});
+                if (locations.items.len == 0) return self.message("no LSP locations", .{});
+                const selected = @min(self.quick_panel.selected_index, locations.items.len - 1);
+                const location = locations.items[selected];
+                const path = self.allocator.dupe(u8, location.path) catch |err| return self.message("open failed: {s}", .{@errorName(err)});
+                defer self.allocator.free(path);
+                const line = location.range.start.line;
+                const column = location.range.start.column;
+                self.quick_panel.close();
+                self.openRelativeLocation(path, line, column);
+                self.message("opened LSP location", .{});
             },
             .problems => {
                 const item = self.quick_panel.selectedProblem() orelse return self.message("no problem selected", .{});
@@ -6256,6 +6289,18 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
                 modes.label(items[row].language),
             }) catch items[row].name;
         },
+        .lsp_locations => blk: {
+            const session = state.app.activeLspSessionConst() orelse break :blk "";
+            const locations = session.last_locations orelse break :blk "";
+            if (row >= locations.items.len) break :blk "";
+            const item = locations.items[row];
+            break :blk std.fmt.bufPrint(text_buf[0..], "{d}. {s}:{d}:{d}", .{
+                row + 1,
+                item.path,
+                item.range.start.line + 1,
+                item.range.start.column + 1,
+            }) catch item.path;
+        },
         .problems => blk: {
             const items = state.quick_panel.problem_matches orelse break :blk "";
             if (row >= items.len) break :blk "";
@@ -7396,6 +7441,7 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .run_task => "RUN TASK",
         .document_symbols => "SYMBOLS",
         .workspace_symbols => "WORKSPACE SYMBOLS",
+        .lsp_locations => "LSP LOCATIONS  Enter opens",
         .problems => "PROBLEMS  diagnostics + security",
         .completion => "COMPLETE  Enter inserts",
         .code_actions => "QUICK FIX  Enter applies",

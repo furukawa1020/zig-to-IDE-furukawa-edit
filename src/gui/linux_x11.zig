@@ -3167,6 +3167,27 @@ const LinuxGuiState = struct {
         }
     }
 
+    fn hasCachedLspWorkspaceEdit(self: *const LinuxGuiState) bool {
+        const session = self.app.activeLspSessionConst() orelse return false;
+        const edit = session.last_workspace_edit orelse return false;
+        return edit.edits.len > 0;
+    }
+
+    fn applyCachedLspWorkspaceEdit(self: *LinuxGuiState) void {
+        const result = dispatcher.dispatch(&self.app, .{ .id = "lsp.apply_workspace_edit", .source = .command_palette }) catch |err| {
+            self.message("workspace edit apply failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "workspace edit apply failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult("lsp.apply_workspace_edit", result);
+        if (std.meta.activeTag(result) == .completed) {
+            self.clearSelection();
+            self.syncActiveDocumentToLsp();
+            self.app.focus = .editor;
+            self.ensureEditorCursorVisible();
+        }
+    }
+
     fn runHeaderAction(self: *LinuxGuiState, action: HeaderAction) void {
         switch (action) {
             .open_workspace => self.openQuickPanel(.open_workspace),
@@ -4118,6 +4139,10 @@ const LinuxGuiState = struct {
             self.execute(if (key.modifiers.shift) "file.previous_editor" else "file.next_editor", .keybinding);
             return;
         }
+        if (key.modifiers.ctrl and std.meta.activeTag(key.code) == .enter and self.hasCachedLspWorkspaceEdit()) {
+            self.applyCachedLspWorkspaceEdit();
+            return;
+        }
         if (key.modifiers.ctrl and self.app.focus == .editor) {
             switch (key.code) {
                 .char => |char| {
@@ -4879,6 +4904,10 @@ const LinuxGuiState = struct {
                 return true;
             },
             .output => {
+                if (self.hasCachedLspWorkspaceEdit() and pointIn(outputApplyButtonRect(self), x, y)) {
+                    self.applyCachedLspWorkspaceEdit();
+                    return true;
+                }
                 if (outputLineRowAt(self, y)) |index| {
                     if (index < self.app.process_console.lines.items.len) {
                         const line = self.app.process_console.lines.items[index];
@@ -5634,6 +5663,10 @@ fn drawOutputPanel(x11: *X11, state: *LinuxGuiState) !void {
         app.process_console.sanitized_stats.stripped_control,
     }) catch "OUTPUT";
     try x11.text(x11.gc.green, 18, bottom + 58, header);
+    if (state.hasCachedLspWorkspaceEdit()) {
+        try drawActionButton(x11, outputApplyButtonRect(state), "APPLY");
+        try x11.text(x11.gc.muted, outputApplyButtonRect(state).left - 104, bottom + 58, "Ctrl+Enter");
+    }
 
     var y: i16 = outputLinesTop(state);
     const max_lines = outputVisibleRows(state);
@@ -7839,6 +7872,12 @@ fn publishPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?PublishPan
         if (pointIn(publishPanelActionRect(state, action), x, y)) return action;
     }
     return null;
+}
+
+fn outputApplyButtonRect(state: *const LinuxGuiState) HitRect {
+    const bottom = state.bottomTop();
+    const right = state.window_width - 18;
+    return .{ .left = right - 76, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
 
 fn gitPanelActionRect(state: *const LinuxGuiState, action: GitPanelAction) HitRect {

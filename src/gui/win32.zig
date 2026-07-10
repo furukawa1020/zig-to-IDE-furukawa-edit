@@ -2288,6 +2288,27 @@ const GuiState = struct {
         }
     }
 
+    fn hasCachedLspWorkspaceEdit(self: *const GuiState) bool {
+        const session = self.app.activeLspSessionConst() orelse return false;
+        const edit = session.last_workspace_edit orelse return false;
+        return edit.edits.len > 0;
+    }
+
+    fn applyCachedLspWorkspaceEdit(self: *GuiState) void {
+        const result = dispatcher.dispatch(&self.app, .{ .id = "lsp.apply_workspace_edit", .source = .command_palette }) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "workspace edit apply failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult("lsp.apply_workspace_edit", result);
+        if (std.meta.activeTag(result) == .completed) {
+            self.clearSelection();
+            self.syncActiveDocumentToLsp();
+            self.app.focus = .editor;
+            self.ensureCursorVisible();
+        }
+    }
+
     fn appendOutput(self: *GuiState, stream: console_mod.Stream, comptime fmt: []const u8, args: anytype) void {
         var text: std.Io.Writer.Allocating = .init(self.allocator);
         defer text.deinit();
@@ -3217,6 +3238,13 @@ const GuiState = struct {
                     return;
                 }
             }
+            if (self.bottom_panel == .output) {
+                const output = consoleOutputRect(layout, self);
+                if (self.hasCachedLspWorkspaceEdit() and pointIn(outputApplyButtonRect(output), x, y)) {
+                    self.applyCachedLspWorkspaceEdit();
+                    return;
+                }
+            }
             switch (self.bottom_panel) {
                 .output => self.openConsoleLineAt(layout, y),
                 .git => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.openGitPanelRow(self.git_scroll_line + row),
@@ -3374,6 +3402,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
     }
     if (ctrl and key == VK_OEM_PERIOD) {
         state.executeCommand("lsp.request_code_action");
+        return;
+    }
+    if (ctrl and key == VK_RETURN and state.hasCachedLspWorkspaceEdit()) {
+        state.applyCachedLspWorkspaceEdit();
         return;
     }
     if (ctrl and key == 'P') {
@@ -4105,7 +4137,13 @@ fn drawBottomPanelTab(hdc: windows.HDC, rect: RECT, panel: BottomPanel, active: 
 
 fn drawConsoleOutput(hdc: windows.HDC, state: *GuiState, output: RECT) void {
     fillRect(hdc, RECT{ .left = output.left, .top = output.top, .right = output.right, .bottom = output.top + 1 }, rgb(43, 53, 61));
-    drawText(hdc, output.left + 16, output.top + 10, rgb(79, 230, 226), "OUTPUT");
+    const can_apply = state.hasCachedLspWorkspaceEdit();
+    const header_right = if (can_apply) outputApplyButtonRect(output).left - 10 else output.right - 16;
+    drawTextClipped(hdc, output.left + 16, output.top + 10, header_right, rgb(79, 230, 226), "OUTPUT");
+    if (can_apply) {
+        drawButton(hdc, outputApplyButtonRect(output), "APPLY");
+        drawTextClipped(hdc, outputApplyButtonRect(output).left - 104, output.top + 10, outputApplyButtonRect(output).left - 12, rgb(116, 128, 140), "Ctrl+Enter");
+    }
 
     const lines = state.app.process_console.lines.items;
     const rows = @max(0, @divTrunc(output.bottom - output.top - HEADER_HEIGHT, ROW_HEIGHT));
@@ -5489,6 +5527,15 @@ fn consoleOutputRect(layout: Layout, state: *const GuiState) RECT {
         };
     }
     return bottomPanelContentRect(layout.output);
+}
+
+fn outputApplyButtonRect(rect: RECT) RECT {
+    return .{
+        .left = @max(rect.left + 110, rect.right - 94),
+        .top = rect.top + 7,
+        .right = rect.right - 14,
+        .bottom = rect.top + 31,
+    };
 }
 
 fn searchResultRowAt(rect: RECT, y: c_int) ?usize {

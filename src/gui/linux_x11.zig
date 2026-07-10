@@ -629,6 +629,7 @@ const QuickPanelMode = enum {
     run_task,
     document_symbols,
     workspace_symbols,
+    lsp_actions,
     lsp_locations,
     problems,
     completion,
@@ -694,6 +695,29 @@ const TaskMatch = struct {
     }
 };
 
+const LspPanelAction = struct {
+    id: []const u8,
+    label: []const u8,
+    hint: []const u8,
+};
+
+const lsp_panel_actions = [_]LspPanelAction{
+    .{ .id = "lsp.status", .label = "Status", .hint = "session, pending requests, cached results" },
+    .{ .id = "lsp.plan", .label = "Launch plan", .hint = "show server command without spawning it" },
+    .{ .id = "lsp.start", .label = "Start server", .hint = "trust-gated language server process" },
+    .{ .id = "lsp.stop", .label = "Stop server", .hint = "terminate the active language server" },
+    .{ .id = "lsp.sync_current", .label = "Sync current file", .hint = "send didOpen/didChange for this buffer" },
+    .{ .id = "lsp.drain", .label = "Drain frames", .hint = "process buffered server responses" },
+    .{ .id = "lsp.request_hover", .label = "Hover", .hint = "show documentation for cursor symbol" },
+    .{ .id = "editor.complete", .label = "Complete", .hint = "open local and cached LSP completions" },
+    .{ .id = "editor.format_document", .label = "Format document", .hint = "preview WorkspaceEdit before applying" },
+    .{ .id = "symbol.goto_definition", .label = "Go to definition", .hint = "LSP first, local fallback" },
+    .{ .id = "symbol.find_references", .label = "Find references", .hint = "LSP first, local fallback" },
+    .{ .id = "symbol.rename", .label = "Rename symbol", .hint = "preview rename edits safely" },
+    .{ .id = "lsp.request_code_action", .label = "Quick fixes", .hint = "request code actions for cursor diagnostics" },
+    .{ .id = "lsp.apply_workspace_edit", .label = "Apply last edit", .hint = "apply cached LSP edit after boundary checks" },
+};
+
 const QuickPanel = struct {
     allocator: std.mem.Allocator,
     visible: bool = false,
@@ -710,6 +734,7 @@ const QuickPanel = struct {
     problem_matches: ?[]problems_search.Result = null,
     completion_matches: ?[]completion_mod.Item = null,
     language_matches: ?[]modes.LanguageMode = null,
+    lsp_action_count: usize = 0,
     lsp_location_count: usize = 0,
     lsp_hover_line_count: usize = 0,
     code_action_count: usize = 0,
@@ -786,6 +811,7 @@ const QuickPanel = struct {
             .run_task => if (self.task_matches) |items| items.len else 0,
             .document_symbols => if (self.symbol_matches) |items| items.len else 0,
             .workspace_symbols => if (self.workspace_symbol_matches) |items| items.len else 0,
+            .lsp_actions => self.lsp_action_count,
             .lsp_locations => self.lsp_location_count,
             .problems => if (self.problem_matches) |items| items.len else 0,
             .completion => if (self.completion_matches) |items| items.len else 0,
@@ -940,6 +966,9 @@ const QuickPanel = struct {
                     .max_results = 512,
                 });
             },
+            .lsp_actions => {
+                self.lsp_action_count = lspActionCount(self.query.items);
+            },
             .lsp_locations => {
                 self.lsp_location_count = if (app.activeLspSessionConst()) |session|
                     if (session.last_locations) |locations| locations.items.len else 0
@@ -1046,6 +1075,7 @@ const QuickPanel = struct {
             completion_mod.deinitItems(self.allocator, items);
             self.completion_matches = null;
         }
+        self.lsp_action_count = 0;
         self.lsp_location_count = 0;
         self.lsp_hover_line_count = 0;
         self.code_action_count = 0;
@@ -3040,6 +3070,10 @@ const LinuxGuiState = struct {
             self.openRenamePanel();
             return;
         }
+        if (std.mem.eql(u8, id, "lsp.actions")) {
+            self.openQuickPanel(.lsp_actions);
+            return;
+        }
         if (std.mem.eql(u8, id, "lsp.request_code_action")) {
             if (self.requestCodeActionsFromLsp()) return;
         }
@@ -3637,6 +3671,11 @@ const LinuxGuiState = struct {
                 const column = item.column;
                 self.quick_panel.close();
                 self.openRelativeLocation(path, line, column);
+            },
+            .lsp_actions => {
+                const action = lspActionAt(self.quick_panel.query.items, self.quick_panel.selected_index) orelse return self.message("no LSP action selected", .{});
+                self.quick_panel.close();
+                self.execute(action.id, .command_palette);
             },
             .lsp_locations => {
                 const session = self.app.activeLspSessionConst() orelse return self.message("no LSP session", .{});
@@ -4274,6 +4313,10 @@ const LinuxGuiState = struct {
                         }
                         if (key.modifiers.shift and (char == 'x' or char == 'X')) {
                             self.runHeaderAction(.extensions);
+                            return;
+                        }
+                        if (key.modifiers.alt and (char == 'l' or char == 'L')) {
+                            self.execute("lsp.actions", .keybinding);
                             return;
                         }
                         if (key.modifiers.shift and (char == 'l' or char == 'L')) {
@@ -6392,6 +6435,10 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
                 modes.label(items[row].language),
             }) catch items[row].name;
         },
+        .lsp_actions => blk: {
+            const action = lspActionAt(state.quick_panel.query.items, row) orelse break :blk "";
+            break :blk std.fmt.bufPrint(text_buf[0..], "{s}  {s}  {s}", .{ action.label, action.id, action.hint }) catch action.label;
+        },
         .lsp_locations => blk: {
             const session = state.app.activeLspSessionConst() orelse break :blk "";
             const locations = session.last_locations orelse break :blk "";
@@ -7441,6 +7488,31 @@ fn isDocumentSearchMode(mode: QuickPanelMode) bool {
     return mode == .find_document or mode == .replace_document;
 }
 
+fn lspActionMatches(query: []const u8, action: LspPanelAction) bool {
+    if (query.len == 0) return true;
+    return command_mod.fuzzyScore(query, action.label) != null or
+        command_mod.fuzzyScore(query, action.id) != null or
+        command_mod.fuzzyScore(query, action.hint) != null;
+}
+
+fn lspActionCount(query: []const u8) usize {
+    var count: usize = 0;
+    for (lsp_panel_actions) |action| {
+        if (lspActionMatches(query, action)) count += 1;
+    }
+    return count;
+}
+
+fn lspActionAt(query: []const u8, display_index: usize) ?LspPanelAction {
+    var index: usize = 0;
+    for (lsp_panel_actions) |action| {
+        if (!lspActionMatches(query, action)) continue;
+        if (index == display_index) return action;
+        index += 1;
+    }
+    return null;
+}
+
 fn hoverDisplayLineCount(text: []const u8) usize {
     if (text.len == 0) return 0;
     var count: usize = 1;
@@ -7575,6 +7647,7 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .run_task => "RUN TASK",
         .document_symbols => "SYMBOLS",
         .workspace_symbols => "WORKSPACE SYMBOLS",
+        .lsp_actions => "LSP ACTIONS  Ctrl+Alt+L",
         .lsp_locations => "LSP LOCATIONS  Enter opens",
         .problems => "PROBLEMS  diagnostics + security",
         .completion => "COMPLETE  Enter inserts",

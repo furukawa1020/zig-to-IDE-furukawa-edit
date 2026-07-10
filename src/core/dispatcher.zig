@@ -297,6 +297,11 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "LSP status rendered" };
     }
 
+    if (std.mem.eql(u8, definition.id, "lsp.actions")) {
+        try renderLspStatus(app);
+        return .{ .completed = "LSP actions status rendered" };
+    }
+
     if (std.mem.eql(u8, definition.id, "lsp.sync_current")) {
         return try syncCurrentDocumentToLsp(app);
     }

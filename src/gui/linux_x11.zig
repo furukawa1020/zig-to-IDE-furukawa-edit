@@ -5415,19 +5415,21 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
     if (state.context_menu_visible) try drawContextMenu(x11, state);
 
     try x11.fillRect(x11.gc.cyan, 0, state.window_height - STATUS_HEIGHT, width_u, STATUS_HEIGHT);
-    var status_buf: [760]u8 = undefined;
+    var status_buf: [880]u8 = undefined;
     var hot_buf: [80]u8 = undefined;
+    var lsp_buf: [80]u8 = undefined;
     const active = app.documents.active();
     const dirty_count = app.documents.dirtyCount();
     const language = if (active) |doc| modes.label(doc.language) else "none";
     const cursor = if (active) |doc| doc.cursor.position else null;
     const current_risk = currentDocumentRiskCounts(state);
     const hot_boundary = currentLineBoundaryHint(state, hot_buf[0..]);
+    const lsp_status = activeLspStatusText(app, lsp_buf[0..]);
     const git_changes = if (state.git_overview) |overview| overview.changes.len else 0;
     const linux_grade = linuxBoundaryGrade(&state.linux_security);
     const status = std.fmt.bufPrint(
         status_buf[0..],
-        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} linux:{s} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+T Ctrl+S Ctrl+G | {s}",
+        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} lsp:{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} linux:{s} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+T Ctrl+S Ctrl+G Ctrl+Alt+L | {s}",
         .{
             @tagName(app.mode),
             @tagName(app.focus),
@@ -5435,6 +5437,7 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
             if (cursor) |pos| pos.column + 1 else 0,
             dirty_count,
             language,
+            lsp_status,
             @tagName(app.runtime.trust_state),
             current_risk.critical,
             current_risk.high,
@@ -7511,6 +7514,16 @@ fn lspActionAt(query: []const u8, display_index: usize) ?LspPanelAction {
         index += 1;
     }
     return null;
+}
+
+fn activeLspStatusText(app: *const app_mod.App, buffer: []u8) []const u8 {
+    const language = app.activeLanguage() orelse return "none";
+    const server = app.lsp_manager.findServerConst(language) orelse return "none";
+    return std.fmt.bufPrint(buffer, "{s}/{s}/p{d}", .{
+        modes.label(language),
+        if (server.transport != null) "run" else "stop",
+        server.session.pendingCount(),
+    }) catch "err";
 }
 
 fn hoverDisplayLineCount(text: []const u8) usize {

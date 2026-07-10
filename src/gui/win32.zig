@@ -5246,8 +5246,9 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
 }
 
 fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
-    var buffer: [640]u8 = undefined;
+    var buffer: [760]u8 = undefined;
     var boundary_buffer: [64]u8 = undefined;
+    var lsp_buffer: [80]u8 = undefined;
     const mode = @tagName(state.app.mode);
     const focus = @tagName(state.app.focus);
     const message = state.last_error orelse "ready";
@@ -5259,10 +5260,11 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
     const encoding = if (state.app.documents.active()) |doc| doc.encodingLabel() else "UTF-8";
     const current_risk = currentDocumentRiskCounts(state);
     const current_boundary = currentLineBoundaryHint(state, &boundary_buffer);
+    const lsp_status = activeLspStatusText(&state.app, &lsp_buffer);
     const git_changes = if (state.git_overview) |overview| overview.changes.len else 0;
     const text = std.fmt.bufPrint(
         &buffer,
-        " {s}/{s}  |  line:{d} col:{d} {s} dirty:{d} lang:{s} fmt:{s}/{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
+        " {s}/{s}  |  line:{d} col:{d} {s} dirty:{d} lang:{s} lsp:{s} fmt:{s}/{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} | files:{d} code:{d} langs:{d} docs:{d} zig:{d} output:{s} | {s}",
         .{
             mode,
             focus,
@@ -5271,6 +5273,7 @@ fn drawStatus(hdc: windows.HDC, state: *GuiState, status: RECT) void {
             if (dirty) "dirty" else "clean",
             dirty_count,
             language,
+            lsp_status,
             encoding,
             newline,
             @tagName(state.app.runtime.trust_state),
@@ -5369,6 +5372,16 @@ fn lspActionAt(query: []const u8, display_index: usize) ?LspPanelAction {
         index += 1;
     }
     return null;
+}
+
+fn activeLspStatusText(app: *const app_mod.App, buffer: []u8) []const u8 {
+    const language = app.activeLanguage() orelse return "none";
+    const server = app.lsp_manager.findServerConst(language) orelse return "none";
+    return std.fmt.bufPrint(buffer, "{s}/{s}/p{d}", .{
+        modes.label(language),
+        if (server.transport != null) "run" else "stop",
+        server.session.pendingCount(),
+    }) catch "err";
 }
 
 fn hoverDisplayLineCount(text: []const u8) usize {

@@ -955,6 +955,9 @@ const GuiState = struct {
         if (std.mem.eql(u8, id, "lsp.request_code_action")) {
             if (self.requestCodeActionsFromLsp()) return;
         }
+        if (std.mem.eql(u8, id, "lsp.request_hover")) {
+            if (self.requestHoverFromLsp()) return;
+        }
         if (std.mem.eql(u8, id, "workspace.find_file")) {
             self.openQuickPanel(.find_file);
             return;
@@ -1311,6 +1314,7 @@ const GuiState = struct {
             .problems => "Problems",
             .rename_symbol => "Rename symbol",
             .completion => "Complete symbol",
+            .lsp_hover => "LSP hover",
             .code_actions => "Quick Fix",
             .language_mode => "Language mode",
         }) catch {};
@@ -1636,6 +1640,11 @@ const GuiState = struct {
                 self.app.focus = .editor;
                 self.ensureCursorVisible();
                 self.setMessage("Completed") catch {};
+            },
+            .lsp_hover => {
+                self.quick_panel.close();
+                self.app.focus = .editor;
+                self.setMessage("Closed LSP hover") catch {};
             },
             .code_actions => {
                 const count = self.quick_panel.itemCount();
@@ -2322,6 +2331,17 @@ const GuiState = struct {
         return true;
     }
 
+    fn requestHoverFromLsp(self: *GuiState) bool {
+        const sent = dispatcher.requestActiveHoverFromRunningLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp hover request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.pending_lsp_action = .hover;
+        self.setMessage("LSP hover requested") catch {};
+        return true;
+    }
+
     fn requestReferencesFromLsp(self: *GuiState) bool {
         const sent = dispatcher.requestActiveReferencesFromRunningLsp(&self.app) catch |err| {
             self.appendOutput(.stderr, "lsp references request failed: {s}\n", .{@errorName(err)});
@@ -2388,6 +2408,14 @@ const GuiState = struct {
                     }
                 }
             },
+            .hover => {
+                if (self.app.activeLspSessionConst()) |session| {
+                    if (session.last_hover) |hover| {
+                        self.pending_lsp_action = .none;
+                        self.showLspHover("LSP hover", &hover);
+                    }
+                }
+            },
             .rename_preview => {
                 if (self.app.activeLspSessionConst()) |session| {
                     if (session.last_workspace_edit) |edit| {
@@ -2423,6 +2451,19 @@ const GuiState = struct {
             self.quick_panel.visible = true;
             self.setMessage("Select an LSP location and press Enter") catch {};
         }
+    }
+
+    fn showLspHover(self: *GuiState, label: []const u8, hover: *const lsp_responses.Hover) void {
+        self.show_output = true;
+        self.bottom_panel = .output;
+        self.appendOutput(.stdout, "{s}: {d} bytes\n{s}\n", .{ label, hover.text.len, hover.text });
+        if (hover.text.len == 0) {
+            self.setMessage("Empty LSP hover") catch {};
+            return;
+        }
+        self.openQuickPanel(.lsp_hover);
+        self.quick_panel.visible = true;
+        self.setMessage("LSP hover") catch {};
     }
 
     fn showLspWorkspaceEdit(self: *GuiState, label: []const u8, edit: *const lsp_responses.WorkspaceEdit) void {
@@ -4929,6 +4970,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .lsp_locations => "LSP LOCATIONS  Enter opens",
         .problems => "PROBLEMS  diagnostics + security",
         .completion => "COMPLETE  Enter inserts",
+        .lsp_hover => "HOVER  Enter closes",
         .code_actions => "QUICK FIX  Enter applies",
         .language_mode => "LANGUAGE MODE",
     };
@@ -5051,6 +5093,12 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 drawTextClipped(hdc, panel.left + 18, y, panel.left + 250, color, item.label);
                 drawTextClipped(hdc, panel.left + 260, y, panel.left + 370, color, @tagName(item.kind));
                 drawTextClipped(hdc, panel.left + 380, y, panel.right - 16, color, item.detail);
+            },
+            .lsp_hover => {
+                const session = state.app.activeLspSessionConst() orelse break;
+                const hover = session.last_hover orelse break;
+                const line = hoverLineAt(hover.text, row) orelse break;
+                drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, line);
             },
             .code_actions => {
                 const session = state.app.activeLspSessionConst() orelse break;

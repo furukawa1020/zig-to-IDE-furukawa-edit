@@ -2008,6 +2008,7 @@ const GuiState = struct {
         };
         const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse {
             self.setMessage("No identifier under cursor") catch {};
+            self.ensureLspForFeature("definition", .goto_definition);
             return;
         };
         const path = doc.path orelse "(scratch)";
@@ -2029,6 +2030,7 @@ const GuiState = struct {
         }
 
         self.setMessage("No local top-level definition") catch {};
+        self.ensureLspForFeature("definition", .goto_definition);
     }
 
     fn findReferencesAtCursor(self: *GuiState) void {
@@ -2048,6 +2050,7 @@ const GuiState = struct {
         };
         const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse {
             self.setMessage("No identifier under cursor") catch {};
+            self.ensureLspForFeature("references", .find_references);
             return;
         };
 
@@ -2064,6 +2067,7 @@ const GuiState = struct {
             if (self.search_panel.itemCount() == 1) "" else "s",
         }) catch "References found";
         self.setMessage(message) catch {};
+        if (self.search_panel.itemCount() == 0) self.ensureLspForFeature("references", .find_references);
     }
 
     fn renameWorkspaceSymbol(self: *GuiState, old_name: []const u8, new_name: []const u8) void {
@@ -2423,6 +2427,8 @@ const GuiState = struct {
         self.deferred_lsp_action = .none;
         switch (action) {
             .completion => _ = self.requestCompletionFromLsp(),
+            .goto_definition => _ = self.requestDefinitionFromLsp(),
+            .find_references => _ = self.requestReferencesFromLsp(),
             .hover => _ = self.requestHoverFromLsp(),
             .formatting_preview => _ = self.requestFormattingFromLsp(),
             .code_actions => _ = self.requestCodeActionsFromLsp(),

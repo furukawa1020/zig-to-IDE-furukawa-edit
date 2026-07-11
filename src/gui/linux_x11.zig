@@ -1293,6 +1293,8 @@ const LinuxGuiState = struct {
         self.deferred_lsp_action = .none;
         switch (action) {
             .completion => _ = self.requestCompletionFromLsp(),
+            .goto_definition => _ = self.requestDefinitionFromLsp(),
+            .find_references => _ = self.requestReferencesFromLsp(),
             .hover => _ = self.requestHoverFromLsp(),
             .formatting_preview => _ = self.requestFormattingFromLsp(),
             .code_actions => _ = self.requestCodeActionsFromLsp(),
@@ -4028,7 +4030,11 @@ const LinuxGuiState = struct {
         }
 
         const doc = self.app.documents.active() orelse return self.message("no active document", .{});
-        const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse return self.message("no identifier under cursor", .{});
+        const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse {
+            self.message("no identifier under cursor", .{});
+            self.ensureLspForFeature("definition", .goto_definition);
+            return;
+        };
         const path = doc.path orelse "(scratch)";
         var index = symbols_mod.collectDocument(self.allocator, doc.text.bytes, path, doc.language) catch |err| return self.message("symbol scan failed: {s}", .{@errorName(err)});
         defer index.deinit();
@@ -4044,6 +4050,7 @@ const LinuxGuiState = struct {
             return;
         }
         self.message("no local top-level definition", .{});
+        self.ensureLspForFeature("definition", .goto_definition);
     }
 
     fn findReferencesAtCursor(self: *LinuxGuiState) void {
@@ -4058,7 +4065,11 @@ const LinuxGuiState = struct {
         }
 
         const doc = self.app.documents.active() orelse return self.message("no active document", .{});
-        const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse return self.message("no identifier under cursor", .{});
+        const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse {
+            self.message("no identifier under cursor", .{});
+            self.ensureLspForFeature("references", .find_references);
+            return;
+        };
         const owned_name = self.allocator.dupe(u8, name) catch |err| return self.message("reference search failed: {s}", .{@errorName(err)});
         defer self.allocator.free(owned_name);
 
@@ -4079,6 +4090,7 @@ const LinuxGuiState = struct {
         }
         if (results.len > 80) self.appendOutput(.stdout, "... {d} more references\n", .{results.len - 80});
         self.message("found {d} reference(s)", .{results.len});
+        if (results.len == 0) self.ensureLspForFeature("references", .find_references);
     }
 
     fn renameWorkspaceSymbol(self: *LinuxGuiState, old_name: []const u8, new_name: []const u8) void {

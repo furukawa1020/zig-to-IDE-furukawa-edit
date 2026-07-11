@@ -937,6 +937,10 @@ fn syncCurrentDocumentToLsp(app: *app_mod.App) !Result {
     const doc = app.documents.active() orelse return .no_active_document;
     const path = doc.path orelse return .{ .blocked = "scratch documents cannot be synced to LSP yet" };
     const server = try app.lsp_manager.ensureServer(doc.language);
+    if (server.transport != null and !lspServerReady(server)) {
+        try appendConsole(app, .stdout, "lsp sync delayed: waiting for initialize acknowledgement\n", .{});
+        return .{ .blocked = "LSP server is still initializing" };
+    }
     const existing_version = server.session.documentVersion(path);
     const version = if (existing_version) |value| value + 1 else 1;
 
@@ -957,7 +961,7 @@ pub fn syncActiveDocumentToRunningLsp(app: *app_mod.App) !bool {
 
 fn syncDocumentToRunningLsp(app: *app_mod.App, doc: *document_mod.Document) !bool {
     const server = app.lsp_manager.findServer(doc.language) orelse return false;
-    if (server.transport == null) return false;
+    if (!lspServerReady(server)) return false;
     if (doc.text.bytes.len > max_automatic_lsp_sync_bytes) return false;
     const path = doc.path orelse return false;
     const existing_version = server.session.documentVersion(path);
@@ -982,7 +986,7 @@ pub fn notifyActiveDocumentSavedToRunningLsp(app: *app_mod.App) !bool {
 
 fn notifyDocumentSavedToRunningLsp(app: *app_mod.App, doc: *document_mod.Document) !bool {
     const server = app.lsp_manager.findServer(doc.language) orelse return false;
-    if (server.transport == null) return false;
+    if (!lspServerReady(server)) return false;
     const path = doc.path orelse return false;
     var outbound = try server.session.makeDidSave(path, null);
     defer outbound.deinit();
@@ -990,6 +994,10 @@ fn notifyDocumentSavedToRunningLsp(app: *app_mod.App, doc: *document_mod.Documen
         .log_sent = false,
         .emit_when_missing = false,
     });
+}
+
+fn lspServerReady(server: *const lsp_manager.Server) bool {
+    return server.transport != null and server.session.state == .initialized;
 }
 
 pub fn requestActiveCompletionFromRunningLsp(app: *app_mod.App) !bool {
@@ -1003,7 +1011,7 @@ pub fn requestActiveHoverFromRunningLsp(app: *app_mod.App) !bool {
 pub fn requestActiveFormattingFromRunningLsp(app: *app_mod.App) !bool {
     const doc = app.documents.active() orelse return false;
     const server = app.lsp_manager.findServer(doc.language) orelse return false;
-    if (server.transport == null) return false;
+    if (!lspServerReady(server)) return false;
     const path = doc.path orelse return false;
     _ = try syncDocumentToRunningLsp(app, doc);
     server.session.clearCachedResultForRequest(.formatting);
@@ -1026,7 +1034,7 @@ pub fn requestActiveReferencesFromRunningLsp(app: *app_mod.App) !bool {
 pub fn requestActiveCodeActionsFromRunningLsp(app: *app_mod.App) !bool {
     const doc = app.documents.active() orelse return false;
     const server = app.lsp_manager.findServer(doc.language) orelse return false;
-    if (server.transport == null) return false;
+    if (!lspServerReady(server)) return false;
     const path = doc.path orelse return false;
     _ = try syncDocumentToRunningLsp(app, doc);
     const range = codeActionRangeForActiveDocument(app, doc);
@@ -1043,7 +1051,7 @@ pub fn requestActiveCodeActionsFromRunningLsp(app: *app_mod.App) !bool {
 pub fn requestActiveRenameFromRunningLsp(app: *app_mod.App, new_name: []const u8) !bool {
     const doc = app.documents.active() orelse return false;
     const server = app.lsp_manager.findServer(doc.language) orelse return false;
-    if (server.transport == null) return false;
+    if (!lspServerReady(server)) return false;
     const path = doc.path orelse return false;
     _ = try syncDocumentToRunningLsp(app, doc);
     server.session.clearCachedResultForRequest(.rename);
@@ -1058,7 +1066,7 @@ pub fn requestActiveRenameFromRunningLsp(app: *app_mod.App, new_name: []const u8
 fn requestActivePositionFromRunningLsp(app: *app_mod.App, kind: lsp_session.RequestKind, label: []const u8) !bool {
     const doc = app.documents.active() orelse return false;
     const server = app.lsp_manager.findServer(doc.language) orelse return false;
-    if (server.transport == null) return false;
+    if (!lspServerReady(server)) return false;
     const path = doc.path orelse return false;
     _ = try syncDocumentToRunningLsp(app, doc);
     server.session.clearCachedResultForRequest(kind);
@@ -1074,6 +1082,8 @@ fn requestCurrentPositionLsp(app: *app_mod.App, kind: lsp_session.RequestKind, l
     const doc = app.documents.active() orelse return .no_active_document;
     const path = doc.path orelse return .{ .blocked = "scratch documents cannot request LSP features yet" };
     const server = try app.lsp_manager.ensureServer(doc.language);
+    if (server.transport != null and !lspServerReady(server)) return .{ .blocked = "LSP server is still initializing" };
+    _ = try syncDocumentToRunningLsp(app, doc);
 
     server.session.clearCachedResultForRequest(kind);
     var outbound = try server.session.requestPosition(kind, path, doc.cursor.position);
@@ -1086,6 +1096,8 @@ fn requestCurrentRenameLsp(app: *app_mod.App, new_name: []const u8) !Result {
     const doc = app.documents.active() orelse return .no_active_document;
     const path = doc.path orelse return .{ .blocked = "scratch documents cannot request LSP rename yet" };
     const server = try app.lsp_manager.ensureServer(doc.language);
+    if (server.transport != null and !lspServerReady(server)) return .{ .blocked = "LSP server is still initializing" };
+    _ = try syncDocumentToRunningLsp(app, doc);
 
     server.session.clearCachedResultForRequest(.rename);
     var outbound = try server.session.requestRename(path, doc.cursor.position, new_name);
@@ -1098,6 +1110,8 @@ fn requestCurrentFormattingLsp(app: *app_mod.App) !Result {
     const doc = app.documents.active() orelse return .no_active_document;
     const path = doc.path orelse return .{ .blocked = "scratch documents cannot request LSP formatting yet" };
     const server = try app.lsp_manager.ensureServer(doc.language);
+    if (server.transport != null and !lspServerReady(server)) return .{ .blocked = "LSP server is still initializing" };
+    _ = try syncDocumentToRunningLsp(app, doc);
 
     server.session.clearCachedResultForRequest(.formatting);
     var outbound = try server.session.requestFormatting(path, 4, true);
@@ -1110,6 +1124,8 @@ fn requestCurrentCodeActionsLsp(app: *app_mod.App) !Result {
     const doc = app.documents.active() orelse return .no_active_document;
     const path = doc.path orelse return .{ .blocked = "scratch documents cannot request LSP code actions yet" };
     const server = try app.lsp_manager.ensureServer(doc.language);
+    if (server.transport != null and !lspServerReady(server)) return .{ .blocked = "LSP server is still initializing" };
+    _ = try syncDocumentToRunningLsp(app, doc);
     const range = codeActionRangeForActiveDocument(app, doc);
     const diagnostics = collectCodeActionDiagnostics(app, path, range);
 
@@ -1402,15 +1418,9 @@ fn ensureActiveLsp(app: *app_mod.App, source: command.Source) !Result {
     }
 
     const started = try startLspTransport(app);
-    switch (started) {
-        .completed => {},
-        else => return started,
-    }
-
-    const synced = try syncCurrentDocumentToLsp(app);
-    return switch (synced) {
-        .completed => .{ .completed = "LSP server ready and document synced" },
-        else => synced,
+    return switch (started) {
+        .completed => .{ .completed = "LSP server starting; waiting for initialize acknowledgement" },
+        else => started,
     };
 }
 
@@ -1484,6 +1494,10 @@ pub fn pumpLsp(app: *app_mod.App) !LspPumpResult {
             var frame = (try transport.nextStdoutFrame()) orelse break;
             const ingest_result = try server.session.ingestPayload(frame.body, &app.diagnostics);
             try renderLspIngestResult(app, ingest_result);
+            switch (ingest_result) {
+                .acknowledged => |kind| if (kind == .initialize) try completeLspInitialization(app, server),
+                else => {},
+            }
             frame.deinit();
             result.frames += 1;
         }
@@ -1497,6 +1511,18 @@ pub fn pumpLsp(app: *app_mod.App) !LspPumpResult {
     }
 
     return result;
+}
+
+fn completeLspInitialization(app: *app_mod.App, server: *lsp_manager.Server) !void {
+    var initialized = try server.session.makeInitialized();
+    defer initialized.deinit();
+    _ = try deliverLspOutbound(app, server, "initialized", &initialized);
+
+    if (try syncActiveDocumentToRunningLsp(app)) {
+        try appendConsole(app, .stdout, "lsp ready: active document synced\n", .{});
+    } else {
+        try appendConsole(app, .stdout, "lsp ready: no active document sync needed\n", .{});
+    }
 }
 
 fn deliverLspOutbound(app: *app_mod.App, server: *lsp_manager.Server, label: []const u8, outbound: *const lsp_session.Outbound) !bool {

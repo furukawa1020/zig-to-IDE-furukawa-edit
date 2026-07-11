@@ -155,6 +155,11 @@ pub const Session = struct {
         return try self.wrapNotification(payload);
     }
 
+    pub fn makeInitialized(self: *Session) !Outbound {
+        const payload = try protocol.makeInitializedNotification(self.allocator);
+        return try self.wrapNotification(payload);
+    }
+
     pub fn makeDidOpen(self: *Session, path: []const u8, language: modes.LanguageMode, version: i64, text: []const u8) !Outbound {
         const uri = try self.uriForPath(path);
         defer self.allocator.free(uri);
@@ -472,6 +477,20 @@ test "session builds initialize and tracks pending request" {
     try std.testing.expectEqual(@as(usize, 1), session.pendingCount());
     try std.testing.expect(std.mem.startsWith(u8, outbound.framed, "Content-Length: "));
     try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "\"method\":\"initialize\"") != null);
+}
+
+test "session builds initialized notification without pending request" {
+    var session = try Session.init(std.testing.allocator, "C:\\Projects\\zide");
+    defer session.deinit();
+
+    var outbound = try session.makeInitialized();
+    defer outbound.deinit();
+
+    try std.testing.expect(outbound.id == null);
+    try std.testing.expect(outbound.kind == null);
+    try std.testing.expectEqual(@as(usize, 0), session.pendingCount());
+    try std.testing.expect(std.mem.startsWith(u8, outbound.framed, "Content-Length: "));
+    try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "\"method\":\"initialized\"") != null);
 }
 
 test "session syncs document notifications and versions" {

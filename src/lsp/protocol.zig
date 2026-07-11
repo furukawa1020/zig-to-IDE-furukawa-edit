@@ -109,6 +109,20 @@ pub fn makeExitNotification(allocator: std.mem.Allocator) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+pub fn makeInitializedNotification(allocator: std.mem.Allocator) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginNotification(&json, "initialized");
+        try json.objectField("params");
+        try json.beginObject();
+        try json.endObject();
+        try json.endObject();
+    }
+    return try out.toOwnedSlice();
+}
+
 pub fn makeDidOpenNotification(allocator: std.mem.Allocator, document: TextDocument) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -597,6 +611,14 @@ test "build initialize request" {
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"method\":\"initialize\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"rootUri\":\"file:///tmp/project\"") != null);
+}
+
+test "build initialized notification" {
+    const payload = try makeInitializedNotification(std.testing.allocator);
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"method\":\"initialized\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"params\":{}") != null);
 }
 
 test "build completion request and frame" {

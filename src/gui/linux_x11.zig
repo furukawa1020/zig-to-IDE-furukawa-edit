@@ -1260,11 +1260,25 @@ const LinuxGuiState = struct {
         };
     }
 
-    fn requestCompletionFromLsp(self: *LinuxGuiState) void {
-        _ = dispatcher.requestActiveCompletionFromRunningLsp(&self.app) catch |err| {
+    fn requestCompletionFromLsp(self: *LinuxGuiState) bool {
+        const sent = dispatcher.requestActiveCompletionFromRunningLsp(&self.app) catch |err| {
             self.appendOutput(.stderr, "lsp completion request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.message("LSP completion requested", .{});
+        return true;
+    }
+
+    fn ensureLspForFeature(self: *LinuxGuiState, feature: []const u8) void {
+        const result = dispatcher.dispatch(&self.app, .{ .id = "lsp.ensure_active", .source = .command_palette }) catch |err| {
+            self.message("lsp ensure failed", .{});
+            self.appendOutput(.stderr, "lsp ensure failed for {s}: {s}\n", .{ feature, @errorName(err) });
             return;
         };
+        self.handleDispatchResult("lsp.ensure_active", result);
+        self.bottom_panel = .output;
+        self.message("LSP ensure requested", .{});
     }
 
     fn requestDefinitionFromLsp(self: *LinuxGuiState) bool {
@@ -3077,12 +3091,18 @@ const LinuxGuiState = struct {
         }
         if (std.mem.eql(u8, id, "lsp.request_code_action")) {
             if (self.requestCodeActionsFromLsp()) return;
+            self.ensureLspForFeature("quick fixes");
+            return;
         }
         if (std.mem.eql(u8, id, "lsp.request_hover")) {
             if (self.requestHoverFromLsp()) return;
+            self.ensureLspForFeature("hover");
+            return;
         }
         if (std.mem.eql(u8, id, "editor.format_document") or std.mem.eql(u8, id, "lsp.request_formatting")) {
             if (self.requestFormattingFromLsp()) return;
+            self.ensureLspForFeature("formatting");
+            return;
         }
         if (std.mem.eql(u8, id, "preferences.open_settings")) {
             self.bottom_panel = .settings;
@@ -3443,7 +3463,7 @@ const LinuxGuiState = struct {
         self.seedQuickPanelFromLastSearch(mode);
         self.app.mode = .command;
         self.message("{s}", .{quickPanelTitle(mode)});
-        if (mode == .completion) self.requestCompletionFromLsp();
+        if (mode == .completion and !self.requestCompletionFromLsp()) self.ensureLspForFeature("completion");
     }
 
     fn openRenamePanel(self: *LinuxGuiState) void {
@@ -3475,7 +3495,7 @@ const LinuxGuiState = struct {
             return;
         };
         self.rememberDocumentSearchFromQuickPanel();
-        if (self.quick_panel.visible and self.quick_panel.mode == .completion) self.requestCompletionFromLsp();
+        if (self.quick_panel.visible and self.quick_panel.mode == .completion) _ = self.requestCompletionFromLsp();
     }
 
     fn quickPanelDeleteBackward(self: *LinuxGuiState) void {
@@ -3484,7 +3504,7 @@ const LinuxGuiState = struct {
             return;
         };
         self.rememberDocumentSearchFromQuickPanel();
-        if (self.quick_panel.visible and self.quick_panel.mode == .completion) self.requestCompletionFromLsp();
+        if (self.quick_panel.visible and self.quick_panel.mode == .completion) _ = self.requestCompletionFromLsp();
     }
 
     fn toggleQuickPanelCaseSensitive(self: *LinuxGuiState) void {

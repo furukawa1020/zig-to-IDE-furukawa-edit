@@ -1278,7 +1278,6 @@ const LinuxGuiState = struct {
         };
         self.handleDispatchResult("lsp.ensure_active", result);
         self.bottom_panel = .output;
-        self.message("LSP ensure requested", .{});
     }
 
     fn requestDefinitionFromLsp(self: *LinuxGuiState) bool {

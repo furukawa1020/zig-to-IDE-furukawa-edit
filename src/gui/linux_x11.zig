@@ -496,6 +496,7 @@ const BottomPanel = enum {
 
 const PendingLspAction = enum {
     none,
+    completion,
     goto_definition,
     find_references,
     hover,
@@ -1160,6 +1161,7 @@ const LinuxGuiState = struct {
     context_menu_y: i16 = 0,
     context_menu_selected: usize = 0,
     pending_lsp_action: PendingLspAction = .none,
+    deferred_lsp_action: PendingLspAction = .none,
     clipboard: std.array_list.Managed(u8),
     primary_selection: std.array_list.Managed(u8),
     clipboard_owned: bool = false,
@@ -1250,6 +1252,7 @@ const LinuxGuiState = struct {
             };
         }
         self.finishPendingLspAction();
+        self.runDeferredLspActionIfReady();
         return true;
     }
 
@@ -1266,18 +1269,35 @@ const LinuxGuiState = struct {
             return false;
         };
         if (!sent) return false;
+        self.pending_lsp_action = .completion;
         self.message("LSP completion requested", .{});
         return true;
     }
 
-    fn ensureLspForFeature(self: *LinuxGuiState, feature: []const u8) void {
+    fn ensureLspForFeature(self: *LinuxGuiState, feature: []const u8, action: PendingLspAction) void {
         const result = dispatcher.dispatch(&self.app, .{ .id = "lsp.ensure_active", .source = .command_palette }) catch |err| {
             self.message("lsp ensure failed", .{});
             self.appendOutput(.stderr, "lsp ensure failed for {s}: {s}\n", .{ feature, @errorName(err) });
             return;
         };
+        self.deferred_lsp_action = if (std.meta.activeTag(result) == .completed or self.app.hasRunningLspForActiveDocument()) action else .none;
         self.handleDispatchResult("lsp.ensure_active", result);
         self.bottom_panel = .output;
+    }
+
+    fn runDeferredLspActionIfReady(self: *LinuxGuiState) void {
+        if (self.deferred_lsp_action == .none or self.pending_lsp_action != .none) return;
+        const session = self.app.activeLspSessionConst() orelse return;
+        if (session.state != .initialized) return;
+        const action = self.deferred_lsp_action;
+        self.deferred_lsp_action = .none;
+        switch (action) {
+            .completion => _ = self.requestCompletionFromLsp(),
+            .hover => _ = self.requestHoverFromLsp(),
+            .formatting_preview => _ = self.requestFormattingFromLsp(),
+            .code_actions => _ = self.requestCodeActionsFromLsp(),
+            else => {},
+        }
     }
 
     fn requestDefinitionFromLsp(self: *LinuxGuiState) bool {
@@ -1349,6 +1369,19 @@ const LinuxGuiState = struct {
     fn finishPendingLspAction(self: *LinuxGuiState) void {
         switch (self.pending_lsp_action) {
             .none => {},
+            .completion => {
+                if (self.app.activeLspSessionConst()) |session| {
+                    if (session.last_completion != null) {
+                        self.pending_lsp_action = .none;
+                        if (self.quick_panel.visible and self.quick_panel.mode == .completion) {
+                            self.quick_panel.rebuild(&self.app) catch |err| {
+                                self.appendOutput(.stderr, "completion refresh failed: {s}\n", .{@errorName(err)});
+                            };
+                        }
+                        self.message("LSP completions updated", .{});
+                    }
+                }
+            },
             .goto_definition => {
                 if (self.app.activeLspSessionConst()) |session| {
                     if (session.last_locations) |locations| {
@@ -3090,17 +3123,17 @@ const LinuxGuiState = struct {
         }
         if (std.mem.eql(u8, id, "lsp.request_code_action")) {
             if (self.requestCodeActionsFromLsp()) return;
-            self.ensureLspForFeature("quick fixes");
+            self.ensureLspForFeature("quick fixes", .code_actions);
             return;
         }
         if (std.mem.eql(u8, id, "lsp.request_hover")) {
             if (self.requestHoverFromLsp()) return;
-            self.ensureLspForFeature("hover");
+            self.ensureLspForFeature("hover", .hover);
             return;
         }
         if (std.mem.eql(u8, id, "editor.format_document") or std.mem.eql(u8, id, "lsp.request_formatting")) {
             if (self.requestFormattingFromLsp()) return;
-            self.ensureLspForFeature("formatting");
+            self.ensureLspForFeature("formatting", .formatting_preview);
             return;
         }
         if (std.mem.eql(u8, id, "preferences.open_settings")) {
@@ -3462,7 +3495,7 @@ const LinuxGuiState = struct {
         self.seedQuickPanelFromLastSearch(mode);
         self.app.mode = .command;
         self.message("{s}", .{quickPanelTitle(mode)});
-        if (mode == .completion and !self.requestCompletionFromLsp()) self.ensureLspForFeature("completion");
+        if (mode == .completion and !self.requestCompletionFromLsp()) self.ensureLspForFeature("completion", .completion);
     }
 
     fn openRenamePanel(self: *LinuxGuiState) void {
@@ -4170,6 +4203,7 @@ const LinuxGuiState = struct {
         self.clearSelection();
         self.editor_dragging = false;
         self.pending_lsp_action = .none;
+        self.deferred_lsp_action = .none;
         self.file_scroll_line = 0;
         self.editor_scroll_line = 0;
         self.output_scroll_line = 0;

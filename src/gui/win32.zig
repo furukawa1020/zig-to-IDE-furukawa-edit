@@ -990,12 +990,18 @@ const GuiState = struct {
         }
         if (std.mem.eql(u8, id, "lsp.request_code_action")) {
             if (self.requestCodeActionsFromLsp()) return;
+            self.ensureLspForFeature("quick fixes");
+            return;
         }
         if (std.mem.eql(u8, id, "lsp.request_hover")) {
             if (self.requestHoverFromLsp()) return;
+            self.ensureLspForFeature("hover");
+            return;
         }
         if (std.mem.eql(u8, id, "editor.format_document") or std.mem.eql(u8, id, "lsp.request_formatting")) {
             if (self.requestFormattingFromLsp()) return;
+            self.ensureLspForFeature("formatting");
+            return;
         }
         if (std.mem.eql(u8, id, "workspace.find_file")) {
             self.openQuickPanel(.find_file);
@@ -1358,7 +1364,7 @@ const GuiState = struct {
             .code_actions => "Quick Fix",
             .language_mode => "Language mode",
         }) catch {};
-        if (mode == .completion) self.requestCompletionFromLsp();
+        if (mode == .completion and !self.requestCompletionFromLsp()) self.ensureLspForFeature("completion");
     }
 
     fn seedQuickPanelFromSelection(self: *GuiState, mode: QuickPanelMode) bool {
@@ -1414,7 +1420,7 @@ const GuiState = struct {
         };
         self.rememberDocumentSearchFromQuickPanel();
         self.refreshSearchPanelFromQuickPanel();
-        if (self.quick_panel.visible and self.quick_panel.mode == .completion) self.requestCompletionFromLsp();
+        if (self.quick_panel.visible and self.quick_panel.mode == .completion) _ = self.requestCompletionFromLsp();
     }
 
     fn quickPanelDeleteBackward(self: *GuiState) void {
@@ -1424,7 +1430,7 @@ const GuiState = struct {
         };
         self.rememberDocumentSearchFromQuickPanel();
         self.refreshSearchPanelFromQuickPanel();
-        if (self.quick_panel.visible and self.quick_panel.mode == .completion) self.requestCompletionFromLsp();
+        if (self.quick_panel.visible and self.quick_panel.mode == .completion) _ = self.requestCompletionFromLsp();
     }
 
     fn refreshSearchPanelFromQuickPanel(self: *GuiState) void {
@@ -2382,11 +2388,26 @@ const GuiState = struct {
         };
     }
 
-    fn requestCompletionFromLsp(self: *GuiState) void {
-        _ = dispatcher.requestActiveCompletionFromRunningLsp(&self.app) catch |err| {
+    fn requestCompletionFromLsp(self: *GuiState) bool {
+        const sent = dispatcher.requestActiveCompletionFromRunningLsp(&self.app) catch |err| {
             self.appendOutput(.stderr, "lsp completion request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.setMessage("LSP completion requested") catch {};
+        return true;
+    }
+
+    fn ensureLspForFeature(self: *GuiState, feature: []const u8) void {
+        const result = dispatcher.dispatch(&self.app, .{ .id = "lsp.ensure_active", .source = .command_palette }) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "lsp ensure failed for {s}: {s}\n", .{ feature, @errorName(err) });
             return;
         };
+        self.handleDispatchResult("lsp.ensure_active", result);
+        self.show_output = true;
+        self.bottom_panel = .output;
+        self.setMessage("LSP ensure requested") catch {};
     }
 
     fn requestDefinitionFromLsp(self: *GuiState) bool {

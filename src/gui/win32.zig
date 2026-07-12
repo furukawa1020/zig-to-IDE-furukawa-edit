@@ -12,6 +12,7 @@ const git_repository = @import("../git/repository.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
 const highlight = @import("../language/highlight.zig");
 const lsp_responses = @import("../lsp/responses.zig");
+const lsp_session = @import("../lsp/session.zig");
 const modes = @import("../language/modes.zig");
 const completion_mod = @import("../language/completion.zig");
 const symbols_mod = @import("../language/symbols.zig");
@@ -59,6 +60,8 @@ const PendingLspAction = enum {
     none,
     completion,
     goto_definition,
+    goto_implementation,
+    goto_type_definition,
     find_references,
     hover,
     rename_preview,
@@ -94,6 +97,8 @@ const lsp_panel_actions = [_]LspPanelAction{
     .{ .id = "editor.complete", .label = "Complete", .hint = "open local and cached LSP completions" },
     .{ .id = "editor.format_document", .label = "Format document", .hint = "preview WorkspaceEdit before applying" },
     .{ .id = "symbol.goto_definition", .label = "Go to definition", .hint = "LSP first, local fallback" },
+    .{ .id = "symbol.goto_implementation", .label = "Go to implementation", .hint = "LSP implementation locations" },
+    .{ .id = "symbol.goto_type_definition", .label = "Go to type definition", .hint = "LSP type definition locations" },
     .{ .id = "symbol.find_references", .label = "Find references", .hint = "LSP first, local fallback" },
     .{ .id = "symbol.rename", .label = "Rename symbol", .hint = "preview rename edits safely" },
     .{ .id = "lsp.request_code_action", .label = "Quick fixes", .hint = "request code actions for cursor diagnostics" },
@@ -981,6 +986,14 @@ const GuiState = struct {
         }
         if (std.mem.eql(u8, id, "symbol.goto_definition")) {
             self.gotoLocalDefinitionAtCursor();
+            return;
+        }
+        if (std.mem.eql(u8, id, "symbol.goto_implementation")) {
+            self.gotoImplementationAtCursor();
+            return;
+        }
+        if (std.mem.eql(u8, id, "symbol.goto_type_definition")) {
+            self.gotoTypeDefinitionAtCursor();
             return;
         }
         if (std.mem.eql(u8, id, "symbol.find_references")) {
@@ -2001,6 +2014,24 @@ const GuiState = struct {
         self.selectActiveDocumentRange(match.start, match.end, "Found match");
     }
 
+    fn openCachedLspLocationsForKind(self: *GuiState, kind: lsp_session.RequestKind, list_label: []const u8, opened_message: []const u8, empty_message: []const u8) bool {
+        const session = self.app.activeLspSessionConst() orelse return false;
+        if (session.last_locations_kind != kind) return false;
+        const locations = session.last_locations orelse return false;
+        if (locations.items.len == 0) {
+            self.setMessage(empty_message) catch {};
+            return true;
+        }
+        if (locations.items.len > 1) {
+            self.showLspLocations(list_label);
+            return true;
+        }
+        const location = locations.items[0];
+        self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
+        self.setMessage(opened_message) catch {};
+        return true;
+    }
+
     fn gotoLocalDefinitionAtCursor(self: *GuiState) void {
         if (self.requestDefinitionFromLsp()) return;
         if (self.app.activeLspSessionConst()) |session| {
@@ -2045,6 +2076,18 @@ const GuiState = struct {
 
         self.setMessage("No local top-level definition") catch {};
         self.ensureLspForFeature("definition", .goto_definition);
+    }
+
+    fn gotoImplementationAtCursor(self: *GuiState) void {
+        if (self.requestImplementationFromLsp()) return;
+        if (self.openCachedLspLocationsForKind(.implementation, "LSP implementations", "Opened LSP implementation", "No LSP implementation")) return;
+        self.ensureLspForFeature("implementation", .goto_implementation);
+    }
+
+    fn gotoTypeDefinitionAtCursor(self: *GuiState) void {
+        if (self.requestTypeDefinitionFromLsp()) return;
+        if (self.openCachedLspLocationsForKind(.type_definition, "LSP type definitions", "Opened LSP type definition", "No LSP type definition")) return;
+        self.ensureLspForFeature("type definition", .goto_type_definition);
     }
 
     fn findReferencesAtCursor(self: *GuiState) void {
@@ -2444,6 +2487,8 @@ const GuiState = struct {
         switch (action) {
             .completion => _ = self.requestCompletionFromLsp(),
             .goto_definition => _ = self.requestDefinitionFromLsp(),
+            .goto_implementation => _ = self.requestImplementationFromLsp(),
+            .goto_type_definition => _ = self.requestTypeDefinitionFromLsp(),
             .find_references => _ = self.requestReferencesFromLsp(),
             .hover => _ = self.requestHoverFromLsp(),
             .rename_preview => {
@@ -2465,6 +2510,28 @@ const GuiState = struct {
         if (!sent) return false;
         self.pending_lsp_action = .goto_definition;
         self.setMessage("LSP definition requested") catch {};
+        return true;
+    }
+
+    fn requestImplementationFromLsp(self: *GuiState) bool {
+        const sent = dispatcher.requestActiveImplementationFromRunningLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp implementation request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.pending_lsp_action = .goto_implementation;
+        self.setMessage("LSP implementation requested") catch {};
+        return true;
+    }
+
+    fn requestTypeDefinitionFromLsp(self: *GuiState) bool {
+        const sent = dispatcher.requestActiveTypeDefinitionFromRunningLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp type definition request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.pending_lsp_action = .goto_type_definition;
+        self.setMessage("LSP type definition requested") catch {};
         return true;
     }
 
@@ -2557,6 +2624,16 @@ const GuiState = struct {
                             self.setMessage("Opened LSP definition") catch {};
                         }
                     }
+                }
+            },
+            .goto_implementation => {
+                if (self.openCachedLspLocationsForKind(.implementation, "LSP implementations", "Opened LSP implementation", "No LSP implementation")) {
+                    self.pending_lsp_action = .none;
+                }
+            },
+            .goto_type_definition => {
+                if (self.openCachedLspLocationsForKind(.type_definition, "LSP type definitions", "Opened LSP type definition", "No LSP type definition")) {
+                    self.pending_lsp_action = .none;
                 }
             },
             .find_references => {

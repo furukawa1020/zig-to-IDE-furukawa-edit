@@ -3748,7 +3748,13 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         return;
     }
     if (key == VK_F12) {
-        state.executeCommand(if (shift) "symbol.find_references" else "symbol.goto_definition");
+        if (ctrl and alt) {
+            state.executeCommand("symbol.goto_type_definition");
+        } else if (ctrl) {
+            state.executeCommand("symbol.goto_implementation");
+        } else {
+            state.executeCommand(if (shift) "symbol.find_references" else "symbol.goto_definition");
+        }
         return;
     }
     if (key == VK_F6) {

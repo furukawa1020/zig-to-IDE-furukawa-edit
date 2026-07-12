@@ -4673,7 +4673,11 @@ const LinuxGuiState = struct {
                     return;
                 },
                 12 => {
-                    if (key.modifiers.shift) {
+                    if (key.modifiers.ctrl and key.modifiers.alt) {
+                        self.gotoTypeDefinitionAtCursor();
+                    } else if (key.modifiers.ctrl) {
+                        self.gotoImplementationAtCursor();
+                    } else if (key.modifiers.shift) {
                         self.findReferencesAtCursor();
                     } else {
                         self.gotoLocalDefinitionAtCursor();

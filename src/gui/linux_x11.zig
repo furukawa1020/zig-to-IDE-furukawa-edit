@@ -1162,6 +1162,7 @@ const LinuxGuiState = struct {
     context_menu_selected: usize = 0,
     pending_lsp_action: PendingLspAction = .none,
     deferred_lsp_action: PendingLspAction = .none,
+    deferred_lsp_rename_name: std.array_list.Managed(u8),
     clipboard: std.array_list.Managed(u8),
     primary_selection: std.array_list.Managed(u8),
     clipboard_owned: bool = false,
@@ -1206,6 +1207,7 @@ const LinuxGuiState = struct {
             .quick_panel = QuickPanel.init(allocator),
             .collapsed_dirs = collapsed_dirs,
             .last_document_search_query = std.array_list.Managed(u8).init(allocator),
+            .deferred_lsp_rename_name = std.array_list.Managed(u8).init(allocator),
             .clipboard = std.array_list.Managed(u8).init(allocator),
             .primary_selection = std.array_list.Managed(u8).init(allocator),
             .terminal_input = std.array_list.Managed(u8).init(allocator),
@@ -1221,6 +1223,7 @@ const LinuxGuiState = struct {
         self.terminal_input.deinit();
         self.primary_selection.deinit();
         self.clipboard.deinit();
+        self.deferred_lsp_rename_name.deinit();
         self.last_document_search_query.deinit();
         self.quick_panel.deinit();
         self.allocator.free(self.collapsed_dirs);
@@ -1296,6 +1299,11 @@ const LinuxGuiState = struct {
             .goto_definition => _ = self.requestDefinitionFromLsp(),
             .find_references => _ = self.requestReferencesFromLsp(),
             .hover => _ = self.requestHoverFromLsp(),
+            .rename_preview => {
+                if (self.deferred_lsp_rename_name.items.len == 0 or !self.requestRenameFromLsp(self.deferred_lsp_rename_name.items)) {
+                    self.deferred_lsp_rename_name.clearRetainingCapacity();
+                }
+            },
             .formatting_preview => _ = self.requestFormattingFromLsp(),
             .code_actions => _ = self.requestCodeActionsFromLsp(),
             else => {},
@@ -1420,6 +1428,7 @@ const LinuxGuiState = struct {
                 if (self.app.activeLspSessionConst()) |session| {
                     if (session.last_workspace_edit) |edit| {
                         self.pending_lsp_action = .none;
+                        self.deferred_lsp_rename_name.clearRetainingCapacity();
                         self.showLspWorkspaceEdit("LSP rename preview", &edit);
                     }
                 }
@@ -3683,6 +3692,11 @@ const LinuxGuiState = struct {
                 defer self.allocator.free(new_name);
                 self.quick_panel.close();
                 if (self.requestRenameFromLsp(new_name)) return;
+                self.deferred_lsp_rename_name.clearRetainingCapacity();
+                self.deferred_lsp_rename_name.appendSlice(new_name) catch |err| return self.message("rename failed: {s}", .{@errorName(err)});
+                self.ensureLspForFeature("rename", .rename_preview);
+                if (self.deferred_lsp_action == .rename_preview) return;
+                self.deferred_lsp_rename_name.clearRetainingCapacity();
                 self.renameWorkspaceSymbol(old_name, new_name);
             },
             .goto_line => self.gotoLineFromQuickPanel(),
@@ -4216,6 +4230,7 @@ const LinuxGuiState = struct {
         self.editor_dragging = false;
         self.pending_lsp_action = .none;
         self.deferred_lsp_action = .none;
+        self.deferred_lsp_rename_name.clearRetainingCapacity();
         self.file_scroll_line = 0;
         self.editor_scroll_line = 0;
         self.output_scroll_line = 0;

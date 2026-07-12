@@ -1438,6 +1438,16 @@ const LinuxGuiState = struct {
                     }
                 }
             },
+            .goto_implementation => {
+                if (self.openCachedLspLocationsForKind(.implementation, "LSP implementations", "opened LSP implementation", "no LSP implementation")) {
+                    self.pending_lsp_action = .none;
+                }
+            },
+            .goto_type_definition => {
+                if (self.openCachedLspLocationsForKind(.type_definition, "LSP type definitions", "opened LSP type definition", "no LSP type definition")) {
+                    self.pending_lsp_action = .none;
+                }
+            },
             .find_references => {
                 if (self.app.activeLspSessionConst()) |session| {
                     if (session.last_locations_kind == .references) {

@@ -6317,7 +6317,7 @@ fn tutorialLines(language: TutorialLanguage) []const []const u8 {
             "F1 opens this tutorial. Ctrl+Shift+P opens commands. Ctrl+O opens a workspace folder.",
             "Click files on the left. Edit in insert mode. Ctrl+S saves with atomic write.",
             "Ctrl+F finds in the file. Ctrl+H replaces in the file. Ctrl+Shift+F searches the workspace.",
-            "F12 jumps to a local Zig definition. Shift+F12 finds references. F2 opens safe rename preview.",
+            "F12 jumps to definition. Ctrl+F12 jumps to implementation. Ctrl+Alt+F12 jumps to type definition. Shift+F12 finds references.",
             "Ctrl+Shift+L opens SHIP, the release, trust, and packaging checklist.",
             "",
             "== RUNNING CODE SAFELY ==",

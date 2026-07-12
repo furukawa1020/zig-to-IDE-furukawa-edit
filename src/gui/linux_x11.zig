@@ -4075,6 +4075,24 @@ const LinuxGuiState = struct {
         self.selectActiveDocumentRange(match.start, match.end, "found match");
     }
 
+    fn openCachedLspLocationsForKind(self: *LinuxGuiState, kind: lsp_session.RequestKind, list_label: []const u8, opened_message: []const u8, empty_message: []const u8) bool {
+        const session = self.app.activeLspSessionConst() orelse return false;
+        if (session.last_locations_kind != kind) return false;
+        const locations = session.last_locations orelse return false;
+        if (locations.items.len == 0) {
+            self.message("{s}", .{empty_message});
+            return true;
+        }
+        if (locations.items.len > 1) {
+            self.showLspLocations(list_label);
+            return true;
+        }
+        const location = locations.items[0];
+        self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
+        self.message("{s}", .{opened_message});
+        return true;
+    }
+
     fn gotoLocalDefinitionAtCursor(self: *LinuxGuiState) void {
         if (self.requestDefinitionFromLsp()) return;
         if (self.app.activeLspSessionConst()) |session| {
@@ -4112,6 +4130,18 @@ const LinuxGuiState = struct {
         }
         self.message("no local top-level definition", .{});
         self.ensureLspForFeature("definition", .goto_definition);
+    }
+
+    fn gotoImplementationAtCursor(self: *LinuxGuiState) void {
+        if (self.requestImplementationFromLsp()) return;
+        if (self.openCachedLspLocationsForKind(.implementation, "LSP implementations", "opened LSP implementation", "no LSP implementation")) return;
+        self.ensureLspForFeature("implementation", .goto_implementation);
+    }
+
+    fn gotoTypeDefinitionAtCursor(self: *LinuxGuiState) void {
+        if (self.requestTypeDefinitionFromLsp()) return;
+        if (self.openCachedLspLocationsForKind(.type_definition, "LSP type definitions", "opened LSP type definition", "no LSP type definition")) return;
+        self.ensureLspForFeature("type definition", .goto_type_definition);
     }
 
     fn findReferencesAtCursor(self: *LinuxGuiState) void {

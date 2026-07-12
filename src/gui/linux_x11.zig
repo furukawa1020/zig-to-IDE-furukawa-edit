@@ -1302,6 +1302,8 @@ const LinuxGuiState = struct {
         switch (action) {
             .completion => _ = self.requestCompletionFromLsp(),
             .goto_definition => _ = self.requestDefinitionFromLsp(),
+            .goto_implementation => _ = self.requestImplementationFromLsp(),
+            .goto_type_definition => _ = self.requestTypeDefinitionFromLsp(),
             .find_references => _ = self.requestReferencesFromLsp(),
             .hover => _ = self.requestHoverFromLsp(),
             .rename_preview => {
@@ -1323,6 +1325,28 @@ const LinuxGuiState = struct {
         if (!sent) return false;
         self.pending_lsp_action = .goto_definition;
         self.message("LSP definition requested", .{});
+        return true;
+    }
+
+    fn requestImplementationFromLsp(self: *LinuxGuiState) bool {
+        const sent = dispatcher.requestActiveImplementationFromRunningLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp implementation request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.pending_lsp_action = .goto_implementation;
+        self.message("LSP implementation requested", .{});
+        return true;
+    }
+
+    fn requestTypeDefinitionFromLsp(self: *LinuxGuiState) bool {
+        const sent = dispatcher.requestActiveTypeDefinitionFromRunningLsp(&self.app) catch |err| {
+            self.appendOutput(.stderr, "lsp type definition request failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        if (!sent) return false;
+        self.pending_lsp_action = .goto_type_definition;
+        self.message("LSP type definition requested", .{});
         return true;
     }
 

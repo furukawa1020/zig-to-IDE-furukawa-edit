@@ -13,6 +13,7 @@ const navigation = @import("../editor/navigation.zig");
 const git_repository = @import("../git/repository.zig");
 const highlight = @import("../language/highlight.zig");
 const lsp_responses = @import("../lsp/responses.zig");
+const lsp_session = @import("../lsp/session.zig");
 const modes = @import("../language/modes.zig");
 const completion_mod = @import("../language/completion.zig");
 const symbols_mod = @import("../language/symbols.zig");
@@ -498,6 +499,8 @@ const PendingLspAction = enum {
     none,
     completion,
     goto_definition,
+    goto_implementation,
+    goto_type_definition,
     find_references,
     hover,
     rename_preview,
@@ -714,6 +717,8 @@ const lsp_panel_actions = [_]LspPanelAction{
     .{ .id = "editor.complete", .label = "Complete", .hint = "open local and cached LSP completions" },
     .{ .id = "editor.format_document", .label = "Format document", .hint = "preview WorkspaceEdit before applying" },
     .{ .id = "symbol.goto_definition", .label = "Go to definition", .hint = "LSP first, local fallback" },
+    .{ .id = "symbol.goto_implementation", .label = "Go to implementation", .hint = "LSP implementation locations" },
+    .{ .id = "symbol.goto_type_definition", .label = "Go to type definition", .hint = "LSP type definition locations" },
     .{ .id = "symbol.find_references", .label = "Find references", .hint = "LSP first, local fallback" },
     .{ .id = "symbol.rename", .label = "Rename symbol", .hint = "preview rename edits safely" },
     .{ .id = "lsp.request_code_action", .label = "Quick fixes", .hint = "request code actions for cursor diagnostics" },
@@ -3126,6 +3131,14 @@ const LinuxGuiState = struct {
         }
         if (std.mem.eql(u8, id, "symbol.goto_definition")) {
             self.gotoLocalDefinitionAtCursor();
+            return;
+        }
+        if (std.mem.eql(u8, id, "symbol.goto_implementation")) {
+            self.gotoImplementationAtCursor();
+            return;
+        }
+        if (std.mem.eql(u8, id, "symbol.goto_type_definition")) {
+            self.gotoTypeDefinitionAtCursor();
             return;
         }
         if (std.mem.eql(u8, id, "symbol.find_references")) {

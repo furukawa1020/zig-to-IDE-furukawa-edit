@@ -322,6 +322,14 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return try requestCurrentPositionLsp(app, .definition, "definition");
     }
 
+    if (std.mem.eql(u8, definition.id, "lsp.request_implementation")) {
+        return try requestCurrentPositionLsp(app, .implementation, "implementation");
+    }
+
+    if (std.mem.eql(u8, definition.id, "lsp.request_type_definition")) {
+        return try requestCurrentPositionLsp(app, .type_definition, "typeDefinition");
+    }
+
     if (std.mem.eql(u8, definition.id, "lsp.request_references")) {
         return try requestCurrentPositionLsp(app, .references, "references");
     }
@@ -1029,6 +1037,14 @@ pub fn requestActiveFormattingFromRunningLsp(app: *app_mod.App) !bool {
 
 pub fn requestActiveDefinitionFromRunningLsp(app: *app_mod.App) !bool {
     return try requestActivePositionFromRunningLsp(app, .definition, "definition");
+}
+
+pub fn requestActiveImplementationFromRunningLsp(app: *app_mod.App) !bool {
+    return try requestActivePositionFromRunningLsp(app, .implementation, "implementation");
+}
+
+pub fn requestActiveTypeDefinitionFromRunningLsp(app: *app_mod.App) !bool {
+    return try requestActivePositionFromRunningLsp(app, .type_definition, "typeDefinition");
 }
 
 pub fn requestActiveReferencesFromRunningLsp(app: *app_mod.App) !bool {

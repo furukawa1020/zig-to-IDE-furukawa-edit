@@ -79,7 +79,9 @@ pub const Session = struct {
     last_completion: ?responses.CompletionItems = null,
     last_hover: ?responses.Hover = null,
     last_locations: ?responses.Locations = null,
+    last_locations_kind: ?RequestKind = null,
     last_workspace_edit: ?responses.WorkspaceEdit = null,
+    last_workspace_edit_kind: ?RequestKind = null,
     last_code_actions: ?responses.CodeActions = null,
 
     pub fn init(allocator: std.mem.Allocator, workspace_root: []const u8) !Session {
@@ -288,6 +290,7 @@ pub const Session = struct {
                 if (try responses.parseLocationResponse(self.allocator, payload, self.workspace_root)) |locations| {
                     self.clearLastLocations();
                     self.last_locations = locations;
+                    self.last_locations_kind = pending.kind;
                     return .{ .locations = locations.items.len };
                 }
                 return .ignored;
@@ -296,6 +299,7 @@ pub const Session = struct {
                 if (try responses.parseWorkspaceEditResponse(self.allocator, payload, self.workspace_root)) |edit| {
                     self.clearLastWorkspaceEdit();
                     self.last_workspace_edit = edit;
+                    self.last_workspace_edit_kind = pending.kind;
                     return .{ .workspace_edit = edit.edits.len };
                 }
                 return .ignored;
@@ -305,6 +309,7 @@ pub const Session = struct {
                 if (try responses.parseFormattingResponse(self.allocator, payload, path)) |edit| {
                     self.clearLastWorkspaceEdit();
                     self.last_workspace_edit = edit;
+                    self.last_workspace_edit_kind = pending.kind;
                     return .{ .workspace_edit = edit.edits.len };
                 }
                 return .ignored;
@@ -409,11 +414,13 @@ pub const Session = struct {
     fn clearLastLocations(self: *Session) void {
         if (self.last_locations) |*locations| locations.deinit();
         self.last_locations = null;
+        self.last_locations_kind = null;
     }
 
     fn clearLastWorkspaceEdit(self: *Session) void {
         if (self.last_workspace_edit) |*edit| edit.deinit();
         self.last_workspace_edit = null;
+        self.last_workspace_edit_kind = null;
     }
 
     fn clearLastCodeActions(self: *Session) void {
@@ -557,6 +564,7 @@ test "session routes definition locations by pending id" {
     const result = try session.ingestPayload(payload, &collection);
     try std.testing.expectEqual(IngestResult{ .locations = 1 }, result);
     try std.testing.expect(session.last_locations != null);
+    try std.testing.expectEqual(RequestKind.definition, session.last_locations_kind.?);
     try std.testing.expectEqualStrings("src/lib.zig", session.last_locations.?.items[0].path);
 }
 
@@ -575,6 +583,7 @@ test "session routes rename workspace edit by pending id" {
     const result = try session.ingestPayload(payload, &collection);
     try std.testing.expectEqual(IngestResult{ .workspace_edit = 1 }, result);
     try std.testing.expect(session.last_workspace_edit != null);
+    try std.testing.expectEqual(RequestKind.rename, session.last_workspace_edit_kind.?);
     try std.testing.expectEqualStrings("src/main.zig", session.last_workspace_edit.?.edits[0].path);
     try std.testing.expectEqualStrings("renamed", session.last_workspace_edit.?.edits[0].new_text);
 }
@@ -595,6 +604,7 @@ test "session routes formatting edits by pending id" {
     const result = try session.ingestPayload(payload, &collection);
     try std.testing.expectEqual(IngestResult{ .workspace_edit = 1 }, result);
     try std.testing.expect(session.last_workspace_edit != null);
+    try std.testing.expectEqual(RequestKind.formatting, session.last_workspace_edit_kind.?);
     try std.testing.expectEqualStrings("src/main.zig", session.last_workspace_edit.?.edits[0].path);
     try std.testing.expectEqualStrings("const x = 1;", session.last_workspace_edit.?.edits[0].new_text);
 }

@@ -890,13 +890,17 @@ fn renderLspStatus(app: *app_mod.App) !void {
                 if (preview_len > 0) try writer.print("last hover preview: {s}\n", .{hover.text[0..preview_len]});
             }
             if (server.session.last_locations) |locations| {
-                try writer.print("last locations: {d}\n", .{locations.items.len});
+                try writer.print("last locations ({s}): {d}\n", .{ @tagName(server.session.last_locations_kind orelse .definition), locations.items.len });
                 for (locations.items[0..@min(locations.items.len, 6)]) |location| {
                     try writer.print("- {s}:{d}:{d}\n", .{ location.path, location.range.start.line + 1, location.range.start.column + 1 });
                 }
             }
             if (server.session.last_workspace_edit) |edit| {
-                try writer.print("last workspace edit: edits={d} skipped_resource_ops={d}\n", .{ edit.edits.len, edit.skipped_resource_ops });
+                try writer.print("last workspace edit ({s}): edits={d} skipped_resource_ops={d}\n", .{
+                    @tagName(server.session.last_workspace_edit_kind orelse .rename),
+                    edit.edits.len,
+                    edit.skipped_resource_ops,
+                });
                 for (edit.edits[0..@min(edit.edits.len, 6)]) |item| {
                     try writer.print("- {s}:{d}:{d}-{d}:{d} bytes={d}\n", .{
                         item.path,

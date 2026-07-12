@@ -2004,12 +2004,14 @@ const GuiState = struct {
     fn gotoLocalDefinitionAtCursor(self: *GuiState) void {
         if (self.requestDefinitionFromLsp()) return;
         if (self.app.activeLspSessionConst()) |session| {
-            if (session.last_locations) |locations| {
-                if (locations.items.len > 0) {
-                    const location = locations.items[0];
-                    self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
-                    self.setMessage("Opened LSP definition") catch {};
-                    return;
+            if (session.last_locations_kind == .definition) {
+                if (session.last_locations) |locations| {
+                    if (locations.items.len > 0) {
+                        const location = locations.items[0];
+                        self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
+                        self.setMessage("Opened LSP definition") catch {};
+                        return;
+                    }
                 }
             }
         }
@@ -2048,10 +2050,12 @@ const GuiState = struct {
     fn findReferencesAtCursor(self: *GuiState) void {
         if (self.requestReferencesFromLsp()) return;
         if (self.app.activeLspSessionConst()) |session| {
-            if (session.last_locations) |locations| {
-                if (locations.items.len > 0) {
-                    self.showLspLocations("LSP locations");
-                    return;
+            if (session.last_locations_kind == .references) {
+                if (session.last_locations) |locations| {
+                    if (locations.items.len > 0) {
+                        self.showLspLocations("LSP locations");
+                        return;
+                    }
                 }
             }
         }
@@ -2537,31 +2541,35 @@ const GuiState = struct {
             },
             .goto_definition => {
                 if (self.app.activeLspSessionConst()) |session| {
-                    if (session.last_locations) |locations| {
-                        self.pending_lsp_action = .none;
-                        if (locations.items.len == 0) {
-                            self.setMessage("No LSP definition") catch {};
-                            return;
+                    if (session.last_locations_kind == .definition) {
+                        if (session.last_locations) |locations| {
+                            self.pending_lsp_action = .none;
+                            if (locations.items.len == 0) {
+                                self.setMessage("No LSP definition") catch {};
+                                return;
+                            }
+                            if (locations.items.len > 1) {
+                                self.showLspLocations("LSP definitions");
+                                return;
+                            }
+                            const location = locations.items[0];
+                            self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
+                            self.setMessage("Opened LSP definition") catch {};
                         }
-                        if (locations.items.len > 1) {
-                            self.showLspLocations("LSP definitions");
-                            return;
-                        }
-                        const location = locations.items[0];
-                        self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
-                        self.setMessage("Opened LSP definition") catch {};
                     }
                 }
             },
             .find_references => {
                 if (self.app.activeLspSessionConst()) |session| {
-                    if (session.last_locations) |locations| {
-                        self.pending_lsp_action = .none;
-                        if (locations.items.len == 0) {
-                            self.setMessage("No LSP references") catch {};
-                            return;
+                    if (session.last_locations_kind == .references) {
+                        if (session.last_locations) |locations| {
+                            self.pending_lsp_action = .none;
+                            if (locations.items.len == 0) {
+                                self.setMessage("No LSP references") catch {};
+                                return;
+                            }
+                            self.showLspLocations("LSP references");
                         }
-                        self.showLspLocations("LSP references");
                     }
                 }
             },
@@ -2575,18 +2583,22 @@ const GuiState = struct {
             },
             .rename_preview => {
                 if (self.app.activeLspSessionConst()) |session| {
-                    if (session.last_workspace_edit) |edit| {
-                        self.pending_lsp_action = .none;
-                        self.deferred_lsp_rename_name.clearRetainingCapacity();
-                        self.showLspWorkspaceEdit("LSP rename preview", &edit);
+                    if (session.last_workspace_edit_kind == .rename) {
+                        if (session.last_workspace_edit) |edit| {
+                            self.pending_lsp_action = .none;
+                            self.deferred_lsp_rename_name.clearRetainingCapacity();
+                            self.showLspWorkspaceEdit("LSP rename preview", &edit);
+                        }
                     }
                 }
             },
             .formatting_preview => {
                 if (self.app.activeLspSessionConst()) |session| {
-                    if (session.last_workspace_edit) |edit| {
-                        self.pending_lsp_action = .none;
-                        self.showLspWorkspaceEdit("LSP formatting preview", &edit);
+                    if (session.last_workspace_edit_kind == .formatting) {
+                        if (session.last_workspace_edit) |edit| {
+                            self.pending_lsp_action = .none;
+                            self.showLspWorkspaceEdit("LSP formatting preview", &edit);
+                        }
                     }
                 }
             },

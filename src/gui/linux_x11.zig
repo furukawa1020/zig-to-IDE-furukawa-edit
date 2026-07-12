@@ -1394,25 +1394,29 @@ const LinuxGuiState = struct {
             },
             .goto_definition => {
                 if (self.app.activeLspSessionConst()) |session| {
-                    if (session.last_locations) |locations| {
-                        self.pending_lsp_action = .none;
-                        if (locations.items.len == 0) return self.message("no LSP definition", .{});
-                        if (locations.items.len > 1) {
-                            self.showLspLocations("LSP definitions");
-                            return;
+                    if (session.last_locations_kind == .definition) {
+                        if (session.last_locations) |locations| {
+                            self.pending_lsp_action = .none;
+                            if (locations.items.len == 0) return self.message("no LSP definition", .{});
+                            if (locations.items.len > 1) {
+                                self.showLspLocations("LSP definitions");
+                                return;
+                            }
+                            const location = locations.items[0];
+                            self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
+                            self.message("opened LSP definition", .{});
                         }
-                        const location = locations.items[0];
-                        self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
-                        self.message("opened LSP definition", .{});
                     }
                 }
             },
             .find_references => {
                 if (self.app.activeLspSessionConst()) |session| {
-                    if (session.last_locations) |locations| {
-                        self.pending_lsp_action = .none;
-                        if (locations.items.len == 0) return self.message("no LSP references", .{});
-                        self.showLspLocations("LSP references");
+                    if (session.last_locations_kind == .references) {
+                        if (session.last_locations) |locations| {
+                            self.pending_lsp_action = .none;
+                            if (locations.items.len == 0) return self.message("no LSP references", .{});
+                            self.showLspLocations("LSP references");
+                        }
                     }
                 }
             },
@@ -1426,18 +1430,22 @@ const LinuxGuiState = struct {
             },
             .rename_preview => {
                 if (self.app.activeLspSessionConst()) |session| {
-                    if (session.last_workspace_edit) |edit| {
-                        self.pending_lsp_action = .none;
-                        self.deferred_lsp_rename_name.clearRetainingCapacity();
-                        self.showLspWorkspaceEdit("LSP rename preview", &edit);
+                    if (session.last_workspace_edit_kind == .rename) {
+                        if (session.last_workspace_edit) |edit| {
+                            self.pending_lsp_action = .none;
+                            self.deferred_lsp_rename_name.clearRetainingCapacity();
+                            self.showLspWorkspaceEdit("LSP rename preview", &edit);
+                        }
                     }
                 }
             },
             .formatting_preview => {
                 if (self.app.activeLspSessionConst()) |session| {
-                    if (session.last_workspace_edit) |edit| {
-                        self.pending_lsp_action = .none;
-                        self.showLspWorkspaceEdit("LSP formatting preview", &edit);
+                    if (session.last_workspace_edit_kind == .formatting) {
+                        if (session.last_workspace_edit) |edit| {
+                            self.pending_lsp_action = .none;
+                            self.showLspWorkspaceEdit("LSP formatting preview", &edit);
+                        }
                     }
                 }
             },
@@ -4033,12 +4041,14 @@ const LinuxGuiState = struct {
     fn gotoLocalDefinitionAtCursor(self: *LinuxGuiState) void {
         if (self.requestDefinitionFromLsp()) return;
         if (self.app.activeLspSessionConst()) |session| {
-            if (session.last_locations) |locations| {
-                if (locations.items.len > 0) {
-                    const location = locations.items[0];
-                    self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
-                    self.message("opened LSP definition", .{});
-                    return;
+            if (session.last_locations_kind == .definition) {
+                if (session.last_locations) |locations| {
+                    if (locations.items.len > 0) {
+                        const location = locations.items[0];
+                        self.openRelativeLocation(location.path, location.range.start.line, location.range.start.column);
+                        self.message("opened LSP definition", .{});
+                        return;
+                    }
                 }
             }
         }
@@ -4070,10 +4080,12 @@ const LinuxGuiState = struct {
     fn findReferencesAtCursor(self: *LinuxGuiState) void {
         if (self.requestReferencesFromLsp()) return;
         if (self.app.activeLspSessionConst()) |session| {
-            if (session.last_locations) |locations| {
-                if (locations.items.len > 0) {
-                    self.showLspLocations("LSP locations");
-                    return;
+            if (session.last_locations_kind == .references) {
+                if (session.last_locations) |locations| {
+                    if (locations.items.len > 0) {
+                        self.showLspLocations("LSP locations");
+                        return;
+                    }
                 }
             }
         }

@@ -708,6 +708,7 @@ const GuiState = struct {
     extensions_registry: ?extension_registry.Registry = null,
     pending_lsp_action: PendingLspAction = .none,
     deferred_lsp_action: PendingLspAction = .none,
+    deferred_lsp_rename_name: std.array_list.Managed(u8),
 
     fn init(allocator: std.mem.Allocator, root_path: []const u8) !GuiState {
         var app = try app_mod.App.init(allocator, root_path);
@@ -721,6 +722,7 @@ const GuiState = struct {
             .app = app,
             .collapsed_dirs = collapsed_dirs,
             .last_document_search_query = std.array_list.Managed(u8).init(allocator),
+            .deferred_lsp_rename_name = std.array_list.Managed(u8).init(allocator),
             .quick_panel = QuickPanel.init(allocator),
             .search_panel = SearchPanel.init(allocator),
         };
@@ -761,6 +763,7 @@ const GuiState = struct {
         self.search_panel.clear();
         self.pending_lsp_action = .none;
         self.deferred_lsp_action = .none;
+        self.deferred_lsp_rename_name.clearRetainingCapacity();
         self.setMessage("Workspace opened") catch {};
         self.appendOutput(.stdout, "opened workspace: {s}\n", .{self.app.workspace.root_path});
         self.runZigSecurityAudit("workspace open");
@@ -847,6 +850,7 @@ const GuiState = struct {
         self.clearExtensionsRegistry();
         self.search_panel.deinit();
         self.quick_panel.deinit();
+        self.deferred_lsp_rename_name.deinit();
         self.last_document_search_query.deinit();
         self.allocator.free(self.collapsed_dirs);
         self.app.deinit();
@@ -1547,6 +1551,14 @@ const GuiState = struct {
                 defer self.allocator.free(new_name);
                 self.quick_panel.close();
                 if (self.requestRenameFromLsp(new_name)) return;
+                self.deferred_lsp_rename_name.clearRetainingCapacity();
+                self.deferred_lsp_rename_name.appendSlice(new_name) catch |err| {
+                    self.setError(err) catch {};
+                    return;
+                };
+                self.ensureLspForFeature("rename", .rename_preview);
+                if (self.deferred_lsp_action == .rename_preview) return;
+                self.deferred_lsp_rename_name.clearRetainingCapacity();
                 self.renameWorkspaceSymbol(old_name, new_name);
             },
             .search_workspace => {
@@ -2430,6 +2442,11 @@ const GuiState = struct {
             .goto_definition => _ = self.requestDefinitionFromLsp(),
             .find_references => _ = self.requestReferencesFromLsp(),
             .hover => _ = self.requestHoverFromLsp(),
+            .rename_preview => {
+                if (self.deferred_lsp_rename_name.items.len == 0 or !self.requestRenameFromLsp(self.deferred_lsp_rename_name.items)) {
+                    self.deferred_lsp_rename_name.clearRetainingCapacity();
+                }
+            },
             .formatting_preview => _ = self.requestFormattingFromLsp(),
             .code_actions => _ = self.requestCodeActionsFromLsp(),
             else => {},
@@ -2560,6 +2577,7 @@ const GuiState = struct {
                 if (self.app.activeLspSessionConst()) |session| {
                     if (session.last_workspace_edit) |edit| {
                         self.pending_lsp_action = .none;
+                        self.deferred_lsp_rename_name.clearRetainingCapacity();
                         self.showLspWorkspaceEdit("LSP rename preview", &edit);
                     }
                 }

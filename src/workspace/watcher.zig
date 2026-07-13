@@ -132,10 +132,12 @@ pub const Poller = struct {
             error.FileNotFound => null,
             else => return err,
         };
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
         try self.entries.append(.{
-            .path = try self.allocator.dupe(u8, path),
+            .path = owned_path,
             .fingerprint = fingerprint,
-            .missing_reported = fingerprint == null,
+            .missing_reported = false,
         });
         return &self.entries.items[self.entries.items.len - 1];
     }

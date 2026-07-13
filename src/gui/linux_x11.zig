@@ -3314,6 +3314,10 @@ const LinuxGuiState = struct {
             .completed => |message_text| {
                 self.message("{s}: {s}", .{ id, message_text });
                 self.appendOutput(.stdout, "{s}: {s}\n", .{ id, message_text });
+                if (std.mem.eql(u8, id, "workspace.refresh")) {
+                    self.refreshWorkspaceTreeState();
+                    self.ensureFileCursorVisible();
+                }
                 if (isEditorLineCommand(id)) {
                     self.clearSelection();
                     self.app.focus = .editor;

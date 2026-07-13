@@ -355,6 +355,11 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "workspace search complete" };
     }
 
+    if (std.mem.eql(u8, definition.id, "workspace.refresh")) {
+        try app.workspace.refresh();
+        return .{ .completed = "workspace explorer refreshed" };
+    }
+
     if (std.mem.eql(u8, definition.id, "workspace.language_report")) {
         try renderWorkspaceLanguageReport(app);
         return .{ .completed = "workspace language report rendered" };

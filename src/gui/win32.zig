@@ -2434,6 +2434,7 @@ const GuiState = struct {
             .completed => |message| {
                 self.setMessage(message) catch {};
                 self.appendOutput(.stdout, "{s}: {s}\n", .{ id, message });
+                if (std.mem.eql(u8, id, "workspace.refresh")) self.syncCollapsedDirs();
                 if (self.git_overview != null and (std.mem.eql(u8, id, "file.save") or std.mem.eql(u8, id, "file.save_all") or std.mem.eql(u8, id, "file.new") or std.mem.eql(u8, id, "file.new_folder") or std.mem.eql(u8, id, "file.rename") or std.mem.eql(u8, id, "file.delete"))) {
                     self.refreshGitOverview();
                     self.setMessage(message) catch {};

@@ -53,6 +53,9 @@ pub const Definition = struct {
 const definitions = [_]Definition{
     .{ .id = "file.open", .title = "Open File", .description = "Open a file in the workspace.", .default_key = "ctrl-o", .scope = .file, .capability = .safe },
     .{ .id = "file.new", .title = "New File", .description = "Create a new file inside the workspace.", .default_key = "ctrl-n", .scope = .file, .capability = .workspace_write },
+    .{ .id = "file.new_folder", .title = "New Folder", .description = "Create a folder inside the workspace after boundary checks.", .default_key = "", .scope = .file, .capability = .workspace_write },
+    .{ .id = "file.rename", .title = "Rename File or Folder", .description = "Rename a workspace file or folder and update open editor paths.", .default_key = "", .scope = .file, .capability = .workspace_write },
+    .{ .id = "file.delete", .title = "Delete File or Empty Folder", .description = "Delete a workspace file or empty folder after explicit DELETE confirmation.", .default_key = "", .scope = .file, .capability = .workspace_write },
     .{ .id = "file.close", .title = "Close Editor", .description = "Close the active editor tab when it has no unsaved changes.", .default_key = "ctrl-w", .scope = .file, .capability = .safe },
     .{ .id = "file.next_editor", .title = "Next Editor", .description = "Switch to the next open editor tab.", .default_key = "ctrl-tab", .scope = .file, .capability = .safe },
     .{ .id = "file.previous_editor", .title = "Previous Editor", .description = "Switch to the previous open editor tab.", .default_key = "ctrl-shift-tab", .scope = .file, .capability = .safe },

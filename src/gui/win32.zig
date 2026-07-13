@@ -35,6 +35,9 @@ const QuickPanelMode = enum {
     search_workspace,
     run_task,
     new_file,
+    new_folder,
+    rename_path,
+    delete_path,
     document_symbols,
     workspace_symbols,
     lsp_actions,
@@ -278,6 +281,9 @@ const QuickPanel = struct {
             .search_workspace => if (self.search_results) |items| items.len else 0,
             .run_task => if (self.task_matches) |items| items.len else 0,
             .new_file => if (self.query.items.len > 0) 1 else 0,
+            .new_folder => if (self.query.items.len > 0) 1 else 0,
+            .rename_path => if (pathMutationRequest(self.query.items)) |_| 1 else 0,
+            .delete_path => if (confirmedDeletePath(self.query.items)) |_| 1 else 0,
             .document_symbols => if (self.symbol_matches) |items| items.len else 0,
             .workspace_symbols => if (self.workspace_symbol_matches) |items| items.len else 0,
             .lsp_actions => self.lsp_action_count,
@@ -397,7 +403,7 @@ const QuickPanel = struct {
 
                 self.task_matches = try matches.toOwnedSlice();
             },
-            .new_file => {},
+            .new_file, .new_folder, .rename_path, .delete_path => {},
             .document_symbols => {
                 const active_index = app.documents.activeIndex() orelse return;
                 const doc = &app.documents.documents.items[active_index];
@@ -976,6 +982,18 @@ const GuiState = struct {
             self.openNewFilePanel();
             return;
         }
+        if (std.mem.eql(u8, id, "file.new_folder")) {
+            self.openWorkspaceMutationPanel(.new_folder);
+            return;
+        }
+        if (std.mem.eql(u8, id, "file.rename")) {
+            self.openWorkspaceMutationPanel(.rename_path);
+            return;
+        }
+        if (std.mem.eql(u8, id, "file.delete")) {
+            self.openWorkspaceMutationPanel(.delete_path);
+            return;
+        }
         if (std.mem.eql(u8, id, "symbol.goto_symbol")) {
             self.openSymbolPanel();
             return;
@@ -1373,6 +1391,9 @@ const GuiState = struct {
             .search_workspace => "Search workspace",
             .run_task => "Run task",
             .new_file => "New file",
+            .new_folder => "New folder",
+            .rename_path => "Rename file or folder",
+            .delete_path => "Delete file or empty folder",
             .document_symbols => "Document symbols",
             .workspace_symbols => "Workspace symbols",
             .lsp_actions => "LSP actions",
@@ -1385,6 +1406,33 @@ const GuiState = struct {
             .language_mode => "Language mode",
         }) catch {};
         if (mode == .completion and !self.requestCompletionFromLsp()) self.ensureLspForFeature("completion", .completion);
+    }
+
+    fn openWorkspaceMutationPanel(self: *GuiState, mode: QuickPanelMode) void {
+        self.openQuickPanel(mode);
+        if (!self.quick_panel.visible) return;
+        const entry = self.app.selectedWorkspaceEntry() orelse return;
+
+        self.quick_panel.query.clearRetainingCapacity();
+        switch (mode) {
+            .new_folder => {
+                const parent = if (entry.kind == .directory) entry.path else std.fs.path.dirname(entry.path) orelse "";
+                if (parent.len > 0) {
+                    self.quick_panel.query.appendSlice(parent) catch |err| return self.setError(err) catch {};
+                    self.quick_panel.query.appendSlice("\\") catch |err| return self.setError(err) catch {};
+                }
+            },
+            .rename_path => {
+                self.quick_panel.query.appendSlice(entry.path) catch |err| return self.setError(err) catch {};
+                self.quick_panel.query.appendSlice("=>") catch |err| return self.setError(err) catch {};
+            },
+            .delete_path => {
+                self.quick_panel.query.appendSlice(entry.path) catch |err| return self.setError(err) catch {};
+                self.quick_panel.query.appendSlice("=>DELETE") catch |err| return self.setError(err) catch {};
+            },
+            else => return,
+        }
+        self.quick_panel.rebuild(&self.app) catch |err| self.setError(err) catch {};
     }
 
     fn seedQuickPanelFromSelection(self: *GuiState, mode: QuickPanelMode) bool {
@@ -1626,6 +1674,9 @@ const GuiState = struct {
                     self.ensureCursorVisible();
                 }
             },
+            .new_folder => self.dispatchQuickPanelFileMutation("file.new_folder", "new folder failed"),
+            .rename_path => self.dispatchQuickPanelFileMutation("file.rename", "rename failed"),
+            .delete_path => self.dispatchQuickPanelFileMutation("file.delete", "delete failed"),
             .document_symbols => {
                 const item = self.quick_panel.selectedSymbol() orelse {
                     self.setMessage("No symbol selected") catch {};
@@ -1759,6 +1810,31 @@ const GuiState = struct {
                 self.quick_panel.close();
                 self.setActiveDocumentLanguage(mode);
             },
+        }
+    }
+
+    fn dispatchQuickPanelFileMutation(self: *GuiState, id: []const u8, error_label: []const u8) void {
+        if (self.quick_panel.query.items.len == 0) {
+            self.setMessage("Type a workspace-relative path") catch {};
+            return;
+        }
+        const argument = self.allocator.dupe(u8, self.quick_panel.query.items) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        defer self.allocator.free(argument);
+        self.quick_panel.close();
+
+        const result = dispatcher.dispatch(&self.app, .{ .id = id, .argument = argument, .source = .command_palette }) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "{s}: {s}\n", .{ error_label, @errorName(err) });
+            return;
+        };
+        self.handleDispatchResult(id, result);
+        if (std.meta.activeTag(result) == .completed) {
+            self.clearSelection();
+            self.syncCollapsedDirs();
+            self.ensureCursorVisible();
         }
     }
 
@@ -2351,7 +2427,7 @@ const GuiState = struct {
             .completed => |message| {
                 self.setMessage(message) catch {};
                 self.appendOutput(.stdout, "{s}: {s}\n", .{ id, message });
-                if (self.git_overview != null and (std.mem.eql(u8, id, "file.save") or std.mem.eql(u8, id, "file.save_all") or std.mem.eql(u8, id, "file.new"))) {
+                if (self.git_overview != null and (std.mem.eql(u8, id, "file.save") or std.mem.eql(u8, id, "file.save_all") or std.mem.eql(u8, id, "file.new") or std.mem.eql(u8, id, "file.new_folder") or std.mem.eql(u8, id, "file.rename") or std.mem.eql(u8, id, "file.delete"))) {
                     self.refreshGitOverview();
                     self.setMessage(message) catch {};
                 }
@@ -5251,6 +5327,9 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .search_workspace => "SEARCH",
         .run_task => "TASKS",
         .new_file => "NEW FILE",
+        .new_folder => "NEW FOLDER",
+        .rename_path => "RENAME PATH  old=>new",
+        .delete_path => "DELETE PATH  path=>DELETE",
         .document_symbols => "SYMBOLS",
         .workspace_symbols => "WORKSPACE SYMBOLS",
         .lsp_actions => "LSP ACTIONS  Ctrl+Alt+L",
@@ -5312,7 +5391,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 drawTextClipped(hdc, panel.left + 116, y, panel.right - 16, color, item.preview);
             },
             .rename_symbol => {
-                const request = renameRequest(state.quick_panel.query.items) orelse break;
+                const request = pathMutationRequest(state.quick_panel.query.items) orelse break;
                 var rename_buf: [240]u8 = undefined;
                 const label = std.fmt.bufPrint(&rename_buf, "{s} -> {s}", .{ request.find, request.replace }) catch "Rename";
                 drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
@@ -5325,6 +5404,21 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
             },
             .new_file => {
                 drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, "Create inside workspace");
+            },
+            .new_folder => {
+                drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, "Create folder inside workspace");
+            },
+            .rename_path => {
+                const request = renameRequest(state.quick_panel.query.items) orelse break;
+                var rename_buf: [320]u8 = undefined;
+                const label = std.fmt.bufPrint(&rename_buf, "{s} -> {s}", .{ request.find, request.replace }) catch "Rename path";
+                drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
+            },
+            .delete_path => {
+                const path = confirmedDeletePath(state.quick_panel.query.items) orelse break;
+                var delete_buf: [320]u8 = undefined;
+                const label = std.fmt.bufPrint(&delete_buf, "Delete {s}", .{path}) catch "Delete path";
+                drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
             },
             .document_symbols => {
                 const items = state.quick_panel.symbol_matches orelse break;
@@ -5617,6 +5711,19 @@ fn renameRequest(query: []const u8) ?ReplaceRequest {
     const replace = std.mem.trim(u8, request.replace, " \t\r\n");
     if (!isValidIdentifierName(request.find) or !isValidIdentifierName(replace)) return null;
     return .{ .find = request.find, .replace = replace };
+}
+
+fn pathMutationRequest(query: []const u8) ?ReplaceRequest {
+    const request = parseReplaceRequest(query) orelse return null;
+    const replace = std.mem.trim(u8, request.replace, " \t\r\n");
+    if (replace.len == 0) return null;
+    return .{ .find = request.find, .replace = replace };
+}
+
+fn confirmedDeletePath(query: []const u8) ?[]const u8 {
+    const request = pathMutationRequest(query) orelse return null;
+    if (!std.mem.eql(u8, request.replace, "DELETE")) return null;
+    return request.find;
 }
 
 fn isValidIdentifierName(name: []const u8) bool {

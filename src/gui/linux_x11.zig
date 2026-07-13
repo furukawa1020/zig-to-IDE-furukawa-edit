@@ -630,6 +630,9 @@ const QuickPanelMode = enum {
     goto_line,
     search_workspace,
     new_file,
+    new_folder,
+    rename_path,
+    delete_path,
     run_task,
     document_symbols,
     workspace_symbols,
@@ -815,6 +818,9 @@ const QuickPanel = struct {
             .goto_line => if (parseGotoLine(self.query.items)) |_| 1 else 0,
             .search_workspace => if (self.search_results) |items| items.len else 0,
             .new_file => if (self.query.items.len > 0) 1 else 0,
+            .new_folder => if (self.query.items.len > 0) 1 else 0,
+            .rename_path => if (pathMutationRequest(self.query.items)) |_| 1 else 0,
+            .delete_path => if (confirmedDeletePath(self.query.items)) |_| 1 else 0,
             .run_task => if (self.task_matches) |items| items.len else 0,
             .document_symbols => if (self.symbol_matches) |items| items.len else 0,
             .workspace_symbols => if (self.workspace_symbol_matches) |items| items.len else 0,
@@ -915,7 +921,7 @@ const QuickPanel = struct {
                     });
                 }
             },
-            .new_file => {},
+            .new_file, .new_folder, .rename_path, .delete_path => {},
             .run_task => {
                 var registry = try task_registry.loadProjectTasks(self.allocator, app.workspace.root_path);
                 defer registry.deinit();
@@ -3151,6 +3157,18 @@ const LinuxGuiState = struct {
             self.openQuickPanel(.new_file);
             return;
         }
+        if (std.mem.eql(u8, id, "file.new_folder")) {
+            self.openWorkspaceMutationPanel(.new_folder);
+            return;
+        }
+        if (std.mem.eql(u8, id, "file.rename")) {
+            self.openWorkspaceMutationPanel(.rename_path);
+            return;
+        }
+        if (std.mem.eql(u8, id, "file.delete")) {
+            self.openWorkspaceMutationPanel(.delete_path);
+            return;
+        }
         if (std.mem.eql(u8, id, "task.run")) {
             self.openQuickPanel(.run_task);
             return;
@@ -3564,6 +3582,33 @@ const LinuxGuiState = struct {
         if (mode == .completion and !self.requestCompletionFromLsp()) self.ensureLspForFeature("completion", .completion);
     }
 
+    fn openWorkspaceMutationPanel(self: *LinuxGuiState, mode: QuickPanelMode) void {
+        self.openQuickPanel(mode);
+        if (!self.quick_panel.visible) return;
+        const entry = self.app.selectedWorkspaceEntry() orelse return;
+
+        self.quick_panel.query.clearRetainingCapacity();
+        switch (mode) {
+            .new_folder => {
+                const parent = if (entry.kind == .directory) entry.path else std.fs.path.dirname(entry.path) orelse "";
+                if (parent.len > 0) {
+                    self.quick_panel.query.appendSlice(parent) catch |err| return self.message("new folder failed: {s}", .{@errorName(err)});
+                    self.quick_panel.query.appendSlice("/") catch |err| return self.message("new folder failed: {s}", .{@errorName(err)});
+                }
+            },
+            .rename_path => {
+                self.quick_panel.query.appendSlice(entry.path) catch |err| return self.message("rename failed: {s}", .{@errorName(err)});
+                self.quick_panel.query.appendSlice("=>") catch |err| return self.message("rename failed: {s}", .{@errorName(err)});
+            },
+            .delete_path => {
+                self.quick_panel.query.appendSlice(entry.path) catch |err| return self.message("delete failed: {s}", .{@errorName(err)});
+                self.quick_panel.query.appendSlice("=>DELETE") catch |err| return self.message("delete failed: {s}", .{@errorName(err)});
+            },
+            else => return,
+        }
+        self.quick_panel.rebuild(&self.app) catch |err| self.message("panel failed: {s}", .{@errorName(err)});
+    }
+
     fn openRenamePanel(self: *LinuxGuiState) void {
         const doc = self.app.documents.active() orelse return self.message("no active document", .{});
         const name = identifierAtOffset(doc.text.bytes, doc.cursor.position.byte_offset) orelse return self.message("no identifier under cursor", .{});
@@ -3775,6 +3820,9 @@ const LinuxGuiState = struct {
                 };
                 self.handleDispatchResult("file.new", result);
             },
+            .new_folder => self.dispatchQuickPanelFileMutation("file.new_folder", "new folder"),
+            .rename_path => self.dispatchQuickPanelFileMutation("file.rename", "rename"),
+            .delete_path => self.dispatchQuickPanelFileMutation("file.delete", "delete"),
             .run_task => {
                 const item = self.quick_panel.selectedTask() orelse return self.message("no task", .{});
                 const name = self.allocator.dupe(u8, item.name) catch |err| return self.message("task failed: {s}", .{@errorName(err)});
@@ -3870,6 +3918,26 @@ const LinuxGuiState = struct {
                 self.quick_panel.close();
                 self.setActiveDocumentLanguage(mode);
             },
+        }
+    }
+
+    fn dispatchQuickPanelFileMutation(self: *LinuxGuiState, id: []const u8, label: []const u8) void {
+        if (self.quick_panel.query.items.len == 0) return self.message("type a workspace-relative path", .{});
+        const argument = self.allocator.dupe(u8, self.quick_panel.query.items) catch |err| return self.message("{s} failed: {s}", .{ label, @errorName(err) });
+        defer self.allocator.free(argument);
+        self.quick_panel.close();
+
+        const result = dispatcher.dispatch(&self.app, .{ .id = id, .argument = argument, .source = .command_palette }) catch |err| {
+            self.message("{s} failed: {s}", .{ label, @errorName(err) });
+            self.appendOutput(.stderr, "{s} failed: {s}\n", .{ label, @errorName(err) });
+            return;
+        };
+        self.handleDispatchResult(id, result);
+        if (std.meta.activeTag(result) == .completed) {
+            self.clearSelection();
+            self.refreshWorkspaceTreeState();
+            self.ensureFileCursorVisible();
+            self.ensureEditorCursorVisible();
         }
     }
 
@@ -6595,6 +6663,15 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
         },
         .open_workspace => if (state.quick_panel.query.items.len > 0) "Open workspace path" else "",
         .new_file => if (state.quick_panel.query.items.len > 0) "Create file inside workspace" else "",
+        .new_folder => if (state.quick_panel.query.items.len > 0) "Create folder inside workspace" else "",
+        .rename_path => blk: {
+            const request = pathMutationRequest(state.quick_panel.query.items) orelse break :blk "Type old_path=>new_path";
+            break :blk std.fmt.bufPrint(text_buf[0..], "{s} -> {s}", .{ request.find, request.replace }) catch "Rename path";
+        },
+        .delete_path => blk: {
+            const path = confirmedDeletePath(state.quick_panel.query.items) orelse break :blk "Type path=>DELETE";
+            break :blk std.fmt.bufPrint(text_buf[0..], "Delete {s}", .{path}) catch "Delete path";
+        },
         .run_task => blk: {
             const items = state.quick_panel.task_matches orelse break :blk "";
             if (row >= items.len) break :blk "";
@@ -7762,6 +7839,19 @@ fn renameRequest(query: []const u8) ?ReplaceRequest {
     return .{ .find = request.find, .replace = replace };
 }
 
+fn pathMutationRequest(query: []const u8) ?ReplaceRequest {
+    const request = parseReplaceRequest(query) orelse return null;
+    const replace = std.mem.trim(u8, request.replace, " \t\r\n");
+    if (replace.len == 0) return null;
+    return .{ .find = request.find, .replace = replace };
+}
+
+fn confirmedDeletePath(query: []const u8) ?[]const u8 {
+    const request = pathMutationRequest(query) orelse return null;
+    if (!std.mem.eql(u8, request.replace, "DELETE")) return null;
+    return request.find;
+}
+
 fn parseGotoLine(query: []const u8) ?GotoLineTarget {
     const trimmed = std.mem.trim(u8, query, " \t\r\n");
     if (trimmed.len == 0) return null;
@@ -7836,6 +7926,9 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .goto_line => "GO TO LINE  line[:column]",
         .search_workspace => "SEARCH WORKSPACE",
         .new_file => "NEW FILE",
+        .new_folder => "NEW FOLDER",
+        .rename_path => "RENAME PATH  old=>new",
+        .delete_path => "DELETE PATH  path=>DELETE",
         .run_task => "RUN TASK",
         .document_symbols => "SYMBOLS",
         .workspace_symbols => "WORKSPACE SYMBOLS",

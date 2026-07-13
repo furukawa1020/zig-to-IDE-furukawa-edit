@@ -29,6 +29,7 @@ const literal_search = @import("../search/literal.zig");
 const problems_search = @import("../search/problems.zig");
 const workspace_search = @import("../search/workspace_search.zig");
 const workspace_symbols = @import("../search/workspace_symbols.zig");
+const workspace_watcher = @import("../workspace/watcher.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
 const task_registry = @import("../tasks/registry.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
@@ -1174,6 +1175,8 @@ const LinuxGuiState = struct {
     pending_lsp_action: PendingLspAction = .none,
     deferred_lsp_action: PendingLspAction = .none,
     deferred_lsp_rename_name: std.array_list.Managed(u8),
+    file_watcher: workspace_watcher.Poller,
+    last_file_watch_ms: i64 = 0,
     clipboard: std.array_list.Managed(u8),
     primary_selection: std.array_list.Managed(u8),
     clipboard_owned: bool = false,
@@ -1219,6 +1222,7 @@ const LinuxGuiState = struct {
             .collapsed_dirs = collapsed_dirs,
             .last_document_search_query = std.array_list.Managed(u8).init(allocator),
             .deferred_lsp_rename_name = std.array_list.Managed(u8).init(allocator),
+            .file_watcher = workspace_watcher.Poller.init(allocator, .{}),
             .clipboard = std.array_list.Managed(u8).init(allocator),
             .primary_selection = std.array_list.Managed(u8).init(allocator),
             .terminal_input = std.array_list.Managed(u8).init(allocator),
@@ -1235,6 +1239,7 @@ const LinuxGuiState = struct {
         self.primary_selection.deinit();
         self.clipboard.deinit();
         self.deferred_lsp_rename_name.deinit();
+        self.file_watcher.deinit();
         self.last_document_search_query.deinit();
         self.quick_panel.deinit();
         self.allocator.free(self.collapsed_dirs);
@@ -1268,6 +1273,60 @@ const LinuxGuiState = struct {
         self.finishPendingLspAction();
         self.runDeferredLspActionIfReady();
         return true;
+    }
+
+    fn pollExternalFileChanges(self: *LinuxGuiState) bool {
+        const now = monotonicMillis();
+        if (now - self.last_file_watch_ms < self.file_watcher.config.poll_interval_ms) return false;
+        self.last_file_watch_ms = now;
+
+        var batch = self.file_watcher.poll(self.app.documents.documents.items) catch |err| {
+            self.appendOutput(.stderr, "file watcher failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        defer batch.deinit();
+
+        var changed = false;
+        for (batch.items) |event| {
+            if (event.document_index >= self.app.documents.documents.items.len) continue;
+            const doc = &self.app.documents.documents.items[event.document_index];
+            const path = doc.path orelse continue;
+            switch (event.kind) {
+                .deleted => {
+                    doc.dirty = true;
+                    self.appendOutput(.stderr, "external delete: {s}; editor buffer retained as unsaved\n", .{path});
+                    self.message("file deleted outside ZIDE; buffer retained", .{});
+                    changed = true;
+                },
+                .modified => {
+                    const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, self.allocator, .limited(32 * 1024 * 1024)) catch |err| {
+                        self.appendOutput(.stderr, "external reload failed: {s}: {s}\n", .{ path, @errorName(err) });
+                        continue;
+                    };
+                    defer self.allocator.free(bytes);
+                    if (std.mem.eql(u8, bytes, doc.text.bytes)) continue;
+                    if (doc.dirty) {
+                        self.appendOutput(.stderr, "external edit conflict: {s}; unsaved editor buffer was not overwritten\n", .{path});
+                        self.message("external edit conflict; local buffer preserved", .{});
+                        changed = true;
+                        continue;
+                    }
+                    doc.reloadFromBytes(bytes) catch |err| {
+                        self.appendOutput(.stderr, "external reload failed: {s}: {s}\n", .{ path, @errorName(err) });
+                        continue;
+                    };
+                    if (self.app.documents.activeIndex() == event.document_index) {
+                        self.clearSelection();
+                        self.ensureEditorCursorVisible();
+                        self.syncActiveDocumentToLsp();
+                    }
+                    self.appendOutput(.stdout, "reloaded external edit: {s}\n", .{path});
+                    self.message("reloaded external file change", .{});
+                    changed = true;
+                },
+            }
+        }
+        return changed;
     }
 
     fn syncActiveDocumentToLsp(self: *LinuxGuiState) void {
@@ -4388,6 +4447,8 @@ const LinuxGuiState = struct {
         self.pending_lsp_action = .none;
         self.deferred_lsp_action = .none;
         self.deferred_lsp_rename_name.clearRetainingCapacity();
+        self.file_watcher.clear();
+        self.last_file_watch_ms = 0;
         self.file_scroll_line = 0;
         self.editor_scroll_line = 0;
         self.output_scroll_line = 0;
@@ -5529,11 +5590,12 @@ pub fn run(
             fd_count += 1;
         }
 
-        const timeout_ms: i32 = if (pty_poll_index != null or state.app.hasAnyRunningLsp()) 100 else -1;
+        const timeout_ms: i32 = if (pty_poll_index != null or state.app.hasAnyRunningLsp()) 100 else 250;
         _ = try std.posix.poll(fds[0..fd_count], timeout_ms);
 
         var needs_draw = state.pumpPtySession();
         needs_draw = state.pumpLsp() or needs_draw;
+        needs_draw = state.pollExternalFileChanges() or needs_draw;
         const pty_ready_mask: i16 = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR;
         if (pty_poll_index) |index| {
             if ((fds[index].revents & pty_ready_mask) != 0) {

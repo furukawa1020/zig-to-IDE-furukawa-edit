@@ -56,6 +56,23 @@ pub const Document = struct {
         self.dirty = true;
     }
 
+    pub fn reloadFromBytes(self: *Document, bytes: []const u8) !void {
+        const previous = self.cursor.position;
+        var next = try buffer.TextBuffer.initFromBytes(self.allocator, bytes);
+        errdefer next.deinit();
+
+        const line = @min(previous.line, next.lineCount() - 1);
+        const column = @min(previous.column, next.lineSlice(line).len);
+        const offset = try next.lineColumnToOffset(line, column);
+        const position: types.Position = .{ .line = line, .column = column, .byte_offset = offset };
+
+        self.text.deinit();
+        self.text = next;
+        self.undo_stack.clear();
+        self.cursor.position = position;
+        self.dirty = false;
+    }
+
     pub fn insertPreferredNewline(self: *Document, offset: usize) !void {
         try self.insert(offset, self.preferredNewline());
     }
@@ -418,6 +435,17 @@ test "document edit tracks dirty and undo" {
 
     try std.testing.expect(try doc.undo());
     try std.testing.expectEqualStrings("pub fn main() void {}\n", doc.text.bytes);
+}
+
+test "document reload replaces clean state and clears undo history" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "const old = 1;\n");
+    defer doc.deinit();
+
+    try doc.insert(0, "// local\n");
+    try doc.reloadFromBytes("const fresh = 2;\n");
+    try std.testing.expectEqualStrings("const fresh = 2;\n", doc.text.bytes);
+    try std.testing.expect(!doc.dirty);
+    try std.testing.expect(!(try doc.undo()));
 }
 
 test "document line operations duplicate delete and move" {

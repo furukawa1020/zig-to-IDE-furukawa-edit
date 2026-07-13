@@ -52,6 +52,13 @@ pub const UndoStack = struct {
         self.* = undefined;
     }
 
+    pub fn clear(self: *UndoStack) void {
+        for (self.undo_items.items) |*item| item.deinit(self.allocator);
+        for (self.redo_items.items) |*item| item.deinit(self.allocator);
+        self.undo_items.clearRetainingCapacity();
+        self.redo_items.clearRetainingCapacity();
+    }
+
     pub fn push(
         self: *UndoStack,
         label: []const u8,

@@ -213,6 +213,9 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         if (!permissions.allowsWrite(.workspace_only, app.workspace.root_path, path)) {
             return .{ .blocked = "new file path is outside workspace" };
         }
+        if (!try existingAncestorInsideWorkspace(app, path)) {
+            return .{ .blocked = "new file path resolves through an unsafe workspace boundary" };
+        }
 
         if (std.fs.path.dirname(path)) |parent| {
             try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, parent);
@@ -231,6 +234,87 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         _ = try app.documents.openFile(path);
         app.focus = .editor;
         return .{ .completed = "created file" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "file.new_folder")) {
+        const argument = request.argument orelse return .{ .unsupported = "file.new_folder requires a workspace-relative path" };
+        const relative = std.mem.trim(u8, argument, " \t\r\n");
+        if (validateWorkspaceMutationPath(relative, .directory)) |message| return .{ .blocked = message };
+
+        const path = try workspacePath(app, relative);
+        defer app.allocator.free(path);
+        if (!permissions.allowsWrite(.workspace_only, app.workspace.root_path, path) or
+            !try existingAncestorInsideWorkspace(app, path))
+        {
+            return .{ .blocked = "new folder path resolves outside workspace" };
+        }
+        if (try pathExists(path)) return .{ .blocked = "file or folder already exists at destination" };
+
+        try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, path);
+        try app.workspace.refresh();
+        return .{ .completed = "created folder" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "file.rename")) {
+        const argument = request.argument orelse return .{ .unsupported = "file.rename requires old_path=>new_path" };
+        const pair = parsePathMutation(argument) orelse return .{ .blocked = "rename must use old_path=>new_path" };
+        if (validateWorkspaceMutationPath(pair.source, .either)) |message| return .{ .blocked = message };
+        if (validateWorkspaceMutationPath(pair.destination, .either)) |message| return .{ .blocked = message };
+        if (workspaceRelativePathEqual(pair.source, pair.destination)) return .{ .blocked = "rename source and destination are identical" };
+
+        const source = try workspacePath(app, pair.source);
+        defer app.allocator.free(source);
+        const destination = try workspacePath(app, pair.destination);
+        defer app.allocator.free(destination);
+        if (!permissions.allowsWrite(.workspace_only, app.workspace.root_path, source) or
+            !permissions.allowsWrite(.workspace_only, app.workspace.root_path, destination) or
+            !try existingPathInsideWorkspace(app, source) or
+            !try existingAncestorInsideWorkspace(app, destination))
+        {
+            return .{ .blocked = "rename path resolves outside workspace" };
+        }
+        if (try pathExists(destination)) return .{ .blocked = "rename destination already exists" };
+
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, std.Options.debug_io);
+        const updated_documents = try app.documents.renamePathPrefix(source, destination);
+        try app.workspace.refresh();
+        try appendConsole(app, .stdout, "renamed: {s} -> {s} (open editors updated: {d})\n", .{ pair.source, pair.destination, updated_documents });
+        return .{ .completed = "renamed workspace path" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "file.delete")) {
+        const argument = request.argument orelse return .{ .unsupported = "file.delete requires path=>DELETE" };
+        const pair = parsePathMutation(argument) orelse return .{ .blocked = "delete must use path=>DELETE" };
+        if (!std.mem.eql(u8, pair.destination, "DELETE")) return .{ .blocked = "type DELETE exactly to confirm deletion" };
+        if (validateWorkspaceMutationPath(pair.source, .either)) |message| return .{ .blocked = message };
+
+        const path = try workspacePath(app, pair.source);
+        defer app.allocator.free(path);
+        if (!permissions.allowsWrite(.workspace_only, app.workspace.root_path, path) or
+            !try existingPathInsideWorkspace(app, path))
+        {
+            return .{ .blocked = "delete path resolves outside workspace" };
+        }
+        if (app.documents.hasDirtyPathPrefix(path)) {
+            return .{ .blocked = "save or close dirty editors under this path before deleting" };
+        }
+
+        const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return .{ .blocked = "delete target does not exist" },
+            else => return err,
+        };
+        switch (stat.kind) {
+            .file => try std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path),
+            .directory => std.Io.Dir.cwd().deleteDir(std.Options.debug_io, path) catch |err| switch (err) {
+                error.DirNotEmpty => return .{ .blocked = "folder is not empty; recursive deletion is intentionally disabled" },
+                else => return err,
+            },
+            else => return .{ .blocked = "only regular files and empty folders can be deleted" },
+        }
+        const closed_documents = try app.documents.closePathPrefix(path, .deny_dirty);
+        try app.workspace.refresh();
+        try appendConsole(app, .stdout, "deleted: {s} (closed editors: {d})\n", .{ pair.source, closed_documents });
+        return .{ .completed = "deleted workspace path" };
     }
 
     if (std.mem.eql(u8, definition.id, "file.open")) {
@@ -680,29 +764,96 @@ fn workspacePath(app: *app_mod.App, path: []const u8) ![]u8 {
     return std.fs.path.join(app.allocator, &.{ app.workspace.root_path, path });
 }
 
+const MutationPathKind = enum { file, directory, either };
+
+const PathMutation = struct {
+    source: []const u8,
+    destination: []const u8,
+};
+
 fn validateNewWorkspaceFilePath(path: []const u8) ?[]const u8 {
-    if (path.len == 0) return "new file path is empty";
-    if (std.fs.path.isAbsolute(path)) return "new file path must be relative to workspace";
-    if (path.len >= 2 and path[1] == ':') return "new file path must not use a drive prefix";
-    if (path[0] == '/' or path[0] == '\\') return "new file path must not start at filesystem root";
-    if (path[path.len - 1] == '/' or path[path.len - 1] == '\\') return "new file path must include a file name";
+    return validateWorkspaceMutationPath(path, .file);
+}
+
+fn validateWorkspaceMutationPath(path: []const u8, kind: MutationPathKind) ?[]const u8 {
+    if (path.len == 0) return "workspace path is empty";
+    if (std.fs.path.isAbsolute(path)) return "workspace path must be relative";
+    if (path.len >= 2 and path[1] == ':') return "workspace path must not use a drive prefix";
+    if (path[0] == '/' or path[0] == '\\') return "workspace path must not start at filesystem root";
+    if (path[path.len - 1] == '/' or path[path.len - 1] == '\\') {
+        return switch (kind) {
+            .file => "new file path must include a file name",
+            .directory, .either => "workspace path must not end with a separator",
+        };
+    }
 
     var start: usize = 0;
     while (start <= path.len) {
         var end = start;
         while (end < path.len and path[end] != '/' and path[end] != '\\') : (end += 1) {}
         const segment = path[start..end];
-        if (std.mem.eql(u8, segment, "..")) return "new file path must not contain parent traversal";
-        if (std.ascii.eqlIgnoreCase(segment, ".git")) return "new file path must not write inside .git";
-        if (std.ascii.eqlIgnoreCase(segment, ".tools")) return "new file path must not write inside .tools";
-        if (std.ascii.eqlIgnoreCase(segment, ".zig-cache") or std.ascii.eqlIgnoreCase(segment, ".zig-global-cache")) {
-            return "new file path must not write inside Zig cache directories";
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".")) return "workspace path contains an empty or current-directory segment";
+        if (std.mem.eql(u8, segment, "..")) return "workspace path must not contain parent traversal";
+        if (std.ascii.eqlIgnoreCase(segment, ".git")) return "workspace path must not modify .git";
+        if (std.ascii.eqlIgnoreCase(segment, ".tools")) return "workspace path must not modify .tools";
+        if (std.ascii.eqlIgnoreCase(segment, ".zig-cache") or
+            std.ascii.startsWithIgnoreCase(segment, ".zig-cache-") or
+            std.ascii.eqlIgnoreCase(segment, ".zig-global-cache") or
+            std.ascii.startsWithIgnoreCase(segment, ".zig-global-cache-"))
+        {
+            return "workspace path must not modify Zig cache directories";
         }
-        if (std.ascii.eqlIgnoreCase(segment, "zig-out")) return "new file path must not write inside zig-out";
+        if (std.ascii.eqlIgnoreCase(segment, "zig-out") or std.ascii.startsWithIgnoreCase(segment, "zig-out-")) {
+            return "workspace path must not modify zig-out directories";
+        }
         if (end == path.len) break;
         start = end + 1;
     }
     return null;
+}
+
+fn parsePathMutation(argument: []const u8) ?PathMutation {
+    const arrow = std.mem.indexOf(u8, argument, "=>") orelse return null;
+    const source = std.mem.trim(u8, argument[0..arrow], " \t\r\n");
+    const destination = std.mem.trim(u8, argument[arrow + 2 ..], " \t\r\n");
+    if (source.len == 0 or destination.len == 0) return null;
+    return .{ .source = source, .destination = destination };
+}
+
+fn workspaceRelativePathEqual(left: []const u8, right: []const u8) bool {
+    if (std.fs.path.sep == '\\') return std.ascii.eqlIgnoreCase(left, right);
+    return std.mem.eql(u8, left, right);
+}
+
+fn pathExists(path: []const u8) !bool {
+    _ = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn existingPathInsideWorkspace(app: *app_mod.App, path: []const u8) !bool {
+    const resolved = std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, path, app.allocator) catch return false;
+    defer app.allocator.free(resolved);
+    return permissions.allowsWrite(.workspace_only, app.workspace.root_path, resolved);
+}
+
+fn existingAncestorInsideWorkspace(app: *app_mod.App, path: []const u8) !bool {
+    var current = std.fs.path.dirname(path) orelse return false;
+    while (true) {
+        const resolved = std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, current, app.allocator) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
+                const parent = std.fs.path.dirname(current) orelse return false;
+                if (std.mem.eql(u8, parent, current)) return false;
+                current = parent;
+                continue;
+            },
+            else => return err,
+        };
+        defer app.allocator.free(resolved);
+        return permissions.allowsWrite(.workspace_only, app.workspace.root_path, resolved);
+    }
 }
 
 fn queueConfiguredTask(app: *app_mod.App, name: []const u8) !?[]const u8 {
@@ -4146,6 +4297,71 @@ test "file new rejects workspace escape paths" {
     try std.testing.expect(validateNewWorkspaceFilePath("../outside.zig") != null);
     try std.testing.expect(validateNewWorkspaceFilePath(".git/hooks/pre-commit") != null);
     try std.testing.expect(validateNewWorkspaceFilePath("zig-out/generated.zig") != null);
+    try std.testing.expect(validateNewWorkspaceFilePath(".zig-cache-check/generated.zig") != null);
+}
+
+test "workspace file operations create rename and explicitly delete" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Options.debug_io, "src");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/main.zig", .data = "const answer = 42;\n" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const source_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "src/main.zig" });
+    defer std.testing.allocator.free(source_path);
+    _ = try app.documents.openFile(source_path);
+
+    const folder_result = try dispatch(&app, .{ .id = "file.new_folder", .argument = "lib/generated" });
+    try std.testing.expect(std.meta.activeTag(folder_result) == .completed);
+    _ = try tmp.dir.statFile(std.Options.debug_io, "lib/generated", .{});
+
+    const rename_result = try dispatch(&app, .{ .id = "file.rename", .argument = "src=>source" });
+    try std.testing.expect(std.meta.activeTag(rename_result) == .completed);
+    _ = try tmp.dir.statFile(std.Options.debug_io, "source/main.zig", .{});
+    try std.testing.expect(std.mem.indexOf(u8, app.documents.active().?.path.?, "source") != null);
+
+    const missing_confirmation = try dispatch(&app, .{ .id = "file.delete", .argument = "source/main.zig=>delete" });
+    try std.testing.expect(std.meta.activeTag(missing_confirmation) == .blocked);
+
+    const delete_result = try dispatch(&app, .{ .id = "file.delete", .argument = "source/main.zig=>DELETE" });
+    try std.testing.expect(std.meta.activeTag(delete_result) == .completed);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.Options.debug_io, "source/main.zig", .{}));
+    try std.testing.expectEqual(@as(usize, 0), app.documents.documents.items.len);
+}
+
+test "workspace delete protects dirty editor and non-empty folder" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Options.debug_io, "src");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/main.zig", .data = "const answer = 42;\n" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+    const source_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "src/main.zig" });
+    defer std.testing.allocator.free(source_path);
+    _ = try app.documents.openFile(source_path);
+    app.documents.active().?.dirty = true;
+
+    const dirty_result = try dispatch(&app, .{ .id = "file.delete", .argument = "src/main.zig=>DELETE" });
+    try std.testing.expect(std.meta.activeTag(dirty_result) == .blocked);
+    _ = try tmp.dir.statFile(std.Options.debug_io, "src/main.zig", .{});
+
+    app.documents.active().?.dirty = false;
+    const directory_result = try dispatch(&app, .{ .id = "file.delete", .argument = "src=>DELETE" });
+    try std.testing.expect(std.meta.activeTag(directory_result) == .blocked);
+    _ = try tmp.dir.statFile(std.Options.debug_io, "src/main.zig", .{});
 }
 
 test "workspace edit applies sorted LSP edits to editor buffers" {

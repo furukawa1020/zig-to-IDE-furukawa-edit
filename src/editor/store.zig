@@ -123,6 +123,43 @@ pub const DocumentStore = struct {
         return count;
     }
 
+    pub fn hasDirtyPathPrefix(self: *const DocumentStore, path: []const u8) bool {
+        for (self.documents.items) |doc| {
+            const doc_path = doc.path orelse continue;
+            if (doc.dirty and pathMatchesOrDescendant(doc_path, path)) return true;
+        }
+        return false;
+    }
+
+    pub fn closePathPrefix(self: *DocumentStore, path: []const u8, policy: ClosePolicy) !usize {
+        var closed: usize = 0;
+        var index = self.documents.items.len;
+        while (index > 0) {
+            index -= 1;
+            const doc_path = self.documents.items[index].path orelse continue;
+            if (!pathMatchesOrDescendant(doc_path, path)) continue;
+            try self.closeAt(index, policy);
+            closed += 1;
+        }
+        return closed;
+    }
+
+    pub fn renamePathPrefix(self: *DocumentStore, old_path: []const u8, new_path: []const u8) !usize {
+        var renamed: usize = 0;
+        for (self.documents.items) |*doc| {
+            const doc_path = doc.path orelse continue;
+            if (!pathMatchesOrDescendant(doc_path, old_path)) continue;
+
+            const suffix = doc_path[old_path.len..];
+            const replacement = try std.mem.concat(self.allocator, u8, &.{ new_path, suffix });
+            self.allocator.free(doc.path.?);
+            doc.path = replacement;
+            doc.language = @import("../language/modes.zig").detect(replacement);
+            renamed += 1;
+        }
+        return renamed;
+    }
+
     fn findByPath(self: *const DocumentStore, path: []const u8) ?usize {
         for (self.documents.items, 0..) |doc, index| {
             const doc_path = doc.path orelse continue;
@@ -131,6 +168,17 @@ pub const DocumentStore = struct {
         return null;
     }
 };
+
+fn pathMatchesOrDescendant(path: []const u8, prefix: []const u8) bool {
+    if (pathEqual(path, prefix)) return true;
+    if (path.len <= prefix.len or !pathEqual(path[0..prefix.len], prefix)) return false;
+    return path[prefix.len] == '/' or path[prefix.len] == '\\';
+}
+
+fn pathEqual(left: []const u8, right: []const u8) bool {
+    if (std.fs.path.sep == '\\') return std.ascii.eqlIgnoreCase(left, right);
+    return std.mem.eql(u8, left, right);
+}
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, allocator, .limited(max_bytes));
@@ -184,4 +232,19 @@ test "document store counts dirty documents" {
     try std.testing.expectEqual(@as(usize, 2), store.dirtyCount());
     store.documents.items[1].dirty = false;
     try std.testing.expectEqual(@as(usize, 1), store.dirtyCount());
+}
+
+test "document store follows renamed directory and protects dirty deletes" {
+    var store = DocumentStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    _ = try store.createScratch("C:\\repo\\src\\main.zig", "const x = 1;\n");
+    _ = try store.createScratch("C:\\repo\\src2\\keep.zig", "const y = 2;\n");
+    store.documents.items[0].dirty = true;
+
+    try std.testing.expect(store.hasDirtyPathPrefix("C:\\repo\\src"));
+    try std.testing.expect(!store.hasDirtyPathPrefix("C:\\repo\\src2"));
+    try std.testing.expectEqual(@as(usize, 1), try store.renamePathPrefix("C:\\repo\\src", "C:\\repo\\lib"));
+    try std.testing.expectEqualStrings("C:\\repo\\lib\\main.zig", store.documents.items[0].path.?);
+    try std.testing.expectError(error.DirtyDocument, store.closePathPrefix("C:\\repo\\lib", .deny_dirty));
 }

@@ -115,6 +115,21 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "redo" };
     }
 
+    if (std.mem.eql(u8, definition.id, "editor.indent")) {
+        const doc = app.documents.active() orelse return .no_active_document;
+        const offset = doc.cursor.position.byte_offset;
+        _ = try doc.indentLines(offset, offset, "    ");
+        return .{ .completed = "indented line" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "editor.outdent")) {
+        const doc = app.documents.active() orelse return .no_active_document;
+        const offset = doc.cursor.position.byte_offset;
+        const result = try doc.outdentLines(offset, offset, 4);
+        if (!result.changed) return .{ .blocked = "line is already fully outdented" };
+        return .{ .completed = "outdented line" };
+    }
+
     if (std.mem.eql(u8, definition.id, "editor.delete_line")) {
         const doc = app.documents.active() orelse return .no_active_document;
         if (try doc.deleteLine(doc.cursor.position.line)) return .{ .completed = "deleted line" };

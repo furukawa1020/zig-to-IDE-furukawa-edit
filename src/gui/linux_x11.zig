@@ -2601,6 +2601,60 @@ const LinuxGuiState = struct {
         self.syncActiveDocumentToLsp();
     }
 
+    fn insertTypedText(self: *LinuxGuiState, bytes: []const u8) void {
+        const doc = self.app.documents.active() orelse {
+            self.message("open a file before typing", .{});
+            return;
+        };
+        const result = doc.typeText(self.selection_anchor, bytes) catch |err| {
+            self.message("insert failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.selection_anchor = result.selection_anchor;
+        self.app.mode = .insert;
+        self.app.focus = .editor;
+        self.ensureEditorCursorVisible();
+        if (result.changed) self.syncActiveDocumentToLsp();
+    }
+
+    fn changeIndentation(self: *LinuxGuiState, outdent: bool) void {
+        const doc = self.app.documents.active() orelse {
+            self.message("open a file before indenting", .{});
+            return;
+        };
+        const cursor_offset = doc.cursor.position.byte_offset;
+        const selected = self.selectedRange(doc) != null;
+        if (!selected and !outdent) {
+            const spaces = 4 - (doc.cursor.position.column % 4);
+            self.insertText("    "[0..spaces]);
+            return;
+        }
+
+        const anchor_offset = if (selected) self.selection_anchor.? else cursor_offset;
+        const result = if (outdent)
+            doc.outdentLines(anchor_offset, cursor_offset, 4)
+        else
+            doc.indentLines(anchor_offset, cursor_offset, "    ");
+        const edit = result catch |err| {
+            self.message("indent failed: {s}", .{@errorName(err)});
+            return;
+        };
+        if (selected) {
+            self.selection_anchor = edit.anchor_offset;
+        } else {
+            self.clearSelection();
+        }
+        self.app.mode = .insert;
+        self.app.focus = .editor;
+        self.ensureEditorCursorVisible();
+        if (edit.changed) {
+            self.syncActiveDocumentToLsp();
+            self.message(if (outdent) "outdented lines" else "indented lines", .{});
+        } else {
+            self.message("line is already fully outdented", .{});
+        }
+    }
+
     fn insertNewline(self: *LinuxGuiState) void {
         const doc = self.app.documents.active() orelse {
             self.message("open a file before typing", .{});
@@ -3190,6 +3244,14 @@ const LinuxGuiState = struct {
         }
         if (std.mem.eql(u8, id, "editor.toggle_comment")) {
             self.toggleActiveDocumentComment();
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.indent")) {
+            self.changeIndentation(false);
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.outdent")) {
+            self.changeIndentation(true);
             return;
         }
         if (std.mem.eql(u8, id, "editor.find_next")) {
@@ -4674,7 +4736,7 @@ const LinuxGuiState = struct {
                     return;
                 },
                 .tab => {
-                    self.insertText("    ");
+                    self.changeIndentation(key.modifiers.shift);
                     return;
                 },
                 .arrow_left => {
@@ -4696,7 +4758,7 @@ const LinuxGuiState = struct {
                 .char => |char| {
                     var bytes: [4]u8 = undefined;
                     const len = encodeUtf8(char, &bytes) catch return;
-                    self.insertText(bytes[0..len]);
+                    self.insertTypedText(bytes[0..len]);
                     return;
                 },
                 else => {},
@@ -4995,13 +5057,11 @@ const LinuxGuiState = struct {
             self.message("deleted selection", .{});
             return;
         }
-        const current = doc.cursor.position.byte_offset;
-        if (current == 0) return;
-        const previous = doc.text.previousByteOffset(current) catch current - 1;
-        doc.deleteRange(previous, current) catch |err| {
+        const changed = doc.deleteBackwardSmart() catch |err| {
             self.message("delete failed: {s}", .{@errorName(err)});
             return;
         };
+        if (!changed) return;
         self.syncActiveDocumentToLsp();
         self.message("deleted backward", .{});
     }
@@ -7951,6 +8011,8 @@ fn isValidIdentifierName(name: []const u8) bool {
 
 fn isEditorLineCommand(id: []const u8) bool {
     return std.mem.eql(u8, id, "editor.delete_line") or
+        std.mem.eql(u8, id, "editor.indent") or
+        std.mem.eql(u8, id, "editor.outdent") or
         std.mem.eql(u8, id, "editor.duplicate_line") or
         std.mem.eql(u8, id, "editor.move_line_up") or
         std.mem.eql(u8, id, "editor.move_line_down");

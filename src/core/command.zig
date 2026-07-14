@@ -70,6 +70,8 @@ const definitions = [_]Definition{
     .{ .id = "editor.move_down", .title = "Move Down", .description = "Move the cursor one line down.", .default_key = "down", .scope = .editor, .capability = .safe },
     .{ .id = "editor.undo", .title = "Undo", .description = "Undo the last editing transaction.", .default_key = "ctrl-z", .scope = .editor, .capability = .safe },
     .{ .id = "editor.redo", .title = "Redo", .description = "Redo the last undone editing transaction.", .default_key = "ctrl-y", .scope = .editor, .capability = .safe },
+    .{ .id = "editor.indent", .title = "Indent Lines", .description = "Indent the current line or selected lines as one undoable edit.", .default_key = "tab", .scope = .editor, .capability = .safe },
+    .{ .id = "editor.outdent", .title = "Outdent Lines", .description = "Remove one indentation level from the current line or selected lines.", .default_key = "shift-tab", .scope = .editor, .capability = .safe },
     .{ .id = "editor.find", .title = "Find in File", .description = "Find literal text in the current editor document.", .default_key = "ctrl-f", .scope = .editor, .capability = .safe },
     .{ .id = "editor.goto_line", .title = "Go To Line", .description = "Jump to a line and optional column in the current editor document.", .default_key = "ctrl-g", .scope = .editor, .capability = .safe },
     .{ .id = "editor.replace", .title = "Replace in File", .description = "Replace the selected current-document match.", .default_key = "ctrl-h", .scope = .editor, .capability = .safe },

@@ -56,6 +56,122 @@ pub const Document = struct {
         self.dirty = true;
     }
 
+    pub fn typeText(self: *Document, selection_anchor: ?usize, bytes: []const u8) !TypeResult {
+        const cursor_offset = @min(self.cursor.position.byte_offset, self.text.bytes.len);
+        if (selection_anchor) |raw_anchor| {
+            const anchor = @min(raw_anchor, self.text.bytes.len);
+            if (anchor != cursor_offset) {
+                const start = @min(anchor, cursor_offset);
+                const end = @max(anchor, cursor_offset);
+                if (bytes.len == 1) {
+                    if (closingPair(bytes[0])) |closing| {
+                        var replacement: std.Io.Writer.Allocating = .init(self.allocator);
+                        defer replacement.deinit();
+                        try replacement.writer.writeByte(bytes[0]);
+                        try replacement.writer.writeAll(self.text.bytes[start..end]);
+                        try replacement.writer.writeByte(closing);
+                        try self.replaceRange(start, end, replacement.written());
+
+                        const mapped_anchor = if (anchor < cursor_offset) start + 1 else end + 1;
+                        const mapped_cursor = if (anchor < cursor_offset) end + 1 else start + 1;
+                        self.cursor.position = try self.positionFromOffset(mapped_cursor);
+                        return .{ .selection_anchor = mapped_anchor, .changed = true, .wrapped = true };
+                    }
+                }
+
+                try self.replaceRange(start, end, bytes);
+                return .{ .changed = true };
+            }
+        }
+
+        if (bytes.len == 1) {
+            const typed = bytes[0];
+            if (isClosingByte(typed) and cursor_offset < self.text.bytes.len and self.text.bytes[cursor_offset] == typed) {
+                self.cursor.position = try self.positionFromOffset(cursor_offset + 1);
+                return .{ .changed = false };
+            }
+            if (closingPair(typed)) |closing| {
+                if (shouldAutoClose(self.text.bytes, cursor_offset, typed)) {
+                    const pair = [_]u8{ typed, closing };
+                    try self.insert(cursor_offset, &pair);
+                    self.cursor.position = try self.positionFromOffset(cursor_offset + 1);
+                    return .{ .changed = true };
+                }
+            }
+        }
+
+        try self.insert(cursor_offset, bytes);
+        return .{ .changed = bytes.len > 0 };
+    }
+
+    pub fn deleteBackwardSmart(self: *Document) !bool {
+        const current = @min(self.cursor.position.byte_offset, self.text.bytes.len);
+        if (current == 0) return false;
+        if (current < self.text.bytes.len and isPair(self.text.bytes[current - 1], self.text.bytes[current])) {
+            try self.deleteRange(current - 1, current + 1);
+            return true;
+        }
+        const previous = try self.text.previousByteOffset(current);
+        try self.deleteRange(previous, current);
+        return true;
+    }
+
+    pub fn indentLines(self: *Document, anchor_offset: usize, cursor_offset: usize, indent: []const u8) !IndentationResult {
+        if (indent.len == 0) {
+            return .{
+                .anchor_offset = @min(anchor_offset, self.text.bytes.len),
+                .cursor_offset = @min(cursor_offset, self.text.bytes.len),
+                .changed = false,
+            };
+        }
+
+        const selected = try self.lineRangeForOffsets(anchor_offset, cursor_offset);
+        const first = self.lineRange(selected.start_line) orelse return error.InvalidLineRange;
+        const last = self.lineRange(selected.end_line) orelse return error.InvalidLineRange;
+        const mapped_anchor = self.mapOffsetAfterIndent(anchor_offset, selected, indent.len);
+        const mapped_cursor = self.mapOffsetAfterIndent(cursor_offset, selected, indent.len);
+
+        var replacement: std.Io.Writer.Allocating = .init(self.allocator);
+        defer replacement.deinit();
+        var line = selected.start_line;
+        while (line <= selected.end_line) : (line += 1) {
+            const range = self.lineRange(line) orelse continue;
+            try replacement.writer.writeAll(indent);
+            try replacement.writer.writeAll(self.text.bytes[range.start..range.end]);
+        }
+
+        try self.replaceRange(first.start, last.end, replacement.written());
+        self.cursor.position = try self.positionFromOffset(mapped_cursor);
+        return .{ .anchor_offset = mapped_anchor, .cursor_offset = mapped_cursor, .changed = true };
+    }
+
+    pub fn outdentLines(self: *Document, anchor_offset: usize, cursor_offset: usize, tab_width: usize) !IndentationResult {
+        const width = @max(tab_width, 1);
+        const selected = try self.lineRangeForOffsets(anchor_offset, cursor_offset);
+        const first = self.lineRange(selected.start_line) orelse return error.InvalidLineRange;
+        const last = self.lineRange(selected.end_line) orelse return error.InvalidLineRange;
+        const mapped_anchor = self.mapOffsetAfterOutdent(anchor_offset, selected, width);
+        const mapped_cursor = self.mapOffsetAfterOutdent(cursor_offset, selected, width);
+
+        var replacement: std.Io.Writer.Allocating = .init(self.allocator);
+        defer replacement.deinit();
+        var changed = false;
+        var line = selected.start_line;
+        while (line <= selected.end_line) : (line += 1) {
+            const range = self.lineRange(line) orelse continue;
+            const remove = removableIndent(self.text.bytes[range.start..range.content_end], width);
+            changed = changed or remove > 0;
+            try replacement.writer.writeAll(self.text.bytes[range.start + remove .. range.end]);
+        }
+        if (!changed) {
+            return .{ .anchor_offset = mapped_anchor, .cursor_offset = mapped_cursor, .changed = false };
+        }
+
+        try self.replaceRange(first.start, last.end, replacement.written());
+        self.cursor.position = try self.positionFromOffset(mapped_cursor);
+        return .{ .anchor_offset = mapped_anchor, .cursor_offset = mapped_cursor, .changed = true };
+    }
+
     pub fn reloadFromBytes(self: *Document, bytes: []const u8) !void {
         const previous = self.cursor.position;
         var next = try buffer.TextBuffer.initFromBytes(self.allocator, bytes);
@@ -243,6 +359,32 @@ pub const Document = struct {
         };
     }
 
+    fn mapOffsetAfterIndent(self: *const Document, raw_offset: usize, selected: LineSelection, indent_len: usize) usize {
+        const offset = @min(raw_offset, self.text.bytes.len);
+        var insertions: usize = 0;
+        var line = selected.start_line;
+        while (line <= selected.end_line) : (line += 1) {
+            const start = self.text.lineStart(line) orelse continue;
+            if (start > offset) break;
+            insertions += 1;
+        }
+        return offset + insertions * indent_len;
+    }
+
+    fn mapOffsetAfterOutdent(self: *const Document, raw_offset: usize, selected: LineSelection, tab_width: usize) usize {
+        const offset = @min(raw_offset, self.text.bytes.len);
+        var removed_before: usize = 0;
+        var line = selected.start_line;
+        while (line <= selected.end_line) : (line += 1) {
+            const range = self.lineRange(line) orelse continue;
+            if (offset < range.start) break;
+            const remove = removableIndent(self.text.bytes[range.start..range.content_end], tab_width);
+            if (offset <= range.start + remove) return range.start - removed_before;
+            removed_before += remove;
+        }
+        return offset - removed_before;
+    }
+
     fn toggleLineComment(self: *Document, prefix: []const u8, start_line: usize, end_line: usize) !CommentToggleResult {
         if (self.text.lineCount() == 0) return .line_commented;
         const first_line = @min(start_line, self.text.lineCount() - 1);
@@ -344,6 +486,18 @@ const LineSelection = struct {
     end_line: usize,
 };
 
+pub const TypeResult = struct {
+    selection_anchor: ?usize = null,
+    changed: bool,
+    wrapped: bool = false,
+};
+
+pub const IndentationResult = struct {
+    anchor_offset: usize,
+    cursor_offset: usize,
+    changed: bool,
+};
+
 pub const CommentToggleResult = enum {
     line_commented,
     line_uncommented,
@@ -414,6 +568,58 @@ fn blockCommentBounds(content: []const u8, comment: modes.BlockComment) ?BlockBo
         .inner_end = inner_end,
         .end_suffix = right,
     };
+}
+
+fn closingPair(opening: u8) ?u8 {
+    return switch (opening) {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '\"' => '\"',
+        '\'' => '\'',
+        '`' => '`',
+        else => null,
+    };
+}
+
+fn isClosingByte(byte: u8) bool {
+    return switch (byte) {
+        ')', ']', '}', '\"', '\'', '`' => true,
+        else => false,
+    };
+}
+
+fn isPair(opening: u8, closing: u8) bool {
+    return closingPair(opening) == closing;
+}
+
+fn shouldAutoClose(source: []const u8, offset: usize, opening: u8) bool {
+    if (opening != '\"' and opening != '\'' and opening != '`') return true;
+    if (isEscapedAt(source, offset)) return false;
+    if (opening == '\'' and offset > 0 and offset < source.len and isWordByte(source[offset - 1]) and isWordByte(source[offset])) return false;
+    return true;
+}
+
+fn isEscapedAt(source: []const u8, offset: usize) bool {
+    var index = @min(offset, source.len);
+    var backslashes: usize = 0;
+    while (index > 0 and source[index - 1] == '\\') {
+        backslashes += 1;
+        index -= 1;
+    }
+    return backslashes % 2 == 1;
+}
+
+fn isWordByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+fn removableIndent(content: []const u8, tab_width: usize) usize {
+    if (content.len == 0) return 0;
+    if (content[0] == '\t') return 1;
+    var count: usize = 0;
+    while (count < content.len and count < tab_width and content[count] == ' ') : (count += 1) {}
+    return count;
 }
 
 pub fn newlineLabelFor(newline: Newline) []const u8 {
@@ -517,4 +723,68 @@ test "document toggles block comments for markup languages" {
 
     try std.testing.expectEqual(CommentToggleResult.block_uncommented, (try doc.toggleComment(0, doc.text.bytes.len)).?);
     try std.testing.expectEqualStrings("<main>Hi</main>", doc.text.bytes);
+}
+
+test "document paired typing inserts skips wraps and deletes as one edit" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "value");
+    defer doc.deinit();
+
+    doc.cursor.position = try doc.positionFromOffset(0);
+    var result = try doc.typeText(null, "(");
+    try std.testing.expect(result.changed);
+    try std.testing.expectEqualStrings("()value", doc.text.bytes);
+    try std.testing.expectEqual(@as(usize, 1), doc.cursor.position.byte_offset);
+
+    result = try doc.typeText(null, ")");
+    try std.testing.expect(!result.changed);
+    try std.testing.expectEqual(@as(usize, 2), doc.cursor.position.byte_offset);
+
+    doc.cursor.position = try doc.positionFromOffset(doc.text.bytes.len);
+    result = try doc.typeText(2, "[");
+    try std.testing.expect(result.wrapped);
+    try std.testing.expectEqual(@as(?usize, 3), result.selection_anchor);
+    try std.testing.expectEqualStrings("()[value]", doc.text.bytes);
+    try std.testing.expectEqual(@as(usize, 8), doc.cursor.position.byte_offset);
+
+    var empty = try Document.fromBytes(std.testing.allocator, "main.zig", "{}");
+    defer empty.deinit();
+    empty.cursor.position = try empty.positionFromOffset(1);
+    try std.testing.expect(try empty.deleteBackwardSmart());
+    try std.testing.expectEqualStrings("", empty.text.bytes);
+    try std.testing.expect(try empty.undo());
+    try std.testing.expectEqualStrings("{}", empty.text.bytes);
+}
+
+test "document quote pairing does not split apostrophes or escaped quotes" {
+    var doc = try Document.fromBytes(std.testing.allocator, "notes.txt", "dont");
+    defer doc.deinit();
+
+    doc.cursor.position = try doc.positionFromOffset(3);
+    _ = try doc.typeText(null, "'");
+    try std.testing.expectEqualStrings("don't", doc.text.bytes);
+
+    var escaped = try Document.fromBytes(std.testing.allocator, "main.zig", "\\\\");
+    defer escaped.deinit();
+    escaped.cursor.position = try escaped.positionFromOffset(1);
+    _ = try escaped.typeText(null, "\"");
+    try std.testing.expectEqualStrings("\\\\\"", escaped.text.bytes);
+}
+
+test "document indents and outdents selected lines with mapped selection" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "alpha\n  beta\n\tgamma\n");
+    defer doc.deinit();
+
+    const indented = try doc.indentLines(0, 13, "    ");
+    try std.testing.expect(indented.changed);
+    try std.testing.expectEqualStrings("    alpha\n      beta\n\tgamma\n", doc.text.bytes);
+    try std.testing.expectEqual(@as(usize, 4), indented.anchor_offset);
+    try std.testing.expectEqual(@as(usize, 21), indented.cursor_offset);
+    try std.testing.expect(try doc.undo());
+    try std.testing.expectEqualStrings("alpha\n  beta\n\tgamma\n", doc.text.bytes);
+
+    const outdented = try doc.outdentLines(0, doc.text.bytes.len, 4);
+    try std.testing.expect(outdented.changed);
+    try std.testing.expectEqualStrings("alpha\nbeta\ngamma\n", doc.text.bytes);
+    try std.testing.expectEqual(@as(usize, 0), outdented.anchor_offset);
+    try std.testing.expectEqual(@as(usize, 17), outdented.cursor_offset);
 }

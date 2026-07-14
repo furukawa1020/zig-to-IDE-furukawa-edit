@@ -2649,7 +2649,11 @@ const LinuxGuiState = struct {
         self.ensureEditorCursorVisible();
         if (edit.changed) {
             self.syncActiveDocumentToLsp();
-            self.message(if (outdent) "outdented lines" else "indented lines", .{});
+            if (outdent) {
+                self.message("outdented lines", .{});
+            } else {
+                self.message("indented lines", .{});
+            }
         } else {
             self.message("line is already fully outdented", .{});
         }
@@ -2660,7 +2664,15 @@ const LinuxGuiState = struct {
             self.message("open a file before typing", .{});
             return;
         };
-        self.insertText(doc.preferredNewline());
+        const result = doc.insertSmartNewline(self.selection_anchor, 4) catch |err| {
+            self.message("newline failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.selection_anchor = result.selection_anchor;
+        self.app.mode = .insert;
+        self.app.focus = .editor;
+        self.ensureEditorCursorVisible();
+        if (result.changed) self.syncActiveDocumentToLsp();
     }
 
     fn selectAll(self: *LinuxGuiState, x11: *X11) void {

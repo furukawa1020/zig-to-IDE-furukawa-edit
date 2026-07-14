@@ -104,6 +104,42 @@ pub const Document = struct {
         return .{ .changed = bytes.len > 0 };
     }
 
+    pub fn insertSmartNewline(self: *Document, selection_anchor: ?usize, indent_width: usize) !TypeResult {
+        const cursor_offset = @min(self.cursor.position.byte_offset, self.text.bytes.len);
+        if (selection_anchor) |raw_anchor| {
+            const anchor = @min(raw_anchor, self.text.bytes.len);
+            if (anchor != cursor_offset) {
+                try self.replaceRange(@min(anchor, cursor_offset), @max(anchor, cursor_offset), self.preferredNewline());
+                return .{ .changed = true };
+            }
+        }
+
+        const line = try self.text.offsetToLine(cursor_offset);
+        const line_start = self.text.lineStart(line) orelse cursor_offset;
+        var indent_end = line_start;
+        while (indent_end < cursor_offset and (self.text.bytes[indent_end] == ' ' or self.text.bytes[indent_end] == '\t')) : (indent_end += 1) {}
+        const base_indent = self.text.bytes[line_start..indent_end];
+        const opening = previousNonWhitespace(self.text.bytes, line_start, cursor_offset);
+        const closing = if (cursor_offset < self.text.bytes.len) self.text.bytes[cursor_offset] else 0;
+        const expand_pair = if (opening) |byte| isStructuralOpening(byte) and closingPair(byte) == closing else false;
+        const add_indent = if (opening) |byte| isStructuralOpening(byte) else false;
+
+        var inserted: std.Io.Writer.Allocating = .init(self.allocator);
+        defer inserted.deinit();
+        try inserted.writer.writeAll(self.preferredNewline());
+        try inserted.writer.writeAll(base_indent);
+        if (add_indent) try writeIndentUnit(&inserted.writer, base_indent, indent_width);
+        const cursor_after_first_line = cursor_offset + inserted.written().len;
+        if (expand_pair) {
+            try inserted.writer.writeAll(self.preferredNewline());
+            try inserted.writer.writeAll(base_indent);
+        }
+
+        try self.insert(cursor_offset, inserted.written());
+        self.cursor.position = try self.positionFromOffset(cursor_after_first_line);
+        return .{ .changed = true };
+    }
+
     pub fn deleteBackwardSmart(self: *Document) !bool {
         const current = @min(self.cursor.position.byte_offset, self.text.bytes.len);
         if (current == 0) return false;
@@ -593,6 +629,10 @@ fn isPair(opening: u8, closing: u8) bool {
     return closingPair(opening) == closing;
 }
 
+fn isStructuralOpening(byte: u8) bool {
+    return byte == '(' or byte == '[' or byte == '{';
+}
+
 fn shouldAutoClose(source: []const u8, offset: usize, opening: u8) bool {
     if (opening != '\"' and opening != '\'' and opening != '`') return true;
     if (isEscapedAt(source, offset)) return false;
@@ -620,6 +660,23 @@ fn removableIndent(content: []const u8, tab_width: usize) usize {
     var count: usize = 0;
     while (count < content.len and count < tab_width and content[count] == ' ') : (count += 1) {}
     return count;
+}
+
+fn previousNonWhitespace(source: []const u8, line_start: usize, cursor_offset: usize) ?u8 {
+    var index = @min(cursor_offset, source.len);
+    while (index > line_start) {
+        index -= 1;
+        if (!std.ascii.isWhitespace(source[index])) return source[index];
+    }
+    return null;
+}
+
+fn writeIndentUnit(writer: *std.Io.Writer, base_indent: []const u8, indent_width: usize) !void {
+    if (std.mem.indexOfScalar(u8, base_indent, '\t') != null and std.mem.indexOfScalar(u8, base_indent, ' ') == null) {
+        try writer.writeByte('\t');
+        return;
+    }
+    try writer.splatByteAll(' ', @max(indent_width, 1));
 }
 
 pub fn newlineLabelFor(newline: Newline) []const u8 {
@@ -763,11 +820,11 @@ test "document quote pairing does not split apostrophes or escaped quotes" {
     _ = try doc.typeText(null, "'");
     try std.testing.expectEqualStrings("don't", doc.text.bytes);
 
-    var escaped = try Document.fromBytes(std.testing.allocator, "main.zig", "\\\\");
+    var escaped = try Document.fromBytes(std.testing.allocator, "main.zig", "\\");
     defer escaped.deinit();
     escaped.cursor.position = try escaped.positionFromOffset(1);
     _ = try escaped.typeText(null, "\"");
-    try std.testing.expectEqualStrings("\\\\\"", escaped.text.bytes);
+    try std.testing.expectEqualStrings("\\\"", escaped.text.bytes);
 }
 
 test "document indents and outdents selected lines with mapped selection" {
@@ -787,4 +844,39 @@ test "document indents and outdents selected lines with mapped selection" {
     try std.testing.expectEqualStrings("alpha\nbeta\ngamma\n", doc.text.bytes);
     try std.testing.expectEqual(@as(usize, 0), outdented.anchor_offset);
     try std.testing.expectEqual(@as(usize, 17), outdented.cursor_offset);
+}
+
+test "document smart newline expands structural pairs as one undo step" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "fn main() void {}");
+    defer doc.deinit();
+
+    const opening = std.mem.indexOfScalar(u8, doc.text.bytes, '{').?;
+    doc.cursor.position = try doc.positionFromOffset(opening + 1);
+    const result = try doc.insertSmartNewline(null, 4);
+    try std.testing.expect(result.changed);
+    try std.testing.expectEqualStrings("fn main() void {\n    \n}", doc.text.bytes);
+    try std.testing.expectEqual(opening + 1 + "\n    ".len, doc.cursor.position.byte_offset);
+    try std.testing.expect(try doc.undo());
+    try std.testing.expectEqualStrings("fn main() void {}", doc.text.bytes);
+}
+
+test "document smart newline preserves crlf and tab indentation" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "\tif (ready) {}");
+    defer doc.deinit();
+
+    doc.text.newline = .crlf;
+    const opening = std.mem.indexOfScalar(u8, doc.text.bytes, '{').?;
+    doc.cursor.position = try doc.positionFromOffset(opening + 1);
+    _ = try doc.insertSmartNewline(null, 4);
+    try std.testing.expectEqualStrings("\tif (ready) {\r\n\t\t\r\n\t}", doc.text.bytes);
+}
+
+test "document smart newline does not expand quote pairs as blocks" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "\"\"");
+    defer doc.deinit();
+
+    doc.cursor.position = try doc.positionFromOffset(1);
+    _ = try doc.insertSmartNewline(null, 4);
+    try std.testing.expectEqualStrings("\"\n\"", doc.text.bytes);
+    try std.testing.expectEqual(@as(usize, 2), doc.cursor.position.byte_offset);
 }

@@ -147,6 +147,8 @@ fn shouldSkip(name: []const u8, options: ScanOptions) bool {
     if (!options.include_hidden and name.len > 0 and name[0] == '.') return true;
     return std.mem.eql(u8, name, ".git") or
         std.mem.eql(u8, name, ".tools") or
+        std.mem.eql(u8, name, ".zig-toolchain") or
+        std.mem.startsWith(u8, name, ".zig-toolchain-") or
         generatedZigDir(name) or
         std.mem.eql(u8, name, "node_modules") or
         std.mem.eql(u8, name, ".DS_Store");
@@ -172,6 +174,8 @@ test "workspace can open current directory" {
 
 test "workspace skips generated tool and cache directories" {
     try std.testing.expect(shouldSkip(".tools", .{}));
+    try std.testing.expect(shouldSkip(".zig-toolchain", .{}));
+    try std.testing.expect(shouldSkip(".zig-toolchain-nightly", .{}));
     try std.testing.expect(shouldSkip(".zig-cache", .{}));
     try std.testing.expect(shouldSkip(".zig-cache-test-check", .{}));
     try std.testing.expect(shouldSkip(".zig-global-cache", .{}));

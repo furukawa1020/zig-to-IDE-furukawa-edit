@@ -708,6 +708,8 @@ const GuiState = struct {
     git_scroll_line: usize = 0,
     extensions_scroll_line: usize = 0,
     selection_anchor: ?usize = null,
+    suppressed_char: ?u21 = null,
+    pending_high_surrogate: ?u16 = null,
     editor_dragging: bool = false,
     last_document_search_query: std.array_list.Managed(u8),
     last_document_search_options: literal_search.Options = .{},
@@ -3004,7 +3006,15 @@ const GuiState = struct {
             self.setMessage("Open a file before typing") catch {};
             return;
         };
-        self.insertText(doc.preferredNewline());
+        const result = doc.insertSmartNewline(self.selection_anchor, 4) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.selection_anchor = result.selection_anchor;
+        self.app.mode = .insert;
+        self.app.focus = .editor;
+        self.ensureCursorVisible();
+        if (result.changed) self.syncActiveDocumentToLsp();
     }
 
     fn normalizeActiveDocumentNewlines(self: *GuiState, newline: document_mod.Newline) void {
@@ -3761,7 +3771,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
             VK_ESCAPE => state.quick_panel.close(),
             VK_UP => state.quick_panel.moveSelection(-1),
             VK_DOWN => state.quick_panel.moveSelection(1),
-            VK_RETURN => if (ctrl and state.quick_panel.mode == .replace_document) state.replaceAllFromQuickPanel() else state.executeSelectedQuickPanelItem(),
+            VK_RETURN => {
+                state.suppressed_char = '\r';
+                if (ctrl and state.quick_panel.mode == .replace_document) state.replaceAllFromQuickPanel() else state.executeSelectedQuickPanelItem();
+            },
             VK_F3 => state.moveQuickPanelDocumentMatch(if (shift) -1 else 1),
             VK_F6 => state.toggleQuickPanelCaseSensitive(),
             VK_F7 => state.toggleQuickPanelWholeWord(),
@@ -3776,7 +3789,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
             VK_ESCAPE => state.closePalette(),
             VK_UP => state.app.palette.moveSelection(-1),
             VK_DOWN => state.app.palette.moveSelection(1),
-            VK_RETURN => state.executeSelectedPaletteCommand(),
+            VK_RETURN => {
+                state.suppressed_char = '\r';
+                state.executeSelectedPaletteCommand();
+            },
             VK_BACK => state.app.palette.deleteBackward() catch |err| state.setError(err) catch {},
             else => {},
         }
@@ -3980,11 +3996,15 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         },
         VK_RETURN => {
             if (state.app.focus == .files) {
+                state.suppressed_char = '\r';
                 state.openSelected();
             }
         },
         VK_TAB => {
-            if (state.app.mode == .insert and state.app.focus == .editor) state.changeIndentation(shift);
+            if (state.app.mode == .insert and state.app.focus == .editor) {
+                state.suppressed_char = '\t';
+                state.changeIndentation(shift);
+            }
         },
         VK_BACK => {
             if (state.app.mode == .insert and state.app.focus == .editor) state.deleteBackward();
@@ -4016,8 +4036,30 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
 }
 
 fn handleChar(state: *GuiState, key: WPARAM) void {
-    if (isKeyDown(VK_CONTROL)) return;
-    const codepoint: u21 = @intCast(key);
+    if (isKeyDown(VK_CONTROL)) {
+        state.suppressed_char = null;
+        state.pending_high_surrogate = null;
+        return;
+    }
+    const unit: u16 = @truncate(key);
+    if (unit >= 0xD800 and unit <= 0xDBFF) {
+        state.pending_high_surrogate = unit;
+        return;
+    }
+    const codepoint: u21 = if (unit >= 0xDC00 and unit <= 0xDFFF) decoded: {
+        const high = state.pending_high_surrogate orelse return;
+        state.pending_high_surrogate = null;
+        const high_value: u21 = @as(u21, high) - 0xD800;
+        const low_value: u21 = @as(u21, unit) - 0xDC00;
+        break :decoded 0x10000 + (high_value << 10) + low_value;
+    } else decoded: {
+        state.pending_high_surrogate = null;
+        break :decoded @as(u21, unit);
+    };
+    if (state.suppressed_char) |suppressed| {
+        state.suppressed_char = null;
+        if (suppressed == codepoint) return;
+    }
     if (state.quick_panel.visible) {
         if (codepoint >= 0x20 and codepoint != 0x7f) {
             var buffer: [4]u8 = undefined;

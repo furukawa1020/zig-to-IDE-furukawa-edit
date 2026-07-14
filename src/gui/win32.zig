@@ -1080,6 +1080,14 @@ const GuiState = struct {
             self.toggleActiveDocumentComment();
             return;
         }
+        if (std.mem.eql(u8, id, "editor.indent")) {
+            self.changeIndentation(false);
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.outdent")) {
+            self.changeIndentation(true);
+            return;
+        }
         if (std.mem.eql(u8, id, "editor.normalize_newlines_lf")) {
             self.normalizeActiveDocumentNewlines(.lf);
             return;
@@ -2937,6 +2945,60 @@ const GuiState = struct {
         self.syncActiveDocumentToLsp();
     }
 
+    fn insertTypedText(self: *GuiState, bytes: []const u8) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("Open a file before typing") catch {};
+            return;
+        };
+        const result = doc.typeText(self.selection_anchor, bytes) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.selection_anchor = result.selection_anchor;
+        self.app.mode = .insert;
+        self.app.focus = .editor;
+        self.ensureCursorVisible();
+        if (result.changed) self.syncActiveDocumentToLsp();
+    }
+
+    fn changeIndentation(self: *GuiState, outdent: bool) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("Open a file before indenting") catch {};
+            return;
+        };
+        const cursor_offset = doc.cursor.position.byte_offset;
+        const selected = self.selectedRange(doc) != null;
+        if (!selected and !outdent) {
+            const spaces = 4 - (doc.cursor.position.column % 4);
+            self.insertText("    "[0..spaces]);
+            return;
+        }
+
+        const anchor_offset = if (selected) self.selection_anchor.? else cursor_offset;
+        const result = if (outdent)
+            doc.outdentLines(anchor_offset, cursor_offset, 4)
+        else
+            doc.indentLines(anchor_offset, cursor_offset, "    ");
+        const edit = result catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        if (selected) {
+            self.selection_anchor = edit.anchor_offset;
+        } else {
+            self.clearSelection();
+        }
+        self.app.mode = .insert;
+        self.app.focus = .editor;
+        self.ensureCursorVisible();
+        if (edit.changed) {
+            self.syncActiveDocumentToLsp();
+            self.setMessage(if (outdent) "Outdented lines" else "Indented lines") catch {};
+        } else {
+            self.setMessage("Line is already fully outdented") catch {};
+        }
+    }
+
     fn insertNewline(self: *GuiState) void {
         const doc = self.app.documents.active() orelse {
             self.setMessage("Open a file before typing") catch {};
@@ -3114,13 +3176,11 @@ const GuiState = struct {
             self.ensureCursorVisible();
             return;
         }
-        const current = doc.cursor.position.byte_offset;
-        if (current == 0) return;
-        const previous = doc.text.previousByteOffset(current) catch return;
-        doc.deleteRange(previous, current) catch |err| {
+        const changed = doc.deleteBackwardSmart() catch |err| {
             self.setError(err) catch {};
             return;
         };
+        if (!changed) return;
         self.ensureCursorVisible();
         self.syncActiveDocumentToLsp();
     }
@@ -3921,12 +3981,10 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         VK_RETURN => {
             if (state.app.focus == .files) {
                 state.openSelected();
-            } else if (state.app.mode == .insert) {
-                state.insertNewline();
             }
         },
         VK_TAB => {
-            if (state.app.mode == .insert and state.app.focus == .editor) state.insertText("    ");
+            if (state.app.mode == .insert and state.app.focus == .editor) state.changeIndentation(shift);
         },
         VK_BACK => {
             if (state.app.mode == .insert and state.app.focus == .editor) state.deleteBackward();
@@ -3984,13 +4042,12 @@ fn handleChar(state: *GuiState, key: WPARAM) void {
         return;
     }
     if (codepoint == '\t') {
-        state.insertText("    ");
         return;
     }
     if (codepoint < 0x20 or codepoint == 0x7f) return;
     var buffer: [4]u8 = undefined;
     const len = std.unicode.utf8Encode(codepoint, &buffer) catch return;
-    state.insertText(buffer[0..len]);
+    state.insertTypedText(buffer[0..len]);
 }
 
 fn paint(hwnd: windows.HWND) void {
@@ -6088,6 +6145,8 @@ fn isKeyDown(vk: c_int) bool {
 
 fn isEditorLineCommand(id: []const u8) bool {
     return std.mem.eql(u8, id, "editor.delete_line") or
+        std.mem.eql(u8, id, "editor.indent") or
+        std.mem.eql(u8, id, "editor.outdent") or
         std.mem.eql(u8, id, "editor.duplicate_line") or
         std.mem.eql(u8, id, "editor.move_line_up") or
         std.mem.eql(u8, id, "editor.move_line_down");

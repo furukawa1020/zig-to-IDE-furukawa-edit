@@ -26,18 +26,25 @@ pub const DocumentStore = struct {
     }
 
     pub fn openFile(self: *DocumentStore, path: []const u8) !usize {
-        if (self.findByPath(path)) |existing| {
-            self.active_index = existing;
-            return existing;
-        }
-
+        if (self.activatePath(path)) |existing| return existing;
         const bytes = try readFile(self.allocator, path, 32 * 1024 * 1024);
         defer self.allocator.free(bytes);
+        return self.openBytes(path, bytes);
+    }
+
+    pub fn openBytes(self: *DocumentStore, path: []const u8, bytes: []const u8) !usize {
+        if (self.activatePath(path)) |existing| return existing;
 
         try self.documents.append(try document.Document.fromBytes(self.allocator, path, bytes));
         const index = self.documents.items.len - 1;
         self.active_index = index;
         return index;
+    }
+
+    pub fn activatePath(self: *DocumentStore, path: []const u8) ?usize {
+        const existing = self.findByPath(path) orelse return null;
+        self.active_index = existing;
+        return existing;
     }
 
     pub fn createScratch(self: *DocumentStore, name: []const u8, bytes: []const u8) !usize {
@@ -163,7 +170,7 @@ pub const DocumentStore = struct {
     fn findByPath(self: *const DocumentStore, path: []const u8) ?usize {
         for (self.documents.items, 0..) |doc, index| {
             const doc_path = doc.path orelse continue;
-            if (std.mem.eql(u8, doc_path, path)) return index;
+            if (pathEqual(doc_path, path)) return index;
         }
         return null;
     }
@@ -176,7 +183,16 @@ fn pathMatchesOrDescendant(path: []const u8, prefix: []const u8) bool {
 }
 
 fn pathEqual(left: []const u8, right: []const u8) bool {
-    if (std.fs.path.sep == '\\') return std.ascii.eqlIgnoreCase(left, right);
+    if (left.len != right.len) return false;
+    if (std.fs.path.sep == '\\') {
+        for (left, right) |left_byte, right_byte| {
+            const left_separator = left_byte == '/' or left_byte == '\\';
+            const right_separator = right_byte == '/' or right_byte == '\\';
+            if (left_separator and right_separator) continue;
+            if (std.ascii.toLower(left_byte) != std.ascii.toLower(right_byte)) return false;
+        }
+        return true;
+    }
     return std.mem.eql(u8, left, right);
 }
 
@@ -247,4 +263,16 @@ test "document store follows renamed directory and protects dirty deletes" {
     try std.testing.expectEqual(@as(usize, 1), try store.renamePathPrefix("C:\\repo\\src", "C:\\repo\\lib"));
     try std.testing.expectEqualStrings("C:\\repo\\lib\\main.zig", store.documents.items[0].path.?);
     try std.testing.expectError(error.DirtyDocument, store.closePathPrefix("C:\\repo\\lib", .deny_dirty));
+}
+
+test "document store treats Windows separator variants as the same path" {
+    if (std.fs.path.sep != '\\') return;
+
+    var store = DocumentStore.init(std.testing.allocator);
+    defer store.deinit();
+    _ = try store.createScratch("C:\\repo\\src/main.zig", "const x = 1;\n");
+    store.documents.items[0].dirty = true;
+
+    try std.testing.expectEqual(@as(?usize, 0), store.activatePath("c:/repo/src\\main.zig"));
+    try std.testing.expect(store.hasDirtyPathPrefix("C:/REPO/src"));
 }

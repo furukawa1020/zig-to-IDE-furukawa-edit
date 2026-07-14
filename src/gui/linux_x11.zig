@@ -4617,10 +4617,7 @@ const LinuxGuiState = struct {
         while (index > 0) {
             index -= 1;
             const item = results[index];
-            const absolute = std.fs.path.join(self.allocator, &.{ self.app.workspace.root_path, item.path }) catch |err| return self.message("rename path failed: {s}", .{@errorName(err)});
-            defer self.allocator.free(absolute);
-
-            const doc_index = self.app.documents.openFile(absolute) catch |err| {
+            const doc_index = self.app.openWorkspaceFile(item.path) catch |err| {
                 skipped += 1;
                 self.appendOutput(.stderr, "rename skipped open failure: {s}: {s}\n", .{ item.path, @errorName(err) });
                 continue;
@@ -5642,13 +5639,7 @@ const LinuxGuiState = struct {
     }
 
     fn openRelativeLocation(self: *LinuxGuiState, relative: []const u8, line: usize, column: usize) void {
-        const absolute = std.fs.path.join(self.allocator, &.{ self.app.workspace.root_path, relative }) catch |err| {
-            self.message("path failed: {s}", .{@errorName(err)});
-            return;
-        };
-        defer self.allocator.free(absolute);
-
-        const index = self.app.documents.openFile(absolute) catch |err| {
+        const index = self.app.openWorkspaceFile(relative) catch |err| {
             self.message("open failed: {s}", .{@errorName(err)});
             return;
         };

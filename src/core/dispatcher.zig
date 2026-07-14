@@ -24,6 +24,7 @@ const posture = @import("../security/posture.zig");
 const security_findings = @import("../security/findings.zig");
 const types = @import("types.zig");
 const workspace_audit = @import("../security/workspace_audit.zig");
+const workspace_io = @import("../security/workspace_io.zig");
 const modes = @import("../language/modes.zig");
 const package_trust = @import("../security/package_trust.zig");
 const polyglot_scanner = @import("../security/polyglot_scanner.zig");
@@ -190,7 +191,7 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         const doc = app.documents.active() orelse return .no_active_document;
         _ = doc.path orelse return .{ .blocked = "active document has no file path" };
         if (try runSaveSafetyCheck(app)) |message| return .{ .blocked = message };
-        try app.documents.saveActive(.{});
+        try saveDocumentInWorkspace(app, doc, .{});
         _ = try notifyActiveDocumentSavedToRunningLsp(app);
         return .{ .completed = "saved" };
     }
@@ -208,9 +209,7 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         var saved_count: usize = 0;
         for (app.documents.documents.items) |*doc| {
             if (!doc.dirty) continue;
-            const path = doc.path orelse return .{ .blocked = "dirty document has no file path" };
-            try editor_save.saveBytes(app.allocator, path, doc.text.bytes, .{});
-            doc.dirty = false;
+            try saveDocumentInWorkspace(app, doc, .{});
             _ = try notifyDocumentSavedToRunningLsp(app, doc);
             saved_count += 1;
         }
@@ -224,30 +223,14 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         const relative = std.mem.trim(u8, argument, " \t\r\n");
         if (validateNewWorkspaceFilePath(relative)) |message| return .{ .blocked = message };
 
-        const path = try workspacePath(app, relative);
-        defer app.allocator.free(path);
-        if (!permissions.allowsWrite(.workspace_only, app.workspace.root_path, path)) {
-            return .{ .blocked = "new file path is outside workspace" };
-        }
-        if (!try existingAncestorInsideWorkspace(app, path)) {
-            return .{ .blocked = "new file path resolves through an unsafe workspace boundary" };
-        }
-
-        if (std.fs.path.dirname(path)) |parent| {
-            try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, parent);
-        }
-        const exists = exists: {
-            _ = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch |err| switch (err) {
-                error.FileNotFound => break :exists false,
-                else => return err,
-            };
-            break :exists true;
+        var new_file = try workspace_io.openFileCapabilityCreateParents(app.workspace.root_path, relative);
+        defer new_file.close();
+        editor_save.createBytesInDirExclusive(app.allocator, new_file.parent, new_file.name, "") catch |err| switch (err) {
+            error.PathAlreadyExists => return .{ .blocked = "file already exists" },
+            else => return err,
         };
-        if (exists) return .{ .blocked = "file already exists" };
-
-        try editor_save.saveBytes(app.allocator, path, "", .{});
         try app.workspace.refresh();
-        _ = try app.documents.openFile(path);
+        _ = try app.openWorkspaceFile(relative);
         app.focus = .editor;
         return .{ .completed = "created file" };
     }
@@ -257,16 +240,10 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         const relative = std.mem.trim(u8, argument, " \t\r\n");
         if (validateWorkspaceMutationPath(relative, .directory)) |message| return .{ .blocked = message };
 
-        const path = try workspacePath(app, relative);
-        defer app.allocator.free(path);
-        if (!permissions.allowsWrite(.workspace_only, app.workspace.root_path, path) or
-            !try existingAncestorInsideWorkspace(app, path))
-        {
-            return .{ .blocked = "new folder path resolves outside workspace" };
-        }
-        if (try pathExists(path)) return .{ .blocked = "file or folder already exists at destination" };
-
-        try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, path);
+        workspace_io.createDirectoryPath(app.workspace.root_path, relative) catch |err| switch (err) {
+            error.PathAlreadyExists => return .{ .blocked = "file or folder already exists at destination" },
+            else => return err,
+        };
         try app.workspace.refresh();
         return .{ .completed = "created folder" };
     }
@@ -278,20 +255,16 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         if (validateWorkspaceMutationPath(pair.destination, .either)) |message| return .{ .blocked = message };
         if (workspaceRelativePathEqual(pair.source, pair.destination)) return .{ .blocked = "rename source and destination are identical" };
 
-        const source = try workspacePath(app, pair.source);
+        const source = try workspace_io.absolutePathAlloc(app.allocator, app.workspace.root_path, pair.source);
         defer app.allocator.free(source);
-        const destination = try workspacePath(app, pair.destination);
+        const destination = try workspace_io.absolutePathAlloc(app.allocator, app.workspace.root_path, pair.destination);
         defer app.allocator.free(destination);
-        if (!permissions.allowsWrite(.workspace_only, app.workspace.root_path, source) or
-            !permissions.allowsWrite(.workspace_only, app.workspace.root_path, destination) or
-            !try existingPathInsideWorkspace(app, source) or
-            !try existingAncestorInsideWorkspace(app, destination))
-        {
-            return .{ .blocked = "rename path resolves outside workspace" };
-        }
-        if (try pathExists(destination)) return .{ .blocked = "rename destination already exists" };
-
-        try std.Io.Dir.rename(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, std.Options.debug_io);
+        _ = workspace_io.renamePathPreserve(app.workspace.root_path, pair.source, pair.destination) catch |err| switch (err) {
+            error.PathAlreadyExists => return .{ .blocked = "rename destination already exists" },
+            error.FileNotFound, error.NotDir => return .{ .blocked = "rename source or destination folder does not exist" },
+            error.UnsupportedWorkspacePath => return .{ .blocked = "only regular files and folders can be renamed" },
+            else => return err,
+        };
         const updated_documents = try app.documents.renamePathPrefix(source, destination);
         try app.workspace.refresh();
         try appendConsole(app, .stdout, "renamed: {s} -> {s} (open editors updated: {d})\n", .{ pair.source, pair.destination, updated_documents });
@@ -304,29 +277,18 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         if (!std.mem.eql(u8, pair.destination, "DELETE")) return .{ .blocked = "type DELETE exactly to confirm deletion" };
         if (validateWorkspaceMutationPath(pair.source, .either)) |message| return .{ .blocked = message };
 
-        const path = try workspacePath(app, pair.source);
+        const path = try workspace_io.absolutePathAlloc(app.allocator, app.workspace.root_path, pair.source);
         defer app.allocator.free(path);
-        if (!permissions.allowsWrite(.workspace_only, app.workspace.root_path, path) or
-            !try existingPathInsideWorkspace(app, path))
-        {
-            return .{ .blocked = "delete path resolves outside workspace" };
-        }
         if (app.documents.hasDirtyPathPrefix(path)) {
             return .{ .blocked = "save or close dirty editors under this path before deleting" };
         }
 
-        const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return .{ .blocked = "delete target does not exist" },
+        _ = workspace_io.deleteFileOrEmptyDirectory(app.workspace.root_path, pair.source) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return .{ .blocked = "delete target does not exist" },
+            error.DirNotEmpty => return .{ .blocked = "folder is not empty; recursive deletion is intentionally disabled" },
+            error.UnsupportedWorkspacePath => return .{ .blocked = "only regular files and empty folders can be deleted" },
             else => return err,
         };
-        switch (stat.kind) {
-            .file => try std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path),
-            .directory => std.Io.Dir.cwd().deleteDir(std.Options.debug_io, path) catch |err| switch (err) {
-                error.DirNotEmpty => return .{ .blocked = "folder is not empty; recursive deletion is intentionally disabled" },
-                else => return err,
-            },
-            else => return .{ .blocked = "only regular files and empty folders can be deleted" },
-        }
         const closed_documents = try app.documents.closePathPrefix(path, .deny_dirty);
         try app.workspace.refresh();
         try appendConsole(app, .stdout, "deleted: {s} (closed editors: {d})\n", .{ pair.source, closed_documents });
@@ -335,9 +297,11 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
 
     if (std.mem.eql(u8, definition.id, "file.open")) {
         const argument = request.argument orelse return .{ .unsupported = "file.open requires a path argument" };
-        const path = try workspacePath(app, argument);
-        defer app.allocator.free(path);
-        _ = try app.documents.openFile(path);
+        const relative = if (std.fs.path.isAbsolute(argument))
+            try workspace_io.relativeFilePath(app.workspace.root_path, argument)
+        else
+            argument;
+        _ = try app.openWorkspaceFile(relative);
         app.focus = .editor;
         return .{ .completed = "opened file" };
     }
@@ -798,6 +762,19 @@ fn workspacePath(app: *app_mod.App, path: []const u8) ![]u8 {
     return std.fs.path.join(app.allocator, &.{ app.workspace.root_path, path });
 }
 
+fn saveDocumentInWorkspace(
+    app: *app_mod.App,
+    doc: *document_mod.Document,
+    strategy: editor_save.SaveStrategy,
+) !void {
+    const absolute_path = doc.path orelse return error.DocumentHasNoPath;
+    const relative_path = try workspace_io.relativeFilePath(app.workspace.root_path, absolute_path);
+    var capability = try workspace_io.openFileCapability(app.workspace.root_path, relative_path);
+    defer capability.close();
+    try editor_save.saveBytesInDir(app.allocator, capability.parent, capability.name, doc.text.bytes, strategy);
+    doc.dirty = false;
+}
+
 const MutationPathKind = enum { file, directory, either };
 
 const PathMutation = struct {
@@ -857,37 +834,6 @@ fn parsePathMutation(argument: []const u8) ?PathMutation {
 fn workspaceRelativePathEqual(left: []const u8, right: []const u8) bool {
     if (std.fs.path.sep == '\\') return std.ascii.eqlIgnoreCase(left, right);
     return std.mem.eql(u8, left, right);
-}
-
-fn pathExists(path: []const u8) !bool {
-    _ = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    return true;
-}
-
-fn existingPathInsideWorkspace(app: *app_mod.App, path: []const u8) !bool {
-    const resolved = std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, path, app.allocator) catch return false;
-    defer app.allocator.free(resolved);
-    return permissions.allowsWrite(.workspace_only, app.workspace.root_path, resolved);
-}
-
-fn existingAncestorInsideWorkspace(app: *app_mod.App, path: []const u8) !bool {
-    var current = std.fs.path.dirname(path) orelse return false;
-    while (true) {
-        const resolved = std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, current, app.allocator) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => {
-                const parent = std.fs.path.dirname(current) orelse return false;
-                if (std.mem.eql(u8, parent, current)) return false;
-                current = parent;
-                continue;
-            },
-            else => return err,
-        };
-        defer app.allocator.free(resolved);
-        return permissions.allowsWrite(.workspace_only, app.workspace.root_path, resolved);
-    }
 }
 
 fn queueConfiguredTask(app: *app_mod.App, name: []const u8) !?[]const u8 {
@@ -1480,7 +1426,7 @@ fn applyWorkspaceTextEdit(app: *app_mod.App, edit: lsp_responses.TextEdit) !Work
         return .blocked;
     }
 
-    const doc_index = app.documents.openFile(absolute) catch |err| {
+    const doc_index = app.openWorkspacePath(absolute) catch |err| {
         try appendConsole(app, .stderr, "lsp edit failed open: {s}: {s}\n", .{ edit.path, @errorName(err) });
         return .failed;
     };
@@ -1937,7 +1883,7 @@ fn openDiagnostic(app: *app_mod.App, diagnostic: diagnostic_model.Diagnostic) !b
 
     const path = try workspacePath(app, diagnostic.path);
     defer app.allocator.free(path);
-    const index = app.documents.openFile(path) catch return false;
+    const index = app.openWorkspacePath(path) catch return false;
     app.focus = .editor;
     return setDiagnosticCursor(&app.documents.documents.items[index], diagnostic);
 }

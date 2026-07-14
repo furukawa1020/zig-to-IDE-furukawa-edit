@@ -12,6 +12,9 @@ const modes = @import("../language/modes.zig");
 const lsp_manager = @import("../lsp/manager.zig");
 const lsp_session = @import("../lsp/session.zig");
 const workspace = @import("../workspace/workspace.zig");
+const workspace_io = @import("../security/workspace_io.zig");
+
+const max_document_bytes = 32 * 1024 * 1024;
 
 pub const Mode = enum {
     normal,
@@ -83,7 +86,9 @@ pub const App = struct {
         self.file_cursor = self.firstFileEntryIndex() orelse 0;
 
         if (open_kind == .file) {
-            _ = try self.documents.openFile(root_path);
+            const resolved_file = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, root_path, allocator);
+            defer allocator.free(resolved_file);
+            _ = try self.openWorkspacePath(resolved_file);
             self.focus = .editor;
         }
 
@@ -150,11 +155,27 @@ pub const App = struct {
     pub fn openSelectedWorkspaceEntry(self: *App) !bool {
         const entry = self.selectedWorkspaceEntry() orelse return false;
         if (entry.kind != .file) return false;
-        const path = try std.fs.path.join(self.allocator, &.{ self.workspace.root_path, entry.path });
-        defer self.allocator.free(path);
-        _ = try self.documents.openFile(path);
+        _ = try self.openWorkspaceFile(entry.path);
         self.focus = .editor;
         return true;
+    }
+
+    pub fn openWorkspaceFile(self: *App, relative_path: []const u8) !usize {
+        try workspace_io.validateRelativeFilePath(relative_path);
+        const absolute_path = try workspace_io.absolutePathAlloc(self.allocator, self.workspace.root_path, relative_path);
+        defer self.allocator.free(absolute_path);
+        if (self.documents.activatePath(absolute_path)) |existing| return existing;
+
+        var capability = try workspace_io.openFileCapability(self.workspace.root_path, relative_path);
+        defer capability.close();
+        const bytes = try capability.readFileAlloc(self.allocator, max_document_bytes);
+        defer self.allocator.free(bytes);
+        return self.documents.openBytes(absolute_path, bytes);
+    }
+
+    pub fn openWorkspacePath(self: *App, absolute_path: []const u8) !usize {
+        const relative_path = try workspace_io.relativeFilePath(self.workspace.root_path, absolute_path);
+        return self.openWorkspaceFile(relative_path);
     }
 
     pub fn activeLanguage(self: *const App) ?modes.LanguageMode {

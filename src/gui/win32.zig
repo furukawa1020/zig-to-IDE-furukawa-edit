@@ -1942,13 +1942,7 @@ const GuiState = struct {
     }
 
     fn openRelativeFile(self: *GuiState, relative: []const u8, offset: ?usize) void {
-        const absolute = std.fs.path.join(self.allocator, &.{ self.app.workspace.root_path, relative }) catch |err| {
-            self.setError(err) catch {};
-            return;
-        };
-        defer self.allocator.free(absolute);
-
-        const index = self.app.documents.openFile(absolute) catch |err| {
+        const index = self.app.openWorkspaceFile(relative) catch |err| {
             self.setError(err) catch {};
             self.appendOutput(.stderr, "open failed: {s}: {s}\n", .{ relative, @errorName(err) });
             return;
@@ -1973,13 +1967,7 @@ const GuiState = struct {
     }
 
     fn openRelativeLocation(self: *GuiState, relative: []const u8, line: usize, column: usize) void {
-        const absolute = std.fs.path.join(self.allocator, &.{ self.app.workspace.root_path, relative }) catch |err| {
-            self.setError(err) catch {};
-            return;
-        };
-        defer self.allocator.free(absolute);
-
-        const index = self.app.documents.openFile(absolute) catch |err| {
+        const index = self.app.openWorkspaceFile(relative) catch |err| {
             self.setError(err) catch {};
             self.appendOutput(.stderr, "open failed: {s}: {s}\n", .{ relative, @errorName(err) });
             return;
@@ -2353,13 +2341,7 @@ const GuiState = struct {
         while (index > 0) {
             index -= 1;
             const item = results[index];
-            const absolute = std.fs.path.join(self.allocator, &.{ self.app.workspace.root_path, item.path }) catch |err| {
-                self.setError(err) catch {};
-                return;
-            };
-            defer self.allocator.free(absolute);
-
-            const doc_index = self.app.documents.openFile(absolute) catch |err| {
+            const doc_index = self.app.openWorkspaceFile(item.path) catch |err| {
                 skipped += 1;
                 self.appendOutput(.stderr, "rename skipped open failure: {s}: {s}\n", .{ item.path, @errorName(err) });
                 continue;
@@ -2417,13 +2399,7 @@ const GuiState = struct {
     }
 
     fn openSecurityFindingLocation(self: *GuiState, finding: *const findings_mod.Finding) void {
-        const absolute = std.fs.path.join(self.allocator, &.{ self.app.workspace.root_path, finding.path }) catch |err| {
-            self.setError(err) catch {};
-            return;
-        };
-        defer self.allocator.free(absolute);
-
-        const index = self.app.documents.openFile(absolute) catch |err| {
+        const index = self.app.openWorkspaceFile(finding.path) catch |err| {
             self.setError(err) catch {};
             self.appendOutput(.stderr, "open failed: {s}: {s}\n", .{ finding.path, @errorName(err) });
             return;

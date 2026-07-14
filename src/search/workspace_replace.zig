@@ -1,7 +1,7 @@
 const std = @import("std");
 const literal = @import("literal.zig");
 const editor_save = @import("../editor/save.zig");
-const permissions = @import("../security/permissions.zig");
+const workspace_io = @import("../security/workspace_io.zig");
 const workspace_mod = @import("../workspace/workspace.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -164,18 +164,7 @@ pub fn apply(
     var written: usize = 0;
     while (written < plan.files.items.len) {
         const file = &plan.files.items[written];
-        const current = readFile(allocator, file.absolute_path, limits.max_file_bytes) catch |err| {
-            rollback(&plan, written) catch return error.RollbackFailed;
-            return err;
-        };
-        const unchanged = std.mem.eql(u8, current, file.before);
-        allocator.free(current);
-        if (!unchanged) {
-            rollback(&plan, written) catch return error.RollbackFailed;
-            return error.PreviewStale;
-        }
-
-        editor_save.saveBytes(allocator, file.absolute_path, file.after, .{}) catch |err| {
+        applyPreparedFile(allocator, plan.workspace_root, file, limits.max_file_bytes) catch |err| {
             rollback(&plan, written) catch return error.RollbackFailed;
             return err;
         };
@@ -193,7 +182,6 @@ pub fn apply(
 
 const PreparedFile = struct {
     path: []u8,
-    absolute_path: [:0]u8,
     before: []u8,
     after: []u8,
     matches: usize,
@@ -203,7 +191,6 @@ const PreparedFile = struct {
 
     fn deinit(self: *PreparedFile, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
-        allocator.free(self.absolute_path);
         allocator.free(self.before);
         allocator.free(self.after);
         self.* = undefined;
@@ -212,6 +199,7 @@ const PreparedFile = struct {
 
 const Plan = struct {
     allocator: std.mem.Allocator,
+    workspace_root: []const u8,
     files: std.array_list.Managed(PreparedFile),
     matches: usize = 0,
     before_bytes: usize = 0,
@@ -219,9 +207,10 @@ const Plan = struct {
     skipped: Skipped = .{},
     token: Token = undefined,
 
-    fn init(allocator: std.mem.Allocator) Plan {
+    fn init(allocator: std.mem.Allocator, workspace_root: []const u8) Plan {
         return .{
             .allocator = allocator,
+            .workspace_root = workspace_root,
             .files = std.array_list.Managed(PreparedFile).init(allocator),
         };
     }
@@ -242,47 +231,34 @@ fn buildPlan(
     if (request.find.len == 0) return error.EmptyNeedle;
     if (std.mem.eql(u8, request.find, request.replacement)) return error.NoChangeRequested;
 
-    var plan = Plan.init(allocator);
+    var plan = Plan.init(allocator, workspace.root_path);
     errdefer plan.deinit();
 
     for (workspace.entries.items) |entry| {
         if (entry.kind != .file) continue;
 
-        const joined = try std.fs.path.join(allocator, &.{ workspace.root_path, entry.path });
-        defer allocator.free(joined);
-        if (!permissions.allowsWrite(.workspace_only, workspace.root_path, joined)) return error.PathEscapesWorkspace;
-
-        const absolute_path = std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, joined, allocator) catch {
-            plan.skipped.unreadable += 1;
-            continue;
+        var capability = workspace_io.openFileCapability(workspace.root_path, entry.path) catch |err| switch (err) {
+            error.InvalidWorkspacePath, error.WorkspaceRootNotAbsolute => return error.PathEscapesWorkspace,
+            else => {
+                plan.skipped.unreadable += 1;
+                continue;
+            },
         };
-        errdefer allocator.free(absolute_path);
-        if (!permissions.allowsWrite(.workspace_only, workspace.root_path, absolute_path)) return error.PathEscapesWorkspace;
+        defer capability.close();
 
-        const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, absolute_path, .{}) catch {
-            allocator.free(absolute_path);
-            plan.skipped.unreadable += 1;
-            continue;
-        };
-        if (stat.kind != .file) {
-            allocator.free(absolute_path);
-            continue;
-        }
-        if (stat.size > limits.max_file_bytes) {
-            allocator.free(absolute_path);
-            plan.skipped.too_large += 1;
-            continue;
-        }
-
-        const before = readFile(allocator, absolute_path, limits.max_file_bytes) catch {
-            allocator.free(absolute_path);
-            plan.skipped.unreadable += 1;
-            continue;
+        const before = capability.readFileAlloc(allocator, limits.max_file_bytes) catch |err| switch (err) {
+            error.FileTooLarge => {
+                plan.skipped.too_large += 1;
+                continue;
+            },
+            else => {
+                plan.skipped.unreadable += 1;
+                continue;
+            },
         };
         errdefer allocator.free(before);
         if (looksBinary(before)) {
             allocator.free(before);
-            allocator.free(absolute_path);
             plan.skipped.binary += 1;
             continue;
         }
@@ -291,7 +267,6 @@ fn buildPlan(
         defer allocator.free(matches);
         if (matches.len == 0) {
             allocator.free(before);
-            allocator.free(absolute_path);
             continue;
         }
         if (plan.files.items.len >= limits.max_files) return error.TooManyFiles;
@@ -307,7 +282,6 @@ fn buildPlan(
         Sha256.hash(before, &digest, .{});
         var prepared: PreparedFile = .{
             .path = try allocator.dupe(u8, entry.path),
-            .absolute_path = absolute_path,
             .before = before,
             .after = after,
             .matches = matches.len,
@@ -350,11 +324,57 @@ fn rollback(plan: *const Plan, written: usize) !void {
     while (index > 0) {
         index -= 1;
         const file = &plan.files.items[index];
-        const current = try readFile(plan.allocator, file.absolute_path, file.after.len +| 1);
-        defer plan.allocator.free(current);
-        if (!std.mem.eql(u8, current, file.after)) return error.RollbackConflict;
-        try editor_save.saveBytes(plan.allocator, file.absolute_path, file.before, .{});
+        try restorePreparedFile(plan.allocator, plan.workspace_root, file);
     }
+}
+
+fn applyPreparedFile(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    file: *const PreparedFile,
+    max_file_bytes: usize,
+) !void {
+    var capability = try workspace_io.openFileCapability(workspace_root, file.path);
+    defer capability.close();
+
+    const current = try capability.readFileAlloc(allocator, max_file_bytes);
+    defer allocator.free(current);
+    if (!std.mem.eql(u8, current, file.before)) return error.PreviewStale;
+    editor_save.saveBytesInDirIfUnchanged(
+        allocator,
+        capability.parent,
+        capability.name,
+        file.before,
+        file.after,
+        .{},
+    ) catch |err| switch (err) {
+        error.DestinationChanged => return error.PreviewStale,
+        else => return err,
+    };
+}
+
+fn restorePreparedFile(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    file: *const PreparedFile,
+) !void {
+    var capability = try workspace_io.openFileCapability(workspace_root, file.path);
+    defer capability.close();
+
+    const current = try capability.readFileAlloc(allocator, file.after.len +| 1);
+    defer allocator.free(current);
+    if (!std.mem.eql(u8, current, file.after)) return error.RollbackConflict;
+    editor_save.saveBytesInDirIfUnchanged(
+        allocator,
+        capability.parent,
+        capability.name,
+        file.after,
+        file.before,
+        .{},
+    ) catch |err| switch (err) {
+        error.DestinationChanged => return error.RollbackConflict,
+        else => return err,
+    };
 }
 
 fn planToken(plan: *const Plan, request: Request) Token {
@@ -394,10 +414,6 @@ fn hashUsize(hasher: *Sha256, value: usize) void {
 
 fn preparedFileLessThan(_: void, left: PreparedFile, right: PreparedFile) bool {
     return std.mem.order(u8, left.path, right.path) == .lt;
-}
-
-fn readFile(allocator: std.mem.Allocator, absolute_path: []const u8, max_bytes: usize) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, absolute_path, allocator, .limited(max_bytes));
 }
 
 fn looksBinary(bytes: []const u8) bool {

@@ -42,17 +42,56 @@ pub fn saveBytesInDir(
     if (strategy.backup_before_overwrite) {
         try createBackupInDir(allocator, dir, destination_name);
     }
-    try saveBytesInDirNoBackup(allocator, dir, destination_name, bytes, strategy);
+    try saveBytesInDirNoBackup(allocator, dir, destination_name, null, bytes, strategy);
+}
+
+pub fn saveBytesInDirIfUnchanged(
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+    destination_name: []const u8,
+    expected: []const u8,
+    bytes: []const u8,
+    strategy: SaveStrategy,
+) !void {
+    try validateLeafName(destination_name);
+    try verifyExpectedContent(allocator, dir, destination_name, expected);
+    if (strategy.backup_before_overwrite) {
+        try createBackupInDir(allocator, dir, destination_name);
+    }
+    try saveBytesInDirNoBackup(allocator, dir, destination_name, expected, bytes, strategy);
+}
+
+pub fn createBytesInDirExclusive(
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+    destination_name: []const u8,
+    bytes: []const u8,
+) !void {
+    try validateLeafName(destination_name);
+    var temporary = try createTemporaryFile(allocator, dir, .default_file);
+    defer allocator.free(temporary.name);
+
+    var temporary_exists = true;
+    errdefer if (temporary_exists) deleteFileInDirIfExists(dir, temporary.name);
+    {
+        defer temporary.file.close(io);
+        try writeFileBytes(temporary.file, bytes);
+    }
+
+    try std.Io.Dir.renamePreserve(dir, temporary.name, dir, destination_name, io);
+    temporary_exists = false;
 }
 
 fn saveBytesInDirNoBackup(
     allocator: std.mem.Allocator,
     dir: std.Io.Dir,
     destination_name: []const u8,
+    expected: ?[]const u8,
     bytes: []const u8,
     strategy: SaveStrategy,
 ) !void {
     if (!strategy.atomic) {
+        if (expected) |contents| try verifyExpectedContent(allocator, dir, destination_name, contents);
         try writeDirectInDir(dir, destination_name, bytes);
         return;
     }
@@ -71,6 +110,7 @@ fn saveBytesInDirNoBackup(
         try writeFileBytes(temporary.file, bytes);
     }
 
+    if (expected) |contents| try verifyExpectedContent(allocator, dir, destination_name, contents);
     try std.Io.Dir.rename(dir, temporary.name, dir, destination_name, io);
     temporary_exists = false;
 }
@@ -106,7 +146,7 @@ fn createBackupInDir(allocator: std.mem.Allocator, dir: std.Io.Dir, destination_
     const backup_name = try std.fmt.allocPrint(allocator, "{s}.bak", .{destination_name});
     defer allocator.free(backup_name);
     try validateLeafName(backup_name);
-    try saveBytesInDirNoBackup(allocator, dir, backup_name, bytes, .{});
+    try saveBytesInDirNoBackup(allocator, dir, backup_name, null, bytes, .{});
 }
 
 const TemporaryFile = struct {
@@ -165,6 +205,20 @@ fn readFileInDir(
     const file = try workspace_io.openFileNoFollow(dir, file_name, .read_only);
     defer file.close(io);
     return workspace_io.readOpenedFileAlloc(file, allocator, max_bytes);
+}
+
+fn verifyExpectedContent(
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+    file_name: []const u8,
+    expected: []const u8,
+) !void {
+    const current = readFileInDir(allocator, dir, file_name, expected.len +| 1) catch |err| switch (err) {
+        error.FileNotFound, error.FileTooLarge => return error.DestinationChanged,
+        else => return err,
+    };
+    defer allocator.free(current);
+    if (!std.mem.eql(u8, current, expected)) return error.DestinationChanged;
 }
 
 fn validateLeafName(name: []const u8) !void {
@@ -235,4 +289,44 @@ test "directory-relative direct save overwrites through a no-follow handle" {
     const bytes = try tmp.dir.readFileAlloc(io, "document.txt", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("after", bytes);
+}
+
+test "conditional atomic save refuses changed destination content" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "document.txt", .data = "current" });
+
+    try std.testing.expectError(
+        error.DestinationChanged,
+        saveBytesInDirIfUnchanged(std.testing.allocator, tmp.dir, "document.txt", "stale", "after", .{}),
+    );
+    {
+        const current = try tmp.dir.readFileAlloc(io, "document.txt", std.testing.allocator, .limited(64));
+        defer std.testing.allocator.free(current);
+        try std.testing.expectEqualStrings("current", current);
+    }
+
+    try saveBytesInDirIfUnchanged(std.testing.allocator, tmp.dir, "document.txt", "current", "after", .{});
+    const after = try tmp.dir.readFileAlloc(io, "document.txt", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings("after", after);
+}
+
+test "exclusive atomic create never replaces an existing destination" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "existing.txt", .data = "keep" });
+
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        createBytesInDirExclusive(std.testing.allocator, tmp.dir, "existing.txt", "replace"),
+    );
+    try createBytesInDirExclusive(std.testing.allocator, tmp.dir, "new.txt", "created");
+
+    const existing = try tmp.dir.readFileAlloc(io, "existing.txt", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(existing);
+    const created = try tmp.dir.readFileAlloc(io, "new.txt", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(created);
+    try std.testing.expectEqualStrings("keep", existing);
+    try std.testing.expectEqualStrings("created", created);
 }

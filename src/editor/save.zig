@@ -1,5 +1,5 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const workspace_io = @import("../security/workspace_io.zig");
 
 const io = std.Options.debug_io;
 const max_backup_bytes = 128 * 1024 * 1024;
@@ -77,12 +77,7 @@ fn saveBytesInDirNoBackup(
 
 fn writeDirectInDir(dir: std.Io.Dir, destination_name: []const u8, bytes: []const u8) !void {
     var opened_no_follow = true;
-    var file = std.Io.Dir.openFile(dir, io, destination_name, .{
-        .mode = .write_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| created: {
+    var file = workspace_io.openFileNoFollow(dir, destination_name, .write_only) catch |err| created: {
         if (err != error.FileNotFound) return err;
         opened_no_follow = false;
         break :created try std.Io.Dir.createFile(dir, io, destination_name, .{
@@ -91,10 +86,14 @@ fn writeDirectInDir(dir: std.Io.Dir, destination_name: []const u8, bytes: []cons
             .resolve_beneath = true,
         });
     };
-    if (opened_no_follow) markNoFollowFileMode(&file);
     defer file.close(io);
     try file.setLength(io, 0);
-    try writeFileBytes(file, bytes);
+    if (opened_no_follow) {
+        try workspace_io.writeOpenedFileAll(file, bytes);
+        try file.sync(io);
+    } else {
+        try writeFileBytes(file, bytes);
+    }
 }
 
 fn createBackupInDir(allocator: std.mem.Allocator, dir: std.Io.Dir, destination_name: []const u8) !void {
@@ -163,24 +162,9 @@ fn readFileInDir(
     file_name: []const u8,
     max_bytes: usize,
 ) ![]u8 {
-    var file = try std.Io.Dir.openFile(dir, io, file_name, .{
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    });
-    markNoFollowFileMode(&file);
+    const file = try workspace_io.openFileNoFollow(dir, file_name, .read_only);
     defer file.close(io);
-    const stat = try file.stat(io);
-    if (stat.kind != .file) return error.NotRegularFile;
-    if (stat.size > max_bytes) return error.FileTooLarge;
-
-    var read_buffer: [8192]u8 = undefined;
-    var reader = file.readerStreaming(io, &read_buffer);
-    return reader.interface.allocRemaining(allocator, .limited(max_bytes));
-}
-
-fn markNoFollowFileMode(file: *std.Io.File) void {
-    if (builtin.os.tag == .windows) file.flags.nonblocking = true;
+    return workspace_io.readOpenedFileAlloc(file, allocator, max_bytes);
 }
 
 fn validateLeafName(name: []const u8) !void {
@@ -240,4 +224,15 @@ test "directory-relative save accepts only a leaf file name" {
         error.InvalidFileName,
         saveBytesInDir(std.testing.allocator, tmp.dir, "..", "blocked", .{}),
     );
+}
+
+test "directory-relative direct save overwrites through a no-follow handle" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "document.txt", .data = "before and longer" });
+
+    try saveBytesInDir(std.testing.allocator, tmp.dir, "document.txt", "after", .{ .atomic = false });
+    const bytes = try tmp.dir.readFileAlloc(io, "document.txt", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("after", bytes);
 }

@@ -76,6 +76,15 @@ pub fn readOpenedFileAlloc(
     return bytes;
 }
 
+pub fn writeOpenedFileAll(file: std.Io.File, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const write_count = try writeAt(file, bytes[offset..], offset);
+        if (write_count == 0) return error.WriteZero;
+        offset += write_count;
+    }
+}
+
 fn readAt(file: std.Io.File, buffer: []u8, offset: u64) !usize {
     if (builtin.os.tag == .windows) return readAtWindows(file, buffer, offset);
     return file.readPositional(io, &.{buffer}, offset);
@@ -128,6 +137,62 @@ fn readAtWindows(file: std.Io.File, buffer: []u8, offset: u64) !usize {
         .ACCESS_DENIED => error.AccessDenied,
         .INVALID_HANDLE => error.NotOpenForReading,
         .FILE_LOCK_CONFLICT => error.LockViolation,
+        else => |status| windows.unexpectedStatus(status),
+    };
+}
+
+fn writeAt(file: std.Io.File, buffer: []const u8, offset: u64) !usize {
+    if (builtin.os.tag == .windows) return writeAtWindows(file, buffer, offset);
+    return file.writePositional(io, &.{buffer}, offset);
+}
+
+fn writeAtWindows(file: std.Io.File, buffer: []const u8, offset: u64) !usize {
+    const windows = std.os.windows;
+    if (buffer.len == 0) return 0;
+
+    var event: windows.HANDLE = undefined;
+    switch (windows.ntdll.NtCreateEvent(
+        &event,
+        windows.ACCESS_MASK.Specific.Event.ALL_ACCESS,
+        null,
+        .Synchronization,
+        .FALSE,
+    )) {
+        .SUCCESS => {},
+        else => |status| return windows.unexpectedStatus(status),
+    }
+    defer windows.CloseHandle(event);
+
+    var io_status: windows.IO_STATUS_BLOCK = undefined;
+    const signed_offset: windows.LARGE_INTEGER = @intCast(offset);
+    const write_len: windows.ULONG = @intCast(@min(buffer.len, std.math.maxInt(windows.ULONG)));
+    const initial_status = windows.ntdll.NtWriteFile(
+        file.handle,
+        event,
+        null,
+        null,
+        &io_status,
+        buffer.ptr,
+        write_len,
+        &signed_offset,
+        null,
+    );
+    if (initial_status == .PENDING) {
+        switch (windows.ntdll.NtWaitForSingleObject(event, .FALSE, null)) {
+            .WAIT_0 => {},
+            else => |status| return windows.unexpectedStatus(status),
+        }
+    } else if (initial_status != .SUCCESS) {
+        return windows.unexpectedStatus(initial_status);
+    }
+
+    const final_status = if (initial_status == .PENDING) io_status.u.Status else initial_status;
+    return switch (final_status) {
+        .SUCCESS => io_status.Information,
+        .ACCESS_DENIED => error.AccessDenied,
+        .INVALID_HANDLE => error.NotOpenForWriting,
+        .FILE_LOCK_CONFLICT => error.LockViolation,
+        .DISK_FULL => error.NoSpaceLeft,
         else => |status| windows.unexpectedStatus(status),
     };
 }

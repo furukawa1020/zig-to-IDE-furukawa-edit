@@ -46,6 +46,7 @@ test {
     _ = @import("editor/buffer.zig");
     _ = @import("editor/cursor.zig");
     _ = @import("editor/document.zig");
+    _ = @import("editor/multi_cursor.zig");
     _ = @import("editor/navigation.zig");
     _ = @import("editor/save.zig");
     _ = @import("editor/selection.zig");
@@ -82,6 +83,7 @@ test {
     _ = @import("search/literal.zig");
     _ = @import("search/problems.zig");
     _ = @import("search/workspace_search.zig");
+    _ = @import("search/workspace_replace.zig");
     _ = @import("search/workspace_symbols.zig");
     _ = @import("security/findings.zig");
     _ = @import("security/build_consent.zig");
@@ -93,6 +95,7 @@ test {
     _ = @import("security/output_sanitizer.zig");
     _ = @import("security/trust.zig");
     _ = @import("security/workspace_audit.zig");
+    _ = @import("security/workspace_io.zig");
     _ = @import("security/zig_scanner.zig");
     _ = @import("tasks/task.zig");
     _ = @import("tasks/console.zig");

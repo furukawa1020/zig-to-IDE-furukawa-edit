@@ -8,6 +8,7 @@ const dispatcher = @import("../core/dispatcher.zig");
 const event_mod = @import("../core/event.zig");
 const input_handler = @import("../core/input_handler.zig");
 const document_mod = @import("../editor/document.zig");
+const multi_cursor_mod = @import("../editor/multi_cursor.zig");
 const extension_registry = @import("../extensions/registry.zig");
 const navigation = @import("../editor/navigation.zig");
 const git_repository = @import("../git/repository.zig");
@@ -28,6 +29,7 @@ const file_finder = @import("../search/file_finder.zig");
 const literal_search = @import("../search/literal.zig");
 const problems_search = @import("../search/problems.zig");
 const workspace_search = @import("../search/workspace_search.zig");
+const workspace_replace = @import("../search/workspace_replace.zig");
 const workspace_symbols = @import("../search/workspace_symbols.zig");
 const workspace_watcher = @import("../workspace/watcher.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
@@ -54,6 +56,7 @@ const EDITOR_LEFT = FILE_WIDTH + 24;
 const EDITOR_TOP = HEADER_HEIGHT + 58;
 const EDITOR_TEXT_TOP = EDITOR_TOP + 44;
 const X11_SHIFT_MASK: u16 = 1 << 0;
+const X11_MOD1_MASK: u16 = 1 << 3;
 
 const X = struct {
     const EventMask = struct {
@@ -630,6 +633,7 @@ const QuickPanelMode = enum {
     rename_symbol,
     goto_line,
     search_workspace,
+    replace_workspace,
     new_file,
     new_folder,
     rename_path,
@@ -664,6 +668,12 @@ const SelectionRange = struct {
 const SearchDirection = enum {
     forward,
     backward,
+};
+
+const MultiCursorEdit = enum {
+    insert,
+    delete_backward,
+    delete_forward,
 };
 
 const DocumentMatch = struct {
@@ -739,6 +749,7 @@ const QuickPanel = struct {
     file_matches: ?[]file_finder.Match = null,
     document_matches: ?[]DocumentMatch = null,
     search_results: ?[]workspace_search.Result = null,
+    replacement_preview: ?workspace_replace.Preview = null,
     task_matches: ?[]TaskMatch = null,
     symbol_matches: ?[]SymbolMatch = null,
     workspace_symbol_matches: ?[]workspace_symbols.Result = null,
@@ -818,6 +829,7 @@ const QuickPanel = struct {
             .rename_symbol => if (renameRequest(self.query.items)) |_| 1 else 0,
             .goto_line => if (parseGotoLine(self.query.items)) |_| 1 else 0,
             .search_workspace => if (self.search_results) |items| items.len else 0,
+            .replace_workspace => if (self.replacement_preview) |preview| preview.files.len else 0,
             .new_file => if (self.query.items.len > 0) 1 else 0,
             .new_folder => if (self.query.items.len > 0) 1 else 0,
             .rename_path => if (pathMutationRequest(self.query.items)) |_| 1 else 0,
@@ -851,6 +863,12 @@ const QuickPanel = struct {
         const items = self.search_results orelse return null;
         if (items.len == 0) return null;
         return &items[@min(self.selected_index, items.len - 1)];
+    }
+
+    fn selectedReplacementFile(self: *const QuickPanel) ?*const workspace_replace.FilePreview {
+        const preview = if (self.replacement_preview) |*value| value else return null;
+        if (preview.files.len == 0) return null;
+        return &preview.files[@min(self.selected_index, preview.files.len - 1)];
     }
 
     fn selectedTask(self: *const QuickPanel) ?*const TaskMatch {
@@ -921,6 +939,11 @@ const QuickPanel = struct {
                         .max_results = 256,
                     });
                 }
+            },
+            .replace_workspace => {
+                var request = workspace_replace.parseQuery(self.query.items) orelse return;
+                request.literal_options = self.search_options;
+                self.replacement_preview = try workspace_replace.preview(self.allocator, &app.workspace, request, .{});
             },
             .new_file, .new_folder, .rename_path, .delete_path => {},
             .run_task => {
@@ -1066,6 +1089,10 @@ const QuickPanel = struct {
             self.allocator.free(items);
             self.search_results = null;
         }
+        if (self.replacement_preview) |*preview| {
+            preview.deinit();
+            self.replacement_preview = null;
+        }
         if (self.task_matches) |items| {
             for (items) |*item| item.deinit(self.allocator);
             self.allocator.free(items);
@@ -1164,6 +1191,7 @@ const LinuxGuiState = struct {
     last_document_search_query: std.array_list.Managed(u8),
     last_document_search_options: literal_search.Options = .{},
     selection_anchor: ?usize = null,
+    secondary_cursors: std.array_list.Managed(usize),
     editor_dragging: bool = false,
     last_editor_click_time: u32 = 0,
     last_editor_click_x: i16 = 0,
@@ -1220,6 +1248,7 @@ const LinuxGuiState = struct {
             .app = app,
             .quick_panel = QuickPanel.init(allocator),
             .collapsed_dirs = collapsed_dirs,
+            .secondary_cursors = std.array_list.Managed(usize).init(allocator),
             .last_document_search_query = std.array_list.Managed(u8).init(allocator),
             .deferred_lsp_rename_name = std.array_list.Managed(u8).init(allocator),
             .file_watcher = workspace_watcher.Poller.init(allocator, .{}),
@@ -1240,6 +1269,7 @@ const LinuxGuiState = struct {
         self.clipboard.deinit();
         self.deferred_lsp_rename_name.deinit();
         self.file_watcher.deinit();
+        self.secondary_cursors.deinit();
         self.last_document_search_query.deinit();
         self.quick_panel.deinit();
         self.allocator.free(self.collapsed_dirs);
@@ -2547,6 +2577,108 @@ const LinuxGuiState = struct {
 
     fn clearSelection(self: *LinuxGuiState) void {
         self.selection_anchor = null;
+        self.secondary_cursors.clearRetainingCapacity();
+    }
+
+    fn editAtAllCursors(self: *LinuxGuiState, action: MultiCursorEdit, bytes: []const u8) bool {
+        if (self.secondary_cursors.items.len == 0 or self.selection_anchor != null) return false;
+        const doc = self.app.documents.active() orelse return false;
+        const count = self.secondary_cursors.items.len + 1;
+        const edits = self.allocator.alloc(multi_cursor_mod.Edit, count) catch |err| {
+            self.message("multi-cursor edit failed: {s}", .{@errorName(err)});
+            return true;
+        };
+        defer self.allocator.free(edits);
+
+        var changed = false;
+        for (edits, 0..) |*edit, index| {
+            const raw_offset = if (index == 0) doc.cursor.position.byte_offset else self.secondary_cursors.items[index - 1];
+            const offset = @min(raw_offset, doc.text.bytes.len);
+            edit.* = switch (action) {
+                .insert => .{
+                    .start = offset,
+                    .end = offset,
+                    .replacement = bytes,
+                    .cursor_in_replacement = bytes.len,
+                },
+                .delete_backward => blk: {
+                    const previous = if (offset == 0) offset else doc.text.previousByteOffset(offset) catch offset;
+                    break :blk .{ .start = previous, .end = offset, .replacement = "", .cursor_in_replacement = 0 };
+                },
+                .delete_forward => blk: {
+                    const next = doc.text.nextByteOffset(offset) catch offset;
+                    break :blk .{ .start = offset, .end = next, .replacement = "", .cursor_in_replacement = 0 };
+                },
+            };
+            changed = changed or edit.start != edit.end or edit.replacement.len != 0;
+        }
+
+        self.secondary_cursors.ensureTotalCapacity(count - 1) catch |err| {
+            self.message("multi-cursor edit failed: {s}", .{@errorName(err)});
+            return true;
+        };
+        const mapped = doc.editAtCursors(edits) catch |err| {
+            self.message("multi-cursor edit failed: {s}", .{@errorName(err)});
+            return true;
+        };
+        defer self.allocator.free(mapped);
+
+        self.secondary_cursors.clearRetainingCapacity();
+        for (mapped[1..]) |offset| {
+            if (offset == mapped[0] or containsOffset(self.secondary_cursors.items, offset)) continue;
+            self.secondary_cursors.appendAssumeCapacity(offset);
+        }
+        std.mem.sort(usize, self.secondary_cursors.items, {}, offsetLessThan);
+        self.selection_anchor = null;
+        self.app.mode = .insert;
+        self.app.focus = .editor;
+        self.ensureEditorCursorVisible();
+        if (changed) self.syncActiveDocumentToLsp();
+        return true;
+    }
+
+    fn toggleSecondaryCursor(self: *LinuxGuiState, offset_raw: usize) void {
+        const doc = self.app.documents.active() orelse return;
+        const offset = @min(offset_raw, doc.text.bytes.len);
+        self.selection_anchor = null;
+        if (offset == doc.cursor.position.byte_offset) return self.setMultiCursorMessage();
+        for (self.secondary_cursors.items, 0..) |existing, index| {
+            if (existing != offset) continue;
+            _ = self.secondary_cursors.orderedRemove(index);
+            return self.setMultiCursorMessage();
+        }
+        self.secondary_cursors.append(offset) catch |err| return self.message("cursor add failed: {s}", .{@errorName(err)});
+        std.mem.sort(usize, self.secondary_cursors.items, {}, offsetLessThan);
+        self.setMultiCursorMessage();
+    }
+
+    fn addCursorVertically(self: *LinuxGuiState, delta: isize) void {
+        const doc = self.app.documents.active() orelse return;
+        var edge = doc.cursor.position;
+        for (self.secondary_cursors.items) |offset| {
+            const position = doc.positionFromOffset(@min(offset, doc.text.bytes.len)) catch continue;
+            if ((delta < 0 and position.line < edge.line) or (delta > 0 and position.line > edge.line)) edge = position;
+        }
+        const target_line = if (delta < 0) blk: {
+            if (edge.line == 0) return self.setMultiCursorMessage();
+            break :blk edge.line - 1;
+        } else blk: {
+            if (edge.line + 1 >= doc.text.lineCount()) return self.setMultiCursorMessage();
+            break :blk edge.line + 1;
+        };
+        const target_column = @min(edge.column, doc.text.lineSlice(target_line).len);
+        const target = doc.text.lineColumnToOffset(target_line, target_column) catch return;
+        if (target == doc.cursor.position.byte_offset or containsOffset(self.secondary_cursors.items, target)) return;
+        self.secondary_cursors.append(target) catch |err| return self.message("cursor add failed: {s}", .{@errorName(err)});
+        std.mem.sort(usize, self.secondary_cursors.items, {}, offsetLessThan);
+        self.selection_anchor = null;
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.setMultiCursorMessage();
+    }
+
+    fn setMultiCursorMessage(self: *LinuxGuiState) void {
+        self.message("{d} cursors", .{self.secondary_cursors.items.len + 1});
     }
 
     fn publishPrimarySelection(self: *LinuxGuiState, x11: *X11) void {
@@ -2579,6 +2711,7 @@ const LinuxGuiState = struct {
     }
 
     fn insertText(self: *LinuxGuiState, bytes: []const u8) void {
+        if (self.editAtAllCursors(.insert, bytes)) return;
         const doc = self.app.documents.active() orelse {
             self.message("open a file before typing", .{});
             return;
@@ -2602,6 +2735,7 @@ const LinuxGuiState = struct {
     }
 
     fn insertTypedText(self: *LinuxGuiState, bytes: []const u8) void {
+        if (self.editAtAllCursors(.insert, bytes)) return;
         const doc = self.app.documents.active() orelse {
             self.message("open a file before typing", .{});
             return;
@@ -2664,6 +2798,10 @@ const LinuxGuiState = struct {
             self.message("open a file before typing", .{});
             return;
         };
+        if (self.secondary_cursors.items.len > 0 and self.selection_anchor == null) {
+            _ = self.editAtAllCursors(.insert, doc.preferredNewline());
+            return;
+        }
         const result = doc.insertSmartNewline(self.selection_anchor, 4) catch |err| {
             self.message("newline failed: {s}", .{@errorName(err)});
             return;
@@ -2677,6 +2815,7 @@ const LinuxGuiState = struct {
 
     fn selectAll(self: *LinuxGuiState, x11: *X11) void {
         const doc = self.app.documents.active() orelse return;
+        self.secondary_cursors.clearRetainingCapacity();
         self.selection_anchor = 0;
         const position = doc.positionFromOffset(doc.text.bytes.len) catch return;
         navigation.setCursor(doc, position);
@@ -3131,6 +3270,7 @@ const LinuxGuiState = struct {
     fn moveEditorCursor(self: *LinuxGuiState, x11: *X11, move: navigation.Move, extend_selection: bool) void {
         const doc = self.app.documents.active() orelse return;
         const anchor = doc.cursor.position.byte_offset;
+        if (extend_selection) self.secondary_cursors.clearRetainingCapacity();
         if (extend_selection and self.selection_anchor == null) {
             self.selection_anchor = anchor;
         }
@@ -3266,6 +3406,14 @@ const LinuxGuiState = struct {
             self.changeIndentation(true);
             return;
         }
+        if (std.mem.eql(u8, id, "editor.add_cursor_above")) {
+            self.addCursorVertically(-1);
+            return;
+        }
+        if (std.mem.eql(u8, id, "editor.add_cursor_below")) {
+            self.addCursorVertically(1);
+            return;
+        }
         if (std.mem.eql(u8, id, "editor.find_next")) {
             self.findLastDocumentSearch(.forward);
             return;
@@ -3276,6 +3424,10 @@ const LinuxGuiState = struct {
         }
         if (std.mem.eql(u8, id, "workspace.search")) {
             self.openQuickPanel(.search_workspace);
+            return;
+        }
+        if (std.mem.eql(u8, id, "workspace.replace")) {
+            self.openQuickPanel(.replace_workspace);
             return;
         }
         if (std.mem.eql(u8, id, "problems.open")) {
@@ -3788,10 +3940,10 @@ const LinuxGuiState = struct {
     }
 
     fn toggleQuickPanelCaseSensitive(self: *LinuxGuiState) void {
-        if (!isDocumentSearchMode(self.quick_panel.mode)) return;
+        if (!supportsQuickPanelSearchOptions(self.quick_panel.mode)) return;
         self.quick_panel.search_options.case_sensitive = !self.quick_panel.search_options.case_sensitive;
         self.quick_panel.rebuild(&self.app) catch |err| return self.message("panel failed: {s}", .{@errorName(err)});
-        self.rememberDocumentSearchFromQuickPanel();
+        if (isDocumentSearchMode(self.quick_panel.mode)) self.rememberDocumentSearchFromQuickPanel();
         if (self.quick_panel.search_options.case_sensitive) {
             self.message("find: case sensitive", .{});
         } else {
@@ -3800,10 +3952,10 @@ const LinuxGuiState = struct {
     }
 
     fn toggleQuickPanelWholeWord(self: *LinuxGuiState) void {
-        if (!isDocumentSearchMode(self.quick_panel.mode)) return;
+        if (!supportsQuickPanelSearchOptions(self.quick_panel.mode)) return;
         self.quick_panel.search_options.whole_word = !self.quick_panel.search_options.whole_word;
         self.quick_panel.rebuild(&self.app) catch |err| return self.message("panel failed: {s}", .{@errorName(err)});
-        self.rememberDocumentSearchFromQuickPanel();
+        if (isDocumentSearchMode(self.quick_panel.mode)) self.rememberDocumentSearchFromQuickPanel();
         if (self.quick_panel.search_options.whole_word) {
             self.message("find: whole word", .{});
         } else {
@@ -3856,6 +4008,8 @@ const LinuxGuiState = struct {
             .enter => {
                 if (key.modifiers.ctrl and self.quick_panel.mode == .replace_document) {
                     self.replaceAllFromQuickPanel();
+                } else if (key.modifiers.ctrl and self.quick_panel.mode == .replace_workspace) {
+                    self.applyWorkspaceReplacementFromQuickPanel();
                 } else {
                     self.executeSelectedQuickPanelItem();
                 }
@@ -3943,6 +4097,15 @@ const LinuxGuiState = struct {
                 defer self.allocator.free(path);
                 const line = item.line;
                 const column = item.column;
+                self.quick_panel.close();
+                self.openRelativeLocation(path, line, column);
+            },
+            .replace_workspace => {
+                const item = self.quick_panel.selectedReplacementFile() orelse return self.message("no replacement target", .{});
+                const path = self.allocator.dupe(u8, item.path) catch |err| return self.message("open failed: {s}", .{@errorName(err)});
+                defer self.allocator.free(path);
+                const line = item.first_line;
+                const column = item.first_column;
                 self.quick_panel.close();
                 self.openRelativeLocation(path, line, column);
             },
@@ -4116,7 +4279,7 @@ const LinuxGuiState = struct {
     fn normalizeActiveDocumentNewlines(self: *LinuxGuiState, newline: document_mod.Newline) void {
         const doc = self.app.documents.active() orelse return self.message("no active document", .{});
         const changed = doc.normalizeNewlines(newline) catch |err| return self.message("newline normalize failed: {s}", .{@errorName(err)});
-        self.selection_anchor = null;
+        self.clearSelection();
         self.ensureEditorCursorVisible();
         if (changed) {
             const result_message = switch (newline) {
@@ -4139,7 +4302,7 @@ const LinuxGuiState = struct {
         const result = (doc.toggleComment(start, end) catch |err| return self.message("comment toggle failed: {s}", .{@errorName(err)})) orelse {
             return self.message("no comment syntax for language", .{});
         };
-        self.selection_anchor = null;
+        self.clearSelection();
         self.ensureEditorCursorVisible();
         self.syncActiveDocumentToLsp();
         self.message("{s}", .{commentToggleMessage(result)});
@@ -4170,7 +4333,7 @@ const LinuxGuiState = struct {
         const target_column = @min(before_cursor.column, doc.text.lineSlice(target_line).len);
         const target_offset = doc.text.lineColumnToOffset(target_line, target_column) catch @min(before_cursor.byte_offset, doc.text.bytes.len);
         doc.cursor.position = doc.positionFromOffset(target_offset) catch doc.cursor.position;
-        self.selection_anchor = null;
+        self.clearSelection();
         self.ensureEditorCursorVisible();
         self.syncActiveDocumentToLsp();
         self.refreshActiveSecurityFindings("removed hidden control markers");
@@ -4196,7 +4359,7 @@ const LinuxGuiState = struct {
 
     fn jumpToActiveDocumentOffset(self: *LinuxGuiState, offset: usize, text: []const u8) void {
         const doc = self.app.documents.active() orelse return self.message("no active document", .{});
-        self.selection_anchor = null;
+        self.clearSelection();
         const clamped = @min(offset, doc.text.bytes.len);
         navigation.setCursor(doc, doc.positionFromOffset(clamped) catch doc.cursor.position);
         self.app.focus = .editor;
@@ -4223,7 +4386,7 @@ const LinuxGuiState = struct {
         const clamped_end = @min(end, doc.text.bytes.len);
         if (clamped_start > clamped_end) return self.message("invalid replacement range", .{});
         doc.replaceRange(clamped_start, clamped_end, replacement) catch |err| return self.message("replace failed: {s}", .{@errorName(err)});
-        self.selection_anchor = null;
+        self.clearSelection();
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureEditorCursorVisible();
@@ -4241,6 +4404,40 @@ const LinuxGuiState = struct {
         const options = self.quick_panel.search_options;
         self.quick_panel.close();
         self.replaceAllActiveDocumentMatches(find, replacement, options);
+    }
+
+    fn applyWorkspaceReplacementFromQuickPanel(self: *LinuxGuiState) void {
+        if (self.quick_panel.mode != .replace_workspace) return;
+        const preview = if (self.quick_panel.replacement_preview) |*value| value else return self.message("type search=>replacement to build a preview", .{});
+        if (preview.files.len == 0) return self.message("workspace replacement has no matches", .{});
+
+        const argument = workspace_replace.formatApplyArgument(
+            self.allocator,
+            preview.token,
+            self.quick_panel.query.items,
+            self.quick_panel.search_options,
+        ) catch |err| return self.message("workspace replacement failed: {s}", .{@errorName(err)});
+        defer self.allocator.free(argument);
+
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = "workspace.replace_apply",
+            .argument = argument,
+            .source = .command_palette,
+        }) catch |err| {
+            self.message("workspace replacement failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "workspace replacement failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult("workspace.replace_apply", result);
+        self.bottom_panel = .output;
+        if (std.meta.activeTag(result) != .completed) return;
+
+        self.quick_panel.close();
+        self.file_watcher.clear();
+        self.clearSelection();
+        self.app.focus = .editor;
+        self.app.mode = .normal;
+        self.ensureEditorCursorVisible();
     }
 
     fn replaceAllActiveDocumentMatches(self: *LinuxGuiState, find: []const u8, replacement: []const u8, options: literal_search.Options) void {
@@ -4263,7 +4460,7 @@ const LinuxGuiState = struct {
         doc.replaceRange(0, doc.text.bytes.len, next.written()) catch |err| return self.message("replace failed: {s}", .{@errorName(err)});
         const target = @min(first_start + replacement.len, doc.text.bytes.len);
         navigation.setCursor(doc, doc.positionFromOffset(target) catch doc.cursor.position);
-        self.selection_anchor = null;
+        self.clearSelection();
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureEditorCursorVisible();
@@ -4335,7 +4532,7 @@ const LinuxGuiState = struct {
 
         for (index.symbols) |symbol| {
             if (!std.mem.eql(u8, symbol.name, name)) continue;
-            self.selection_anchor = null;
+            self.clearSelection();
             navigation.setCursor(doc, symbol.range.start);
             self.app.focus = .editor;
             self.app.mode = .insert;
@@ -4443,7 +4640,7 @@ const LinuxGuiState = struct {
             replaced += 1;
         }
 
-        self.selection_anchor = null;
+        self.clearSelection();
         self.app.focus = .editor;
         self.app.mode = .insert;
         self.ensureEditorCursorVisible();
@@ -4575,6 +4772,19 @@ const LinuxGuiState = struct {
                 else => {},
             }
         }
+        if (key.modifiers.ctrl and key.modifiers.alt and self.app.focus == .editor) {
+            switch (key.code) {
+                .arrow_up => {
+                    self.addCursorVertically(-1);
+                    return;
+                },
+                .arrow_down => {
+                    self.addCursorVertically(1);
+                    return;
+                },
+                else => {},
+            }
+        }
         if (key.modifiers.alt and self.app.focus == .editor) {
             switch (key.code) {
                 .arrow_up => {
@@ -4631,6 +4841,10 @@ const LinuxGuiState = struct {
                         }
                         if (char == 'f' or char == 'F') {
                             self.openQuickPanel(.find_document);
+                            return;
+                        }
+                        if (key.modifiers.shift and (char == 'h' or char == 'H')) {
+                            self.openQuickPanel(.replace_workspace);
                             return;
                         }
                         if (char == 'h' or char == 'H') {
@@ -4732,7 +4946,12 @@ const LinuxGuiState = struct {
             }
             switch (key.code) {
                 .escape => {
-                    self.execute("editor.exit_insert", .keybinding);
+                    if (self.secondary_cursors.items.len > 0) {
+                        self.clearSelection();
+                        self.message("primary cursor only", .{});
+                    } else {
+                        self.execute("editor.exit_insert", .keybinding);
+                    }
                     return;
                 },
                 .backspace => {
@@ -4962,6 +5181,10 @@ const LinuxGuiState = struct {
                         self.openQuickPanel(.find_document);
                         return;
                     }
+                    if (key.modifiers.shift and (char == 'h' or char == 'H')) {
+                        self.openQuickPanel(.replace_workspace);
+                        return;
+                    }
                     if (char == 'h' or char == 'H') {
                         self.openQuickPanel(.replace_document);
                         return;
@@ -5064,6 +5287,7 @@ const LinuxGuiState = struct {
     }
 
     fn deleteBackward(self: *LinuxGuiState) void {
+        if (self.editAtAllCursors(.delete_backward, "")) return;
         const doc = self.app.documents.active() orelse return;
         if (self.deleteSelectedRange(doc)) {
             self.message("deleted selection", .{});
@@ -5079,6 +5303,7 @@ const LinuxGuiState = struct {
     }
 
     fn deleteForward(self: *LinuxGuiState) void {
+        if (self.editAtAllCursors(.delete_forward, "")) return;
         const doc = self.app.documents.active() orelse return;
         if (self.deleteSelectedRange(doc)) {
             self.message("deleted selection", .{});
@@ -5203,6 +5428,7 @@ const LinuxGuiState = struct {
                 self.message("tab switch failed: {s}", .{@errorName(err)});
                 return;
             };
+            self.clearSelection();
             self.app.focus = .editor;
             self.message("switched document", .{});
             return;
@@ -5226,6 +5452,13 @@ const LinuxGuiState = struct {
             self.terminal_focused = false;
             self.app.focus = .editor;
             if (self.handleBoundaryGutterClick(x, y)) return;
+            if ((state_mask & X11_MOD1_MASK) != 0) {
+                const position = self.editorPositionFromPoint(x, y) orelse return;
+                self.toggleSecondaryCursor(position.byte_offset);
+                self.app.mode = .insert;
+                self.ensureEditorCursorVisible();
+                return;
+            }
             const extend_selection = (state_mask & X11_SHIFT_MASK) != 0;
             if (!extend_selection and self.consumeEditorDoubleClick(time, x, y)) {
                 if (!self.selectIdentifierAtPoint(x11, x, y)) self.beginEditorSelection(x11, x, y, false);
@@ -5458,6 +5691,10 @@ const LinuxGuiState = struct {
         const left: i16 = 245;
         const top: i16 = 92;
         if (x < left or x > left + 790 or y < top or y > top + 420) return false;
+        if (self.quick_panel.mode == .replace_workspace and pointIn(quickPanelApplyButtonRect(), x, y)) {
+            self.applyWorkspaceReplacementFromQuickPanel();
+            return true;
+        }
         const row_top: i16 = top + 89;
         if (y >= row_top) {
             const row = @divTrunc(@as(isize, y - row_top), LINE_HEIGHT + 4);
@@ -5509,6 +5746,7 @@ const LinuxGuiState = struct {
         if (start == end) return false;
 
         self.selection_anchor = start;
+        self.secondary_cursors.clearRetainingCapacity();
         navigation.setCursor(doc, doc.positionFromOffset(end) catch position);
         self.editor_dragging = false;
         self.app.focus = .editor;
@@ -5523,6 +5761,7 @@ const LinuxGuiState = struct {
         const doc = self.app.documents.active() orelse return;
         const previous = doc.cursor.position.byte_offset;
         const position = self.editorPositionFromPoint(x, y) orelse return;
+        self.secondary_cursors.clearRetainingCapacity();
         if (extend_selection) {
             if (self.selection_anchor == null) self.selection_anchor = previous;
         } else {
@@ -5814,12 +6053,13 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
     const linux_grade = linuxBoundaryGrade(&state.linux_security);
     const status = std.fmt.bufPrint(
         status_buf[0..],
-        "{s}/{s} | line:{d} col:{d} dirty:{d} lang:{s} lsp:{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} linux:{s} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+T Ctrl+S Ctrl+G Ctrl+Alt+L/I | {s}",
+        "{s}/{s} | line:{d} col:{d} carets:{d} dirty:{d} lang:{s} lsp:{s} trust:{s} risk:{d}/{d}/{d} at:{s} git:{d} linux:{s} files:{d} code:{d} langs:{d} zig:{d} docs:{d} | Ctrl+P Ctrl+T Ctrl+S Ctrl+G Ctrl+Alt+L/I | {s}",
         .{
             @tagName(app.mode),
             @tagName(app.focus),
             if (cursor) |pos| pos.line + 1 else 0,
             if (cursor) |pos| pos.column + 1 else 0,
+            if (cursor != null) state.secondary_cursors.items.len + 1 else 0,
             dirty_count,
             language,
             lsp_status,
@@ -5956,6 +6196,12 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
         if (selected and app.mode == .insert and app.focus == .editor) {
             const cursor_x: i16 = EDITOR_LEFT + 56 + @as(i16, @intCast(@min(doc.cursor.position.column, 120))) * 8;
             try x11.fillRect(x11.gc.cyan, cursor_x, line_y - 14, 2, LINE_HEIGHT);
+        }
+        for (state.secondary_cursors.items) |offset| {
+            const position = doc.positionFromOffset(@min(offset, doc.text.bytes.len)) catch continue;
+            if (position.line != line_index) continue;
+            const cursor_x: i16 = EDITOR_LEFT + 56 + @as(i16, @intCast(@min(position.column, 120))) * 8;
+            try x11.fillRect(x11.gc.green, cursor_x, line_y - 14, 2, LINE_HEIGHT);
         }
         line_y += LINE_HEIGHT;
     }
@@ -6747,8 +6993,25 @@ fn drawQuickPanel(x11: *X11, state: *LinuxGuiState) !void {
 
     var meta_buf: [160]u8 = undefined;
     const meta = std.fmt.bufPrint(meta_buf[0..], "{d} item(s)", .{state.quick_panel.itemCount()}) catch "";
-    try x11.text(x11.gc.muted, left + 650, top + 34, meta);
-    if (isDocumentSearchMode(state.quick_panel.mode)) {
+    if (state.quick_panel.mode == .replace_workspace) {
+        try drawActionButton(x11, quickPanelApplyButtonRect(), "APPLY");
+    } else {
+        try x11.text(x11.gc.muted, left + 650, top + 34, meta);
+    }
+    if (state.quick_panel.mode == .replace_workspace) {
+        var options_buf: [240]u8 = undefined;
+        const options = if (state.quick_panel.replacement_preview) |preview|
+            std.fmt.bufPrint(options_buf[0..], "{d} files  {d} matches  #{s}  {s}/{s}", .{
+                preview.files.len,
+                preview.matches,
+                preview.token[0..12],
+                if (state.quick_panel.search_options.case_sensitive) "case" else "ignore",
+                if (state.quick_panel.search_options.whole_word) "word" else "partial",
+            }) catch ""
+        else
+            "search=>replacement";
+        try x11.text(x11.gc.muted, left + 18, top + 86, options);
+    } else if (isDocumentSearchMode(state.quick_panel.mode)) {
         var options_buf: [220]u8 = undefined;
         const options = std.fmt.bufPrint(options_buf[0..], "F3 next  F6 {s}  F7 {s}{s}", .{
             if (state.quick_panel.search_options.case_sensitive) "case" else "ignore",
@@ -6798,6 +7061,18 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
             const items = state.quick_panel.search_results orelse break :blk "";
             if (row >= items.len) break :blk "";
             break :blk std.fmt.bufPrint(text_buf[0..], "{s}:{d}:{d}  {s}", .{ items[row].path, items[row].line + 1, items[row].column + 1, items[row].preview }) catch items[row].path;
+        },
+        .replace_workspace => blk: {
+            const preview = if (state.quick_panel.replacement_preview) |*value| value else break :blk "";
+            if (row >= preview.files.len) break :blk "";
+            const item = preview.files[row];
+            break :blk std.fmt.bufPrint(text_buf[0..], "{s}:{d}:{d}  {d} matches  #{s}", .{
+                item.path,
+                item.first_line + 1,
+                item.first_column + 1,
+                item.matches,
+                item.digest[0..12],
+            }) catch item.path;
         },
         .open_workspace => if (state.quick_panel.query.items.len > 0) "Open workspace path" else "",
         .new_file => if (state.quick_panel.query.items.len > 0) "Create file inside workspace" else "",
@@ -7885,6 +8160,19 @@ fn isDocumentSearchMode(mode: QuickPanelMode) bool {
     return mode == .find_document or mode == .replace_document;
 }
 
+fn containsOffset(offsets: []const usize, target: usize) bool {
+    for (offsets) |offset| if (offset == target) return true;
+    return false;
+}
+
+fn offsetLessThan(_: void, left: usize, right: usize) bool {
+    return left < right;
+}
+
+fn supportsQuickPanelSearchOptions(mode: QuickPanelMode) bool {
+    return isDocumentSearchMode(mode) or mode == .search_workspace or mode == .replace_workspace;
+}
+
 fn lspActionMatches(query: []const u8, action: LspPanelAction) bool {
     if (query.len == 0) return true;
     return command_mod.fuzzyScore(query, action.label) != null or
@@ -8065,6 +8353,7 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .rename_symbol => "RENAME  old=>new",
         .goto_line => "GO TO LINE  line[:column]",
         .search_workspace => "SEARCH WORKSPACE",
+        .replace_workspace => "REPLACE WORKSPACE  HASH-LOCKED PREVIEW",
         .new_file => "NEW FILE",
         .new_folder => "NEW FOLDER",
         .rename_path => "RENAME PATH  old=>new",
@@ -8209,6 +8498,10 @@ const HitRect = struct {
     right: i16,
     bottom: i16,
 };
+
+fn quickPanelApplyButtonRect() HitRect {
+    return .{ .left = 935, .top = 104, .right = 1017, .bottom = 132 };
+}
 
 const header_actions = [_]HeaderAction{ .open_workspace, .save, .save_all, .build, .test_run, .task, .git, .audit, .scan, .extensions, .tutorial, .publish };
 

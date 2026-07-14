@@ -101,7 +101,11 @@ fn isInsideWorkspace(workspace_root: []const u8, path: []const u8) bool {
 fn startsWithPath(path: []const u8, root: []const u8) bool {
     if (root.len == 0) return false;
     if (path.len < root.len) return false;
-    if (!std.ascii.eqlIgnoreCase(path[0..root.len], root)) return false;
+    const prefix_matches = if (std.fs.path.sep == '\\')
+        std.ascii.eqlIgnoreCase(path[0..root.len], root)
+    else
+        std.mem.eql(u8, path[0..root.len], root);
+    if (!prefix_matches) return false;
     if (path.len == root.len) return true;
     const next = path[root.len];
     return next == '/' or next == '\\';

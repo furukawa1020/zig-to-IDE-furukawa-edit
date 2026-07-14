@@ -18,6 +18,7 @@ const document_mod = @import("../editor/document.zig");
 const extension_registry = @import("../extensions/registry.zig");
 const file_finder = @import("../search/file_finder.zig");
 const workspace_search = @import("../search/workspace_search.zig");
+const workspace_replace = @import("../search/workspace_replace.zig");
 const permissions = @import("../security/permissions.zig");
 const posture = @import("../security/posture.zig");
 const security_findings = @import("../security/findings.zig");
@@ -368,6 +369,19 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         const query = request.argument orelse return .{ .unsupported = "workspace.search requires a query argument" };
         try renderWorkspaceSearch(app, query);
         return .{ .completed = "workspace search complete" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "workspace.replace")) {
+        const argument = request.argument orelse return .{ .unsupported = "workspace.replace requires search=>replacement" };
+        const replace_request = workspace_replace.parseQuery(argument) orelse return .{ .unsupported = "workspace.replace requires search=>replacement" };
+        try renderWorkspaceReplacePreview(app, replace_request);
+        return .{ .completed = "workspace replacement preview ready" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "workspace.replace_apply")) {
+        const argument = request.argument orelse return .{ .unsupported = "workspace.replace_apply requires token, options, and search=>replacement" };
+        const parsed = workspace_replace.parseApplyArgument(argument) orelse return .{ .unsupported = "invalid workspace replacement confirmation" };
+        return try applyWorkspaceReplacement(app, parsed);
     }
 
     if (std.mem.eql(u8, definition.id, "workspace.refresh")) {
@@ -1991,6 +2005,120 @@ fn renderWorkspaceSearch(app: *app_mod.App, query: []const u8) !void {
         try writer.print("{s}:{d}:{d}: {s}\n", .{ item.path, item.line + 1, item.column + 1, item.preview });
     }
     try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn renderWorkspaceReplacePreview(app: *app_mod.App, request: workspace_replace.Request) !void {
+    var replacement_preview = try workspace_replace.preview(app.allocator, &app.workspace, request, .{
+        .max_file_bytes = 2 * 1024 * 1024,
+        .max_files = 1024,
+        .max_matches = 10_000,
+        .max_total_bytes = 64 * 1024 * 1024,
+    });
+    defer replacement_preview.deinit();
+
+    try appendConsole(
+        app,
+        .stdout,
+        "workspace replacement preview\nfiles: {d}\nmatches: {d}\nbytes: {d} -> {d}\nskipped: binary={d} too_large={d} unreadable={d}\nconfirmation token: {s}\n",
+        .{
+            replacement_preview.files.len,
+            replacement_preview.matches,
+            replacement_preview.before_bytes,
+            replacement_preview.after_bytes,
+            replacement_preview.skipped.binary,
+            replacement_preview.skipped.too_large,
+            replacement_preview.skipped.unreadable,
+            replacement_preview.token[0..],
+        },
+    );
+    for (replacement_preview.files, 0..) |file, index| {
+        if (index >= 40) {
+            try appendConsole(app, .stdout, "... {d} more files\n", .{replacement_preview.files.len - index});
+            break;
+        }
+        try appendConsole(app, .stdout, "{s}:{d}:{d} matches={d} sha256={s}\n", .{
+            file.path,
+            file.first_line + 1,
+            file.first_column + 1,
+            file.matches,
+            file.digest[0..12],
+        });
+    }
+}
+
+fn applyWorkspaceReplacement(app: *app_mod.App, parsed: workspace_replace.ParsedApply) !Result {
+    var replacement_preview = try workspace_replace.preview(app.allocator, &app.workspace, parsed.request, .{});
+    defer replacement_preview.deinit();
+    if (replacement_preview.files.len == 0) return .{ .blocked = "workspace replacement has no matches" };
+    if (!std.ascii.eqlIgnoreCase(parsed.token, replacement_preview.token[0..])) {
+        return .{ .blocked = "workspace changed after preview; review the replacement again" };
+    }
+    if (try workspaceReplacementTouchesDirtyDocument(app, &replacement_preview)) {
+        return .{ .blocked = "workspace replacement touches an unsaved editor; save or close it first" };
+    }
+
+    const report = workspace_replace.apply(app.allocator, &app.workspace, parsed.request, parsed.token, .{}) catch |err| switch (err) {
+        error.PreviewStale => return .{ .blocked = "workspace changed during replacement; no unverified write was applied" },
+        error.NoMatches => return .{ .blocked = "workspace replacement has no matches" },
+        error.RollbackFailed => return .{ .blocked = "workspace replacement rollback failed; inspect files before continuing" },
+        else => return err,
+    };
+    const reloaded = try reloadWorkspaceReplacementDocuments(app, &replacement_preview);
+    try appendConsole(app, .stdout, "workspace replacement applied: files={d} matches={d} open_editors_updated={d} token={s}\n", .{
+        report.files,
+        report.matches,
+        reloaded,
+        report.token[0..],
+    });
+    return .{ .completed = "workspace replacement applied" };
+}
+
+fn workspaceReplacementTouchesDirtyDocument(app: *app_mod.App, replacement_preview: *const workspace_replace.Preview) !bool {
+    for (replacement_preview.files) |file| {
+        const absolute_path = try std.fs.path.join(app.allocator, &.{ app.workspace.root_path, file.path });
+        defer app.allocator.free(absolute_path);
+        for (app.documents.documents.items) |doc| {
+            const document_path = doc.path orelse continue;
+            if (doc.dirty and filesystemPathEqual(document_path, absolute_path)) return true;
+        }
+    }
+    return false;
+}
+
+fn reloadWorkspaceReplacementDocuments(app: *app_mod.App, replacement_preview: *const workspace_replace.Preview) !usize {
+    var updated: usize = 0;
+    for (replacement_preview.files) |file| {
+        const absolute_path = try std.fs.path.join(app.allocator, &.{ app.workspace.root_path, file.path });
+        defer app.allocator.free(absolute_path);
+        for (app.documents.documents.items) |*doc| {
+            const document_path = doc.path orelse continue;
+            if (!filesystemPathEqual(document_path, absolute_path)) continue;
+
+            const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, absolute_path, app.allocator, .limited(2 * 1024 * 1024)) catch |err| {
+                try appendConsole(app, .stderr, "workspace replacement editor reload failed: {s}: {s}\n", .{ file.path, @errorName(err) });
+                continue;
+            };
+            defer app.allocator.free(bytes);
+            if (!std.mem.eql(u8, doc.text.bytes, bytes)) {
+                const previous = doc.cursor.position;
+                try doc.replaceRange(0, doc.text.bytes.len, bytes);
+                const line = @min(previous.line, doc.text.lineCount() - 1);
+                const column = @min(previous.column, doc.text.lineSlice(line).len);
+                const offset = try doc.text.lineColumnToOffset(line, column);
+                doc.cursor.position = try doc.positionFromOffset(offset);
+            }
+            doc.dirty = false;
+            _ = syncDocumentToRunningLsp(app, doc) catch false;
+            _ = notifyDocumentSavedToRunningLsp(app, doc) catch false;
+            updated += 1;
+        }
+    }
+    return updated;
+}
+
+fn filesystemPathEqual(left: []const u8, right: []const u8) bool {
+    if (std.fs.path.sep == '\\') return std.ascii.eqlIgnoreCase(left, right);
+    return std.mem.eql(u8, left, right);
 }
 
 const LanguageRow = struct {
@@ -4040,6 +4168,66 @@ test "workspace search command renders literal matches" {
     const result = try dispatch(&app, .{ .id = "workspace.search", .argument = "workspace.search" });
     try std.testing.expect(std.meta.activeTag(result) == .completed);
     try std.testing.expect(app.process_console.lines.items.len > 0);
+}
+
+test "workspace replacement command updates clean open editors and remains undoable" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "main.txt", .data = "old value\n" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const document_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "main.txt" });
+    defer std.testing.allocator.free(document_path);
+    _ = try app.documents.openFile(document_path);
+
+    const preview_result = try dispatch(&app, .{ .id = "workspace.replace", .argument = "old=>new" });
+    try std.testing.expect(std.meta.activeTag(preview_result) == .completed);
+    var replacement_preview = try workspace_replace.preview(std.testing.allocator, &app.workspace, .{ .find = "old", .replacement = "new" }, .{});
+    defer replacement_preview.deinit();
+    const apply_argument = try workspace_replace.formatApplyArgument(std.testing.allocator, replacement_preview.token, "old=>new", .{});
+    defer std.testing.allocator.free(apply_argument);
+
+    const apply_result = try dispatch(&app, .{ .id = "workspace.replace_apply", .argument = apply_argument });
+    try std.testing.expect(std.meta.activeTag(apply_result) == .completed);
+    const active = app.documents.active().?;
+    try std.testing.expectEqualStrings("new value\n", active.text.bytes);
+    try std.testing.expect(!active.dirty);
+    try std.testing.expect(try active.undo());
+    try std.testing.expectEqualStrings("old value\n", active.text.bytes);
+    try std.testing.expect(active.dirty);
+}
+
+test "workspace replacement command blocks files with unsaved editors" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "main.txt", .data = "old disk\n" });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const document_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "main.txt" });
+    defer std.testing.allocator.free(document_path);
+    _ = try app.documents.openFile(document_path);
+    try app.documents.active().?.insert(0, "unsaved ");
+
+    var replacement_preview = try workspace_replace.preview(std.testing.allocator, &app.workspace, .{ .find = "old", .replacement = "new" }, .{});
+    defer replacement_preview.deinit();
+    const apply_argument = try workspace_replace.formatApplyArgument(std.testing.allocator, replacement_preview.token, "old=>new", .{});
+    defer std.testing.allocator.free(apply_argument);
+    const result = try dispatch(&app, .{ .id = "workspace.replace_apply", .argument = apply_argument });
+    try std.testing.expect(std.meta.activeTag(result) == .blocked);
+
+    const disk = try tmp.dir.readFileAlloc(std.Options.debug_io, "main.txt", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(disk);
+    try std.testing.expectEqualStrings("old disk\n", disk);
 }
 
 test "git overview command renders repository output" {

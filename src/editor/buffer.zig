@@ -105,33 +105,29 @@ pub const TextBuffer = struct {
     }
 
     pub fn insertBytes(self: *TextBuffer, offset: usize, text: []const u8) !void {
-        if (offset > self.bytes.len) return error.OffsetOutOfBounds;
-
-        const old = self.bytes;
-        const next = try self.allocator.alloc(u8, old.len + text.len);
-        std.mem.copyForwards(u8, next[0..offset], old[0..offset]);
-        std.mem.copyForwards(u8, next[offset .. offset + text.len], text);
-        std.mem.copyForwards(u8, next[offset + text.len ..], old[offset..]);
-        self.allocator.free(old);
-        self.bytes = next;
-        try self.rebuildLineIndex();
+        try self.replaceRange(offset, offset, text);
     }
 
     pub fn deleteRange(self: *TextBuffer, start: usize, end: usize) !void {
-        if (start > end or end > self.bytes.len) return error.OffsetOutOfBounds;
-
-        const old = self.bytes;
-        const next = try self.allocator.alloc(u8, old.len - (end - start));
-        std.mem.copyForwards(u8, next[0..start], old[0..start]);
-        std.mem.copyForwards(u8, next[start..], old[end..]);
-        self.allocator.free(old);
-        self.bytes = next;
-        try self.rebuildLineIndex();
+        try self.replaceRange(start, end, "");
     }
 
     pub fn replaceRange(self: *TextBuffer, start: usize, end: usize, text: []const u8) !void {
-        try self.deleteRange(start, end);
-        try self.insertBytes(start, text);
+        if (start > end or end > self.bytes.len) return error.OffsetOutOfBounds;
+        const retained = self.bytes.len - (end - start);
+        const next_len = std.math.add(usize, retained, text.len) catch return error.BufferTooLarge;
+        const next = try self.allocator.alloc(u8, next_len);
+        errdefer self.allocator.free(next);
+
+        std.mem.copyForwards(u8, next[0..start], self.bytes[0..start]);
+        std.mem.copyForwards(u8, next[start .. start + text.len], text);
+        std.mem.copyForwards(u8, next[start + text.len ..], self.bytes[end..]);
+        try self.line_starts.ensureTotalCapacity(requiredLineStarts(next));
+
+        const previous = self.bytes;
+        self.bytes = next;
+        self.allocator.free(previous);
+        self.rebuildLineIndexAssumeCapacity();
     }
 
     fn rebuildLineIndex(self: *TextBuffer) !void {
@@ -149,6 +145,19 @@ pub const TextBuffer = struct {
             }
         }
 
+        self.valid_utf8 = std.unicode.utf8ValidateSlice(self.bytes);
+    }
+
+    fn rebuildLineIndexAssumeCapacity(self: *TextBuffer) void {
+        self.line_starts.clearRetainingCapacity();
+        self.line_starts.appendAssumeCapacity(0);
+        self.newline = .none;
+
+        for (self.bytes, 0..) |byte, index| {
+            if (byte != '\n') continue;
+            self.noteNewline(if (index > 0 and self.bytes[index - 1] == '\r') .crlf else .lf);
+            if (index + 1 < self.bytes.len) self.line_starts.appendAssumeCapacity(index + 1);
+        }
         self.valid_utf8 = std.unicode.utf8ValidateSlice(self.bytes);
     }
 
@@ -176,6 +185,14 @@ fn utf8SequenceLengthFallback(first: u8) usize {
 
 fn isUtf8Continuation(byte: u8) bool {
     return (byte & 0xc0) == 0x80;
+}
+
+fn requiredLineStarts(bytes: []const u8) usize {
+    var count: usize = 1;
+    for (bytes, 0..) |byte, index| {
+        if (byte == '\n' and index + 1 < bytes.len) count += 1;
+    }
+    return count;
 }
 
 test "line index tracks edits" {
@@ -208,4 +225,15 @@ test "offset and line column conversions work" {
     const lc = try buf.offsetToLineColumn(offset);
     try std.testing.expectEqual(@as(usize, 1), lc.line);
     try std.testing.expectEqual(@as(usize, 2), lc.column);
+}
+
+test "replace range is atomic and accepts replacement aliased from the buffer" {
+    var buf = try TextBuffer.initFromBytes(std.testing.allocator, "one\r\ntwo\nthree");
+    defer buf.deinit();
+
+    try buf.replaceRange(5, 8, buf.bytes[0..3]);
+    try std.testing.expectEqualStrings("one\r\none\nthree", buf.bytes);
+    try std.testing.expectEqual(@as(usize, 3), buf.lineCount());
+    try std.testing.expectEqual(Newline.mixed, buf.newline);
+    try std.testing.expect(buf.valid_utf8);
 }

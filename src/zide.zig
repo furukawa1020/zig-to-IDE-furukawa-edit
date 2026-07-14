@@ -61,6 +61,7 @@ pub const editor = struct {
     pub const buffer = @import("editor/buffer.zig");
     pub const cursor = @import("editor/cursor.zig");
     pub const document = @import("editor/document.zig");
+    pub const multi_cursor = @import("editor/multi_cursor.zig");
     pub const navigation = @import("editor/navigation.zig");
     pub const save = @import("editor/save.zig");
     pub const selection = @import("editor/selection.zig");
@@ -124,6 +125,7 @@ pub const search = struct {
     pub const literal = @import("search/literal.zig");
     pub const problems = @import("search/problems.zig");
     pub const workspace_search = @import("search/workspace_search.zig");
+    pub const workspace_replace = @import("search/workspace_replace.zig");
     pub const workspace_symbols = @import("search/workspace_symbols.zig");
 };
 
@@ -162,6 +164,7 @@ pub const security = struct {
     pub const posture = @import("security/posture.zig");
     pub const trust = @import("security/trust.zig");
     pub const workspace_audit = @import("security/workspace_audit.zig");
+    pub const workspace_io = @import("security/workspace_io.zig");
     pub const zig_scanner = @import("security/zig_scanner.zig");
 };
 

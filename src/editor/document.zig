@@ -2,6 +2,7 @@ const std = @import("std");
 const buffer = @import("buffer.zig");
 const cursor = @import("cursor.zig");
 const modes = @import("../language/modes.zig");
+const multi_cursor = @import("multi_cursor.zig");
 const types = @import("../core/types.zig");
 const undo_mod = @import("undo.zig");
 
@@ -54,6 +55,20 @@ pub const Document = struct {
         try self.text.replaceRange(start, end, bytes);
         self.cursor.position = try self.positionFromOffset(start + bytes.len);
         self.dirty = true;
+    }
+
+    pub fn editAtCursors(self: *Document, edits: []const multi_cursor.Edit) ![]usize {
+        const result = try multi_cursor.apply(self.allocator, self.text.bytes, edits);
+        defer self.allocator.free(result.bytes);
+        errdefer self.allocator.free(result.cursor_offsets);
+
+        if (!std.mem.eql(u8, self.text.bytes, result.bytes)) {
+            try self.replaceRange(0, self.text.bytes.len, result.bytes);
+        }
+        if (result.cursor_offsets.len > 0) {
+            self.cursor.position = try self.positionFromOffset(result.cursor_offsets[0]);
+        }
+        return result.cursor_offsets;
     }
 
     pub fn typeText(self: *Document, selection_anchor: ?usize, bytes: []const u8) !TypeResult {
@@ -879,4 +894,22 @@ test "document smart newline does not expand quote pairs as blocks" {
     _ = try doc.insertSmartNewline(null, 4);
     try std.testing.expectEqualStrings("\"\n\"", doc.text.bytes);
     try std.testing.expectEqual(@as(usize, 2), doc.cursor.position.byte_offset);
+}
+
+test "document multi cursor edit is one undo step" {
+    var doc = try Document.fromBytes(std.testing.allocator, "main.zig", "alpha\nbeta\n");
+    defer doc.deinit();
+
+    const edits = [_]multi_cursor.Edit{
+        .{ .start = 5, .end = 5, .replacement = "!", .cursor_in_replacement = 1 },
+        .{ .start = 10, .end = 10, .replacement = "!", .cursor_in_replacement = 1 },
+    };
+    const cursors = try doc.editAtCursors(&edits);
+    defer std.testing.allocator.free(cursors);
+
+    try std.testing.expectEqualStrings("alpha!\nbeta!\n", doc.text.bytes);
+    try std.testing.expectEqualSlices(usize, &.{ 6, 12 }, cursors);
+    try std.testing.expect(try doc.undo());
+    try std.testing.expectEqualStrings("alpha\nbeta\n", doc.text.bytes);
+    try std.testing.expect(!(try doc.undo()));
 }

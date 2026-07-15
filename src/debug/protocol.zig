@@ -13,6 +13,7 @@ pub const SourceBreakpoint = struct {
     line: usize,
     condition: ?[]const u8 = null,
     hit_condition: ?[]const u8 = null,
+    log_message: ?[]const u8 = null,
 };
 
 pub const EvaluateArguments = struct {
@@ -96,6 +97,7 @@ pub fn makeSetBreakpointsRequest(
             try field(&json, "line", breakpoint.line);
             if (breakpoint.condition) |condition| try field(&json, "condition", condition);
             if (breakpoint.hit_condition) |condition| try field(&json, "hitCondition", condition);
+            if (breakpoint.log_message) |message| try field(&json, "logMessage", message);
             try json.endObject();
         }
         try json.endArray();
@@ -317,11 +319,13 @@ test "build DAP initialize and launch requests" {
 test "build DAP breakpoint and reverse-request rejection" {
     const breakpoints = try makeSetBreakpointsRequest(std.testing.allocator, 3, "/repo/main.zig", &.{
         .{ .line = 7 },
-        .{ .line = 11, .condition = "value > 4" },
+        .{ .line = 11, .condition = "value > 4", .hit_condition = "3", .log_message = "value {value}" },
     });
     defer std.testing.allocator.free(breakpoints);
     try std.testing.expect(std.mem.indexOf(u8, breakpoints, "\"line\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, breakpoints, "value > 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, breakpoints, "\"hitCondition\":\"3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, breakpoints, "\"logMessage\":\"value {value}\"") != null);
 
     const denied = try makeErrorResponse(std.testing.allocator, 4, 99, "runInTerminal", "blocked by ZIDE policy");
     defer std.testing.allocator.free(denied);

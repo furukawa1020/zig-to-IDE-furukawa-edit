@@ -40,6 +40,11 @@ test {
     _ = @import("config/model.zig");
     _ = @import("config/parser.zig");
     _ = @import("debug/session.zig");
+    _ = @import("debug/framing.zig");
+    _ = @import("debug/launch_plan.zig");
+    _ = @import("debug/manager.zig");
+    _ = @import("debug/protocol.zig");
+    _ = @import("debug/transport.zig");
     _ = @import("diagnostics/model.zig");
     _ = @import("diagnostics/collection.zig");
     _ = @import("diagnostics/zig_output.zig");

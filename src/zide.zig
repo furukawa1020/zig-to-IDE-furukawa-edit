@@ -141,7 +141,12 @@ pub const persistence = struct {
 };
 
 pub const debug_layer = struct {
+    pub const framing = @import("debug/framing.zig");
+    pub const launch_plan = @import("debug/launch_plan.zig");
+    pub const manager = @import("debug/manager.zig");
+    pub const protocol = @import("debug/protocol.zig");
     pub const session = @import("debug/session.zig");
+    pub const transport = @import("debug/transport.zig");
 };
 
 pub const git = struct {

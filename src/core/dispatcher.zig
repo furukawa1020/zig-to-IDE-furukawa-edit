@@ -38,6 +38,7 @@ const lsp_transport = @import("../lsp/transport.zig");
 const debug_launch_plan = @import("../debug/launch_plan.zig");
 const debug_protocol = @import("../debug/protocol.zig");
 const debug_session = @import("../debug/session.zig");
+const debug_breakpoint = @import("../security/debug_breakpoint.zig");
 const debug_expression = @import("../security/debug_expression.zig");
 
 pub const LspPumpResult = struct {
@@ -509,6 +510,22 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
 
     if (std.mem.eql(u8, definition.id, "debug.toggle_breakpoint")) {
         return try toggleDebugBreakpoint(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.breakpoint_condition")) {
+        return try configureDebugBreakpoint(app, .condition, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.breakpoint_hit_condition")) {
+        return try configureDebugBreakpoint(app, .hit_condition, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.breakpoint_log")) {
+        return try configureDebugBreakpoint(app, .log_message, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.breakpoint_clear_advanced")) {
+        return try clearAdvancedDebugBreakpoint(app);
     }
 
     if (std.mem.eql(u8, definition.id, "debug.status")) {
@@ -2117,11 +2134,7 @@ fn toggleDebugBreakpoint(app: *app_mod.App) !Result {
     const line = doc.cursor.position.line + 1;
     const toggled = try app.debug_manager.session.toggleBreakpoint(path, line);
     const persisted = try persistDebugState(app);
-    if (app.debug_manager.isRunning()) {
-        var outbound = try app.debug_manager.session.makeSetBreakpoints(path);
-        defer outbound.deinit();
-        try app.debug_manager.send(&outbound);
-    }
+    try sendDebugBreakpointsForPath(app, path);
     try appendConsole(app, .stdout, "debug breakpoint {s}: {s}:{d}\n", .{ @tagName(toggled), path, line });
     return .{ .completed = if (toggled == .added)
         if (persisted) "breakpoint added and saved" else "breakpoint added for this session only"
@@ -2131,13 +2144,104 @@ fn toggleDebugBreakpoint(app: *app_mod.App) !Result {
         "breakpoint removed for this session only" };
 }
 
+fn configureDebugBreakpoint(
+    app: *app_mod.App,
+    property: debug_session.BreakpointProperty,
+    argument: ?[]const u8,
+) !Result {
+    const raw_value = argument orelse return .{ .blocked = breakpointArgumentRequired(property) };
+    if (activeAdapterRejectsBreakpointProperty(app, property)) |message| return .{ .blocked = message };
+
+    const doc = app.documents.active() orelse return .no_active_document;
+    const path = doc.path orelse return .{ .blocked = "save the document before configuring a breakpoint" };
+    const line = doc.cursor.position.line + 1;
+    const update = app.debug_manager.session.setBreakpointProperty(path, line, property, raw_value) catch |err| switch (err) {
+        error.EmptyBreakpointValue,
+        error.BreakpointValueTooLong,
+        error.InvalidBreakpointUtf8,
+        error.HiddenBreakpointControl,
+        error.UnsafeBreakpointCondition,
+        error.InvalidHitCondition,
+        error.UnsafeLogMessage,
+        => return .{ .blocked = debug_breakpoint.rejectionMessage(property, err) },
+        else => return err,
+    };
+    const persisted = try persistDebugState(app);
+    try sendDebugBreakpointsForPath(app, path);
+    try appendConsole(app, .stdout, "debug breakpoint {s} {s}: {s}:{d}\n", .{
+        breakpointPropertyLabel(property),
+        @tagName(update),
+        path,
+        line,
+    });
+    return .{ .completed = if (persisted)
+        "advanced breakpoint updated and saved"
+    else
+        "advanced breakpoint updated for this session only" };
+}
+
+fn clearAdvancedDebugBreakpoint(app: *app_mod.App) !Result {
+    const doc = app.documents.active() orelse return .no_active_document;
+    const path = doc.path orelse return .{ .blocked = "save the document before configuring a breakpoint" };
+    const line = doc.cursor.position.line + 1;
+    if (!app.debug_manager.session.clearBreakpointProperties(path, line)) {
+        return .{ .blocked = "no breakpoint exists on the current line" };
+    }
+    const persisted = try persistDebugState(app);
+    try sendDebugBreakpointsForPath(app, path);
+    try appendConsole(app, .stdout, "debug breakpoint advanced settings cleared: {s}:{d}\n", .{ path, line });
+    return .{ .completed = if (persisted)
+        "advanced breakpoint settings cleared and saved"
+    else
+        "advanced breakpoint settings cleared for this session only" };
+}
+
+fn sendDebugBreakpointsForPath(app: *app_mod.App, path: []const u8) !void {
+    const session = &app.debug_manager.session;
+    if (!app.debug_manager.isRunning() or !session.capabilitiesKnown()) return;
+    const unsupported = session.unsupportedBreakpointCountForPath(path);
+    if (unsupported > 0) {
+        try appendConsole(app, .stderr, "debug adapter capability boundary: {d} advanced breakpoint(s) withheld for {s}; none were downgraded\n", .{ unsupported, path });
+    }
+    var outbound = try session.makeSetBreakpoints(path);
+    defer outbound.deinit();
+    try app.debug_manager.send(&outbound);
+}
+
+fn activeAdapterRejectsBreakpointProperty(app: *const app_mod.App, property: debug_session.BreakpointProperty) ?[]const u8 {
+    const manager = &app.debug_manager;
+    const session = &manager.session;
+    if (!manager.isRunning() or !session.capabilitiesKnown()) return null;
+    return switch (property) {
+        .condition => if (!session.capabilities.supports_conditional_breakpoints) "active debug adapter does not support conditional breakpoints" else null,
+        .hit_condition => if (!session.capabilities.supports_hit_conditional_breakpoints) "active debug adapter does not support hit conditions" else null,
+        .log_message => if (!session.capabilities.supports_log_points) "active debug adapter does not support logpoints" else null,
+    };
+}
+
+fn breakpointArgumentRequired(property: debug_session.BreakpointProperty) []const u8 {
+    return switch (property) {
+        .condition => "debug.breakpoint_condition requires a restricted predicate",
+        .hit_condition => "debug.breakpoint_hit_condition requires a positive decimal count",
+        .log_message => "debug.breakpoint_log requires a message",
+    };
+}
+
+fn breakpointPropertyLabel(property: debug_session.BreakpointProperty) []const u8 {
+    return switch (property) {
+        .condition => "condition",
+        .hit_condition => "hit-count",
+        .log_message => "logpoint",
+    };
+}
+
 fn persistDebugState(app: *app_mod.App) !bool {
     const report = app.debug_manager.persistState() catch |err| {
         try appendConsole(app, .stderr, "debug state persistence failed: {s}; changes remain in this IDE session\n", .{@errorName(err)});
         return false;
     };
     if (report.breakpoints_skipped > 0) {
-        try appendConsole(app, .stderr, "debug state skipped {d} breakpoint(s) outside this workspace\n", .{report.breakpoints_skipped});
+        try appendConsole(app, .stderr, "debug state skipped {d} breakpoint(s) with an invalid field or path outside this workspace\n", .{report.breakpoints_skipped});
     }
     return report.breakpoints_skipped == 0;
 }
@@ -2256,9 +2360,7 @@ fn advanceDebugHandshake(app: *app_mod.App, result: debug_session.IngestResult) 
             .initialized => {
                 for (session.breakpoints.items, 0..) |breakpoint, index| {
                     if (!breakpoint.enabled or hasEarlierBreakpointPath(session.breakpoints.items, index, breakpoint.path)) continue;
-                    var set = try session.makeSetBreakpoints(breakpoint.path);
-                    defer set.deinit();
-                    try app.debug_manager.send(&set);
+                    try sendDebugBreakpointsForPath(app, breakpoint.path);
                 }
                 if (session.capabilities.supports_configuration_done_request) {
                     var configured = try session.makeConfigurationDone();
@@ -2356,12 +2458,16 @@ fn renderDebugStatus(app: *app_mod.App) !void {
     if (manager.plan) |plan| try writer.print("adapter: {s}\nprogram: {s}\ncwd: {s}\n", .{ plan.adapter_argv[0], plan.program, plan.cwd });
     try writer.print("breakpoints: {d}\n", .{session.breakpoints.items.len});
     for (session.breakpoints.items[0..@min(session.breakpoints.items.len, 64)]) |breakpoint| {
-        try writer.print("  {s}:{d} enabled={} verified={} id={any} {s}\n", .{
+        try writer.print("  {s}:{d} enabled={} verified={} compatible={} id={any} condition=\"{s}\" hit=\"{s}\" log=\"{s}\" {s}\n", .{
             breakpoint.path,
             breakpoint.line,
             breakpoint.enabled,
             breakpoint.verified,
+            session.breakpointSupported(breakpoint),
             breakpoint.adapter_id,
+            breakpoint.condition orelse "",
+            breakpoint.hit_condition orelse "",
+            breakpoint.log_message orelse "",
             breakpoint.message orelse "",
         });
     }
@@ -4803,6 +4909,48 @@ test "debug watch commands enforce restricted expressions and manage the list" {
     const removed = try dispatch(&app, .{ .id = "debug.watch_remove", .argument = "1" });
     try std.testing.expect(std.meta.activeTag(removed) == .completed);
     try std.testing.expectEqual(@as(usize, 0), app.debug_manager.session.watches.items.len);
+}
+
+test "advanced breakpoint commands validate persist and clear current line settings" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "main.zig", .data = "pub fn main() void {}\n" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buf);
+    const root = root_buf[0..root_len];
+    var app = try app_mod.App.init(std.testing.allocator, root);
+    defer app.deinit();
+    _ = try app.openWorkspaceFile("main.zig");
+
+    app.runtime.trust_state = .locked_down;
+    const locked = try dispatch(&app, .{ .id = "debug.breakpoint_condition", .argument = "ready == true" });
+    try std.testing.expect(std.meta.activeTag(locked) == .blocked);
+    try std.testing.expectEqual(@as(usize, 0), app.debug_manager.session.breakpoints.items.len);
+    app.runtime.trust_state = .untrusted;
+
+    const condition = try dispatch(&app, .{ .id = "debug.breakpoint_condition", .argument = "ready == true" });
+    try std.testing.expect(std.meta.activeTag(condition) == .completed);
+    const rejected = try dispatch(&app, .{ .id = "debug.breakpoint_condition", .argument = "launch()" });
+    try std.testing.expect(std.meta.activeTag(rejected) == .blocked);
+    _ = try dispatch(&app, .{ .id = "debug.breakpoint_hit_condition", .argument = "5" });
+    _ = try dispatch(&app, .{ .id = "debug.breakpoint_log", .argument = "ready {ready}" });
+    try std.testing.expectEqual(@as(usize, 1), app.debug_manager.session.breakpoints.items.len);
+    try std.testing.expectEqualStrings("ready == true", app.debug_manager.session.breakpoints.items[0].condition.?);
+    try std.testing.expectEqualStrings("5", app.debug_manager.session.breakpoints.items[0].hit_condition.?);
+    try std.testing.expectEqualStrings("ready {ready}", app.debug_manager.session.breakpoints.items[0].log_message.?);
+
+    var restored = try app_mod.App.init(std.testing.allocator, root);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(usize, 1), restored.debug_manager.session.breakpoints.items.len);
+    try std.testing.expectEqualStrings("ready == true", restored.debug_manager.session.breakpoints.items[0].condition.?);
+    try std.testing.expectEqualStrings("5", restored.debug_manager.session.breakpoints.items[0].hit_condition.?);
+    try std.testing.expectEqualStrings("ready {ready}", restored.debug_manager.session.breakpoints.items[0].log_message.?);
+
+    const cleared = try dispatch(&app, .{ .id = "debug.breakpoint_clear_advanced" });
+    try std.testing.expect(std.meta.activeTag(cleared) == .completed);
+    try std.testing.expect(app.debug_manager.session.breakpoints.items[0].condition == null);
+    try std.testing.expect(app.debug_manager.session.breakpoints.items[0].hit_condition == null);
+    try std.testing.expect(app.debug_manager.session.breakpoints.items[0].log_message == null);
 }
 
 test "open selected workspace file activates editor focus" {

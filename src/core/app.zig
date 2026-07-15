@@ -13,6 +13,7 @@ const lsp_manager = @import("../lsp/manager.zig");
 const lsp_session = @import("../lsp/session.zig");
 const workspace = @import("../workspace/workspace.zig");
 const workspace_io = @import("../security/workspace_io.zig");
+const debug_manager = @import("../debug/manager.zig");
 
 const max_document_bytes = 32 * 1024 * 1024;
 
@@ -43,8 +44,10 @@ pub const App = struct {
     security_findings: security_findings.Collection,
     process_console: console.ProcessConsole,
     lsp_manager: lsp_manager.Manager,
+    debug_manager: debug_manager.Manager,
     pending_build_consent: ?build_consent.Preview,
     pending_build_source_id: ?[]u8,
+    pending_build_argument: ?[]u8,
     execution_queue: execution_queue.Queue,
 
     pub fn init(allocator: std.mem.Allocator, root_path: []const u8) !App {
@@ -63,24 +66,35 @@ pub const App = struct {
         else
             root_path;
 
-        var self = App{
-            .allocator = allocator,
-            .io = io,
-            .environ = environ,
-            .runtime = runtime.Runtime.init(allocator),
-            .mode = .normal,
-            .focus = .files,
-            .file_cursor = 0,
-            .workspace = try workspace.Workspace.open(allocator, workspace_path),
-            .documents = store.DocumentStore.init(allocator),
-            .palette = command_palette.CommandPalette.init(allocator),
-            .diagnostics = diagnostics.Collection.init(allocator),
-            .security_findings = security_findings.Collection.init(allocator),
-            .process_console = console.ProcessConsole.init(allocator),
-            .lsp_manager = try lsp_manager.Manager.init(allocator, workspace_path),
-            .pending_build_consent = null,
-            .pending_build_source_id = null,
-            .execution_queue = execution_queue.Queue.init(allocator),
+        var self = initialized: {
+            var workspace_state = try workspace.Workspace.open(allocator, workspace_path);
+            errdefer workspace_state.deinit();
+            var language_servers = try lsp_manager.Manager.init(allocator, workspace_path);
+            errdefer language_servers.deinit();
+            var debugger = try debug_manager.Manager.init(allocator, workspace_path);
+            errdefer debugger.deinit();
+
+            break :initialized App{
+                .allocator = allocator,
+                .io = io,
+                .environ = environ,
+                .runtime = runtime.Runtime.init(allocator),
+                .mode = .normal,
+                .focus = .files,
+                .file_cursor = 0,
+                .workspace = workspace_state,
+                .documents = store.DocumentStore.init(allocator),
+                .palette = command_palette.CommandPalette.init(allocator),
+                .diagnostics = diagnostics.Collection.init(allocator),
+                .security_findings = security_findings.Collection.init(allocator),
+                .process_console = console.ProcessConsole.init(allocator),
+                .lsp_manager = language_servers,
+                .debug_manager = debugger,
+                .pending_build_consent = null,
+                .pending_build_source_id = null,
+                .pending_build_argument = null,
+                .execution_queue = execution_queue.Queue.init(allocator),
+            };
         };
         errdefer self.deinit();
         self.file_cursor = self.firstFileEntryIndex() orelse 0;
@@ -97,6 +111,7 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.clearPendingBuildConsent();
+        self.debug_manager.deinit();
         self.lsp_manager.deinit();
         self.execution_queue.deinit();
         self.process_console.deinit();
@@ -118,16 +133,28 @@ pub const App = struct {
         if (self.pending_build_source_id) |source_id| {
             self.allocator.free(source_id);
         }
+        if (self.pending_build_argument) |argument| {
+            self.allocator.free(argument);
+        }
         self.pending_build_consent = null;
         self.pending_build_source_id = null;
+        self.pending_build_argument = null;
     }
 
-    pub fn setPendingBuildConsent(self: *App, source_command_id: []const u8, preview: build_consent.Preview) !void {
+    pub fn setPendingBuildConsent(
+        self: *App,
+        source_command_id: []const u8,
+        argument: ?[]const u8,
+        preview: build_consent.Preview,
+    ) !void {
         const owned_source_id = try self.allocator.dupe(u8, source_command_id);
         errdefer self.allocator.free(owned_source_id);
+        const owned_argument = if (argument) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_argument) |value| self.allocator.free(value);
         self.clearPendingBuildConsent();
         self.pending_build_consent = preview;
         self.pending_build_source_id = owned_source_id;
+        self.pending_build_argument = owned_argument;
     }
 
     pub fn selectedWorkspaceEntry(self: *const App) ?*const workspace.FileEntry {

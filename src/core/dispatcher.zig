@@ -541,12 +541,11 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
     }
 
     if (std.mem.eql(u8, definition.id, "debug.watch_remove")) {
-        return removeDebugWatch(app, request.argument);
+        return try removeDebugWatch(app, request.argument);
     }
 
     if (std.mem.eql(u8, definition.id, "debug.watch_clear")) {
-        app.debug_manager.session.clearWatches();
-        return .{ .completed = "debug watches cleared" };
+        return try clearDebugWatches(app);
     }
 
     if (std.mem.eql(u8, definition.id, "debug.watch_refresh")) {
@@ -2062,15 +2061,23 @@ fn addDebugWatch(app: *app_mod.App, argument: ?[]const u8) !Result {
             _ = try sendDebugWatches(app, frame_id, watch_id);
         }
     }
+    const persisted = try persistDebugState(app);
     try appendConsole(app, .stdout, "restricted debug watch added: {s}\n", .{expression});
-    return .{ .completed = "restricted debug watch added" };
+    return .{ .completed = if (persisted) "restricted debug watch added and saved" else "restricted debug watch added for this session only" };
 }
 
-fn removeDebugWatch(app: *app_mod.App, argument: ?[]const u8) Result {
+fn removeDebugWatch(app: *app_mod.App, argument: ?[]const u8) !Result {
     const one_based = parseDebugReference(argument) orelse return .{ .blocked = "debug.watch_remove requires a one-based watch index" };
     const index = std.math.cast(usize, one_based - 1) orelse return .{ .blocked = "debug watch index is out of range" };
     if (!app.debug_manager.session.removeWatchAt(index)) return .{ .blocked = "debug watch index is out of range" };
-    return .{ .completed = "debug watch removed" };
+    const persisted = try persistDebugState(app);
+    return .{ .completed = if (persisted) "debug watch removed and state saved" else "debug watch removed for this session only" };
+}
+
+fn clearDebugWatches(app: *app_mod.App) !Result {
+    app.debug_manager.session.clearWatches();
+    const persisted = try persistDebugState(app);
+    return .{ .completed = if (persisted) "debug watches cleared and state saved" else "debug watches cleared for this session only" };
 }
 
 fn refreshDebugWatches(app: *app_mod.App, argument: ?[]const u8) !Result {
@@ -2109,13 +2116,30 @@ fn toggleDebugBreakpoint(app: *app_mod.App) !Result {
     const path = doc.path orelse return .{ .blocked = "save the document before adding a breakpoint" };
     const line = doc.cursor.position.line + 1;
     const toggled = try app.debug_manager.session.toggleBreakpoint(path, line);
+    const persisted = try persistDebugState(app);
     if (app.debug_manager.isRunning()) {
         var outbound = try app.debug_manager.session.makeSetBreakpoints(path);
         defer outbound.deinit();
         try app.debug_manager.send(&outbound);
     }
     try appendConsole(app, .stdout, "debug breakpoint {s}: {s}:{d}\n", .{ @tagName(toggled), path, line });
-    return .{ .completed = if (toggled == .added) "breakpoint added" else "breakpoint removed" };
+    return .{ .completed = if (toggled == .added)
+        if (persisted) "breakpoint added and saved" else "breakpoint added for this session only"
+    else if (persisted)
+        "breakpoint removed and state saved"
+    else
+        "breakpoint removed for this session only" };
+}
+
+fn persistDebugState(app: *app_mod.App) !bool {
+    const report = app.debug_manager.persistState() catch |err| {
+        try appendConsole(app, .stderr, "debug state persistence failed: {s}; changes remain in this IDE session\n", .{@errorName(err)});
+        return false;
+    };
+    if (report.breakpoints_skipped > 0) {
+        try appendConsole(app, .stderr, "debug state skipped {d} breakpoint(s) outside this workspace\n", .{report.breakpoints_skipped});
+    }
+    return report.breakpoints_skipped == 0;
 }
 
 fn ingestDebugPayload(app: *app_mod.App, payload: []const u8) !Result {
@@ -2316,6 +2340,19 @@ fn renderDebugStatus(app: *app_mod.App) !void {
         @tagName(manager.fs_policy),
         @tagName(manager.network_policy),
     });
+    try writer.print("state-file: {s} store={s} loaded={d}/{d} rejected={d} saved={d}/{d} skipped={d} bytes={d}\n", .{
+        @import("../debug/workspace_state.zig").relative_path,
+        debugStateStoreLabel(manager),
+        manager.state_load_report.watches_loaded,
+        manager.state_load_report.breakpoints_loaded,
+        manager.state_load_report.entries_rejected,
+        manager.state_save_report.watches_saved,
+        manager.state_save_report.breakpoints_saved,
+        manager.state_save_report.breakpoints_skipped,
+        manager.state_save_report.bytes_written,
+    });
+    if (manager.state_load_error) |err| try writer.print("state-load-error: {s}\n", .{@errorName(err)});
+    if (manager.state_save_error) |err| try writer.print("state-save-error: {s}\n", .{@errorName(err)});
     if (manager.plan) |plan| try writer.print("adapter: {s}\nprogram: {s}\ncwd: {s}\n", .{ plan.adapter_argv[0], plan.program, plan.cwd });
     try writer.print("breakpoints: {d}\n", .{session.breakpoints.items.len});
     for (session.breakpoints.items[0..@min(session.breakpoints.items.len, 64)]) |breakpoint| {
@@ -2348,6 +2385,14 @@ fn renderDebugStatus(app: *app_mod.App) !void {
         });
     }
     try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn debugStateStoreLabel(manager: *const @import("../debug/manager.zig").Manager) []const u8 {
+    if (manager.state_save_error != null) return "save-error";
+    if (manager.state_dirty) return "dirty";
+    if (manager.state_load_error != null) return "load-error";
+    if (manager.state_save_report.bytes_written > 0 or manager.state_load_report.found) return "saved";
+    return "new";
 }
 
 fn hasEarlierBreakpointPath(breakpoints: []const debug_session.Breakpoint, index: usize, path: []const u8) bool {
@@ -4728,8 +4773,19 @@ test "console diagnostics sync parses Zig compiler output" {
 }
 
 test "debug watch commands enforce restricted expressions and manage the list" {
-    var app = try app_mod.App.init(std.testing.allocator, ".");
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buf);
+    const root = root_buf[0..root_len];
+    var app = try app_mod.App.init(std.testing.allocator, root);
     defer app.deinit();
+
+    app.runtime.trust_state = .locked_down;
+    const locked = try dispatch(&app, .{ .id = "debug.watch_add", .argument = "blocked.value" });
+    try std.testing.expect(std.meta.activeTag(locked) == .blocked);
+    try std.testing.expectEqual(@as(usize, 0), app.debug_manager.session.watches.items.len);
+    app.runtime.trust_state = .untrusted;
 
     const added = try dispatch(&app, .{ .id = "debug.watch_add", .argument = "state.items[0].name" });
     try std.testing.expect(std.meta.activeTag(added) == .completed);
@@ -4738,6 +4794,11 @@ test "debug watch commands enforce restricted expressions and manage the list" {
     const rejected = try dispatch(&app, .{ .id = "debug.watch_add", .argument = "state.run()" });
     try std.testing.expect(std.meta.activeTag(rejected) == .blocked);
     try std.testing.expectEqual(@as(usize, 1), app.debug_manager.session.watches.items.len);
+
+    var restored = try app_mod.App.init(std.testing.allocator, root);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(usize, 1), restored.debug_manager.session.watches.items.len);
+    try std.testing.expectEqualStrings("state.items[0].name", restored.debug_manager.session.watches.items[0].expression);
 
     const removed = try dispatch(&app, .{ .id = "debug.watch_remove", .argument = "1" });
     try std.testing.expect(std.meta.activeTag(removed) == .completed);

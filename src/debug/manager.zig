@@ -3,6 +3,7 @@ const launch_plan = @import("launch_plan.zig");
 const permissions = @import("../security/permissions.zig");
 const session_mod = @import("session.zig");
 const transport_mod = @import("transport.zig");
+const workspace_state = @import("workspace_state.zig");
 
 pub const Manager = struct {
     allocator: std.mem.Allocator,
@@ -13,15 +14,28 @@ pub const Manager = struct {
     env_policy: permissions.EnvPolicy = .empty,
     fs_policy: permissions.FileSystemPolicy = .workspace_only,
     network_policy: permissions.NetworkPolicy = .deny,
+    state_load_report: workspace_state.LoadReport = .{},
+    state_load_error: ?anyerror = null,
+    state_save_report: workspace_state.SaveReport = .{},
+    state_save_error: ?anyerror = null,
+    state_dirty: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, workspace_root: []const u8) !Manager {
         const root = try allocator.dupe(u8, workspace_root);
         errdefer allocator.free(root);
-        return .{
+        var debug_session = try session_mod.Session.init(allocator, workspace_root);
+        errdefer debug_session.deinit();
+        var manager: Manager = .{
             .allocator = allocator,
             .workspace_root = root,
-            .session = try session_mod.Session.init(allocator, workspace_root),
+            .session = debug_session,
         };
+        manager.state_load_report = workspace_state.load(allocator, workspace_root, &manager.session) catch |err| failed: {
+            manager.state_load_error = err;
+            break :failed .{};
+        };
+        manager.state_dirty = manager.state_load_report.entries_rejected > 0;
+        return manager;
     }
 
     pub fn deinit(self: *Manager) void {
@@ -76,6 +90,19 @@ pub const Manager = struct {
     pub fn send(self: *Manager, outbound: *const session_mod.Outbound) !void {
         const transport = if (self.transport) |*value| value else return error.DebugTransportNotRunning;
         try transport.send(outbound.framed);
+    }
+
+    pub fn persistState(self: *Manager) !workspace_state.SaveReport {
+        const report = workspace_state.save(self.allocator, self.workspace_root, &self.session) catch |err| {
+            self.state_save_error = err;
+            self.state_dirty = true;
+            return err;
+        };
+        self.state_save_report = report;
+        self.state_load_error = null;
+        self.state_save_error = null;
+        self.state_dirty = report.breakpoints_skipped > 0;
+        return report;
     }
 
     pub fn stop(self: *Manager) bool {

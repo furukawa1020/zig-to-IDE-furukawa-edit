@@ -71,7 +71,7 @@ pub const App = struct {
             errdefer workspace_state.deinit();
             var language_servers = try lsp_manager.Manager.init(allocator, workspace_path);
             errdefer language_servers.deinit();
-            var debugger = try debug_manager.Manager.init(allocator, workspace_path);
+            var debugger = try debug_manager.Manager.init(allocator, workspace_state.root_path);
             errdefer debugger.deinit();
 
             break :initialized App{

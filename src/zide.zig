@@ -147,6 +147,7 @@ pub const debug_layer = struct {
     pub const protocol = @import("debug/protocol.zig");
     pub const session = @import("debug/session.zig");
     pub const transport = @import("debug/transport.zig");
+    pub const workspace_state = @import("debug/workspace_state.zig");
 };
 
 pub const git = struct {

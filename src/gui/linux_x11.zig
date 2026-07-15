@@ -6611,8 +6611,9 @@ fn drawDebugPanel(x11: *X11, state: *LinuxGuiState) !void {
     try drawDebugPanelActions(x11, state);
 
     var header_buf: [360]u8 = undefined;
-    const header = std.fmt.bufPrint(header_buf[0..], "DEBUG state:{s} pending:{d} bp:{d} threads:{d} stack:{d} scopes:{d} vars:{d} watch:{d}", .{
+    const header = std.fmt.bufPrint(header_buf[0..], "DEBUG state:{s} store:{s} pending:{d} bp:{d} threads:{d} stack:{d} scopes:{d} vars:{d} watch:{d}", .{
         @tagName(session.state),
+        debugStoreLabel(manager),
         session.pendingCount(),
         session.breakpoints.items.len,
         session.threads.items.len,
@@ -6702,6 +6703,14 @@ fn drawDebugPanel(x11: *X11, state: *LinuxGuiState) !void {
         }
         y += LINE_HEIGHT;
     }
+}
+
+fn debugStoreLabel(manager: *const @import("../debug/manager.zig").Manager) []const u8 {
+    if (manager.state_save_error != null) return "save-error";
+    if (manager.state_dirty) return "dirty";
+    if (manager.state_load_error != null) return "load-error";
+    if (manager.state_save_report.bytes_written > 0 or manager.state_load_report.found) return "saved";
+    return "new";
 }
 
 fn drawTaskPanel(x11: *X11, state: *LinuxGuiState) !void {

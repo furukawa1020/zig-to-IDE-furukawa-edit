@@ -5169,8 +5169,9 @@ fn drawDebugPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
     const session = &state.app.debug_manager.session;
     var header_buf: [260]u8 = undefined;
-    const header = std.fmt.bufPrint(&header_buf, "DEBUG  {s}  pending:{d}  bp:{d}  threads:{d}  watch:{d}", .{
+    const header = std.fmt.bufPrint(&header_buf, "DEBUG  {s}  store:{s}  pending:{d}  bp:{d}  threads:{d}  watch:{d}", .{
         @tagName(session.state),
+        debugStoreLabel(&state.app.debug_manager),
         session.pendingCount(),
         session.breakpoints.items.len,
         session.threads.items.len,
@@ -5268,6 +5269,14 @@ fn debugStateColor(state: @import("../debug/session.zig").DebugState) windows.CO
         .failed => rgb(255, 118, 118),
         else => rgb(127, 211, 255),
     };
+}
+
+fn debugStoreLabel(manager: *const @import("../debug/manager.zig").Manager) []const u8 {
+    if (manager.state_save_error != null) return "save-error";
+    if (manager.state_dirty) return "dirty";
+    if (manager.state_load_error != null) return "load-error";
+    if (manager.state_save_report.bytes_written > 0 or manager.state_load_report.found) return "saved";
+    return "new";
 }
 
 fn debugPanelRowsTop(rect: RECT) c_int {

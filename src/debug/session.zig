@@ -5,6 +5,7 @@ const max_collection_items: usize = 4096;
 const max_event_text_bytes: usize = 64 * 1024;
 const max_watches: usize = 64;
 const max_watch_expression_bytes: usize = 4096;
+const max_breakpoints: usize = 4096;
 
 pub const DebugState = enum {
     idle,
@@ -331,11 +332,31 @@ pub const Session = struct {
             removed.deinit(self.allocator);
             return .removed;
         }
-        try self.breakpoints.append(.{
-            .path = try self.allocator.dupe(u8, path),
-            .line = line,
-        });
+        _ = try self.addBreakpoint(path, line, true);
         return .added;
+    }
+
+    pub fn addBreakpoint(self: *Session, path: []const u8, line: usize, enabled: bool) !bool {
+        if (line == 0) return error.InvalidBreakpointLine;
+        if (path.len == 0 or path.len > std.fs.max_path_bytes) return error.InvalidBreakpointPath;
+        for (self.breakpoints.items) |breakpoint| {
+            if (breakpoint.line == line and pathEquals(breakpoint.path, path)) return false;
+        }
+        if (self.breakpoints.items.len >= max_breakpoints) return error.TooManyBreakpoints;
+
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        try self.breakpoints.append(.{
+            .path = owned_path,
+            .line = line,
+            .enabled = enabled,
+        });
+        return true;
+    }
+
+    pub fn clearBreakpoints(self: *Session) void {
+        for (self.breakpoints.items) |*breakpoint| breakpoint.deinit(self.allocator);
+        self.breakpoints.clearRetainingCapacity();
     }
 
     pub fn makeInitialize(self: *Session, adapter_id: []const u8) !Outbound {

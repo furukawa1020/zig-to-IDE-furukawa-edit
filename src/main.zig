@@ -45,6 +45,7 @@ test {
     _ = @import("debug/manager.zig");
     _ = @import("debug/protocol.zig");
     _ = @import("debug/transport.zig");
+    _ = @import("debug/workspace_state.zig");
     _ = @import("diagnostics/model.zig");
     _ = @import("diagnostics/collection.zig");
     _ = @import("diagnostics/zig_output.zig");

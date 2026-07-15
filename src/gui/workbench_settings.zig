@@ -14,6 +14,7 @@ pub const TutorialLanguage = enum {
 
 pub const BottomPanel = enum {
     output,
+    debug,
     tasks,
     git,
     extensions,
@@ -98,6 +99,7 @@ fn parseTutorialLanguage(value: []const u8) ?TutorialLanguage {
 
 fn parseBottomPanel(value: []const u8) ?BottomPanel {
     if (std.mem.eql(u8, value, "output")) return .output;
+    if (std.mem.eql(u8, value, "debug")) return .debug;
     if (std.mem.eql(u8, value, "tasks")) return .tasks;
     if (std.mem.eql(u8, value, "git")) return .git;
     if (std.mem.eql(u8, value, "extensions")) return .extensions;

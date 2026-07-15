@@ -55,12 +55,26 @@ const QuickPanelMode = enum {
 
 const BottomPanel = enum {
     output,
+    debug,
     git,
     extensions,
     diagnostics,
     security,
     tutorial,
     publish,
+};
+
+const DebugPanelAction = enum {
+    configure,
+    start,
+    continue_execution,
+    pause,
+    step_over,
+    step_into,
+    step_out,
+    breakpoint,
+    stop,
+    status,
 };
 
 const PendingLspAction = enum {
@@ -1189,6 +1203,97 @@ const GuiState = struct {
         if (std.mem.startsWith(u8, id, "release.")) {
             self.bottom_panel = .output;
         }
+        if (std.mem.startsWith(u8, id, "debug.")) {
+            self.show_output = true;
+            self.bottom_panel = .debug;
+        }
+    }
+
+    fn executeDebugPanelAction(self: *GuiState, action: DebugPanelAction) void {
+        const id = switch (action) {
+            .configure => "debug.create_config",
+            .start => "debug.start",
+            .continue_execution => "debug.continue",
+            .pause => "debug.pause",
+            .step_over => "debug.step_over",
+            .step_into => "debug.step_into",
+            .step_out => "debug.step_out",
+            .breakpoint => "debug.toggle_breakpoint",
+            .stop => "debug.stop",
+            .status => "debug.status",
+        };
+        self.executeCommand(id);
+        self.show_output = true;
+        self.bottom_panel = .debug;
+    }
+
+    fn selectDebugFrameAt(self: *GuiState, index: usize) void {
+        const session = &self.app.debug_manager.session;
+        if (index >= session.stack_frames.items.len) return;
+        const frame = session.stack_frames.items[index];
+        const frame_id = frame.id;
+        const line = if (frame.line > 0) frame.line - 1 else 0;
+        const column = if (frame.column > 0) frame.column - 1 else 0;
+        const path = if (frame.path) |value| self.allocator.dupe(u8, value) catch null else null;
+        defer if (path) |value| self.allocator.free(value);
+
+        var argument_buf: [48]u8 = undefined;
+        const argument = std.fmt.bufPrint(&argument_buf, "{d}", .{frame_id}) catch return;
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = "debug.select_frame",
+            .argument = argument,
+            .source = .command_palette,
+        }) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.handleDispatchResult("debug.select_frame", result);
+        if (path) |value| self.openDebugSourceLocation(value, line, column);
+        self.show_output = true;
+        self.bottom_panel = .debug;
+    }
+
+    fn expandDebugVariableAt(self: *GuiState, index: usize) void {
+        const variables = self.app.debug_manager.session.variables.items;
+        if (index >= variables.len) return;
+        const reference = variables[index].variables_reference;
+        if (reference <= 0) {
+            self.setMessage("Debug variable has no children") catch {};
+            return;
+        }
+        var argument_buf: [48]u8 = undefined;
+        const argument = std.fmt.bufPrint(&argument_buf, "{d}", .{reference}) catch return;
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = "debug.variables",
+            .argument = argument,
+            .source = .command_palette,
+        }) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.handleDispatchResult("debug.variables", result);
+    }
+
+    fn openDebugSourceLocation(self: *GuiState, path: []const u8, line: usize, column: usize) void {
+        const index = (if (std.fs.path.isAbsolute(path))
+            self.app.openWorkspacePath(path)
+        else
+            self.app.openWorkspaceFile(path)) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "debug source blocked: {s}: {s}\n", .{ path, @errorName(err) });
+            return;
+        };
+        const doc = &self.app.documents.documents.items[index];
+        const safe_line = @min(line, if (doc.text.lineCount() == 0) 0 else doc.text.lineCount() - 1);
+        const safe_column = @min(column, doc.text.lineSlice(safe_line).len);
+        const offset = doc.text.lineColumnToOffset(safe_line, safe_column) catch 0;
+        navigation.setCursor(doc, doc.positionFromOffset(offset) catch doc.cursor.position);
+        self.clearSelection();
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureCursorVisible();
+        self.syncActiveDocumentToLsp();
+        self.setMessage("Opened debug stack frame") catch {};
     }
 
     fn executeGitPanelAction(self: *GuiState, action: GitPanelAction) void {
@@ -2619,6 +2724,14 @@ const GuiState = struct {
         return true;
     }
 
+    fn pumpDebug(self: *GuiState) bool {
+        const result = dispatcher.pumpDebug(&self.app) catch |err| {
+            self.appendOutput(.stderr, "debug pump failed: {s}\n", .{@errorName(err)});
+            return true;
+        };
+        return result.frames > 0 or result.stderr_bytes > 0 or result.protocol_violation or result.adapter_closed;
+    }
+
     fn pollExternalFileChanges(self: *GuiState) bool {
         var batch = self.file_watcher.poll(self.app.documents.documents.items) catch |err| {
             self.appendOutput(.stderr, "file watcher failed: {s}\n", .{@errorName(err)});
@@ -3612,6 +3725,7 @@ const GuiState = struct {
     fn scrollBottomPanel(self: *GuiState, layout: Layout, delta: isize) void {
         switch (self.bottom_panel) {
             .output => self.scrollOutput(delta),
+            .debug => {},
             .git => {
                 const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
                 const total = if (self.git_overview) |overview| gitPanelRowCount(overview) else 0;
@@ -3802,6 +3916,16 @@ const GuiState = struct {
                 return;
             }
             if (y < HEADER_HEIGHT) return;
+            if (x >= layout.editor.left and x < layout.editor.left + 18) {
+                const position = self.editorPositionFromPoint(layout, x, y) orelse return;
+                if (self.app.documents.active()) |doc| navigation.setCursor(doc, position);
+                self.clearSelection();
+                self.app.focus = .editor;
+                self.app.mode = .insert;
+                self.ensureCursorVisible();
+                self.executeDebugPanelAction(.breakpoint);
+                return;
+            }
             if (isKeyDown(VK_MENU)) {
                 const position = self.editorPositionFromPoint(layout, x, y) orelse return;
                 self.toggleSecondaryCursor(position.byte_offset);
@@ -3833,6 +3957,21 @@ const GuiState = struct {
                 if (panel == .git and self.git_overview == null) self.refreshGitOverview();
                 if (panel == .extensions and self.extensions_registry == null) self.refreshExtensionsRegistry();
                 return;
+            }
+            if (self.bottom_panel == .debug) {
+                const content = bottomPanelContentRect(layout.output);
+                if (debugPanelActionAt(content, x, y)) |action| {
+                    self.executeDebugPanelAction(action);
+                    return;
+                }
+                if (debugPanelStackRowAt(content, x, y)) |row| {
+                    self.selectDebugFrameAt(row);
+                    return;
+                }
+                if (debugPanelVariableRowAt(content, x, y)) |row| {
+                    self.expandDebugVariableAt(row);
+                    return;
+                }
             }
             if (self.bottom_panel == .git) {
                 const content = bottomPanelContentRect(layout.output);
@@ -3878,6 +4017,7 @@ const GuiState = struct {
             }
             switch (self.bottom_panel) {
                 .output => self.openConsoleLineAt(layout, y),
+                .debug => {},
                 .git => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.openGitPanelRow(self.git_scroll_line + row),
                 .extensions => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.openExtensionPanelRow(self.extensions_scroll_line + row),
                 .diagnostics => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToDiagnostic(self.diagnostics_scroll_line + row),
@@ -3953,6 +4093,7 @@ fn windowProc(hwnd: windows.HWND, msg: windows.UINT, wparam: WPARAM, lparam: win
             if (wparam == LSP_PUMP_TIMER_ID) {
                 if (global_state) |state| {
                     var redraw = state.pumpLsp();
+                    redraw = state.pumpDebug() or redraw;
                     state.file_watch_ticks +%= 1;
                     if (state.file_watch_ticks >= 8) {
                         state.file_watch_ticks = 0;
@@ -4085,6 +4226,28 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         state.openQuickPanel(.replace_document);
         return;
     }
+    if (key == VK_F5) {
+        if (shift) {
+            state.executeDebugPanelAction(.stop);
+        } else if (state.app.debug_manager.session.state == .paused) {
+            state.executeDebugPanelAction(.continue_execution);
+        } else {
+            state.executeDebugPanelAction(.start);
+        }
+        return;
+    }
+    if (key == VK_F9) {
+        state.executeDebugPanelAction(.breakpoint);
+        return;
+    }
+    if (key == VK_F10) {
+        state.executeDebugPanelAction(.step_over);
+        return;
+    }
+    if (key == VK_F11) {
+        state.executeDebugPanelAction(if (shift) .step_out else .step_into);
+        return;
+    }
     if (key == VK_F1) {
         state.openTutorialPanel();
         return;
@@ -4200,7 +4363,11 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         return;
     }
     if (key == VK_F6) {
-        state.show_output = !state.show_output;
+        if (state.app.debug_manager.isRunning()) {
+            state.executeDebugPanelAction(.pause);
+        } else {
+            state.show_output = !state.show_output;
+        }
         return;
     }
     if (ctrl and alt and key == VK_UP and state.app.focus == .editor) {
@@ -4526,8 +4693,16 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
                 fillRect(hdc, RECT{ .left = editor.left + GUTTER_WIDTH, .top = y - 2, .right = editor.right, .bottom = y + ROW_HEIGHT - 2 }, markerBackgroundColor(marker));
                 fillRect(hdc, RECT{ .left = editor.left + GUTTER_WIDTH - 5, .top = y - 2, .right = editor.left + GUTTER_WIDTH - 1, .bottom = y + ROW_HEIGHT - 2 }, markerStripeColor(marker));
             }
-            if (current_line) {
+            if (current_line and !marker.active_execution) {
                 fillRect(hdc, RECT{ .left = editor.left + GUTTER_WIDTH, .top = y - 2, .right = editor.right, .bottom = y + ROW_HEIGHT - 2 }, rgb(20, 27, 34));
+            }
+            if (marker.breakpoint_verified) |verified| {
+                fillRect(hdc, RECT{
+                    .left = editor.left + 5,
+                    .top = y + 3,
+                    .right = editor.left + 13,
+                    .bottom = y + 11,
+                }, if (verified) rgb(112, 220, 154) else rgb(255, 118, 118));
             }
             drawSearchHighlightsForLine(hdc, state, editor, doc, line, y);
             if (selection) |range| {
@@ -4721,9 +4896,11 @@ fn drawEditorHeader(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
 const EditorLineMarker = struct {
     severity: ?types.Severity = null,
     risk: ?findings_mod.Risk = null,
+    breakpoint_verified: ?bool = null,
+    active_execution: bool = false,
 
     fn hasAny(self: EditorLineMarker) bool {
-        return self.severity != null or self.risk != null;
+        return self.severity != null or self.risk != null or self.breakpoint_verified != null or self.active_execution;
     }
 };
 
@@ -4747,16 +4924,36 @@ fn editorLineMarker(state: *const GuiState, document_path: ?[]const u8, line: us
         }
     }
 
+    for (state.app.debug_manager.session.breakpoints.items) |breakpoint| {
+        if (!breakpoint.enabled or breakpoint.line != line + 1) continue;
+        if (!pathMatches(path, breakpoint.path)) continue;
+        marker.breakpoint_verified = breakpoint.verified;
+        break;
+    }
+
+    if (state.app.debug_manager.session.active_frame_id) |active_id| {
+        for (state.app.debug_manager.session.stack_frames.items) |frame| {
+            if (frame.id != active_id or frame.line != line + 1) continue;
+            const frame_path = frame.path orelse continue;
+            if (!pathMatches(path, frame_path)) continue;
+            marker.active_execution = true;
+            break;
+        }
+    }
+
     return marker;
 }
 
 fn markerStripeColor(marker: EditorLineMarker) windows.COLORREF {
+    if (marker.active_execution) return rgb(255, 207, 92);
+    if (marker.breakpoint_verified) |verified| return if (verified) rgb(112, 220, 154) else rgb(255, 118, 118);
     if (marker.risk) |risk| return riskColor(risk);
     if (marker.severity) |severity| return severityColor(severity);
     return rgb(121, 133, 145);
 }
 
 fn markerBackgroundColor(marker: EditorLineMarker) windows.COLORREF {
+    if (marker.active_execution) return rgb(45, 39, 22);
     if (marker.risk) |risk| {
         return switch (risk) {
             .critical, .high => rgb(39, 19, 24),
@@ -4771,6 +4968,7 @@ fn markerBackgroundColor(marker: EditorLineMarker) windows.COLORREF {
             .info => rgb(18, 28, 34),
         };
     }
+    if (marker.breakpoint_verified != null) return rgb(18, 34, 29);
     return rgb(20, 27, 34);
 }
 
@@ -4826,6 +5024,7 @@ fn drawOutput(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
             }
             drawConsoleOutput(hdc, state, consoleOutputRect(layout, state));
         },
+        .debug => drawDebugPanel(hdc, state, content),
         .git => drawGitPanel(hdc, state, content),
         .extensions => drawExtensionsPanel(hdc, state, content),
         .diagnostics => drawDiagnosticsPanel(hdc, state, content),
@@ -4839,6 +5038,7 @@ fn drawBottomPanelTabs(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + HEADER_HEIGHT }, rgb(12, 16, 20));
     fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
     drawBottomPanelTab(hdc, rect, .output, state.bottom_panel == .output, "OUTPUT");
+    drawBottomPanelTab(hdc, rect, .debug, state.bottom_panel == .debug, "DEBUG");
     drawBottomPanelTab(hdc, rect, .git, state.bottom_panel == .git, "GIT");
     drawBottomPanelTab(hdc, rect, .extensions, state.bottom_panel == .extensions, "EXT");
     drawBottomPanelTab(hdc, rect, .diagnostics, state.bottom_panel == .diagnostics, "DIAG");
@@ -4883,6 +5083,165 @@ fn drawConsoleOutput(hdc: windows.HDC, state: *GuiState, output: RECT) void {
     if (lines.len == 0) {
         drawText(hdc, output.left + 16, output.top + HEADER_HEIGHT, rgb(116, 128, 140), "No output yet");
     }
+}
+
+fn drawDebugPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
+    fillRect(hdc, rect, rgb(10, 12, 14));
+    fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
+    const session = &state.app.debug_manager.session;
+    var header_buf: [260]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "DEBUG  {s}  pending:{d}  bp:{d}  threads:{d}", .{
+        @tagName(session.state),
+        session.pendingCount(),
+        session.breakpoints.items.len,
+        session.threads.items.len,
+    }) catch "DEBUG";
+    const header_right = if (debugPanelHasActionButtons(rect)) debugPanelActionButtonRect(rect, .start).left - 10 else rect.right - 16;
+    drawTextClipped(hdc, rect.left + 16, rect.top + 10, header_right, debugStateColor(session.state), header);
+    drawDebugPanelActions(hdc, rect);
+
+    var policy_buf: [640]u8 = undefined;
+    const policy = std.fmt.bufPrint(&policy_buf, "policy env:{s} fs:{s} net:{s} reverse-launch:deny frame:8MiB  F5 run/continue  F9 breakpoint  F10/F11 step", .{
+        @tagName(state.app.debug_manager.env_policy),
+        @tagName(state.app.debug_manager.fs_policy),
+        @tagName(state.app.debug_manager.network_policy),
+    }) catch "debug policy";
+    drawTextClipped(hdc, rect.left + 16, rect.top + 42, rect.right - 16, rgb(116, 128, 140), policy);
+
+    var y = rect.top + 66;
+    if (state.app.debug_manager.plan) |plan| {
+        var plan_buf: [900]u8 = undefined;
+        const plan_line = std.fmt.bufPrint(&plan_buf, "adapter {s}  program {s}", .{ plan.adapter_argv[0], plan.program }) catch plan.program;
+        drawTextClipped(hdc, rect.left + 16, y, rect.right - 16, rgb(127, 211, 255), plan_line);
+        y += ROW_HEIGHT;
+    } else {
+        drawTextClipped(hdc, rect.left + 16, y, rect.right - 16, rgb(116, 128, 140), "No active adapter. Add .zide/debug.json or select a Python file, then press START.");
+        y += ROW_HEIGHT;
+    }
+
+    var state_buf: [420]u8 = undefined;
+    const state_line = std.fmt.bufPrint(&state_buf, "stop:{s}  active thread:{any} frame:{any}  stack:{d} scopes:{d} vars:{d}", .{
+        session.stop_reason orelse "-",
+        session.active_thread_id,
+        session.active_frame_id,
+        session.stack_frames.items.len,
+        session.scopes.items.len,
+        session.variables.items.len,
+    }) catch "debug state";
+    drawTextClipped(hdc, rect.left + 16, y, rect.right - 16, rgb(255, 207, 92), state_line);
+    y += ROW_HEIGHT;
+
+    y = debugPanelRowsTop(rect);
+    const left_right = rect.left + @divTrunc(rect.right - rect.left, 2) - 8;
+    var row: usize = 0;
+    while (row < 4 and y + @as(c_int, @intCast(row * ROW_HEIGHT)) < rect.bottom) : (row += 1) {
+        const row_y = y + @as(c_int, @intCast(row * ROW_HEIGHT));
+        if (row < session.stack_frames.items.len) {
+            const frame = session.stack_frames.items[row];
+            var frame_buf: [520]u8 = undefined;
+            const text = std.fmt.bufPrint(&frame_buf, "{s} #{d} {s}  {s}:{d}", .{
+                if (session.active_frame_id == frame.id) ">" else " ",
+                frame.id,
+                frame.name,
+                frame.path orelse "(no source)",
+                frame.line,
+            }) catch frame.name;
+            drawTextClipped(hdc, rect.left + 16, row_y, left_right, if (session.active_frame_id == frame.id) rgb(255, 207, 92) else rgb(200, 207, 216), text);
+        }
+        if (row < session.variables.items.len) {
+            const variable = session.variables.items[row];
+            var variable_buf: [520]u8 = undefined;
+            const text = std.fmt.bufPrint(&variable_buf, "{s} {s}: {s}  ({s})", .{
+                if (variable.variables_reference > 0) "+" else " ",
+                variable.name,
+                variable.value,
+                variable.type_name orelse "?",
+            }) catch variable.name;
+            drawTextClipped(hdc, left_right + 16, row_y, rect.right - 16, rgb(165, 214, 167), text);
+        }
+    }
+}
+
+fn debugStateColor(state: @import("../debug/session.zig").DebugState) windows.COLORREF {
+    return switch (state) {
+        .paused => rgb(255, 207, 92),
+        .running, .launching, .configuring, .initializing => rgb(79, 230, 226),
+        .failed => rgb(255, 118, 118),
+        else => rgb(127, 211, 255),
+    };
+}
+
+fn debugPanelRowsTop(rect: RECT) c_int {
+    return rect.top + 66 + ROW_HEIGHT * 2;
+}
+
+fn debugPanelStackRowAt(rect: RECT, x: c_int, y: c_int) ?usize {
+    const split = rect.left + @divTrunc(rect.right - rect.left, 2) - 8;
+    if (x < rect.left + 8 or x >= split) return null;
+    return debugPanelDataRowAt(rect, y);
+}
+
+fn debugPanelVariableRowAt(rect: RECT, x: c_int, y: c_int) ?usize {
+    const split = rect.left + @divTrunc(rect.right - rect.left, 2) - 8;
+    if (x < split or x >= rect.right - 8) return null;
+    return debugPanelDataRowAt(rect, y);
+}
+
+fn debugPanelDataRowAt(rect: RECT, y: c_int) ?usize {
+    const top = debugPanelRowsTop(rect) - 3;
+    if (y < top or y >= top + ROW_HEIGHT * 4) return null;
+    return @intCast(@divTrunc(y - top, ROW_HEIGHT));
+}
+
+fn drawDebugPanelActions(hdc: windows.HDC, rect: RECT) void {
+    if (!debugPanelHasActionButtons(rect)) return;
+    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .breakpoint, .stop, .status };
+    for (actions) |action| drawButton(hdc, debugPanelActionButtonRect(rect, action), debugPanelActionLabel(action));
+}
+
+fn debugPanelActionAt(rect: RECT, x: c_int, y: c_int) ?DebugPanelAction {
+    if (!debugPanelHasActionButtons(rect) or y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
+    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .breakpoint, .stop, .status };
+    for (actions) |action| if (pointIn(debugPanelActionButtonRect(rect, action), x, y)) return action;
+    return null;
+}
+
+fn debugPanelHasActionButtons(rect: RECT) bool {
+    return rect.right - rect.left >= 824;
+}
+
+fn debugPanelActionButtonRect(rect: RECT, action: DebugPanelAction) RECT {
+    const width: c_int = 58;
+    const gap: c_int = 6;
+    const slot: c_int = switch (action) {
+        .status => 0,
+        .stop => 1,
+        .breakpoint => 2,
+        .step_out => 3,
+        .step_into => 4,
+        .step_over => 5,
+        .pause => 6,
+        .continue_execution => 7,
+        .start => 8,
+        .configure => 9,
+    };
+    const right = rect.right - 12 - slot * (width + gap);
+    return .{ .left = right - width, .top = rect.top + 7, .right = right, .bottom = rect.top + 31 };
+}
+
+fn debugPanelActionLabel(action: DebugPanelAction) []const u8 {
+    return switch (action) {
+        .configure => "CFG",
+        .start => "START",
+        .continue_execution => "CONT",
+        .pause => "PAUSE",
+        .step_over => "OVER",
+        .step_into => "INTO",
+        .step_out => "OUT",
+        .breakpoint => "BP",
+        .stop => "STOP",
+        .status => "INFO",
+    };
 }
 
 fn drawGitPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
@@ -6410,12 +6769,13 @@ fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
     const gap: c_int = 6;
     const index: c_int = switch (panel) {
         .output => 0,
-        .git => 1,
-        .extensions => 2,
-        .diagnostics => 3,
-        .security => 4,
-        .tutorial => 5,
-        .publish => 6,
+        .debug => 1,
+        .git => 2,
+        .extensions => 3,
+        .diagnostics => 4,
+        .security => 5,
+        .tutorial => 6,
+        .publish => 7,
     };
     const left = rect.left + 12 + index * (width + gap);
     return .{ .left = left, .top = rect.top + 9, .right = left + width, .bottom = rect.top + 33 };
@@ -6423,7 +6783,7 @@ fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
 
 fn bottomPanelTabAt(rect: RECT, x: c_int, y: c_int) ?BottomPanel {
     if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const panels = [_]BottomPanel{ .output, .git, .extensions, .diagnostics, .security, .tutorial, .publish };
+    const panels = [_]BottomPanel{ .output, .debug, .git, .extensions, .diagnostics, .security, .tutorial, .publish };
     for (panels) |panel| {
         if (pointIn(bottomPanelTabRect(rect, panel), x, y)) return panel;
     }
@@ -7227,9 +7587,13 @@ const VK_DELETE: WPARAM = 0x2E;
 const VK_F1: WPARAM = 0x70;
 const VK_F2: WPARAM = 0x71;
 const VK_F3: WPARAM = 0x72;
+const VK_F5: WPARAM = 0x74;
 const VK_F6: WPARAM = 0x75;
 const VK_F7: WPARAM = 0x76;
 const VK_F8: WPARAM = 0x77;
+const VK_F9: WPARAM = 0x78;
+const VK_F10: WPARAM = 0x79;
+const VK_F11: WPARAM = 0x7A;
 const VK_F12: WPARAM = 0x7B;
 const LSP_PUMP_TIMER_ID: WPARAM = 29;
 

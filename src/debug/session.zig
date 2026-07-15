@@ -1,5 +1,6 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const debug_breakpoint = @import("../security/debug_breakpoint.zig");
 
 const max_collection_items: usize = 4096;
 const max_event_text_bytes: usize = 64 * 1024;
@@ -76,6 +77,7 @@ pub const Breakpoint = struct {
     enabled: bool = true,
     condition: ?[]u8 = null,
     hit_condition: ?[]u8 = null,
+    log_message: ?[]u8 = null,
     verified: bool = false,
     adapter_id: ?i64 = null,
     resolved_line: ?usize = null,
@@ -85,6 +87,7 @@ pub const Breakpoint = struct {
         allocator.free(self.path);
         if (self.condition) |value| allocator.free(value);
         if (self.hit_condition) |value| allocator.free(value);
+        if (self.log_message) |value| allocator.free(value);
         if (self.message) |value| allocator.free(value);
         self.* = undefined;
     }
@@ -213,6 +216,23 @@ pub const IngestResult = union(enum) {
 
 pub const ToggleResult = enum { added, removed };
 
+pub const BreakpointProperty = debug_breakpoint.Property;
+
+pub const BreakpointUpdateResult = enum {
+    created,
+    updated,
+    unchanged,
+};
+
+pub const BreakpointSpec = struct {
+    path: []const u8,
+    line: usize,
+    enabled: bool = true,
+    condition: ?[]const u8 = null,
+    hit_condition: ?[]const u8 = null,
+    log_message: ?[]const u8 = null,
+};
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     workspace_root: []u8,
@@ -337,21 +357,121 @@ pub const Session = struct {
     }
 
     pub fn addBreakpoint(self: *Session, path: []const u8, line: usize, enabled: bool) !bool {
-        if (line == 0) return error.InvalidBreakpointLine;
-        if (path.len == 0 or path.len > std.fs.max_path_bytes) return error.InvalidBreakpointPath;
+        return self.addConfiguredBreakpoint(.{ .path = path, .line = line, .enabled = enabled });
+    }
+
+    pub fn addConfiguredBreakpoint(self: *Session, spec: BreakpointSpec) !bool {
+        if (spec.line == 0) return error.InvalidBreakpointLine;
+        if (spec.path.len == 0 or spec.path.len > std.fs.max_path_bytes) return error.InvalidBreakpointPath;
         for (self.breakpoints.items) |breakpoint| {
-            if (breakpoint.line == line and pathEquals(breakpoint.path, path)) return false;
+            if (breakpoint.line == spec.line and pathEquals(breakpoint.path, spec.path)) return false;
         }
         if (self.breakpoints.items.len >= max_breakpoints) return error.TooManyBreakpoints;
 
-        const owned_path = try self.allocator.dupe(u8, path);
+        const condition = if (spec.condition) |value| try debug_breakpoint.validateCondition(value) else null;
+        const hit_condition = if (spec.hit_condition) |value| try debug_breakpoint.validateHitCondition(value) else null;
+        const log_message = if (spec.log_message) |value| try debug_breakpoint.validateLogMessage(value) else null;
+
+        const owned_path = try self.allocator.dupe(u8, spec.path);
         errdefer self.allocator.free(owned_path);
+        const owned_condition = if (condition) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_condition) |value| self.allocator.free(value);
+        const owned_hit_condition = if (hit_condition) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_hit_condition) |value| self.allocator.free(value);
+        const owned_log_message = if (log_message) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_log_message) |value| self.allocator.free(value);
         try self.breakpoints.append(.{
             .path = owned_path,
-            .line = line,
-            .enabled = enabled,
+            .line = spec.line,
+            .enabled = spec.enabled,
+            .condition = owned_condition,
+            .hit_condition = owned_hit_condition,
+            .log_message = owned_log_message,
         });
         return true;
+    }
+
+    pub fn setBreakpointProperty(
+        self: *Session,
+        path: []const u8,
+        line: usize,
+        property: BreakpointProperty,
+        raw_value: []const u8,
+    ) !BreakpointUpdateResult {
+        const value = try debug_breakpoint.validate(property, raw_value);
+        for (self.breakpoints.items) |*breakpoint| {
+            if (breakpoint.line != line or !pathEquals(breakpoint.path, path)) continue;
+            const destination = switch (property) {
+                .condition => &breakpoint.condition,
+                .hit_condition => &breakpoint.hit_condition,
+                .log_message => &breakpoint.log_message,
+            };
+            if (destination.*) |existing| {
+                if (std.mem.eql(u8, existing, value)) return .unchanged;
+            }
+            const owned = try self.allocator.dupe(u8, value);
+            if (destination.*) |existing| self.allocator.free(existing);
+            destination.* = owned;
+            breakpoint.verified = false;
+            breakpoint.adapter_id = null;
+            breakpoint.resolved_line = null;
+            if (breakpoint.message) |message| self.allocator.free(message);
+            breakpoint.message = null;
+            return .updated;
+        }
+
+        var spec: BreakpointSpec = .{ .path = path, .line = line };
+        switch (property) {
+            .condition => spec.condition = value,
+            .hit_condition => spec.hit_condition = value,
+            .log_message => spec.log_message = value,
+        }
+        _ = try self.addConfiguredBreakpoint(spec);
+        return .created;
+    }
+
+    pub fn clearBreakpointProperties(self: *Session, path: []const u8, line: usize) bool {
+        for (self.breakpoints.items) |*breakpoint| {
+            if (breakpoint.line != line or !pathEquals(breakpoint.path, path)) continue;
+            if (breakpoint.condition) |value| self.allocator.free(value);
+            if (breakpoint.hit_condition) |value| self.allocator.free(value);
+            if (breakpoint.log_message) |value| self.allocator.free(value);
+            breakpoint.condition = null;
+            breakpoint.hit_condition = null;
+            breakpoint.log_message = null;
+            breakpoint.verified = false;
+            breakpoint.adapter_id = null;
+            breakpoint.resolved_line = null;
+            if (breakpoint.message) |message| self.allocator.free(message);
+            breakpoint.message = null;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn capabilitiesKnown(self: *const Session) bool {
+        return switch (self.state) {
+            .idle, .initializing => false,
+            else => true,
+        };
+    }
+
+    pub fn breakpointSupported(self: *const Session, breakpoint: Breakpoint) bool {
+        if (!self.capabilitiesKnown()) return true;
+        if (breakpoint.condition != null and !self.capabilities.supports_conditional_breakpoints) return false;
+        if (breakpoint.hit_condition != null and !self.capabilities.supports_hit_conditional_breakpoints) return false;
+        if (breakpoint.log_message != null and !self.capabilities.supports_log_points) return false;
+        return true;
+    }
+
+    pub fn unsupportedBreakpointCountForPath(self: *const Session, path: []const u8) usize {
+        if (!self.capabilitiesKnown()) return 0;
+        var count: usize = 0;
+        for (self.breakpoints.items) |breakpoint| {
+            if (!breakpoint.enabled or !pathEquals(breakpoint.path, path)) continue;
+            if (!self.breakpointSupported(breakpoint)) count += 1;
+        }
+        return count;
     }
 
     pub fn clearBreakpoints(self: *Session) void {
@@ -378,10 +498,12 @@ pub const Session = struct {
         defer items.deinit();
         for (self.breakpoints.items) |breakpoint| {
             if (!breakpoint.enabled or !pathEquals(breakpoint.path, path)) continue;
+            if (!self.breakpointSupported(breakpoint)) continue;
             try items.append(.{
                 .line = breakpoint.line,
                 .condition = breakpoint.condition,
                 .hit_condition = breakpoint.hit_condition,
+                .log_message = breakpoint.log_message,
             });
         }
         const seq = self.takeSeq();
@@ -985,6 +1107,49 @@ test "DAP session tracks breakpoints and rejects reverse execution requests" {
     );
     try std.testing.expectEqual(ReverseRequestKind.run_in_terminal, reverse.reverse_request.kind);
     try std.testing.expectEqualStrings("runInTerminal", session.last_reverse_command.?);
+}
+
+test "DAP session validates and emits advanced source breakpoints" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+    session.state = .initialized;
+    session.capabilities.supports_conditional_breakpoints = true;
+    session.capabilities.supports_hit_conditional_breakpoints = true;
+    session.capabilities.supports_log_points = true;
+
+    try std.testing.expectEqual(BreakpointUpdateResult.created, try session.setBreakpointProperty("/repo/main.zig", 12, .condition, "value > 4"));
+    try std.testing.expectEqual(BreakpointUpdateResult.updated, try session.setBreakpointProperty("/repo/main.zig", 12, .hit_condition, "3"));
+    try std.testing.expectEqual(BreakpointUpdateResult.updated, try session.setBreakpointProperty("/repo/main.zig", 12, .log_message, "value {value}"));
+    try std.testing.expectEqual(BreakpointUpdateResult.unchanged, try session.setBreakpointProperty("/repo/main.zig", 12, .hit_condition, "3"));
+
+    var outbound = try session.makeSetBreakpoints("/repo/main.zig");
+    defer outbound.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "\"condition\":\"value > 4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "\"hitCondition\":\"3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "\"logMessage\":\"value {value}\"") != null);
+
+    try std.testing.expect(session.clearBreakpointProperties("/repo/main.zig", 12));
+    try std.testing.expect(session.breakpoints.items[0].condition == null);
+    try std.testing.expect(session.breakpoints.items[0].hit_condition == null);
+    try std.testing.expect(session.breakpoints.items[0].log_message == null);
+}
+
+test "DAP session withholds unsupported advanced breakpoints without downgrade" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+    _ = try session.addConfiguredBreakpoint(.{
+        .path = "/repo/main.zig",
+        .line = 7,
+        .condition = "ready == true",
+    });
+    session.state = .initialized;
+    try std.testing.expectEqual(@as(usize, 1), session.unsupportedBreakpointCountForPath("/repo/main.zig"));
+
+    var outbound = try session.makeSetBreakpoints("/repo/main.zig");
+    defer outbound.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "\"breakpoints\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "ready == true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "\"line\":7") == null);
 }
 
 test "DAP session evaluates persistent watches and ignores stale results" {

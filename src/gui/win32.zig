@@ -29,6 +29,7 @@ const findings_mod = @import("../security/findings.zig");
 const text_integrity = @import("../security/text_integrity.zig");
 const console_mod = @import("../tasks/console.zig");
 const task_registry = @import("../tasks/registry.zig");
+const debug_session = @import("../debug/session.zig");
 
 const QuickPanelMode = enum {
     find_file,
@@ -52,6 +53,10 @@ const QuickPanelMode = enum {
     code_actions,
     language_mode,
     debug_watch,
+    debug_breakpoint,
+    debug_breakpoint_condition,
+    debug_breakpoint_hit,
+    debug_breakpoint_log,
 };
 
 const BottomPanel = enum {
@@ -74,6 +79,7 @@ const DebugPanelAction = enum {
     step_into,
     step_out,
     breakpoint,
+    advanced_breakpoint,
     watch,
     stop,
     status,
@@ -323,6 +329,8 @@ const QuickPanel = struct {
             .code_actions => self.code_action_count,
             .language_mode => if (self.language_matches) |items| items.len else 0,
             .debug_watch => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else self.debug_watch_count,
+            .debug_breakpoint => 4,
+            .debug_breakpoint_condition, .debug_breakpoint_hit, .debug_breakpoint_log => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else 0,
         };
     }
 
@@ -447,6 +455,7 @@ const QuickPanel = struct {
             },
             .new_file, .new_folder, .rename_path, .delete_path => {},
             .debug_watch => self.debug_watch_count = app.debug_manager.session.watches.items.len,
+            .debug_breakpoint, .debug_breakpoint_condition, .debug_breakpoint_hit, .debug_breakpoint_log => {},
             .document_symbols => {
                 const active_index = app.documents.activeIndex() orelse return;
                 const doc = &app.documents.documents.items[active_index];
@@ -1041,6 +1050,18 @@ const GuiState = struct {
             self.openQuickPanel(.debug_watch);
             return;
         }
+        if (std.mem.eql(u8, id, "debug.breakpoint_condition")) {
+            self.openBreakpointValueEditor(.debug_breakpoint_condition);
+            return;
+        }
+        if (std.mem.eql(u8, id, "debug.breakpoint_hit_condition")) {
+            self.openBreakpointValueEditor(.debug_breakpoint_hit);
+            return;
+        }
+        if (std.mem.eql(u8, id, "debug.breakpoint_log")) {
+            self.openBreakpointValueEditor(.debug_breakpoint_log);
+            return;
+        }
         if (std.mem.eql(u8, id, "file.new")) {
             self.openNewFilePanel();
             return;
@@ -1226,6 +1247,12 @@ const GuiState = struct {
             self.bottom_panel = .debug;
             return;
         }
+        if (action == .advanced_breakpoint) {
+            self.openQuickPanel(.debug_breakpoint);
+            self.show_output = true;
+            self.bottom_panel = .debug;
+            return;
+        }
         const id = switch (action) {
             .configure => "debug.create_config",
             .start => "debug.start",
@@ -1235,11 +1262,80 @@ const GuiState = struct {
             .step_into => "debug.step_into",
             .step_out => "debug.step_out",
             .breakpoint => "debug.toggle_breakpoint",
+            .advanced_breakpoint => unreachable,
             .watch => unreachable,
             .stop => "debug.stop",
             .status => "debug.status",
         };
         self.executeCommand(id);
+        self.show_output = true;
+        self.bottom_panel = .debug;
+    }
+
+    fn currentLineBreakpoint(self: *const GuiState) ?*const debug_session.Breakpoint {
+        const document_index = self.app.documents.activeIndex() orelse return null;
+        const doc = &self.app.documents.documents.items[document_index];
+        const path = doc.path orelse return null;
+        const line = doc.cursor.position.line + 1;
+        for (self.app.debug_manager.session.breakpoints.items) |*breakpoint| {
+            if (breakpoint.line == line and pathMatches(path, breakpoint.path)) return breakpoint;
+        }
+        return null;
+    }
+
+    fn openBreakpointValueEditor(self: *GuiState, mode: QuickPanelMode) void {
+        self.openQuickPanel(mode);
+        if (!self.quick_panel.visible) return;
+        const breakpoint = self.currentLineBreakpoint();
+        const existing = if (breakpoint) |item| switch (mode) {
+            .debug_breakpoint_condition => item.condition,
+            .debug_breakpoint_hit => item.hit_condition,
+            .debug_breakpoint_log => item.log_message,
+            else => null,
+        } else null;
+        if (existing) |value| {
+            self.quick_panel.query.appendSlice(value) catch |err| return self.setError(err) catch {};
+            self.quick_panel.rebuild(&self.app) catch |err| self.setError(err) catch {};
+        }
+    }
+
+    fn executeBreakpointMenuItem(self: *GuiState) void {
+        switch (@min(self.quick_panel.selected_index, @as(usize, 3))) {
+            0 => self.openBreakpointValueEditor(.debug_breakpoint_condition),
+            1 => self.openBreakpointValueEditor(.debug_breakpoint_hit),
+            2 => self.openBreakpointValueEditor(.debug_breakpoint_log),
+            3 => {
+                const result = dispatcher.dispatch(&self.app, .{
+                    .id = "debug.breakpoint_clear_advanced",
+                    .source = .command_palette,
+                }) catch |err| return self.setError(err) catch {};
+                self.handleDispatchResult("debug.breakpoint_clear_advanced", result);
+                if (std.meta.activeTag(result) == .completed) self.quick_panel.close();
+            },
+        }
+        self.show_output = true;
+        self.bottom_panel = .debug;
+    }
+
+    fn applyBreakpointValueEditor(self: *GuiState, mode: QuickPanelMode) void {
+        const value = std.mem.trim(u8, self.quick_panel.query.items, " \t\r\n");
+        if (value.len == 0) {
+            self.setMessage("Breakpoint value cannot be empty; use Clear advanced settings") catch {};
+            return;
+        }
+        const id = switch (mode) {
+            .debug_breakpoint_condition => "debug.breakpoint_condition",
+            .debug_breakpoint_hit => "debug.breakpoint_hit_condition",
+            .debug_breakpoint_log => "debug.breakpoint_log",
+            else => return,
+        };
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = id,
+            .argument = value,
+            .source = .command_palette,
+        }) catch |err| return self.setError(err) catch {};
+        self.handleDispatchResult(id, result);
+        if (std.meta.activeTag(result) == .completed) self.quick_panel.close();
         self.show_output = true;
         self.bottom_panel = .debug;
     }
@@ -1608,6 +1704,10 @@ const GuiState = struct {
             .code_actions => "Quick Fix",
             .language_mode => "Language mode",
             .debug_watch => "Add restricted debug watch",
+            .debug_breakpoint => "Advanced breakpoint",
+            .debug_breakpoint_condition => "Restricted breakpoint condition",
+            .debug_breakpoint_hit => "Breakpoint hit count",
+            .debug_breakpoint_log => "Restricted logpoint",
         }) catch {};
         if (mode == .completion and !self.requestCompletionFromLsp()) self.ensureLspForFeature("completion", .completion);
     }
@@ -2069,6 +2169,8 @@ const GuiState = struct {
                 self.show_output = true;
                 self.bottom_panel = .debug;
             },
+            .debug_breakpoint => self.executeBreakpointMenuItem(),
+            .debug_breakpoint_condition, .debug_breakpoint_hit, .debug_breakpoint_log => self.applyBreakpointValueEditor(self.quick_panel.mode),
         }
     }
 
@@ -4781,7 +4883,7 @@ fn drawEditor(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
                     .top = y + 3,
                     .right = editor.left + 13,
                     .bottom = y + 11,
-                }, if (verified) rgb(112, 220, 154) else rgb(255, 118, 118));
+                }, breakpointMarkerColor(marker, verified));
             }
             drawSearchHighlightsForLine(hdc, state, editor, doc, line, y);
             if (selection) |range| {
@@ -4972,10 +5074,13 @@ fn drawEditorHeader(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
     }
 }
 
+const BreakpointVisualKind = enum { normal, hit, condition, log };
+
 const EditorLineMarker = struct {
     severity: ?types.Severity = null,
     risk: ?findings_mod.Risk = null,
     breakpoint_verified: ?bool = null,
+    breakpoint_kind: ?BreakpointVisualKind = null,
     active_execution: bool = false,
 
     fn hasAny(self: EditorLineMarker) bool {
@@ -5007,6 +5112,7 @@ fn editorLineMarker(state: *const GuiState, document_path: ?[]const u8, line: us
         if (!breakpoint.enabled or breakpoint.line != line + 1) continue;
         if (!pathMatches(path, breakpoint.path)) continue;
         marker.breakpoint_verified = breakpoint.verified;
+        marker.breakpoint_kind = breakpointVisualKind(breakpoint);
         break;
     }
 
@@ -5025,7 +5131,7 @@ fn editorLineMarker(state: *const GuiState, document_path: ?[]const u8, line: us
 
 fn markerStripeColor(marker: EditorLineMarker) windows.COLORREF {
     if (marker.active_execution) return rgb(255, 207, 92);
-    if (marker.breakpoint_verified) |verified| return if (verified) rgb(112, 220, 154) else rgb(255, 118, 118);
+    if (marker.breakpoint_verified) |verified| return breakpointMarkerColor(marker, verified);
     if (marker.risk) |risk| return riskColor(risk);
     if (marker.severity) |severity| return severityColor(severity);
     return rgb(121, 133, 145);
@@ -5047,8 +5153,30 @@ fn markerBackgroundColor(marker: EditorLineMarker) windows.COLORREF {
             .info => rgb(18, 28, 34),
         };
     }
-    if (marker.breakpoint_verified != null) return rgb(18, 34, 29);
+    if (marker.breakpoint_kind) |kind| return switch (kind) {
+        .normal => rgb(18, 34, 29),
+        .hit => rgb(38, 30, 16),
+        .condition => rgb(15, 34, 34),
+        .log => rgb(15, 27, 39),
+    };
     return rgb(20, 27, 34);
+}
+
+fn breakpointVisualKind(breakpoint: debug_session.Breakpoint) BreakpointVisualKind {
+    if (breakpoint.log_message != null) return .log;
+    if (breakpoint.condition != null) return .condition;
+    if (breakpoint.hit_condition != null) return .hit;
+    return .normal;
+}
+
+fn breakpointMarkerColor(marker: EditorLineMarker, verified: bool) windows.COLORREF {
+    if (!verified) return rgb(255, 118, 118);
+    return switch (marker.breakpoint_kind orelse .normal) {
+        .normal => rgb(112, 220, 154),
+        .hit => rgb(255, 207, 92),
+        .condition => rgb(79, 230, 226),
+        .log => rgb(95, 170, 255),
+    };
 }
 
 fn drawHighlightedLine(hdc: windows.HDC, state: *GuiState, mode: modes.LanguageMode, x: c_int, y: c_int, right: c_int, line: []const u8) void {
@@ -5168,21 +5296,25 @@ fn drawDebugPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     fillRect(hdc, rect, rgb(10, 12, 14));
     fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
     const session = &state.app.debug_manager.session;
-    var header_buf: [260]u8 = undefined;
-    const header = std.fmt.bufPrint(&header_buf, "DEBUG  {s}  store:{s}  pending:{d}  bp:{d}  threads:{d}  watch:{d}", .{
+    const advanced = advancedBreakpointCounts(session);
+    var header_buf: [420]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "DEBUG  {s}  store:{s}  pending:{d}  bp:{d}", .{
         @tagName(session.state),
         debugStoreLabel(&state.app.debug_manager),
         session.pendingCount(),
         session.breakpoints.items.len,
-        session.threads.items.len,
-        session.watches.items.len,
     }) catch "DEBUG";
     const header_right = if (debugPanelHasActionButtons(rect)) debugPanelActionButtonRect(rect, .start).left - 10 else rect.right - 16;
     drawTextClipped(hdc, rect.left + 16, rect.top + 10, header_right, debugStateColor(session.state), header);
     drawDebugPanelActions(hdc, rect);
 
     var policy_buf: [640]u8 = undefined;
-    const policy = std.fmt.bufPrint(&policy_buf, "policy env:{s} fs:{s} net:{s} reverse-launch:deny frame:8MiB  F5 run/continue  F9 breakpoint  F10/F11 step", .{
+    const policy = std.fmt.bufPrint(&policy_buf, "advanced c:{d} h:{d} log:{d}  data threads:{d} watch:{d}  policy env:{s} fs:{s} net:{s} reverse-launch:deny frame:8MiB", .{
+        advanced.conditions,
+        advanced.hit_conditions,
+        advanced.logpoints,
+        session.threads.items.len,
+        session.watches.items.len,
         @tagName(state.app.debug_manager.env_policy),
         @tagName(state.app.debug_manager.fs_policy),
         @tagName(state.app.debug_manager.network_policy),
@@ -5262,6 +5394,22 @@ fn drawDebugPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     }
 }
 
+const AdvancedBreakpointCounts = struct {
+    conditions: usize = 0,
+    hit_conditions: usize = 0,
+    logpoints: usize = 0,
+};
+
+fn advancedBreakpointCounts(session: *const debug_session.Session) AdvancedBreakpointCounts {
+    var counts: AdvancedBreakpointCounts = .{};
+    for (session.breakpoints.items) |breakpoint| {
+        if (breakpoint.condition != null) counts.conditions += 1;
+        if (breakpoint.hit_condition != null) counts.hit_conditions += 1;
+        if (breakpoint.log_message != null) counts.logpoints += 1;
+    }
+    return counts;
+}
+
 fn debugStateColor(state: @import("../debug/session.zig").DebugState) windows.COLORREF {
     return switch (state) {
         .paused => rgb(255, 207, 92),
@@ -5303,13 +5451,13 @@ fn debugPanelDataRowAt(rect: RECT, y: c_int) ?usize {
 
 fn drawDebugPanelActions(hdc: windows.HDC, rect: RECT) void {
     if (!debugPanelHasActionButtons(rect)) return;
-    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .watch, .breakpoint, .stop, .status };
+    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .watch, .advanced_breakpoint, .breakpoint, .stop, .status };
     for (actions) |action| drawButton(hdc, debugPanelActionButtonRect(rect, action), debugPanelActionLabel(action));
 }
 
 fn debugPanelActionAt(rect: RECT, x: c_int, y: c_int) ?DebugPanelAction {
     if (!debugPanelHasActionButtons(rect) or y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .watch, .breakpoint, .stop, .status };
+    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .watch, .advanced_breakpoint, .breakpoint, .stop, .status };
     for (actions) |action| if (pointIn(debugPanelActionButtonRect(rect, action), x, y)) return action;
     return null;
 }
@@ -5325,14 +5473,15 @@ fn debugPanelActionButtonRect(rect: RECT, action: DebugPanelAction) RECT {
         .status => 0,
         .stop => 1,
         .breakpoint => 2,
-        .watch => 3,
-        .step_out => 4,
-        .step_into => 5,
-        .step_over => 6,
-        .pause => 7,
-        .continue_execution => 8,
-        .start => 9,
-        .configure => 10,
+        .advanced_breakpoint => 3,
+        .watch => 4,
+        .step_out => 5,
+        .step_into => 6,
+        .step_over => 7,
+        .pause => 8,
+        .continue_execution => 9,
+        .start => 10,
+        .configure => 11,
     };
     const right = rect.right - 12 - slot * (width + gap);
     return .{ .left = right - width, .top = rect.top + 7, .right = right, .bottom = rect.top + 31 };
@@ -5348,6 +5497,7 @@ fn debugPanelActionLabel(action: DebugPanelAction) []const u8 {
         .step_into => "INTO",
         .step_out => "OUT",
         .breakpoint => "BP",
+        .advanced_breakpoint => "ADV",
         .watch => "WATCH",
         .stop => "STOP",
         .status => "INFO",
@@ -6228,6 +6378,10 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .code_actions => "QUICK FIX  Enter applies",
         .language_mode => "LANGUAGE MODE",
         .debug_watch => "RESTRICTED WATCH  type to add; Enter removes selected; calls and assignments blocked",
+        .debug_breakpoint => "ADVANCED BREAKPOINT  current source line",
+        .debug_breakpoint_condition => "CONDITION  bounded predicate / no calls or assignments",
+        .debug_breakpoint_hit => "HIT COUNT  positive decimal",
+        .debug_breakpoint_log => "LOGPOINT  restricted {inspection} interpolation",
     };
     drawText(hdc, panel.left + 16, panel.top + 14, rgb(79, 230, 226), title);
     if (state.quick_panel.mode == .replace_workspace) {
@@ -6437,12 +6591,34 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                     drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
                 }
             },
+            .debug_breakpoint => {
+                const breakpoint = state.currentLineBreakpoint();
+                var value_buf: [900]u8 = undefined;
+                const label = switch (row) {
+                    0 => std.fmt.bufPrint(&value_buf, "CONDITION  {s}", .{if (breakpoint) |item| item.condition orelse "(not set)" else "(not set)"}) catch "CONDITION",
+                    1 => std.fmt.bufPrint(&value_buf, "HIT COUNT  {s}", .{if (breakpoint) |item| item.hit_condition orelse "(not set)" else "(not set)"}) catch "HIT COUNT",
+                    2 => std.fmt.bufPrint(&value_buf, "LOGPOINT  {s}", .{if (breakpoint) |item| item.log_message orelse "(not set)" else "(not set)"}) catch "LOGPOINT",
+                    3 => "CLEAR ADVANCED SETTINGS",
+                    else => "",
+                };
+                drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
+            },
+            .debug_breakpoint_condition => drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, "SET RESTRICTED CONDITION"),
+            .debug_breakpoint_hit => drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, "SET HIT COUNT"),
+            .debug_breakpoint_log => drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, "SET RESTRICTED LOGPOINT"),
         }
         y += ROW_HEIGHT;
     }
 
     if (state.quick_panel.itemCount() == 0) {
-        drawText(hdc, panel.left + 18, y, rgb(126, 138, 150), if (state.quick_panel.mode == .debug_watch) "Type a field, pointer, or indexed value" else "No matches");
+        const empty_text = switch (state.quick_panel.mode) {
+            .debug_watch => "Type a field, pointer, or indexed value",
+            .debug_breakpoint_condition => "Enter a comparison predicate",
+            .debug_breakpoint_hit => "Enter a positive hit count",
+            .debug_breakpoint_log => "Enter a log message",
+            else => "No matches",
+        };
+        drawText(hdc, panel.left + 18, y, rgb(126, 138, 150), empty_text);
     }
 }
 

@@ -508,6 +508,7 @@ const DebugPanelAction = enum {
     step_over,
     step_into,
     step_out,
+    watch,
     breakpoint,
     stop,
     status,
@@ -662,6 +663,7 @@ const QuickPanelMode = enum {
     lsp_hover,
     code_actions,
     language_mode,
+    debug_watch,
 };
 
 const ReplaceRequest = struct {
@@ -774,6 +776,7 @@ const QuickPanel = struct {
     lsp_location_count: usize = 0,
     lsp_hover_line_count: usize = 0,
     code_action_count: usize = 0,
+    debug_watch_count: usize = 0,
     completion_replace_start: usize = 0,
     completion_replace_end: usize = 0,
 
@@ -858,6 +861,7 @@ const QuickPanel = struct {
             .lsp_hover => self.lsp_hover_line_count,
             .code_actions => self.code_action_count,
             .language_mode => if (self.language_matches) |items| items.len else 0,
+            .debug_watch => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else self.debug_watch_count,
         };
     }
 
@@ -960,6 +964,7 @@ const QuickPanel = struct {
                 self.replacement_preview = try workspace_replace.preview(self.allocator, &app.workspace, request, .{});
             },
             .new_file, .new_folder, .rename_path, .delete_path => {},
+            .debug_watch => self.debug_watch_count = app.debug_manager.session.watches.items.len,
             .run_task => {
                 var registry = try task_registry.loadProjectTasks(self.allocator, app.workspace.root_path);
                 defer registry.deinit();
@@ -1134,6 +1139,7 @@ const QuickPanel = struct {
         self.lsp_location_count = 0;
         self.lsp_hover_line_count = 0;
         self.code_action_count = 0;
+        self.debug_watch_count = 0;
         if (self.language_matches) |items| {
             self.allocator.free(items);
             self.language_matches = null;
@@ -3360,6 +3366,10 @@ const LinuxGuiState = struct {
     }
 
     fn execute(self: *LinuxGuiState, id: []const u8, source: command_mod.Source) void {
+        if (std.mem.eql(u8, id, "debug.watch_add") or std.mem.eql(u8, id, "debug.watch_remove")) {
+            self.openQuickPanel(.debug_watch);
+            return;
+        }
         if (std.mem.eql(u8, id, "view.command_palette")) {
             self.quick_panel.close();
             self.app.palette.open() catch |err| {
@@ -3738,6 +3748,12 @@ const LinuxGuiState = struct {
     }
 
     fn executeDebugPanelAction(self: *LinuxGuiState, action: DebugPanelAction) void {
+        if (action == .watch) {
+            self.openQuickPanel(.debug_watch);
+            self.bottom_panel = .debug;
+            self.terminal_focused = false;
+            return;
+        }
         const id = switch (action) {
             .configure => "debug.create_config",
             .start => "debug.start",
@@ -3746,6 +3762,7 @@ const LinuxGuiState = struct {
             .step_over => "debug.step_over",
             .step_into => "debug.step_into",
             .step_out => "debug.step_out",
+            .watch => unreachable,
             .breakpoint => "debug.toggle_breakpoint",
             .stop => "debug.stop",
             .status => "debug.status",
@@ -3796,6 +3813,27 @@ const LinuxGuiState = struct {
             return;
         };
         self.handleDispatchResult("debug.variables", result);
+    }
+
+    fn activateDebugValueAt(self: *LinuxGuiState, row: usize) void {
+        const session = &self.app.debug_manager.session;
+        const visible_watches = @min(session.watches.items.len, @as(usize, 2));
+        if (row >= visible_watches) {
+            self.expandDebugVariableAt(row - visible_watches);
+            return;
+        }
+
+        var argument_buf: [32]u8 = undefined;
+        const argument = std.fmt.bufPrint(argument_buf[0..], "{d}", .{row + 1}) catch return;
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = "debug.watch_refresh",
+            .argument = argument,
+            .source = .command_palette,
+        }) catch |err| {
+            self.message("debug watch failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult("debug.watch_refresh", result);
     }
 
     fn openDebugSourceLocation(self: *LinuxGuiState, path: []const u8, line: usize, column: usize) void {
@@ -4328,6 +4366,40 @@ const LinuxGuiState = struct {
                 const mode = self.quick_panel.selectedLanguageMode() orelse return self.message("no language selected", .{});
                 self.quick_panel.close();
                 self.setActiveDocumentLanguage(mode);
+            },
+            .debug_watch => {
+                const expression = std.mem.trim(u8, self.quick_panel.query.items, " \t\r\n");
+                if (expression.len == 0) {
+                    if (self.quick_panel.debug_watch_count == 0) return self.message("type an inspection expression", .{});
+                    var index_buf: [32]u8 = undefined;
+                    const argument = std.fmt.bufPrint(&index_buf, "{d}", .{self.quick_panel.selected_index + 1}) catch return;
+                    self.quick_panel.close();
+                    const result = dispatcher.dispatch(&self.app, .{
+                        .id = "debug.watch_remove",
+                        .argument = argument,
+                        .source = .command_palette,
+                    }) catch |err| {
+                        self.message("watch remove failed: {s}", .{@errorName(err)});
+                        return;
+                    };
+                    self.handleDispatchResult("debug.watch_remove", result);
+                    if (std.meta.activeTag(result) == .completed) self.openQuickPanel(.debug_watch);
+                    return;
+                }
+                const owned_expression = self.allocator.dupe(u8, expression) catch |err| return self.message("watch failed: {s}", .{@errorName(err)});
+                defer self.allocator.free(owned_expression);
+                const result = dispatcher.dispatch(&self.app, .{
+                    .id = "debug.watch_add",
+                    .argument = owned_expression,
+                    .source = .command_palette,
+                }) catch |err| {
+                    self.message("watch failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                self.handleDispatchResult("debug.watch_add", result);
+                if (std.meta.activeTag(result) == .completed) self.quick_panel.close();
+                self.bottom_panel = .debug;
+                self.terminal_focused = false;
             },
         }
     }
@@ -5688,7 +5760,7 @@ const LinuxGuiState = struct {
                     self.selectDebugFrameAt(row);
                     return true;
                 }
-                if (debugPanelVariableRowAt(self, x, y)) |row| self.expandDebugVariableAt(row);
+                if (debugPanelVariableRowAt(self, x, y)) |row| self.activateDebugValueAt(row);
                 return true;
             },
             .security => {
@@ -6539,7 +6611,7 @@ fn drawDebugPanel(x11: *X11, state: *LinuxGuiState) !void {
     try drawDebugPanelActions(x11, state);
 
     var header_buf: [360]u8 = undefined;
-    const header = std.fmt.bufPrint(header_buf[0..], "DEBUG state:{s} pending:{d} bp:{d} threads:{d} stack:{d} scopes:{d} vars:{d}", .{
+    const header = std.fmt.bufPrint(header_buf[0..], "DEBUG state:{s} pending:{d} bp:{d} threads:{d} stack:{d} scopes:{d} vars:{d} watch:{d}", .{
         @tagName(session.state),
         session.pendingCount(),
         session.breakpoints.items.len,
@@ -6547,6 +6619,7 @@ fn drawDebugPanel(x11: *X11, state: *LinuxGuiState) !void {
         session.stack_frames.items.len,
         session.scopes.items.len,
         session.variables.items.len,
+        session.watches.items.len,
     }) catch "DEBUG";
     const state_gc = switch (session.state) {
         .paused => x11.gc.amber,
@@ -6596,8 +6669,27 @@ fn drawDebugPanel(x11: *X11, state: *LinuxGuiState) !void {
             var ascii_buf: [620]u8 = undefined;
             try x11.text(if (session.active_frame_id == frame.id) x11.gc.amber else x11.gc.text, 18, y, asciiInto(ascii_buf[0..], frame_line));
         }
-        if (row < session.variables.items.len) {
-            const variable = session.variables.items[row];
+        const visible_watches = @min(session.watches.items.len, @as(usize, 2));
+        if (row < visible_watches) {
+            const watch = session.watches.items[row];
+            const display_value = watch.result orelse watch.error_message orelse if (watch.pending_seq != null) "(pending)" else "(not evaluated)";
+            var watch_buf: [760]u8 = undefined;
+            const watch_line = std.fmt.bufPrint(watch_buf[0..], "WATCH {d} {s} = {s} ({s})", .{
+                row + 1,
+                watch.expression,
+                display_value,
+                watch.type_name orelse "?",
+            }) catch watch.expression;
+            var ascii_buf: [760]u8 = undefined;
+            const watch_gc = if (watch.error_message != null)
+                x11.gc.red
+            else if (watch.pending_seq != null)
+                x11.gc.cyan
+            else
+                x11.gc.green;
+            try x11.text(watch_gc, @max(@as(i16, 520), @divTrunc(state.window_width, 2)), y, asciiInto(ascii_buf[0..], watch_line));
+        } else if (row - visible_watches < session.variables.items.len) {
+            const variable = session.variables.items[row - visible_watches];
             var variable_buf: [620]u8 = undefined;
             const variable_line = std.fmt.bufPrint(variable_buf[0..], "{s} {s}: {s} ({s})", .{
                 if (variable.variables_reference > 0) "+" else " ",
@@ -7282,7 +7374,7 @@ fn drawQuickPanel(x11: *X11, state: *LinuxGuiState) !void {
         y += LINE_HEIGHT + 4;
     }
     if (state.quick_panel.itemCount() == 0) {
-        try x11.text(x11.gc.muted, left + 18, y, "No matches");
+        try x11.text(x11.gc.muted, left + 18, y, if (state.quick_panel.mode == .debug_watch) "Type a field, pointer, or indexed value" else "No matches");
     }
 }
 
@@ -7421,6 +7513,14 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
                 @tagName(modes.family(mode)),
                 modes.securityFocus(mode),
             }) catch modes.label(mode);
+        },
+        .debug_watch => blk: {
+            if (std.mem.trim(u8, state.quick_panel.query.items, " \t\r\n").len > 0) break :blk "ADD  session inspection watch";
+            const watches = state.app.debug_manager.session.watches.items;
+            if (row >= watches.len) break :blk "";
+            const watch = watches[row];
+            const value = watch.result orelse watch.error_message orelse if (watch.pending_seq != null) "(pending)" else "(not evaluated)";
+            break :blk std.fmt.bufPrint(text_buf[0..], "REMOVE {d}  {s} = {s}", .{ row + 1, watch.expression, value }) catch watch.expression;
         },
     };
     var ascii_buf: [720]u8 = undefined;
@@ -8644,6 +8744,7 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .lsp_hover => "HOVER  Enter closes",
         .code_actions => "QUICK FIX  Enter applies",
         .language_mode => "LANGUAGE MODE",
+        .debug_watch => "RESTRICTED WATCH  type to add; Enter removes selected; calls and assignments blocked",
     };
 }
 
@@ -8841,7 +8942,7 @@ fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
 }
 
 const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
-const debug_panel_actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .breakpoint, .stop, .status };
+const debug_panel_actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .watch, .breakpoint, .stop, .status };
 const task_panel_actions = [_]TaskPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .terminal, .queue_terminal, .run_pty, .stop_pty, .tasks, .preview, .seal, .run_next, .history };
 const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .seal, .linux };
 const settings_panel_actions = [_]SettingsPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .tutorial_ja, .tutorial_en, .review, .trust, .lock, .seal };
@@ -8996,13 +9097,14 @@ fn debugPanelActionRect(state: *const LinuxGuiState, action: DebugPanelAction) H
         .step_over => 4,
         .step_into => 5,
         .step_out => 6,
-        .breakpoint => 7,
-        .stop => 8,
-        .status => 9,
+        .watch => 7,
+        .breakpoint => 8,
+        .stop => 9,
+        .status => 10,
     };
     const width: i16 = 58;
     const gap: i16 = 6;
-    const right = state.window_width - 18 - (9 - index) * (width + gap);
+    const right = state.window_width - 18 - (10 - index) * (width + gap);
     const bottom = state.bottomTop();
     return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
@@ -9140,6 +9242,7 @@ fn debugPanelActionLabel(action: DebugPanelAction) []const u8 {
         .step_over => "OVER",
         .step_into => "INTO",
         .step_out => "OUT",
+        .watch => "WATCH",
         .breakpoint => "BP",
         .stop => "STOP",
         .status => "INFO",

@@ -93,6 +93,7 @@ test {
     _ = @import("security/findings.zig");
     _ = @import("security/build_consent.zig");
     _ = @import("security/build_firewall.zig");
+    _ = @import("security/debug_expression.zig");
     _ = @import("security/package_trust.zig");
     _ = @import("security/polyglot_scanner.zig");
     _ = @import("security/permissions.zig");

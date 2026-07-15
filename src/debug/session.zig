@@ -3,6 +3,8 @@ const protocol = @import("protocol.zig");
 
 const max_collection_items: usize = 4096;
 const max_event_text_bytes: usize = 64 * 1024;
+const max_watches: usize = 64;
+const max_watch_expression_bytes: usize = 4096;
 
 pub const DebugState = enum {
     idle,
@@ -34,6 +36,7 @@ pub const RequestKind = enum {
     stack_trace,
     scopes,
     variables,
+    evaluate,
 };
 
 pub const EventKind = enum {
@@ -141,10 +144,38 @@ pub const Variable = struct {
     }
 };
 
+pub const Watch = struct {
+    id: u64,
+    expression: []u8,
+    result: ?[]u8 = null,
+    type_name: ?[]u8 = null,
+    error_message: ?[]u8 = null,
+    variables_reference: i64 = 0,
+    pending_seq: ?i64 = null,
+
+    fn clearRuntime(self: *Watch, allocator: std.mem.Allocator) void {
+        if (self.result) |value| allocator.free(value);
+        if (self.type_name) |value| allocator.free(value);
+        if (self.error_message) |value| allocator.free(value);
+        self.result = null;
+        self.type_name = null;
+        self.error_message = null;
+        self.variables_reference = 0;
+        self.pending_seq = null;
+    }
+
+    fn deinit(self: *Watch, allocator: std.mem.Allocator) void {
+        self.clearRuntime(allocator);
+        allocator.free(self.expression);
+        self.* = undefined;
+    }
+};
+
 pub const Pending = struct {
     seq: i64,
     kind: RequestKind,
     path: ?[]u8 = null,
+    watch_id: ?u64 = null,
 
     fn deinit(self: *Pending, allocator: std.mem.Allocator) void {
         if (self.path) |path| allocator.free(path);
@@ -192,6 +223,8 @@ pub const Session = struct {
     stack_frames: std.array_list.Managed(StackFrame),
     scopes: std.array_list.Managed(Scope),
     variables: std.array_list.Managed(Variable),
+    watches: std.array_list.Managed(Watch),
+    next_watch_id: u64 = 1,
     capabilities: Capabilities = .{},
     active_thread_id: ?i64 = null,
     active_frame_id: ?i64 = null,
@@ -212,13 +245,16 @@ pub const Session = struct {
             .stack_frames = std.array_list.Managed(StackFrame).init(allocator),
             .scopes = std.array_list.Managed(Scope).init(allocator),
             .variables = std.array_list.Managed(Variable).init(allocator),
+            .watches = std.array_list.Managed(Watch).init(allocator),
         };
     }
 
     pub fn deinit(self: *Session) void {
         self.clearRuntimeData();
         for (self.breakpoints.items) |*item| item.deinit(self.allocator);
+        for (self.watches.items) |*item| item.deinit(self.allocator);
         self.breakpoints.deinit();
+        self.watches.deinit();
         self.variables.deinit();
         self.scopes.deinit();
         self.stack_frames.deinit();
@@ -245,6 +281,46 @@ pub const Session = struct {
 
     pub fn pendingCount(self: *const Session) usize {
         return self.pending.items.len;
+    }
+
+    pub fn hasPending(self: *const Session, kind: RequestKind) bool {
+        for (self.pending.items) |pending| {
+            if (pending.kind == kind) return true;
+        }
+        return false;
+    }
+
+    pub fn addWatch(self: *Session, raw_expression: []const u8) !u64 {
+        const expression = std.mem.trim(u8, raw_expression, " \t\r\n");
+        if (expression.len == 0) return error.EmptyWatchExpression;
+        if (expression.len > max_watch_expression_bytes) return error.WatchExpressionTooLong;
+        for (self.watches.items) |watch| {
+            if (std.mem.eql(u8, watch.expression, expression)) return watch.id;
+        }
+        if (self.watches.items.len >= max_watches) return error.TooManyWatches;
+
+        const owned_expression = try self.allocator.dupe(u8, expression);
+        errdefer self.allocator.free(owned_expression);
+        const id = self.next_watch_id;
+        try self.watches.append(.{
+            .id = id,
+            .expression = owned_expression,
+        });
+        self.next_watch_id +%= 1;
+        if (self.next_watch_id == 0) self.next_watch_id = 1;
+        return id;
+    }
+
+    pub fn removeWatchAt(self: *Session, index: usize) bool {
+        if (index >= self.watches.items.len) return false;
+        var removed = self.watches.orderedRemove(index);
+        removed.deinit(self.allocator);
+        return true;
+    }
+
+    pub fn clearWatches(self: *Session) void {
+        for (self.watches.items) |*watch| watch.deinit(self.allocator);
+        self.watches.clearRetainingCapacity();
     }
 
     pub fn toggleBreakpoint(self: *Session, path: []const u8, line: usize) !ToggleResult {
@@ -318,6 +394,20 @@ pub const Session = struct {
         return self.wrapRequest(try protocol.makeVariablesRequest(self.allocator, seq, reference, 0, 1000), seq, .variables, null);
     }
 
+    pub fn makeEvaluateWatch(self: *Session, watch_id: u64, frame_id: i64) !Outbound {
+        const watch = self.findWatch(watch_id) orelse return error.UnknownWatch;
+        const seq = self.takeSeq();
+        const payload = try protocol.makeEvaluateRequest(self.allocator, seq, .{
+            .expression = watch.expression,
+            .frame_id = frame_id,
+            .context = "watch",
+        });
+        const outbound = try self.wrapWatchRequest(payload, seq, watch_id);
+        watch.clearRuntime(self.allocator);
+        watch.pending_seq = seq;
+        return outbound;
+    }
+
     pub fn makeContinue(self: *Session, thread_id: i64) !Outbound {
         const seq = self.takeSeq();
         return self.wrapRequest(try protocol.makeContinueRequest(self.allocator, seq, thread_id), seq, .continue_execution, null);
@@ -384,6 +474,10 @@ pub const Session = struct {
         const success = boolField(object, "success", false);
         if (!success) {
             const message = stringField(object, "message") orelse "debug adapter request failed";
+            if (pending.kind == .evaluate) {
+                if (pending.watch_id) |watch_id| try self.setWatchError(watch_id, request_seq, message);
+                return .{ .failed = pending.kind };
+            }
             try self.setLastError(message);
             if (pending.kind == .initialize or pending.kind == .launch or pending.kind == .configuration_done) {
                 self.state = .failed;
@@ -407,6 +501,12 @@ pub const Session = struct {
             .stack_trace => if (body) |value| try self.parseStackFrames(value),
             .scopes => if (body) |value| try self.parseScopes(value),
             .variables => if (body) |value| try self.parseVariables(value),
+            .evaluate => if (pending.watch_id) |watch_id| {
+                if (body) |value|
+                    try self.parseWatchEvaluation(watch_id, request_seq, value)
+                else
+                    try self.setWatchError(watch_id, request_seq, "debug adapter returned no evaluation body");
+            },
         }
         self.clearLastError();
         return .{ .acknowledged = pending.kind };
@@ -596,6 +696,40 @@ pub const Session = struct {
         }
     }
 
+    fn parseWatchEvaluation(self: *Session, watch_id: u64, request_seq: i64, body: std.json.ObjectMap) !void {
+        const watch = self.findWatch(watch_id) orelse return;
+        if (watch.pending_seq != request_seq) return;
+
+        const display_value = stringField(body, "result") orelse "";
+        const owned_result = try dupeLimited(self.allocator, display_value, max_event_text_bytes);
+        errdefer self.allocator.free(owned_result);
+        const owned_type = if (stringField(body, "type")) |type_name|
+            try dupeLimited(self.allocator, type_name, 4096)
+        else
+            null;
+        errdefer if (owned_type) |value| self.allocator.free(value);
+
+        watch.clearRuntime(self.allocator);
+        watch.result = owned_result;
+        watch.type_name = owned_type;
+        watch.variables_reference = intField(body, "variablesReference") orelse 0;
+    }
+
+    fn setWatchError(self: *Session, watch_id: u64, request_seq: i64, message: []const u8) !void {
+        const watch = self.findWatch(watch_id) orelse return;
+        if (watch.pending_seq != request_seq) return;
+        const owned_message = try dupeLimited(self.allocator, message, max_event_text_bytes);
+        watch.clearRuntime(self.allocator);
+        watch.error_message = owned_message;
+    }
+
+    fn findWatch(self: *Session, watch_id: u64) ?*Watch {
+        for (self.watches.items) |*watch| {
+            if (watch.id == watch_id) return watch;
+        }
+        return null;
+    }
+
     fn wrapRequest(self: *Session, payload: []u8, seq: i64, kind: RequestKind, path: ?[]const u8) !Outbound {
         errdefer self.allocator.free(payload);
         const framed = try protocol.makeFramed(self.allocator, payload);
@@ -604,6 +738,14 @@ pub const Session = struct {
         errdefer if (owned_path) |value| self.allocator.free(value);
         try self.pending.append(.{ .seq = seq, .kind = kind, .path = owned_path });
         return .{ .allocator = self.allocator, .seq = seq, .kind = kind, .payload = payload, .framed = framed };
+    }
+
+    fn wrapWatchRequest(self: *Session, payload: []u8, seq: i64, watch_id: u64) !Outbound {
+        errdefer self.allocator.free(payload);
+        const framed = try protocol.makeFramed(self.allocator, payload);
+        errdefer self.allocator.free(framed);
+        try self.pending.append(.{ .seq = seq, .kind = .evaluate, .watch_id = watch_id });
+        return .{ .allocator = self.allocator, .seq = seq, .kind = .evaluate, .payload = payload, .framed = framed };
     }
 
     fn takeSeq(self: *Session) i64 {
@@ -627,6 +769,7 @@ pub const Session = struct {
         clearStackFrames(self);
         clearScopes(self);
         clearVariables(self);
+        for (self.watches.items) |*watch| watch.clearRuntime(self.allocator);
         self.active_thread_id = null;
         self.active_frame_id = null;
         if (self.stop_reason) |value| self.allocator.free(value);
@@ -821,4 +964,71 @@ test "DAP session tracks breakpoints and rejects reverse execution requests" {
     );
     try std.testing.expectEqual(ReverseRequestKind.run_in_terminal, reverse.reverse_request.kind);
     try std.testing.expectEqualStrings("runInTerminal", session.last_reverse_command.?);
+}
+
+test "DAP session evaluates persistent watches and ignores stale results" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+
+    const watch_id = try session.addWatch(" state.items[0].name ");
+    try std.testing.expectEqual(watch_id, try session.addWatch("state.items[0].name"));
+    try std.testing.expectEqual(@as(usize, 1), session.watches.items.len);
+    try std.testing.expectEqualStrings("state.items[0].name", session.watches.items[0].expression);
+
+    var first = try session.makeEvaluateWatch(watch_id, 41);
+    defer first.deinit();
+    var latest = try session.makeEvaluateWatch(watch_id, 42);
+    defer latest.deinit();
+
+    _ = try session.ingestPayload(
+        \\{"seq":3,"type":"response","request_seq":1,"success":true,"command":"evaluate","body":{"result":"stale","type":"[]const u8","variablesReference":0}}
+    );
+    try std.testing.expect(session.watches.items[0].result == null);
+    try std.testing.expectEqual(@as(?i64, 2), session.watches.items[0].pending_seq);
+
+    const result = try session.ingestPayload(
+        \\{"seq":4,"type":"response","request_seq":2,"success":true,"command":"evaluate","body":{"result":"zide","type":"[]const u8","variablesReference":17}}
+    );
+    try std.testing.expectEqual(RequestKind.evaluate, result.acknowledged);
+    try std.testing.expectEqualStrings("zide", session.watches.items[0].result.?);
+    try std.testing.expectEqualStrings("[]const u8", session.watches.items[0].type_name.?);
+    try std.testing.expectEqual(@as(i64, 17), session.watches.items[0].variables_reference);
+    try std.testing.expect(session.watches.items[0].pending_seq == null);
+
+    session.reset();
+    try std.testing.expectEqual(@as(usize, 1), session.watches.items.len);
+    try std.testing.expectEqualStrings("state.items[0].name", session.watches.items[0].expression);
+    try std.testing.expect(session.watches.items[0].result == null);
+}
+
+test "DAP session stores watch evaluation failures locally" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+
+    const watch_id = try session.addWatch("missing.field");
+    var evaluate = try session.makeEvaluateWatch(watch_id, 7);
+    defer evaluate.deinit();
+    const result = try session.ingestPayload(
+        \\{"seq":2,"type":"response","request_seq":1,"success":false,"command":"evaluate","message":"unknown identifier"}
+    );
+    try std.testing.expectEqual(RequestKind.evaluate, result.failed);
+    try std.testing.expectEqualStrings("unknown identifier", session.watches.items[0].error_message.?);
+    try std.testing.expect(session.watches.items[0].pending_seq == null);
+    try std.testing.expect(session.last_error == null);
+
+    try std.testing.expect(session.removeWatchAt(0));
+    try std.testing.expectEqual(@as(usize, 0), session.watches.items.len);
+    try std.testing.expect(!session.removeWatchAt(0));
+}
+
+test "DAP session bounds automatic watch count" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+
+    var expression_buf: [32]u8 = undefined;
+    for (0..max_watches) |index| {
+        const expression = try std.fmt.bufPrint(&expression_buf, "watch_{d}", .{index});
+        _ = try session.addWatch(expression);
+    }
+    try std.testing.expectError(error.TooManyWatches, session.addWatch("one_too_many"));
 }

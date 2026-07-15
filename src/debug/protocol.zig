@@ -15,6 +15,12 @@ pub const SourceBreakpoint = struct {
     hit_condition: ?[]const u8 = null,
 };
 
+pub const EvaluateArguments = struct {
+    expression: []const u8,
+    frame_id: ?i64 = null,
+    context: []const u8 = "watch",
+};
+
 pub fn makeInitializeRequest(allocator: std.mem.Allocator, seq: i64, adapter_id: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -145,6 +151,23 @@ pub fn makeVariablesRequest(allocator: std.mem.Allocator, seq: i64, reference: i
         try field(&json, "variablesReference", reference);
         try field(&json, "start", start);
         try field(&json, "count", count);
+        try json.endObject();
+        try json.endObject();
+    }
+    return out.toOwnedSlice();
+}
+
+pub fn makeEvaluateRequest(allocator: std.mem.Allocator, seq: i64, arguments: EvaluateArguments) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, seq, "evaluate");
+        try json.objectField("arguments");
+        try json.beginObject();
+        try field(&json, "expression", arguments.expression);
+        if (arguments.frame_id) |frame_id| try field(&json, "frameId", frame_id);
+        try field(&json, "context", arguments.context);
         try json.endObject();
         try json.endObject();
     }
@@ -303,4 +326,15 @@ test "build DAP breakpoint and reverse-request rejection" {
     const denied = try makeErrorResponse(std.testing.allocator, 4, 99, "runInTerminal", "blocked by ZIDE policy");
     defer std.testing.allocator.free(denied);
     try std.testing.expect(std.mem.indexOf(u8, denied, "\"success\":false") != null);
+}
+
+test "build DAP watch evaluation request" {
+    const evaluate = try makeEvaluateRequest(std.testing.allocator, 5, .{
+        .expression = "state.items[0].name",
+        .frame_id = 42,
+    });
+    defer std.testing.allocator.free(evaluate);
+    try std.testing.expect(std.mem.indexOf(u8, evaluate, "\"command\":\"evaluate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evaluate, "\"frameId\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evaluate, "\"context\":\"watch\"") != null);
 }

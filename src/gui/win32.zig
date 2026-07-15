@@ -51,6 +51,7 @@ const QuickPanelMode = enum {
     lsp_hover,
     code_actions,
     language_mode,
+    debug_watch,
 };
 
 const BottomPanel = enum {
@@ -73,6 +74,7 @@ const DebugPanelAction = enum {
     step_into,
     step_out,
     breakpoint,
+    watch,
     stop,
     status,
 };
@@ -237,6 +239,7 @@ const QuickPanel = struct {
     lsp_location_count: usize = 0,
     lsp_hover_line_count: usize = 0,
     code_action_count: usize = 0,
+    debug_watch_count: usize = 0,
     completion_replace_start: usize = 0,
     completion_replace_end: usize = 0,
 
@@ -319,6 +322,7 @@ const QuickPanel = struct {
             .lsp_hover => self.lsp_hover_line_count,
             .code_actions => self.code_action_count,
             .language_mode => if (self.language_matches) |items| items.len else 0,
+            .debug_watch => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else self.debug_watch_count,
         };
     }
 
@@ -442,6 +446,7 @@ const QuickPanel = struct {
                 self.task_matches = try matches.toOwnedSlice();
             },
             .new_file, .new_folder, .rename_path, .delete_path => {},
+            .debug_watch => self.debug_watch_count = app.debug_manager.session.watches.items.len,
             .document_symbols => {
                 const active_index = app.documents.activeIndex() orelse return;
                 const doc = &app.documents.documents.items[active_index];
@@ -595,6 +600,7 @@ const QuickPanel = struct {
         self.lsp_location_count = 0;
         self.lsp_hover_line_count = 0;
         self.code_action_count = 0;
+        self.debug_watch_count = 0;
         if (self.language_matches) |items| {
             self.allocator.free(items);
             self.language_matches = null;
@@ -1031,6 +1037,10 @@ const GuiState = struct {
     }
 
     fn executeCommand(self: *GuiState, id: []const u8) void {
+        if (std.mem.eql(u8, id, "debug.watch_add") or std.mem.eql(u8, id, "debug.watch_remove")) {
+            self.openQuickPanel(.debug_watch);
+            return;
+        }
         if (std.mem.eql(u8, id, "file.new")) {
             self.openNewFilePanel();
             return;
@@ -1210,6 +1220,12 @@ const GuiState = struct {
     }
 
     fn executeDebugPanelAction(self: *GuiState, action: DebugPanelAction) void {
+        if (action == .watch) {
+            self.openQuickPanel(.debug_watch);
+            self.show_output = true;
+            self.bottom_panel = .debug;
+            return;
+        }
         const id = switch (action) {
             .configure => "debug.create_config",
             .start => "debug.start",
@@ -1219,6 +1235,7 @@ const GuiState = struct {
             .step_into => "debug.step_into",
             .step_out => "debug.step_out",
             .breakpoint => "debug.toggle_breakpoint",
+            .watch => unreachable,
             .stop => "debug.stop",
             .status => "debug.status",
         };
@@ -1272,6 +1289,27 @@ const GuiState = struct {
             return;
         };
         self.handleDispatchResult("debug.variables", result);
+    }
+
+    fn activateDebugValueAt(self: *GuiState, row: usize) void {
+        const session = &self.app.debug_manager.session;
+        const visible_watches = @min(session.watches.items.len, @as(usize, 2));
+        if (row >= visible_watches) {
+            self.expandDebugVariableAt(row - visible_watches);
+            return;
+        }
+
+        var argument_buf: [32]u8 = undefined;
+        const argument = std.fmt.bufPrint(&argument_buf, "{d}", .{row + 1}) catch return;
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = "debug.watch_refresh",
+            .argument = argument,
+            .source = .command_palette,
+        }) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.handleDispatchResult("debug.watch_refresh", result);
     }
 
     fn openDebugSourceLocation(self: *GuiState, path: []const u8, line: usize, column: usize) void {
@@ -1569,6 +1607,7 @@ const GuiState = struct {
             .lsp_hover => "LSP hover",
             .code_actions => "Quick Fix",
             .language_mode => "Language mode",
+            .debug_watch => "Add restricted debug watch",
         }) catch {};
         if (mode == .completion and !self.requestCompletionFromLsp()) self.ensureLspForFeature("completion", .completion);
     }
@@ -1989,6 +2028,46 @@ const GuiState = struct {
                 };
                 self.quick_panel.close();
                 self.setActiveDocumentLanguage(mode);
+            },
+            .debug_watch => {
+                const expression = std.mem.trim(u8, self.quick_panel.query.items, " \t\r\n");
+                if (expression.len == 0) {
+                    if (self.quick_panel.debug_watch_count == 0) {
+                        self.setMessage("Type an inspection expression") catch {};
+                        return;
+                    }
+                    var index_buf: [32]u8 = undefined;
+                    const argument = std.fmt.bufPrint(&index_buf, "{d}", .{self.quick_panel.selected_index + 1}) catch return;
+                    self.quick_panel.close();
+                    const result = dispatcher.dispatch(&self.app, .{
+                        .id = "debug.watch_remove",
+                        .argument = argument,
+                        .source = .command_palette,
+                    }) catch |err| {
+                        self.setError(err) catch {};
+                        return;
+                    };
+                    self.handleDispatchResult("debug.watch_remove", result);
+                    if (std.meta.activeTag(result) == .completed) self.openQuickPanel(.debug_watch);
+                    return;
+                }
+                const owned_expression = self.allocator.dupe(u8, expression) catch |err| {
+                    self.setError(err) catch {};
+                    return;
+                };
+                defer self.allocator.free(owned_expression);
+                const result = dispatcher.dispatch(&self.app, .{
+                    .id = "debug.watch_add",
+                    .argument = owned_expression,
+                    .source = .command_palette,
+                }) catch |err| {
+                    self.setError(err) catch {};
+                    return;
+                };
+                self.handleDispatchResult("debug.watch_add", result);
+                if (std.meta.activeTag(result) == .completed) self.quick_panel.close();
+                self.show_output = true;
+                self.bottom_panel = .debug;
             },
         }
     }
@@ -3969,7 +4048,7 @@ const GuiState = struct {
                     return;
                 }
                 if (debugPanelVariableRowAt(content, x, y)) |row| {
-                    self.expandDebugVariableAt(row);
+                    self.activateDebugValueAt(row);
                     return;
                 }
             }
@@ -5090,11 +5169,12 @@ fn drawDebugPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
     const session = &state.app.debug_manager.session;
     var header_buf: [260]u8 = undefined;
-    const header = std.fmt.bufPrint(&header_buf, "DEBUG  {s}  pending:{d}  bp:{d}  threads:{d}", .{
+    const header = std.fmt.bufPrint(&header_buf, "DEBUG  {s}  pending:{d}  bp:{d}  threads:{d}  watch:{d}", .{
         @tagName(session.state),
         session.pendingCount(),
         session.breakpoints.items.len,
         session.threads.items.len,
+        session.watches.items.len,
     }) catch "DEBUG";
     const header_right = if (debugPanelHasActionButtons(rect)) debugPanelActionButtonRect(rect, .start).left - 10 else rect.right - 16;
     drawTextClipped(hdc, rect.left + 16, rect.top + 10, header_right, debugStateColor(session.state), header);
@@ -5120,13 +5200,14 @@ fn drawDebugPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     }
 
     var state_buf: [420]u8 = undefined;
-    const state_line = std.fmt.bufPrint(&state_buf, "stop:{s}  active thread:{any} frame:{any}  stack:{d} scopes:{d} vars:{d}", .{
+    const state_line = std.fmt.bufPrint(&state_buf, "stop:{s}  active thread:{any} frame:{any}  stack:{d} scopes:{d} vars:{d} watches:{d}", .{
         session.stop_reason orelse "-",
         session.active_thread_id,
         session.active_frame_id,
         session.stack_frames.items.len,
         session.scopes.items.len,
         session.variables.items.len,
+        session.watches.items.len,
     }) catch "debug state";
     drawTextClipped(hdc, rect.left + 16, y, rect.right - 16, rgb(255, 207, 92), state_line);
     y += ROW_HEIGHT;
@@ -5148,8 +5229,26 @@ fn drawDebugPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
             }) catch frame.name;
             drawTextClipped(hdc, rect.left + 16, row_y, left_right, if (session.active_frame_id == frame.id) rgb(255, 207, 92) else rgb(200, 207, 216), text);
         }
-        if (row < session.variables.items.len) {
-            const variable = session.variables.items[row];
+        const visible_watches = @min(session.watches.items.len, @as(usize, 2));
+        if (row < visible_watches) {
+            const watch = session.watches.items[row];
+            var watch_buf: [720]u8 = undefined;
+            const display_value = watch.result orelse watch.error_message orelse if (watch.pending_seq != null) "(pending)" else "(not evaluated)";
+            const text = std.fmt.bufPrint(&watch_buf, "WATCH {d}  {s} = {s}  ({s})", .{
+                row + 1,
+                watch.expression,
+                display_value,
+                watch.type_name orelse "?",
+            }) catch watch.expression;
+            const color = if (watch.error_message != null)
+                rgb(255, 118, 118)
+            else if (watch.pending_seq != null)
+                rgb(127, 211, 255)
+            else
+                rgb(165, 214, 167);
+            drawTextClipped(hdc, left_right + 16, row_y, rect.right - 16, color, text);
+        } else if (row - visible_watches < session.variables.items.len) {
+            const variable = session.variables.items[row - visible_watches];
             var variable_buf: [520]u8 = undefined;
             const text = std.fmt.bufPrint(&variable_buf, "{s} {s}: {s}  ({s})", .{
                 if (variable.variables_reference > 0) "+" else " ",
@@ -5195,13 +5294,13 @@ fn debugPanelDataRowAt(rect: RECT, y: c_int) ?usize {
 
 fn drawDebugPanelActions(hdc: windows.HDC, rect: RECT) void {
     if (!debugPanelHasActionButtons(rect)) return;
-    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .breakpoint, .stop, .status };
+    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .watch, .breakpoint, .stop, .status };
     for (actions) |action| drawButton(hdc, debugPanelActionButtonRect(rect, action), debugPanelActionLabel(action));
 }
 
 fn debugPanelActionAt(rect: RECT, x: c_int, y: c_int) ?DebugPanelAction {
     if (!debugPanelHasActionButtons(rect) or y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .breakpoint, .stop, .status };
+    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .watch, .breakpoint, .stop, .status };
     for (actions) |action| if (pointIn(debugPanelActionButtonRect(rect, action), x, y)) return action;
     return null;
 }
@@ -5217,13 +5316,14 @@ fn debugPanelActionButtonRect(rect: RECT, action: DebugPanelAction) RECT {
         .status => 0,
         .stop => 1,
         .breakpoint => 2,
-        .step_out => 3,
-        .step_into => 4,
-        .step_over => 5,
-        .pause => 6,
-        .continue_execution => 7,
-        .start => 8,
-        .configure => 9,
+        .watch => 3,
+        .step_out => 4,
+        .step_into => 5,
+        .step_over => 6,
+        .pause => 7,
+        .continue_execution => 8,
+        .start => 9,
+        .configure => 10,
     };
     const right = rect.right - 12 - slot * (width + gap);
     return .{ .left = right - width, .top = rect.top + 7, .right = right, .bottom = rect.top + 31 };
@@ -5239,6 +5339,7 @@ fn debugPanelActionLabel(action: DebugPanelAction) []const u8 {
         .step_into => "INTO",
         .step_out => "OUT",
         .breakpoint => "BP",
+        .watch => "WATCH",
         .stop => "STOP",
         .status => "INFO",
     };
@@ -6117,6 +6218,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .lsp_hover => "HOVER  Enter closes",
         .code_actions => "QUICK FIX  Enter applies",
         .language_mode => "LANGUAGE MODE",
+        .debug_watch => "RESTRICTED WATCH  type to add; Enter removes selected; calls and assignments blocked",
     };
     drawText(hdc, panel.left + 16, panel.top + 14, rgb(79, 230, 226), title);
     if (state.quick_panel.mode == .replace_workspace) {
@@ -6315,12 +6417,23 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 drawTextClipped(hdc, panel.left + 190, y, panel.left + 310, color, @tagName(modes.family(mode)));
                 drawTextClipped(hdc, panel.left + 320, y, panel.right - 16, color, modes.securityFocus(mode));
             },
+            .debug_watch => {
+                if (std.mem.trim(u8, state.quick_panel.query.items, " \t\r\n").len > 0) {
+                    drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, "ADD  session inspection watch");
+                } else if (row < state.app.debug_manager.session.watches.items.len) {
+                    const watch = state.app.debug_manager.session.watches.items[row];
+                    var watch_buf: [720]u8 = undefined;
+                    const value = watch.result orelse watch.error_message orelse if (watch.pending_seq != null) "(pending)" else "(not evaluated)";
+                    const label = std.fmt.bufPrint(&watch_buf, "REMOVE {d}  {s} = {s}", .{ row + 1, watch.expression, value }) catch watch.expression;
+                    drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
+                }
+            },
         }
         y += ROW_HEIGHT;
     }
 
     if (state.quick_panel.itemCount() == 0) {
-        drawText(hdc, panel.left + 18, y, rgb(126, 138, 150), "No matches");
+        drawText(hdc, panel.left + 18, y, rgb(126, 138, 150), if (state.quick_panel.mode == .debug_watch) "Type a field, pointer, or indexed value" else "No matches");
     }
 }
 

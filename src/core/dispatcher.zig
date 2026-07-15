@@ -38,6 +38,7 @@ const lsp_transport = @import("../lsp/transport.zig");
 const debug_launch_plan = @import("../debug/launch_plan.zig");
 const debug_protocol = @import("../debug/protocol.zig");
 const debug_session = @import("../debug/session.zig");
+const debug_expression = @import("../security/debug_expression.zig");
 
 pub const LspPumpResult = struct {
     frames: usize = 0,
@@ -533,6 +534,23 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
 
     if (std.mem.eql(u8, definition.id, "debug.select_frame")) {
         return try selectDebugFrame(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.watch_add")) {
+        return try addDebugWatch(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.watch_remove")) {
+        return removeDebugWatch(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.watch_clear")) {
+        app.debug_manager.session.clearWatches();
+        return .{ .completed = "debug watches cleared" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.watch_refresh")) {
+        return try refreshDebugWatches(app, request.argument);
     }
 
     if (std.mem.eql(u8, definition.id, "debug.ingest_payload")) {
@@ -2023,7 +2041,67 @@ fn selectDebugFrame(app: *app_mod.App, argument: ?[]const u8) !Result {
     var outbound = try session.makeScopes(frame_id);
     defer outbound.deinit();
     try app.debug_manager.send(&outbound);
+    _ = try sendDebugWatches(app, frame_id, null);
     return .{ .completed = "debug stack frame selected" };
+}
+
+fn addDebugWatch(app: *app_mod.App, argument: ?[]const u8) !Result {
+    const expression = std.mem.trim(u8, argument orelse return .{ .blocked = "debug.watch_add requires an expression" }, " \t\r\n");
+    const classification = debug_expression.classify(expression);
+    if (classification != .inspection) return .{ .blocked = debug_expression.rejectionMessage(classification) };
+
+    const session = &app.debug_manager.session;
+    const watch_id = session.addWatch(expression) catch |err| return .{ .blocked = switch (err) {
+        error.EmptyWatchExpression => "watch expression is empty",
+        error.WatchExpressionTooLong => "watch expression exceeds 4096 bytes",
+        error.TooManyWatches => "watch limit reached (64)",
+        else => return err,
+    } };
+    if (app.debug_manager.isRunning() and session.state == .paused) {
+        if (session.active_frame_id) |frame_id| {
+            _ = try sendDebugWatches(app, frame_id, watch_id);
+        }
+    }
+    try appendConsole(app, .stdout, "restricted debug watch added: {s}\n", .{expression});
+    return .{ .completed = "restricted debug watch added" };
+}
+
+fn removeDebugWatch(app: *app_mod.App, argument: ?[]const u8) Result {
+    const one_based = parseDebugReference(argument) orelse return .{ .blocked = "debug.watch_remove requires a one-based watch index" };
+    const index = std.math.cast(usize, one_based - 1) orelse return .{ .blocked = "debug watch index is out of range" };
+    if (!app.debug_manager.session.removeWatchAt(index)) return .{ .blocked = "debug watch index is out of range" };
+    return .{ .completed = "debug watch removed" };
+}
+
+fn refreshDebugWatches(app: *app_mod.App, argument: ?[]const u8) !Result {
+    if (!app.debug_manager.isRunning()) return .{ .blocked = "no debug adapter is running" };
+    const session = &app.debug_manager.session;
+    if (session.state != .paused) return .{ .blocked = "debuggee must be paused to evaluate watches" };
+    const frame_id = session.active_frame_id orelse return .{ .blocked = "no active stack frame" };
+
+    const only_watch_id = if (argument) |raw| blk: {
+        const one_based = parseDebugReference(raw) orelse return .{ .blocked = "watch refresh requires a one-based watch index" };
+        const index = std.math.cast(usize, one_based - 1) orelse return .{ .blocked = "debug watch index is out of range" };
+        if (index >= session.watches.items.len) return .{ .blocked = "debug watch index is out of range" };
+        break :blk session.watches.items[index].id;
+    } else null;
+
+    const sent = try sendDebugWatches(app, frame_id, only_watch_id);
+    if (sent == 0) return .{ .blocked = "no debug watches are registered" };
+    return .{ .completed = "debug watch evaluation requested" };
+}
+
+fn sendDebugWatches(app: *app_mod.App, frame_id: i64, only_watch_id: ?u64) !usize {
+    var sent: usize = 0;
+    const session = &app.debug_manager.session;
+    for (session.watches.items) |watch| {
+        if (only_watch_id) |wanted| if (watch.id != wanted) continue;
+        var outbound = try session.makeEvaluateWatch(watch.id, frame_id);
+        defer outbound.deinit();
+        try app.debug_manager.send(&outbound);
+        sent += 1;
+    }
+    return sent;
 }
 
 fn toggleDebugBreakpoint(app: *app_mod.App) !Result {
@@ -2126,7 +2204,7 @@ fn advanceDebugHandshake(app: *app_mod.App, result: debug_session.IngestResult) 
             },
             .threads => {
                 if (session.active_thread_id) |thread_id| {
-                    if (session.stack_frames.items.len == 0) {
+                    if (session.stack_frames.items.len == 0 and !session.hasPending(.stack_trace)) {
                         var stack = try session.makeStackTrace(thread_id);
                         defer stack.deinit();
                         try app.debug_manager.send(&stack);
@@ -2138,6 +2216,7 @@ fn advanceDebugHandshake(app: *app_mod.App, result: debug_session.IngestResult) 
                     var scopes = try session.makeScopes(frame_id);
                     defer scopes.deinit();
                     try app.debug_manager.send(&scopes);
+                    _ = try sendDebugWatches(app, frame_id, null);
                 }
             },
             .scopes => {
@@ -2192,8 +2271,11 @@ fn renderDebugIngestResult(app: *app_mod.App, result: debug_session.IngestResult
     const session = &app.debug_manager.session;
     switch (result) {
         .ignored => try appendConsole(app, .stdout, "debug ingest: ignored\n", .{}),
-        .acknowledged => |kind| try appendConsole(app, .stdout, "debug acknowledged: {s}\n", .{@tagName(kind)}),
-        .failed => |kind| try appendConsole(app, .stderr, "debug request failed: {s}: {s}\n", .{ @tagName(kind), session.last_error orelse "adapter error" }),
+        .acknowledged => |kind| if (kind != .evaluate) try appendConsole(app, .stdout, "debug acknowledged: {s}\n", .{@tagName(kind)}),
+        .failed => |kind| if (kind == .evaluate)
+            try appendConsole(app, .stderr, "debug watch evaluation failed; details are attached to the watch\n", .{})
+        else
+            try appendConsole(app, .stderr, "debug request failed: {s}: {s}\n", .{ @tagName(kind), session.last_error orelse "adapter error" }),
         .event => |event| switch (event) {
             .output => try app.process_console.appendBytes(
                 if (session.last_output_category != null and std.ascii.eqlIgnoreCase(session.last_output_category.?, "stderr")) .stderr else .stdout,
@@ -2254,6 +2336,17 @@ fn renderDebugStatus(app: *app_mod.App) !void {
     for (session.scopes.items[0..@min(session.scopes.items.len, 64)]) |scope| try writer.print("  {s} ref={d} expensive={}\n", .{ scope.name, scope.variables_reference, scope.expensive });
     try writer.print("variables: {d}\n", .{session.variables.items.len});
     for (session.variables.items[0..@min(session.variables.items.len, 128)]) |variable| try writer.print("  {s}: {s} ({s}) ref={d}\n", .{ variable.name, variable.value, variable.type_name orelse "?", variable.variables_reference });
+    try writer.print("watches: {d}\n", .{session.watches.items.len});
+    for (session.watches.items[0..@min(session.watches.items.len, 128)], 1..) |watch, index| {
+        try writer.print("  [{d}] {s}: {s} ({s}) ref={d}{s}\n", .{
+            index,
+            watch.expression,
+            watch.result orelse watch.error_message orelse if (watch.pending_seq != null) "(pending)" else "(not evaluated)",
+            watch.type_name orelse "?",
+            watch.variables_reference,
+            if (watch.error_message != null) " [error]" else "",
+        });
+    }
     try app.process_console.appendBytes(.stdout, text.written());
 }
 
@@ -4632,6 +4725,23 @@ test "console diagnostics sync parses Zig compiler output" {
 
     try std.testing.expectEqual(@as(usize, 1), app.diagnostics.items.items.len);
     try std.testing.expectEqualStrings("src/main.zig", app.diagnostics.items.items[0].path);
+}
+
+test "debug watch commands enforce restricted expressions and manage the list" {
+    var app = try app_mod.App.init(std.testing.allocator, ".");
+    defer app.deinit();
+
+    const added = try dispatch(&app, .{ .id = "debug.watch_add", .argument = "state.items[0].name" });
+    try std.testing.expect(std.meta.activeTag(added) == .completed);
+    try std.testing.expectEqual(@as(usize, 1), app.debug_manager.session.watches.items.len);
+
+    const rejected = try dispatch(&app, .{ .id = "debug.watch_add", .argument = "state.run()" });
+    try std.testing.expect(std.meta.activeTag(rejected) == .blocked);
+    try std.testing.expectEqual(@as(usize, 1), app.debug_manager.session.watches.items.len);
+
+    const removed = try dispatch(&app, .{ .id = "debug.watch_remove", .argument = "1" });
+    try std.testing.expect(std.meta.activeTag(removed) == .completed);
+    try std.testing.expectEqual(@as(usize, 0), app.debug_manager.session.watches.items.len);
 }
 
 test "open selected workspace file activates editor focus" {

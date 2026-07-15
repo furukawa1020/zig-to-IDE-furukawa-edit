@@ -161,6 +161,7 @@ pub const github = struct {
 pub const security = struct {
     pub const build_consent = @import("security/build_consent.zig");
     pub const build_firewall = @import("security/build_firewall.zig");
+    pub const debug_expression = @import("security/debug_expression.zig");
     pub const findings = @import("security/findings.zig");
     pub const package_trust = @import("security/package_trust.zig");
     pub const polyglot_scanner = @import("security/polyglot_scanner.zig");

@@ -1,11 +1,13 @@
 const std = @import("std");
 const editor_save = @import("../editor/save.zig");
+const debug_breakpoint = @import("../security/debug_breakpoint.zig");
 const debug_expression = @import("../security/debug_expression.zig");
 const workspace_io = @import("../security/workspace_io.zig");
 const session_mod = @import("session.zig");
 
 pub const relative_path = ".zide/debug-state.json";
-pub const schema_version: i64 = 1;
+pub const schema_version: i64 = 2;
+const legacy_schema_version: i64 = 1;
 pub const max_state_bytes: usize = 1024 * 1024;
 const max_stored_watches: usize = 64;
 const max_stored_breakpoints: usize = 4096;
@@ -40,7 +42,7 @@ pub fn load(allocator: std.mem.Allocator, workspace_root: []const u8, session: *
         else => return error.InvalidDebugState,
     };
     const version = intField(root, "version") orelse return error.InvalidDebugState;
-    if (version != schema_version) return error.UnsupportedDebugStateVersion;
+    if (version != legacy_schema_version and version != schema_version) return error.UnsupportedDebugStateVersion;
     const stored_watches = arrayField(root, "watches") orelse return error.InvalidDebugState;
     const stored_breakpoints = arrayField(root, "breakpoints") orelse return error.InvalidDebugState;
 
@@ -84,6 +86,12 @@ pub fn load(allocator: std.mem.Allocator, workspace_root: []const u8, session: *
                     continue;
                 },
             };
+            if (version == legacy_schema_version and
+                (object.contains("condition") or object.contains("hit_condition") or object.contains("log_message")))
+            {
+                report.entries_rejected += 1;
+                continue;
+            }
             const stored_path = stringField(object, "path") orelse {
                 report.entries_rejected += 1;
                 continue;
@@ -104,11 +112,43 @@ pub fn load(allocator: std.mem.Allocator, workspace_root: []const u8, session: *
                 report.entries_rejected += 1;
                 continue;
             };
-            const enabled = boolField(object, "enabled") orelse true;
+            const enabled = optionalBoolField(object, "enabled") catch {
+                report.entries_rejected += 1;
+                continue;
+            } orelse true;
+            const condition = optionalStringField(object, "condition") catch {
+                report.entries_rejected += 1;
+                continue;
+            };
+            const hit_condition = optionalStringField(object, "hit_condition") catch {
+                report.entries_rejected += 1;
+                continue;
+            };
+            const log_message = optionalStringField(object, "log_message") catch {
+                report.entries_rejected += 1;
+                continue;
+            };
             const absolute_path = try workspace_io.absolutePathAlloc(allocator, workspace_root, stored_path);
             defer allocator.free(absolute_path);
-            const added = staged.addBreakpoint(absolute_path, line, enabled) catch |err| switch (err) {
-                error.InvalidBreakpointLine, error.InvalidBreakpointPath, error.TooManyBreakpoints => {
+            const added = staged.addConfiguredBreakpoint(.{
+                .path = absolute_path,
+                .line = line,
+                .enabled = enabled,
+                .condition = condition,
+                .hit_condition = hit_condition,
+                .log_message = log_message,
+            }) catch |err| switch (err) {
+                error.InvalidBreakpointLine,
+                error.InvalidBreakpointPath,
+                error.TooManyBreakpoints,
+                error.EmptyBreakpointValue,
+                error.BreakpointValueTooLong,
+                error.InvalidBreakpointUtf8,
+                error.HiddenBreakpointControl,
+                error.UnsafeBreakpointCondition,
+                error.InvalidHitCondition,
+                error.UnsafeLogMessage,
+                => {
                     report.entries_rejected += 1;
                     continue;
                 },
@@ -148,7 +188,7 @@ pub fn save(allocator: std.mem.Allocator, workspace_root: []const u8, session: *
         try json.objectField("breakpoints");
         try json.beginArray();
         for (session.breakpoints.items[0..@min(session.breakpoints.items.len, max_stored_breakpoints)]) |breakpoint| {
-            if (breakpoint.condition != null or breakpoint.hit_condition != null) {
+            if (!advancedFieldsValid(breakpoint)) {
                 report.breakpoints_skipped += 1;
                 continue;
             }
@@ -163,6 +203,18 @@ pub fn save(allocator: std.mem.Allocator, workspace_root: []const u8, session: *
             try json.write(breakpoint.line);
             try json.objectField("enabled");
             try json.write(breakpoint.enabled);
+            if (breakpoint.condition) |condition| {
+                try json.objectField("condition");
+                try json.write(condition);
+            }
+            if (breakpoint.hit_condition) |hit_condition| {
+                try json.objectField("hit_condition");
+                try json.write(hit_condition);
+            }
+            if (breakpoint.log_message) |log_message| {
+                try json.objectField("log_message");
+                try json.write(log_message);
+            }
             try json.endObject();
             report.breakpoints_saved += 1;
         }
@@ -207,12 +259,27 @@ fn intField(object: std.json.ObjectMap, name: []const u8) ?i64 {
     };
 }
 
-fn boolField(object: std.json.ObjectMap, name: []const u8) ?bool {
+fn optionalStringField(object: std.json.ObjectMap, name: []const u8) !?[]const u8 {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => error.InvalidDebugStateEntry,
+    };
+}
+
+fn optionalBoolField(object: std.json.ObjectMap, name: []const u8) !?bool {
     const value = object.get(name) orelse return null;
     return switch (value) {
         .bool => |flag| flag,
-        else => null,
+        else => error.InvalidDebugStateEntry,
     };
+}
+
+fn advancedFieldsValid(breakpoint: session_mod.Breakpoint) bool {
+    if (breakpoint.condition) |value| _ = debug_breakpoint.validateCondition(value) catch return false;
+    if (breakpoint.hit_condition) |value| _ = debug_breakpoint.validateHitCondition(value) catch return false;
+    if (breakpoint.log_message) |value| _ = debug_breakpoint.validateLogMessage(value) catch return false;
+    return true;
 }
 
 test "debug workspace state atomically round trips restricted watches and breakpoints" {
@@ -267,7 +334,7 @@ test "debug workspace state rejects executable watches and escaping paths" {
     try std.testing.expectEqual(@as(usize, 2), report.entries_rejected);
 }
 
-test "debug workspace state never downgrades conditional breakpoints" {
+test "debug workspace state v2 round trips restricted advanced breakpoints" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -278,17 +345,86 @@ test "debug workspace state never downgrades conditional breakpoints" {
     defer source.deinit();
     const source_path = try workspace_io.absolutePathAlloc(std.testing.allocator, root, "src/main.zig");
     defer std.testing.allocator.free(source_path);
-    _ = try source.addBreakpoint(source_path, 9, true);
-    source.breakpoints.items[0].condition = try std.testing.allocator.dupe(u8, "user.is_admin");
+    _ = try source.addConfiguredBreakpoint(.{
+        .path = source_path,
+        .line = 9,
+        .condition = "user.is_admin == true",
+        .hit_condition = "3",
+        .log_message = "admin {user.name}",
+    });
 
     const saved = try save(std.testing.allocator, root, &source);
-    try std.testing.expectEqual(@as(usize, 0), saved.breakpoints_saved);
-    try std.testing.expectEqual(@as(usize, 1), saved.breakpoints_skipped);
+    try std.testing.expectEqual(@as(usize, 1), saved.breakpoints_saved);
+    try std.testing.expectEqual(@as(usize, 0), saved.breakpoints_skipped);
 
     var restored = try session_mod.Session.init(std.testing.allocator, root);
     defer restored.deinit();
     const loaded = try load(std.testing.allocator, root, &restored);
-    try std.testing.expectEqual(@as(usize, 0), loaded.breakpoints_loaded);
+    try std.testing.expectEqual(@as(usize, 1), loaded.breakpoints_loaded);
+    try std.testing.expectEqualStrings("user.is_admin == true", restored.breakpoints.items[0].condition.?);
+    try std.testing.expectEqualStrings("3", restored.breakpoints.items[0].hit_condition.?);
+    try std.testing.expectEqualStrings("admin {user.name}", restored.breakpoints.items[0].log_message.?);
+}
+
+test "debug workspace state rejects unsafe advanced breakpoint fields transactionally" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.Options.debug_io, ".zide");
+    try tmp.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = relative_path,
+        .data =
+        \\{"version":2,"watches":[],"breakpoints":[{"path":"src/main.zig","line":4,"condition":"launch()"},{"path":"src/ok.zig","line":8,"hit_condition":"5"}]}
+        ,
+    });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    var session = try session_mod.Session.init(std.testing.allocator, root);
+    defer session.deinit();
+    const report = try load(std.testing.allocator, root, &session);
+    try std.testing.expectEqual(@as(usize, 1), report.breakpoints_loaded);
+    try std.testing.expectEqual(@as(usize, 1), report.entries_rejected);
+    try std.testing.expectEqual(@as(usize, 8), session.breakpoints.items[0].line);
+}
+
+test "debug workspace state refuses unsafe in-memory advanced fields" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    var session = try session_mod.Session.init(std.testing.allocator, root);
+    defer session.deinit();
+    const source_path = try workspace_io.absolutePathAlloc(std.testing.allocator, root, "src/main.zig");
+    defer std.testing.allocator.free(source_path);
+    _ = try session.addBreakpoint(source_path, 4, true);
+    session.breakpoints.items[0].condition = try std.testing.allocator.dupe(u8, "launch()");
+
+    const report = try save(std.testing.allocator, root, &session);
+    try std.testing.expectEqual(@as(usize, 0), report.breakpoints_saved);
+    try std.testing.expectEqual(@as(usize, 1), report.breakpoints_skipped);
+}
+
+test "legacy debug state cannot smuggle advanced fields" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.Options.debug_io, ".zide");
+    try tmp.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = relative_path,
+        .data =
+        \\{"version":1,"watches":[],"breakpoints":[{"path":"src/main.zig","line":4,"condition":"ready == true"}]}
+        ,
+    });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buf);
+
+    var session = try session_mod.Session.init(std.testing.allocator, root_buf[0..root_len]);
+    defer session.deinit();
+    const report = try load(std.testing.allocator, root_buf[0..root_len], &session);
+    try std.testing.expectEqual(@as(usize, 0), report.breakpoints_loaded);
+    try std.testing.expectEqual(@as(usize, 1), report.entries_rejected);
 }
 
 test "debug workspace state rejects incomplete schemas" {

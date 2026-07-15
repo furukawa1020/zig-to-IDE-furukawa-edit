@@ -488,6 +488,7 @@ const XAuth = struct {
 
 const BottomPanel = enum {
     output,
+    debug,
     tasks,
     git,
     extensions,
@@ -497,6 +498,19 @@ const BottomPanel = enum {
     keybindings,
     tutorial,
     publish,
+};
+
+const DebugPanelAction = enum {
+    configure,
+    start,
+    continue_execution,
+    pause,
+    step_over,
+    step_into,
+    step_out,
+    breakpoint,
+    stop,
+    status,
 };
 
 const PendingLspAction = enum {
@@ -1303,6 +1317,14 @@ const LinuxGuiState = struct {
         self.finishPendingLspAction();
         self.runDeferredLspActionIfReady();
         return true;
+    }
+
+    fn pumpDebug(self: *LinuxGuiState) bool {
+        const result = dispatcher.pumpDebug(&self.app) catch |err| {
+            self.appendOutput(.stderr, "debug pump failed: {s}\n", .{@errorName(err)});
+            return true;
+        };
+        return result.frames > 0 or result.stderr_bytes > 0 or result.protocol_violation or result.adapter_closed;
     }
 
     fn pollExternalFileChanges(self: *LinuxGuiState) bool {
@@ -2150,6 +2172,7 @@ const LinuxGuiState = struct {
             },
             .bottom_panel = switch (self.bottom_panel) {
                 .output => .output,
+                .debug => .debug,
                 .tasks => .tasks,
                 .git => .git,
                 .extensions => .extensions,
@@ -2176,6 +2199,7 @@ const LinuxGuiState = struct {
         };
         self.bottom_panel = switch (settings.bottom_panel) {
             .output => .output,
+            .debug => .debug,
             .tasks => .tasks,
             .git => .git,
             .extensions => .extensions,
@@ -3524,6 +3548,11 @@ const LinuxGuiState = struct {
             return;
         };
         self.handleDispatchResult(id, result);
+        if (std.mem.startsWith(u8, id, "debug.")) {
+            self.bottom_panel = .debug;
+            self.terminal_focused = false;
+            self.saveWorkbenchSettings();
+        }
     }
 
     fn handleOutcome(self: *LinuxGuiState, outcome: input_handler.Outcome) void {
@@ -3706,6 +3735,88 @@ const LinuxGuiState = struct {
             overview.deinit();
             self.git_overview = null;
         }
+    }
+
+    fn executeDebugPanelAction(self: *LinuxGuiState, action: DebugPanelAction) void {
+        const id = switch (action) {
+            .configure => "debug.create_config",
+            .start => "debug.start",
+            .continue_execution => "debug.continue",
+            .pause => "debug.pause",
+            .step_over => "debug.step_over",
+            .step_into => "debug.step_into",
+            .step_out => "debug.step_out",
+            .breakpoint => "debug.toggle_breakpoint",
+            .stop => "debug.stop",
+            .status => "debug.status",
+        };
+        self.execute(id, .command_palette);
+        self.bottom_panel = .debug;
+        self.terminal_focused = false;
+    }
+
+    fn selectDebugFrameAt(self: *LinuxGuiState, index: usize) void {
+        const session = &self.app.debug_manager.session;
+        if (index >= session.stack_frames.items.len) return;
+        const frame = session.stack_frames.items[index];
+        const frame_id = frame.id;
+        const line = if (frame.line > 0) frame.line - 1 else 0;
+        const column = if (frame.column > 0) frame.column - 1 else 0;
+        const path = if (frame.path) |value| self.allocator.dupe(u8, value) catch null else null;
+        defer if (path) |value| self.allocator.free(value);
+
+        var argument_buf: [48]u8 = undefined;
+        const argument = std.fmt.bufPrint(argument_buf[0..], "{d}", .{frame_id}) catch return;
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = "debug.select_frame",
+            .argument = argument,
+            .source = .command_palette,
+        }) catch |err| {
+            self.message("debug frame failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult("debug.select_frame", result);
+        if (path) |value| self.openDebugSourceLocation(value, line, column);
+        self.bottom_panel = .debug;
+    }
+
+    fn expandDebugVariableAt(self: *LinuxGuiState, index: usize) void {
+        const variables = self.app.debug_manager.session.variables.items;
+        if (index >= variables.len) return;
+        const reference = variables[index].variables_reference;
+        if (reference <= 0) return self.message("debug variable has no children", .{});
+        var argument_buf: [48]u8 = undefined;
+        const argument = std.fmt.bufPrint(argument_buf[0..], "{d}", .{reference}) catch return;
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = "debug.variables",
+            .argument = argument,
+            .source = .command_palette,
+        }) catch |err| {
+            self.message("debug variables failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult("debug.variables", result);
+    }
+
+    fn openDebugSourceLocation(self: *LinuxGuiState, path: []const u8, line: usize, column: usize) void {
+        const index = (if (std.fs.path.isAbsolute(path))
+            self.app.openWorkspacePath(path)
+        else
+            self.app.openWorkspaceFile(path)) catch |err| {
+            self.message("debug source blocked: {s}", .{@errorName(err)});
+            return;
+        };
+        const doc = &self.app.documents.documents.items[index];
+        const safe_line = @min(line, if (doc.text.lineCount() == 0) 0 else doc.text.lineCount() - 1);
+        const safe_column = @min(column, doc.text.lineSlice(safe_line).len);
+        const offset = doc.text.lineColumnToOffset(safe_line, safe_column) catch 0;
+        navigation.setCursor(doc, doc.positionFromOffset(offset) catch doc.cursor.position);
+        self.clearSelection();
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        self.syncActiveDocumentToLsp();
+        self.message("debug frame {s}:{d}:{d}", .{ path, safe_line + 1, safe_column + 1 });
     }
 
     fn executeGitPanelAction(self: *LinuxGuiState, action: GitPanelAction) void {
@@ -5090,9 +5201,35 @@ const LinuxGuiState = struct {
                     self.findLastDocumentSearch(if (key.modifiers.shift) .backward else .forward);
                     return;
                 },
+                5 => {
+                    if (key.modifiers.shift) {
+                        self.executeDebugPanelAction(.stop);
+                    } else if (self.app.debug_manager.session.state == .paused) {
+                        self.executeDebugPanelAction(.continue_execution);
+                    } else {
+                        self.executeDebugPanelAction(.start);
+                    }
+                    return;
+                },
+                6 => {
+                    if (self.app.debug_manager.isRunning()) self.executeDebugPanelAction(.pause);
+                    return;
+                },
                 8 => {
                     self.bottom_panel = .diagnostics;
                     self.execute("diagnostics.next", .keybinding);
+                    return;
+                },
+                9 => {
+                    self.executeDebugPanelAction(.breakpoint);
+                    return;
+                },
+                10 => {
+                    self.executeDebugPanelAction(.step_over);
+                    return;
+                },
+                11 => {
+                    self.executeDebugPanelAction(if (key.modifiers.shift) .step_out else .step_into);
                     return;
                 },
                 12 => {
@@ -5448,6 +5585,7 @@ const LinuxGuiState = struct {
         if (y >= HEADER_HEIGHT and y < bottom and x >= FILE_WIDTH) {
             self.terminal_focused = false;
             self.app.focus = .editor;
+            if (self.handleDebugGutterClick(x, y)) return;
             if (self.handleBoundaryGutterClick(x, y)) return;
             if ((state_mask & X11_MOD1_MASK) != 0) {
                 const position = self.editorPositionFromPoint(x, y) orelse return;
@@ -5521,8 +5659,38 @@ const LinuxGuiState = struct {
         return true;
     }
 
+    fn handleDebugGutterClick(self: *LinuxGuiState, x: i16, y: i16) bool {
+        if (x < EDITOR_LEFT or x >= EDITOR_LEFT + 32) return false;
+        const doc = self.app.documents.active() orelse return false;
+        if (y < EDITOR_TEXT_TOP - 14) return false;
+        const line_delta = @divTrunc(@as(isize, y - (EDITOR_TEXT_TOP - 14)), LINE_HEIGHT);
+        if (line_delta < 0) return false;
+        const line = self.editor_scroll_line + @as(usize, @intCast(line_delta));
+        if (line >= doc.text.lineCount()) return false;
+        const offset = doc.text.lineStart(line) orelse return false;
+        navigation.setCursor(doc, doc.positionFromOffset(offset) catch doc.cursor.position);
+        self.clearSelection();
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureEditorCursorVisible();
+        self.executeDebugPanelAction(.breakpoint);
+        return true;
+    }
+
     fn handleBottomPanelContentClick(self: *LinuxGuiState, x: i16, y: i16) bool {
         switch (self.bottom_panel) {
+            .debug => {
+                if (debugPanelActionAt(self, x, y)) |action| {
+                    self.executeDebugPanelAction(action);
+                    return true;
+                }
+                if (debugPanelStackRowAt(self, x, y)) |row| {
+                    self.selectDebugFrameAt(row);
+                    return true;
+                }
+                if (debugPanelVariableRowAt(self, x, y)) |row| self.expandDebugVariableAt(row);
+                return true;
+            },
             .security => {
                 if (securityPanelActionAt(self, x, y)) |action| {
                     self.executeSecurityPanelAction(action);
@@ -5793,6 +5961,7 @@ const LinuxGuiState = struct {
 
     fn scrollBottomPanel(self: *LinuxGuiState, delta: isize) void {
         switch (self.bottom_panel) {
+            .debug => {},
             .output => {
                 const visible = outputVisibleRows(self);
                 const total = self.app.process_console.lines.items.len;
@@ -5896,11 +6065,12 @@ pub fn run(
             fd_count += 1;
         }
 
-        const timeout_ms: i32 = if (pty_poll_index != null or state.app.hasAnyRunningLsp()) 100 else 250;
+        const timeout_ms: i32 = if (pty_poll_index != null or state.app.hasAnyRunningLsp() or state.app.debug_manager.isRunning()) 100 else 250;
         _ = try std.posix.poll(fds[0..fd_count], timeout_ms);
 
         var needs_draw = state.pumpPtySession();
         needs_draw = state.pumpLsp() or needs_draw;
+        needs_draw = state.pumpDebug() or needs_draw;
         needs_draw = state.pollExternalFileChanges() or needs_draw;
         const pty_ready_mask: i16 = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR;
         if (pty_poll_index) |index| {
@@ -6154,7 +6324,12 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
         const line_index = state.editor_scroll_line + row;
         const line = doc.text.lineSlice(line_index);
         const selected = line_index == cursor_line;
+        const debug_marker = debugLineMarkerX11(state, path, line_index);
         if (selected) try x11.fillRect(x11.gc.panel_2, EDITOR_LEFT - 8, line_y - 14, toU16(state.window_width - EDITOR_LEFT - 20), LINE_HEIGHT);
+        if (debug_marker.active_execution) {
+            try x11.fillRect(x11.gc.line, EDITOR_LEFT + 56, line_y - 14, toU16(state.window_width - EDITOR_LEFT - 76), LINE_HEIGHT);
+            try x11.fillRect(x11.gc.amber, EDITOR_LEFT + 39, line_y - 14, 3, LINE_HEIGHT);
+        }
 
         if (selection) |range| {
             if (doc.text.lineStart(line_index)) |line_start| {
@@ -6174,6 +6349,9 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
         var number_buf: [24]u8 = undefined;
         const number = std.fmt.bufPrint(number_buf[0..], "{d: >4}", .{line_index + 1}) catch "   ?";
         try x11.text(x11.gc.muted, EDITOR_LEFT, line_y, number);
+        if (debug_marker.breakpoint_verified) |verified| {
+            try x11.fillRect(if (verified) x11.gc.green else x11.gc.red, EDITOR_LEFT + 44, line_y - 9, 7, 7);
+        }
         if (lineBoundaryMarker(state, path, line_index)) |marker| {
             const marker_gc = riskGc(x11, marker.risk);
             try x11.fillRect(marker_gc, EDITOR_LEFT + 52, line_y - 14, 3, LINE_HEIGHT);
@@ -6246,18 +6424,20 @@ fn drawBottomPanel(x11: *X11, state: *LinuxGuiState) !void {
     const bottom = state.bottomTop();
     try x11.fillRect(x11.gc.line, 0, bottom, toU16(state.window_width), 1);
     try drawPanelTab(x11, bottom, state.bottom_panel == .output, 18, "OUTPUT");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .tasks, 122, "RUN");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .git, 226, "GIT");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .extensions, 330, "EXT");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .diagnostics, 434, "DIAG");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .security, 538, "SEC");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .settings, 642, "SET");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .keybindings, 746, "KEYS");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .tutorial, 850, "HELP");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .publish, 954, "SHIP");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .debug, 122, "DEBUG");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .tasks, 226, "RUN");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .git, 330, "GIT");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .extensions, 434, "EXT");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .diagnostics, 538, "DIAG");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .security, 642, "SEC");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .settings, 746, "SET");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .keybindings, 850, "KEYS");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .tutorial, 954, "HELP");
+    try drawPanelTab(x11, bottom, state.bottom_panel == .publish, 1058, "SHIP");
 
     switch (state.bottom_panel) {
         .output => try drawOutputPanel(x11, state),
+        .debug => try drawDebugPanel(x11, state),
         .tasks => try drawTaskPanel(x11, state),
         .git => try drawGitPanel(x11, state),
         .extensions => try drawExtensionsPanel(x11, state),
@@ -6349,6 +6529,86 @@ fn drawOutputPanel(x11: *X11, state: *LinuxGuiState) !void {
     }
     if (app.process_console.lines.items.len == 0) {
         try x11.text(x11.gc.muted, 18, y, "No output yet.");
+    }
+}
+
+fn drawDebugPanel(x11: *X11, state: *LinuxGuiState) !void {
+    const bottom = state.bottomTop();
+    const manager = &state.app.debug_manager;
+    const session = &manager.session;
+    try drawDebugPanelActions(x11, state);
+
+    var header_buf: [360]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "DEBUG state:{s} pending:{d} bp:{d} threads:{d} stack:{d} scopes:{d} vars:{d}", .{
+        @tagName(session.state),
+        session.pendingCount(),
+        session.breakpoints.items.len,
+        session.threads.items.len,
+        session.stack_frames.items.len,
+        session.scopes.items.len,
+        session.variables.items.len,
+    }) catch "DEBUG";
+    const state_gc = switch (session.state) {
+        .paused => x11.gc.amber,
+        .running, .launching, .configuring, .initializing => x11.gc.cyan,
+        .failed => x11.gc.red,
+        else => x11.gc.green,
+    };
+    try x11.text(state_gc, 18, bottom + 58, header);
+
+    var policy_buf: [720]u8 = undefined;
+    const policy = std.fmt.bufPrint(policy_buf[0..], "BOUNDARY env:{s} fs:{s} net:{s} reverse-launch:deny frame:8MiB argv-only no-follow  F5 F9 F10 F11", .{
+        @tagName(manager.env_policy),
+        @tagName(manager.fs_policy),
+        @tagName(manager.network_policy),
+    }) catch "BOUNDARY";
+    try x11.text(x11.gc.muted, 18, bottom + 82, policy);
+
+    var y: i16 = bottom + 106;
+    if (manager.plan) |plan| {
+        var plan_buf: [900]u8 = undefined;
+        const plan_line = std.fmt.bufPrint(plan_buf[0..], "ADAPTER {s}  PROGRAM {s}", .{ plan.adapter_argv[0], plan.program }) catch plan.program;
+        var ascii_buf: [900]u8 = undefined;
+        try x11.text(x11.gc.cyan, 18, y, asciiInto(ascii_buf[0..], plan_line));
+    } else {
+        try x11.text(x11.gc.muted, 18, y, "No active adapter. Add .zide/debug.json or select a Python file, then START.");
+    }
+    y += LINE_HEIGHT;
+
+    var stop_buf: [360]u8 = undefined;
+    const stop_line = std.fmt.bufPrint(stop_buf[0..], "STOP {s} thread:{any} frame:{any}", .{ session.stop_reason orelse "-", session.active_thread_id, session.active_frame_id }) catch "STOP";
+    try x11.text(x11.gc.amber, 18, y, stop_line);
+    y += LINE_HEIGHT;
+
+    y = debugPanelRowsTop(state);
+    var row: usize = 0;
+    while (row < 4 and y < state.window_height - STATUS_HEIGHT) : (row += 1) {
+        if (row < session.stack_frames.items.len) {
+            const frame = session.stack_frames.items[row];
+            var frame_buf: [620]u8 = undefined;
+            const frame_line = std.fmt.bufPrint(frame_buf[0..], "{s} #{d} {s} {s}:{d}", .{
+                if (session.active_frame_id == frame.id) ">" else " ",
+                frame.id,
+                frame.name,
+                frame.path orelse "(no source)",
+                frame.line,
+            }) catch frame.name;
+            var ascii_buf: [620]u8 = undefined;
+            try x11.text(if (session.active_frame_id == frame.id) x11.gc.amber else x11.gc.text, 18, y, asciiInto(ascii_buf[0..], frame_line));
+        }
+        if (row < session.variables.items.len) {
+            const variable = session.variables.items[row];
+            var variable_buf: [620]u8 = undefined;
+            const variable_line = std.fmt.bufPrint(variable_buf[0..], "{s} {s}: {s} ({s})", .{
+                if (variable.variables_reference > 0) "+" else " ",
+                variable.name,
+                variable.value,
+                variable.type_name orelse "?",
+            }) catch variable.name;
+            var ascii_buf: [620]u8 = undefined;
+            try x11.text(x11.gc.green, @max(@as(i16, 520), @divTrunc(state.window_width, 2)), y, asciiInto(ascii_buf[0..], variable_line));
+        }
+        y += LINE_HEIGHT;
     }
 }
 
@@ -7198,6 +7458,11 @@ const LineBoundaryMarker = struct {
     count: usize,
 };
 
+const DebugLineMarkerX11 = struct {
+    breakpoint_verified: ?bool = null,
+    active_execution: bool = false,
+};
+
 const GitMarker = struct {
     label: []const u8,
     status: git_repository.ChangeStatus,
@@ -7279,6 +7544,26 @@ fn lineBoundaryMarker(state: *const LinuxGuiState, path: []const u8, line: usize
             }
         } else {
             marker = .{ .risk = item.risk, .boundary = boundary, .count = 1 };
+        }
+    }
+    return marker;
+}
+
+fn debugLineMarkerX11(state: *const LinuxGuiState, path: []const u8, line: usize) DebugLineMarkerX11 {
+    var marker = DebugLineMarkerX11{};
+    for (state.app.debug_manager.session.breakpoints.items) |breakpoint| {
+        if (!breakpoint.enabled or breakpoint.line != line + 1) continue;
+        if (!pathMatchesX11(path, breakpoint.path)) continue;
+        marker.breakpoint_verified = breakpoint.verified;
+        break;
+    }
+    if (state.app.debug_manager.session.active_frame_id) |active_id| {
+        for (state.app.debug_manager.session.stack_frames.items) |frame| {
+            if (frame.id != active_id or frame.line != line + 1) continue;
+            const frame_path = frame.path orelse continue;
+            if (!pathMatchesX11(path, frame_path)) continue;
+            marker.active_execution = true;
+            break;
         }
     }
     return marker;
@@ -8410,8 +8695,12 @@ fn keyEventFromX(bytes: []const u8) ?event_mod.KeyEvent {
         67 => .{ .function = 1 },
         68 => .{ .function = 2 },
         69 => .{ .function = 3 },
+        71 => .{ .function = 5 },
         72 => .{ .function = 6 },
         73 => .{ .function = 7 },
+        74 => .{ .function = 8 },
+        75 => .{ .function = 9 },
+        76 => .{ .function = 10 },
         95 => .{ .function = 11 },
         96 => .{ .function = 12 },
         111 => .arrow_up,
@@ -8542,7 +8831,7 @@ fn headerActionAt(x: i16, y: i16) ?HeaderAction {
 fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
     const bottom = state.bottomTop();
     if (y < bottom or y >= bottom + 34) return null;
-    const panels = [_]BottomPanel{ .output, .tasks, .git, .extensions, .diagnostics, .security, .settings, .keybindings, .tutorial, .publish };
+    const panels = [_]BottomPanel{ .output, .debug, .tasks, .git, .extensions, .diagnostics, .security, .settings, .keybindings, .tutorial, .publish };
     for (panels, 0..) |panel, index| {
         const left: i16 = 10 + @as(i16, @intCast(index)) * 104;
         const rect = HitRect{ .left = left, .top = bottom + 8, .right = left + 96, .bottom = bottom + 32 };
@@ -8552,6 +8841,7 @@ fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
 }
 
 const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
+const debug_panel_actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .breakpoint, .stop, .status };
 const task_panel_actions = [_]TaskPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .terminal, .queue_terminal, .run_pty, .stop_pty, .tasks, .preview, .seal, .run_next, .history };
 const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .seal, .linux };
 const settings_panel_actions = [_]SettingsPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .tutorial_ja, .tutorial_en, .review, .trust, .lock, .seal };
@@ -8563,6 +8853,12 @@ const context_actions = [_]ContextAction{ .copy, .cut, .paste, .select_all, .fin
 fn drawGitPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
     inline for (git_panel_actions) |action| {
         try drawActionButton(x11, gitPanelActionRect(state, action), gitPanelActionLabel(action));
+    }
+}
+
+fn drawDebugPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
+    inline for (debug_panel_actions) |action| {
+        try drawActionButton(x11, debugPanelActionRect(state, action), debugPanelActionLabel(action));
     }
 }
 
@@ -8614,6 +8910,35 @@ fn gitPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?GitPanelAction
     return null;
 }
 
+fn debugPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?DebugPanelAction {
+    inline for (debug_panel_actions) |action| {
+        if (pointIn(debugPanelActionRect(state, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn debugPanelRowsTop(state: *const LinuxGuiState) i16 {
+    return state.bottomTop() + 106 + LINE_HEIGHT * 2;
+}
+
+fn debugPanelStackRowAt(state: *const LinuxGuiState, x: i16, y: i16) ?usize {
+    const split = @max(@as(i16, 520), @divTrunc(state.window_width, 2));
+    if (x < 12 or x >= split) return null;
+    return debugPanelDataRowAt(state, y);
+}
+
+fn debugPanelVariableRowAt(state: *const LinuxGuiState, x: i16, y: i16) ?usize {
+    const split = @max(@as(i16, 520), @divTrunc(state.window_width, 2));
+    if (x < split or x >= state.window_width - 8) return null;
+    return debugPanelDataRowAt(state, y);
+}
+
+fn debugPanelDataRowAt(state: *const LinuxGuiState, y: i16) ?usize {
+    const top = debugPanelRowsTop(state) - 14;
+    if (y < top or y >= top + LINE_HEIGHT * 4) return null;
+    return @intCast(@divTrunc(y - top, LINE_HEIGHT));
+}
+
 fn taskPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?TaskPanelAction {
     inline for (task_panel_actions) |action| {
         if (pointIn(taskPanelActionRect(state, action), x, y)) return action;
@@ -8660,6 +8985,26 @@ fn outputApplyButtonRect(state: *const LinuxGuiState) HitRect {
     const bottom = state.bottomTop();
     const right = state.window_width - 18;
     return .{ .left = right - 76, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
+}
+
+fn debugPanelActionRect(state: *const LinuxGuiState, action: DebugPanelAction) HitRect {
+    const index: i16 = switch (action) {
+        .configure => 0,
+        .start => 1,
+        .continue_execution => 2,
+        .pause => 3,
+        .step_over => 4,
+        .step_into => 5,
+        .step_out => 6,
+        .breakpoint => 7,
+        .stop => 8,
+        .status => 9,
+    };
+    const width: i16 = 58;
+    const gap: i16 = 6;
+    const right = state.window_width - 18 - (9 - index) * (width + gap);
+    const bottom = state.bottomTop();
+    return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
 
 fn gitPanelActionRect(state: *const LinuxGuiState, action: GitPanelAction) HitRect {
@@ -8783,6 +9128,21 @@ fn gitPanelActionLabel(action: GitPanelAction) []const u8 {
         .issues => "ISS",
         .failures => "FAIL",
         .draft_pr => "PR",
+    };
+}
+
+fn debugPanelActionLabel(action: DebugPanelAction) []const u8 {
+    return switch (action) {
+        .configure => "CFG",
+        .start => "START",
+        .continue_execution => "CONT",
+        .pause => "PAUSE",
+        .step_over => "OVER",
+        .step_into => "INTO",
+        .step_out => "OUT",
+        .breakpoint => "BP",
+        .stop => "STOP",
+        .status => "INFO",
     };
 }
 

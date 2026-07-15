@@ -85,15 +85,31 @@ Zig向けに最初から見るべき危険境界:
 
 ただし、これは**副作用が絶対にないことの証明ではない**。言語によってはproperty getter、indexer、`__getattribute__`、`__getitem__`などがフィールド参照や添字で実行される。DAP adapter自身も信頼境界の内側にある。そのため、現状のウォッチは「構文を制限した評価」であり、未信頼debuggeeに対する完全なread-only inspectionではない。任意式REPLを追加する場合は、別の明示的な同意境界として実装する。
 
+### 高度ブレークポイント境界
+
+DAPの `SourceBreakpoint` が持つ `condition` / `hitCondition` / `logMessage` を扱う。ただし、文字列をそのままadapterへ渡す汎用入力にはしない。
+
+- 条件式はフィールド・添字参照、リテラル、比較、論理結合、groupingだけに制限し、関数呼び出し、代入、文、算術式を拒否する
+- hit conditionはadapter固有の任意式ではなく、1以上のbase-10整数だけを受理する
+- log message内の `{expression}` はデバッグウォッチと同じrestricted inspection分類を通し、callやoperator expressionを拒否する
+- UTF-8、hidden control、NUL、長さ、group depth、atom数、interpolation数をZig側で上限検査する
+- 実行中adapterが対応capabilityを広告していない設定は変更時に拒否する
+- 保存済みの高度ブレークポイントを非対応adapterへ送る場合、そのブレークポイント全体を保留し、無条件の通常ブレークポイントへ格下げしない
+- Windows/Linux GUIは同じcore commandを使い、通常、hit、condition、logpointを異なるgutter色で表示する
+
+この制限も副作用の不在を証明しない。比較対象のproperty/indexerやdebuggerの式評価器がコードを実行する可能性は残る。adapterは引き続き信頼境界内であり、GUIには「restricted adapter evaluation」として露出する。DAPのフィールドとcapabilityの意味は[公式仕様](https://microsoft.github.io/debug-adapter-protocol/specification#Types_SourceBreakpoint)に従う。
+
 ### デバッグ状態ファイル
 
-ウォッチと通常ブレークポイントは `.zide/debug-state.json` に保存する。このファイルはユーザーごとの状態なのでGit管理から除外する。
+ウォッチとsource breakpointは `.zide/debug-state.json` に保存する。このファイルはユーザーごとの状態なのでGit管理から除外する。
 
 - 読み込みは1 MiBまで、通常ファイルかつno-followのワークスペース能力経由に限定する
 - 保存先の親ディレクトリをコンポーネントごとにno-followで開き、同じディレクトリ能力内の一時ファイルから原子的にrenameする
 - ブレークポイントのpathはワークスペース相対形式だけを保存・受理し、絶対pathと `..` を拒否する
 - 読み込んだウォッチは上記の制限付き式分類をもう一度通す
 - 読み込みは一時Sessionへステージングし、検証と確保が完了してから現在のリストと交換する
-- 条件式、log expression、任意のadapter引数はこの状態ファイルから読み込まない
+- v1の通常ブレークポイントを読み込める一方、高度設定を含む保存形式はv2とし、古いbinaryによる無条件BPへの誤変換を防ぐ
+- condition、hit condition、log messageは読み込み時にも上記の検証を通し、1項目でも不正ならそのブレークポイント全体を拒否する
+- 任意のadapter引数やruntime responseは状態ファイルから読み込まない
 - 状態を変更するブレークポイント／ウォッチコマンドは `workspace_write` capabilityを持ち、LOCKED_DOWNでは実行前に拒否する
 - 保存失敗は `store:dirty` / `store:save-error` としてGUIへ露出し、メモリ上だけの変更になったことを隠さない

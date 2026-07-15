@@ -35,10 +35,20 @@ const lsp_manager = @import("../lsp/manager.zig");
 const lsp_responses = @import("../lsp/responses.zig");
 const lsp_session = @import("../lsp/session.zig");
 const lsp_transport = @import("../lsp/transport.zig");
+const debug_launch_plan = @import("../debug/launch_plan.zig");
+const debug_protocol = @import("../debug/protocol.zig");
+const debug_session = @import("../debug/session.zig");
 
 pub const LspPumpResult = struct {
     frames: usize = 0,
     stderr_bytes: usize = 0,
+};
+
+pub const DebugPumpResult = struct {
+    frames: usize = 0,
+    stderr_bytes: usize = 0,
+    protocol_violation: bool = false,
+    adapter_closed: bool = false,
 };
 
 const max_automatic_lsp_sync_bytes: usize = 4 * 1024 * 1024;
@@ -460,6 +470,80 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return try drainLspFrames(app);
     }
 
+    if (std.mem.eql(u8, definition.id, "debug.create_config")) {
+        return try createDebugConfiguration(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.plan")) {
+        return try renderResolvedDebugPlan(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.start")) {
+        return try startDebugTransport(app, request.argument, null, null);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.stop")) {
+        return try stopDebugTransport(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.continue")) {
+        return try sendDebugThreadAction(app, .continue_execution);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.pause")) {
+        return try sendDebugThreadAction(app, .pause);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.step_over")) {
+        return try sendDebugThreadAction(app, .next);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.step_into")) {
+        return try sendDebugThreadAction(app, .step_in);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.step_out")) {
+        return try sendDebugThreadAction(app, .step_out);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.toggle_breakpoint")) {
+        return try toggleDebugBreakpoint(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.status")) {
+        try renderDebugStatus(app);
+        return .{ .completed = "debug status rendered" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.threads")) {
+        return try sendDebugDataRequest(app, .threads, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.stack")) {
+        return try sendDebugDataRequest(app, .stack_trace, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.scopes")) {
+        return try sendDebugDataRequest(app, .scopes, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.variables")) {
+        return try sendDebugDataRequest(app, .variables, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.select_frame")) {
+        return try selectDebugFrame(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.ingest_payload")) {
+        const payload = request.argument orelse return .{ .unsupported = "debug.ingest_payload requires a DAP JSON payload" };
+        return try ingestDebugPayload(app, payload);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.drain")) {
+        return try drainDebugFrames(app);
+    }
+
     if (std.mem.eql(u8, definition.id, "security.scan_current")) {
         const doc = app.documents.active() orelse return .no_active_document;
         const path = doc.path orelse "(scratch)";
@@ -541,6 +625,17 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
             .unknown_command => return .unknown_command,
             .blocked => |message| return .{ .blocked = message },
             .allowed, .confirmation_required => {},
+        }
+
+        if (std.mem.eql(u8, source_id, "debug.start")) {
+            const result = try startDebugTransport(
+                app,
+                app.pending_build_argument,
+                preview.consent,
+                preview.command,
+            );
+            if (std.meta.activeTag(result) == .completed) app.clearPendingBuildConsent();
+            return result;
         }
 
         const spec = externalCommandPreviewById(app, source_id) orelse return .{ .blocked = "pending consent is not an executable command" };
@@ -714,10 +809,19 @@ fn zigCommand(app: *app_mod.App, invocation: build_commands.BuildInvocation) pro
 }
 
 fn rememberConsentPreview(app: *app_mod.App, request: command.Request) !void {
+    if (std.mem.eql(u8, request.id, "debug.start")) {
+        const doc = app.documents.active() orelse return;
+        var plan = debug_launch_plan.resolve(app.allocator, app.workspace.root_path, doc.language, doc.path, request.argument) catch return;
+        defer plan.deinit();
+        var preview = try build_consent.makePreview(app.allocator, plan.spawnSpec(), app.runtime.trust_state);
+        errdefer preview.deinit();
+        try app.setPendingBuildConsent(request.id, request.argument, preview);
+        return;
+    }
     const spec = externalCommandPreviewById(app, request.id) orelse return;
     var preview = try build_consent.makePreview(app.allocator, spec, app.runtime.trust_state);
     errdefer preview.deinit();
-    try app.setPendingBuildConsent(request.id, preview);
+    try app.setPendingBuildConsent(request.id, request.argument, preview);
 }
 
 fn externalCommandPreviewById(app: *app_mod.App, id: []const u8) ?process.SpawnSpec {
@@ -1734,6 +1838,448 @@ fn renderLspIngestResult(app: *app_mod.App, result: lsp_session.IngestResult) !v
         .code_actions => |count| try appendConsole(app, .stdout, "lsp ingest: code actions {d}\n", .{count}),
         .acknowledged => |kind| try appendConsole(app, .stdout, "lsp ingest: acknowledged {s}\n", .{@tagName(kind)}),
     }
+}
+
+fn createDebugConfiguration(app: *app_mod.App, explicit_program: ?[]const u8) !Result {
+    const doc = app.documents.active() orelse return .no_active_document;
+    const bytes = try debug_launch_plan.makeConfigTemplate(
+        app.allocator,
+        app.workspace.root_path,
+        doc.language,
+        doc.path,
+        explicit_program,
+    );
+    defer app.allocator.free(bytes);
+
+    var capability = try workspace_io.openFileCapabilityCreateParents(app.workspace.root_path, debug_launch_plan.configPath());
+    defer capability.close();
+    editor_save.createBytesInDirExclusive(app.allocator, capability.parent, capability.name, bytes) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            _ = try app.openWorkspaceFile(debug_launch_plan.configPath());
+            app.focus = .editor;
+            return .{ .completed = "opened existing debug configuration" };
+        },
+        else => return err,
+    };
+
+    try app.workspace.refresh();
+    _ = try app.openWorkspaceFile(debug_launch_plan.configPath());
+    app.focus = .editor;
+    try appendConsole(app, .stdout, "created debug configuration: {s}\nprogram and adapter are argv-only workspace policy inputs\n", .{debug_launch_plan.configPath()});
+    return .{ .completed = "created debug configuration" };
+}
+
+fn renderResolvedDebugPlan(app: *app_mod.App, explicit_program: ?[]const u8) !Result {
+    const doc = app.documents.active() orelse return .no_active_document;
+    var plan = debug_launch_plan.resolve(
+        app.allocator,
+        app.workspace.root_path,
+        doc.language,
+        doc.path,
+        explicit_program,
+    ) catch |err| {
+        try appendConsole(
+            app,
+            .stderr,
+            "debug plan unavailable: {s}\nconfig: {s}\nhint: {s}\n",
+            .{ @errorName(err), debug_launch_plan.configPath(), debug_launch_plan.defaultAdapterHint(doc.language) },
+        );
+        return .{ .blocked = "debug launch plan is incomplete" };
+    };
+    defer plan.deinit();
+    try renderDebugPlan(app, &plan);
+    return .{ .completed = "debug launch plan rendered" };
+}
+
+fn startDebugTransport(
+    app: *app_mod.App,
+    explicit_program: ?[]const u8,
+    approved_consent: ?permissions.Consent,
+    expected_command: ?[]const u8,
+) !Result {
+    if (app.debug_manager.isRunning()) return .{ .blocked = "a debug adapter is already running" };
+    const doc = app.documents.active() orelse return .no_active_document;
+    var plan = debug_launch_plan.resolve(
+        app.allocator,
+        app.workspace.root_path,
+        doc.language,
+        doc.path,
+        explicit_program,
+    ) catch |err| {
+        try appendConsole(
+            app,
+            .stderr,
+            "debug start blocked: {s}\nconfig: {s}\nhint: {s}\n",
+            .{ @errorName(err), debug_launch_plan.configPath(), debug_launch_plan.defaultAdapterHint(doc.language) },
+        );
+        return .{ .blocked = "debug configuration is not ready" };
+    };
+
+    var generated = try build_consent.makePreview(app.allocator, plan.spawnSpec(), app.runtime.trust_state);
+    defer generated.deinit();
+    if (expected_command) |expected| {
+        if (!std.mem.eql(u8, expected, generated.command)) {
+            plan.deinit();
+            try appendConsole(app, .stderr, "debug start blocked: launch plan changed after consent\nexpected: {s}\ncurrent:  {s}\n", .{ expected, generated.command });
+            return .{ .blocked = "debug launch plan changed; review it again" };
+        }
+    }
+
+    var consent = approved_consent orelse generated.consent;
+    consent.fs_policy = .workspace_only;
+    consent.network_policy = .deny;
+    consent.output_sanitized = true;
+
+    app.debug_manager.start(app.io, app.environ, plan, consent) catch |err| {
+        plan.deinit();
+        try appendConsole(app, .stderr, "debug adapter start failed: {s}\nhint: {s}\n", .{ @errorName(err), debug_launch_plan.defaultAdapterHint(doc.language) });
+        return .{ .blocked = "debug adapter could not be started" };
+    };
+    try appendConsole(
+        app,
+        .stdout,
+        "debug adapter started: {s}\nprogram: {s}\ncwd: {s}\npolicy: env={s} fs=workspace_only net=deny reverse-launch=deny frame_limit={d}\n",
+        .{
+            app.debug_manager.transport.?.command_label,
+            app.debug_manager.plan.?.program,
+            app.debug_manager.plan.?.cwd,
+            @tagName(app.debug_manager.env_policy),
+            @import("../debug/framing.zig").max_payload_bytes,
+        },
+    );
+    return .{ .completed = "debug adapter started; initialize sent" };
+}
+
+fn stopDebugTransport(app: *app_mod.App) !Result {
+    if (!app.debug_manager.isRunning()) return .{ .blocked = "no debug adapter is running" };
+    var disconnect = app.debug_manager.session.makeDisconnect(true) catch null;
+    if (disconnect) |*outbound| {
+        defer outbound.deinit();
+        app.debug_manager.send(outbound) catch |err| {
+            try appendConsole(app, .stderr, "debug disconnect send failed: {s}\n", .{@errorName(err)});
+        };
+    }
+    _ = app.debug_manager.stop();
+    try appendConsole(app, .stdout, "debug adapter stopped; debuggee termination requested\n", .{});
+    return .{ .completed = "debug session stopped" };
+}
+
+fn sendDebugThreadAction(app: *app_mod.App, kind: debug_session.RequestKind) !Result {
+    if (!app.debug_manager.isRunning()) return .{ .blocked = "no debug adapter is running" };
+    const session = &app.debug_manager.session;
+    if (kind == .pause) {
+        if (session.state != .running and session.state != .launching and session.state != .configuring) {
+            return .{ .blocked = "debuggee is not running" };
+        }
+    } else if (session.state != .paused) {
+        return .{ .blocked = "debuggee must be paused for this action" };
+    }
+    const thread_id = session.active_thread_id orelse if (session.threads.items.len > 0) session.threads.items[0].id else return .{ .blocked = "no active debug thread" };
+
+    var outbound = switch (kind) {
+        .continue_execution => try session.makeContinue(thread_id),
+        .pause => try session.makePause(thread_id),
+        .next => try session.makeNext(thread_id),
+        .step_in => try session.makeStepIn(thread_id),
+        .step_out => try session.makeStepOut(thread_id),
+        else => return .{ .unsupported = "unsupported debug thread action" },
+    };
+    defer outbound.deinit();
+    try app.debug_manager.send(&outbound);
+    try appendConsole(app, .stdout, "debug request: {s} thread={d}\n", .{ @tagName(kind), thread_id });
+    return .{ .completed = "debug action sent" };
+}
+
+fn sendDebugDataRequest(app: *app_mod.App, kind: debug_session.RequestKind, argument: ?[]const u8) !Result {
+    if (!app.debug_manager.isRunning()) return .{ .blocked = "no debug adapter is running" };
+    const session = &app.debug_manager.session;
+    var outbound = switch (kind) {
+        .threads => try session.makeThreads(),
+        .stack_trace => try session.makeStackTrace(parseDebugReference(argument) orelse session.active_thread_id orelse return .{ .blocked = "no active debug thread" }),
+        .scopes => try session.makeScopes(parseDebugReference(argument) orelse session.active_frame_id orelse return .{ .blocked = "no active stack frame" }),
+        .variables => try session.makeVariables(parseDebugReference(argument) orelse if (session.scopes.items.len > 0) session.scopes.items[0].variables_reference else return .{ .blocked = "no variable scope reference" }),
+        else => return .{ .unsupported = "unsupported debug data request" },
+    };
+    defer outbound.deinit();
+    try app.debug_manager.send(&outbound);
+    return .{ .completed = "debug data request sent" };
+}
+
+fn selectDebugFrame(app: *app_mod.App, argument: ?[]const u8) !Result {
+    if (!app.debug_manager.isRunning()) return .{ .blocked = "no debug adapter is running" };
+    const frame_id = parseDebugReference(argument) orelse return .{ .blocked = "debug.select_frame requires a numeric frame ID" };
+    const session = &app.debug_manager.session;
+    if (session.state != .paused) return .{ .blocked = "debuggee must be paused to select a stack frame" };
+    var found = false;
+    for (session.stack_frames.items) |frame| {
+        if (frame.id == frame_id) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return .{ .blocked = "debug stack frame is no longer available" };
+
+    session.active_frame_id = frame_id;
+    var outbound = try session.makeScopes(frame_id);
+    defer outbound.deinit();
+    try app.debug_manager.send(&outbound);
+    return .{ .completed = "debug stack frame selected" };
+}
+
+fn toggleDebugBreakpoint(app: *app_mod.App) !Result {
+    const doc = app.documents.active() orelse return .no_active_document;
+    const path = doc.path orelse return .{ .blocked = "save the document before adding a breakpoint" };
+    const line = doc.cursor.position.line + 1;
+    const toggled = try app.debug_manager.session.toggleBreakpoint(path, line);
+    if (app.debug_manager.isRunning()) {
+        var outbound = try app.debug_manager.session.makeSetBreakpoints(path);
+        defer outbound.deinit();
+        try app.debug_manager.send(&outbound);
+    }
+    try appendConsole(app, .stdout, "debug breakpoint {s}: {s}:{d}\n", .{ @tagName(toggled), path, line });
+    return .{ .completed = if (toggled == .added) "breakpoint added" else "breakpoint removed" };
+}
+
+fn ingestDebugPayload(app: *app_mod.App, payload: []const u8) !Result {
+    const result = try app.debug_manager.session.ingestPayload(payload);
+    try renderDebugIngestResult(app, result);
+    return switch (result) {
+        .ignored => .{ .blocked = "DAP payload ignored" },
+        else => .{ .completed = "DAP payload ingested" },
+    };
+}
+
+fn drainDebugFrames(app: *app_mod.App) !Result {
+    if (!app.debug_manager.isRunning()) return .{ .blocked = "no debug adapter is running" };
+    const result = try pumpDebug(app);
+    if (result.frames == 0 and result.stderr_bytes == 0 and !result.protocol_violation) {
+        return .{ .blocked = "no complete DAP frames buffered" };
+    }
+    return .{ .completed = "debug adapter frames drained" };
+}
+
+pub fn pumpDebug(app: *app_mod.App) !DebugPumpResult {
+    var result: DebugPumpResult = .{};
+    if (!app.debug_manager.isRunning()) return result;
+    if (app.debug_manager.transport.?.protocolViolated()) {
+        result.protocol_violation = true;
+        try appendConsole(app, .stderr, "debug protocol blocked: adapter exceeded bounded stdout frame buffer\n", .{});
+        _ = app.debug_manager.stop();
+        return result;
+    }
+
+    const transport = &app.debug_manager.transport.?;
+    while (true) {
+        var frame = transport.nextFrame() catch |err| {
+            try appendConsole(app, .stderr, "debug protocol failure: {s}\n", .{@errorName(err)});
+            result.protocol_violation = true;
+            _ = app.debug_manager.stop();
+            return result;
+        } orelse break;
+        defer frame.deinit();
+        const ingest_result = app.debug_manager.session.ingestPayload(frame.body) catch |err| {
+            try appendConsole(app, .stderr, "debug payload rejected: {s}\n", .{@errorName(err)});
+            result.protocol_violation = true;
+            continue;
+        };
+        try renderDebugIngestResult(app, ingest_result);
+        try advanceDebugHandshake(app, ingest_result);
+        result.frames += 1;
+    }
+
+    if (app.debug_manager.transport) |*current_transport| {
+        const preview = try current_transport.takeStderrPreview(app.allocator, 4096);
+        defer app.allocator.free(preview.bytes);
+        result.stderr_bytes += preview.total;
+        if (preview.total > 0) {
+            try appendConsole(app, .stderr, "debug adapter stderr ({d} bytes{s})\n{s}\n", .{
+                preview.total,
+                if (preview.truncated) ", truncated" else "",
+                preview.bytes,
+            });
+        }
+    }
+    const streams_closed = if (app.debug_manager.transport) |*current_transport| current_transport.streamsClosed() else false;
+    if (streams_closed) {
+        const graceful = app.debug_manager.session.state == .terminated;
+        result.adapter_closed = app.debug_manager.finishClosedTransport();
+        try appendConsole(app, if (graceful) .stdout else .stderr, "debug adapter transport closed{s}\n", .{if (graceful) "" else " unexpectedly"});
+    }
+    return result;
+}
+
+fn advanceDebugHandshake(app: *app_mod.App, result: debug_session.IngestResult) !void {
+    const session = &app.debug_manager.session;
+    switch (result) {
+        .acknowledged => |kind| switch (kind) {
+            .initialize => {
+                const plan = app.debug_manager.plan orelse return;
+                var launch = try session.makeLaunch(.{
+                    .adapter_id = plan.adapter_id,
+                    .program = plan.program,
+                    .cwd = plan.cwd,
+                    .args = plan.program_args,
+                    .stop_on_entry = plan.stop_on_entry,
+                });
+                defer launch.deinit();
+                try app.debug_manager.send(&launch);
+            },
+            .threads => {
+                if (session.active_thread_id) |thread_id| {
+                    if (session.stack_frames.items.len == 0) {
+                        var stack = try session.makeStackTrace(thread_id);
+                        defer stack.deinit();
+                        try app.debug_manager.send(&stack);
+                    }
+                }
+            },
+            .stack_trace => {
+                if (session.active_frame_id) |frame_id| {
+                    var scopes = try session.makeScopes(frame_id);
+                    defer scopes.deinit();
+                    try app.debug_manager.send(&scopes);
+                }
+            },
+            .scopes => {
+                if (session.scopes.items.len > 0 and session.scopes.items[0].variables_reference != 0) {
+                    var variables = try session.makeVariables(session.scopes.items[0].variables_reference);
+                    defer variables.deinit();
+                    try app.debug_manager.send(&variables);
+                }
+            },
+            else => {},
+        },
+        .event => |event| switch (event) {
+            .initialized => {
+                for (session.breakpoints.items, 0..) |breakpoint, index| {
+                    if (!breakpoint.enabled or hasEarlierBreakpointPath(session.breakpoints.items, index, breakpoint.path)) continue;
+                    var set = try session.makeSetBreakpoints(breakpoint.path);
+                    defer set.deinit();
+                    try app.debug_manager.send(&set);
+                }
+                if (session.capabilities.supports_configuration_done_request) {
+                    var configured = try session.makeConfigurationDone();
+                    defer configured.deinit();
+                    try app.debug_manager.send(&configured);
+                } else {
+                    session.state = .running;
+                }
+            },
+            .stopped => {
+                var threads = try session.makeThreads();
+                defer threads.deinit();
+                try app.debug_manager.send(&threads);
+                if (session.active_thread_id) |thread_id| {
+                    var stack = try session.makeStackTrace(thread_id);
+                    defer stack.deinit();
+                    try app.debug_manager.send(&stack);
+                }
+            },
+            else => {},
+        },
+        .reverse_request => |request| {
+            const command_name = session.last_reverse_command orelse "unknown";
+            var rejection = try session.makeReverseRequestRejection(request.request_seq, command_name);
+            defer rejection.deinit();
+            try app.debug_manager.send(&rejection);
+            try appendConsole(app, .stderr, "debug reverse request denied: {s} ({s})\n", .{ command_name, @tagName(request.kind) });
+        },
+        else => {},
+    }
+}
+
+fn renderDebugIngestResult(app: *app_mod.App, result: debug_session.IngestResult) !void {
+    const session = &app.debug_manager.session;
+    switch (result) {
+        .ignored => try appendConsole(app, .stdout, "debug ingest: ignored\n", .{}),
+        .acknowledged => |kind| try appendConsole(app, .stdout, "debug acknowledged: {s}\n", .{@tagName(kind)}),
+        .failed => |kind| try appendConsole(app, .stderr, "debug request failed: {s}: {s}\n", .{ @tagName(kind), session.last_error orelse "adapter error" }),
+        .event => |event| switch (event) {
+            .output => try app.process_console.appendBytes(
+                if (session.last_output_category != null and std.ascii.eqlIgnoreCase(session.last_output_category.?, "stderr")) .stderr else .stdout,
+                session.last_output orelse "",
+            ),
+            .stopped => try appendConsole(app, .stdout, "debug stopped: {s} thread={any}\n", .{ session.stop_reason orelse "paused", session.active_thread_id }),
+            .continued => try appendConsole(app, .stdout, "debug continued\n", .{}),
+            .terminated => try appendConsole(app, .stdout, "debug terminated\n", .{}),
+            .exited => try appendConsole(app, .stdout, "debug exited: {any}\n", .{session.exit_code}),
+            else => try appendConsole(app, .stdout, "debug event: {s}\n", .{@tagName(event)}),
+        },
+        .reverse_request => |request| try appendConsole(app, .stderr, "debug adapter requested privileged reverse action: {s}\n", .{@tagName(request.kind)}),
+    }
+}
+
+fn renderDebugPlan(app: *app_mod.App, plan: *const debug_launch_plan.Plan) !void {
+    const display = try process.appendDisplay(app.allocator, plan.spawnSpec().command);
+    defer app.allocator.free(display);
+    try appendConsole(
+        app,
+        .stdout,
+        "debug launch plan\nname: {s}\nsource: {s}\nadapter: {s}\nadapter_id: {s}\nprogram: {s}\ncwd: {s}\nprogram_args: {d}\nstop_on_entry: {}\nsecurity: argv-only, workspace target/cwd, no-follow path validation, network deny, reverse launch deny, bounded DAP frames\n",
+        .{ plan.label, @tagName(plan.source), display, plan.adapter_id, plan.program, plan.cwd, plan.program_args.len, plan.stop_on_entry },
+    );
+}
+
+fn renderDebugStatus(app: *app_mod.App) !void {
+    const manager = &app.debug_manager;
+    const session = &manager.session;
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+    try writer.print("debug status\ntransport: {s}\nstate: {s}\npending: {d}\npolicy: env={s} fs={s} net={s}\n", .{
+        if (manager.isRunning()) "running" else "stopped",
+        @tagName(session.state),
+        session.pendingCount(),
+        @tagName(manager.env_policy),
+        @tagName(manager.fs_policy),
+        @tagName(manager.network_policy),
+    });
+    if (manager.plan) |plan| try writer.print("adapter: {s}\nprogram: {s}\ncwd: {s}\n", .{ plan.adapter_argv[0], plan.program, plan.cwd });
+    try writer.print("breakpoints: {d}\n", .{session.breakpoints.items.len});
+    for (session.breakpoints.items[0..@min(session.breakpoints.items.len, 64)]) |breakpoint| {
+        try writer.print("  {s}:{d} enabled={} verified={} id={any} {s}\n", .{
+            breakpoint.path,
+            breakpoint.line,
+            breakpoint.enabled,
+            breakpoint.verified,
+            breakpoint.adapter_id,
+            breakpoint.message orelse "",
+        });
+    }
+    try writer.print("threads: {d} active={any}\n", .{ session.threads.items.len, session.active_thread_id });
+    for (session.threads.items[0..@min(session.threads.items.len, 64)]) |thread| try writer.print("  [{d}] {s}\n", .{ thread.id, thread.name });
+    try writer.print("stack: {d} active={any}\n", .{ session.stack_frames.items.len, session.active_frame_id });
+    for (session.stack_frames.items[0..@min(session.stack_frames.items.len, 64)]) |frame| try writer.print("  [{d}] {s} {s}:{d}:{d}\n", .{ frame.id, frame.name, frame.path orelse "(no source)", frame.line, frame.column });
+    try writer.print("scopes: {d}\n", .{session.scopes.items.len});
+    for (session.scopes.items[0..@min(session.scopes.items.len, 64)]) |scope| try writer.print("  {s} ref={d} expensive={}\n", .{ scope.name, scope.variables_reference, scope.expensive });
+    try writer.print("variables: {d}\n", .{session.variables.items.len});
+    for (session.variables.items[0..@min(session.variables.items.len, 128)]) |variable| try writer.print("  {s}: {s} ({s}) ref={d}\n", .{ variable.name, variable.value, variable.type_name orelse "?", variable.variables_reference });
+    try app.process_console.appendBytes(.stdout, text.written());
+}
+
+fn hasEarlierBreakpointPath(breakpoints: []const debug_session.Breakpoint, index: usize, path: []const u8) bool {
+    for (breakpoints[0..index]) |breakpoint| {
+        if (workspacePathTextEqual(breakpoint.path, path)) return true;
+    }
+    return false;
+}
+
+fn workspacePathTextEqual(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left == right) continue;
+        if ((left == '/' or left == '\\') and (right == '/' or right == '\\')) continue;
+        if (@import("builtin").os.tag == .windows and std.ascii.toLower(left) == std.ascii.toLower(right)) continue;
+        return false;
+    }
+    return true;
+}
+
+fn parseDebugReference(argument: ?[]const u8) ?i64 {
+    const text = std.mem.trim(u8, argument orelse return null, " \t\r\n");
+    if (text.len == 0) return null;
+    const value = std.fmt.parseInt(i64, text, 10) catch return null;
+    return if (value > 0) value else null;
 }
 
 fn syncDiagnosticsFromConsole(app: *app_mod.App) !void {

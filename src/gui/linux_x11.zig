@@ -1377,6 +1377,15 @@ const LinuxGuiState = struct {
             self.appendOutput(.stderr, "debug pump failed: {s}\n", .{@errorName(err)});
             return true;
         };
+        if (result.frames > 0 and self.quick_panel.visible and self.quick_panel.mode == .debug_data) {
+            const selected = self.quick_panel.selected_index;
+            self.quick_panel.rebuild(&self.app) catch |err| {
+                self.message("data breakpoint panel failed: {s}", .{@errorName(err)});
+                return true;
+            };
+            const count = self.quick_panel.itemCount();
+            self.quick_panel.selected_index = if (count == 0) 0 else @min(selected, count - 1);
+        }
         return result.frames > 0 or result.stderr_bytes > 0 or result.protocol_violation or result.adapter_closed;
     }
 
@@ -4012,9 +4021,7 @@ const LinuxGuiState = struct {
         }) catch |err| return self.message("data breakpoint failed: {s}", .{@errorName(err)});
         self.handleDispatchResult(command_id, result);
         if (std.meta.activeTag(result) == .completed) {
-            if (std.mem.eql(u8, command_id, "debug.data_inspect")) {
-                self.quick_panel.close();
-            } else {
+            if (!std.mem.eql(u8, command_id, "debug.data_inspect")) {
                 self.quick_panel.rebuild(&self.app) catch |err| return self.message("data breakpoint panel failed: {s}", .{@errorName(err)});
                 const count = self.quick_panel.itemCount();
                 self.quick_panel.selected_index = if (count == 0) 0 else @min(selected_index, count - 1);
@@ -6916,7 +6923,7 @@ fn drawDebugPanel(x11: *X11, state: *LinuxGuiState) !void {
         session.unsupportedFunctionBreakpointCount(),
         session.data_breakpoints.items.len,
         @tagName(session.dataBreakpointCapability()),
-        session.unsupportedDataBreakpointCount(),
+        session.withheldDataBreakpointCount(),
         if (session.data_breakpoint_candidate != null) "staged" else "none",
         session.selectedExceptionFilterCount(),
         session.exception_filters.items.len,
@@ -7657,7 +7664,7 @@ fn drawQuickPanel(x11: *X11, state: *LinuxGuiState) !void {
             session.variables.items.len,
             if (session.data_breakpoint_candidate != null) "staged" else "none",
             @tagName(session.dataBreakpointCapability()),
-            session.unsupportedDataBreakpointCount(),
+            session.withheldDataBreakpointCount(),
             session.rejected_data_breakpoint_metadata,
         }) catch "data breakpoint boundary";
     } else asciiInto(query_buf[0..], state.quick_panel.query.items);
@@ -7931,13 +7938,14 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
             if (relative < state.quick_panel.debug_data_breakpoint_count) {
                 if (relative >= session.data_breakpoints.items.len) break :blk "";
                 const breakpoint = session.data_breakpoints.items[relative];
-                break :blk std.fmt.bufPrint(text_buf[0..], "REMOVE {d}  {s}  access:{s}  {s}{s}{s}", .{
+                break :blk std.fmt.bufPrint(text_buf[0..], "REMOVE {d}  {s}  adapter:{s}  access:{s}  {s}{s}{s}", .{
                     relative + 1,
                     breakpoint.description,
+                    breakpoint.adapter_key,
                     if (breakpoint.access_type) |access_type| access_type.protocolName() else "adapter-default",
                     if (breakpoint.can_persist) "persisted" else "session-only",
                     if (breakpoint.verified) |verified| if (verified) "  verified" else "  rejected" else "  pending",
-                    if (session.unsupportedDataBreakpointCount() > 0) "  withheld" else "",
+                    if (!session.dataBreakpointsSupported() or session.active_adapter_key == null or !std.mem.eql(u8, breakpoint.adapter_key, session.active_adapter_key.?)) "  withheld" else "",
                 }) catch breakpoint.description;
             }
             relative -= state.quick_panel.debug_data_breakpoint_count;

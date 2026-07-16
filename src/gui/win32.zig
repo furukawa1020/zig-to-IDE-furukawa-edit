@@ -1506,9 +1506,7 @@ const GuiState = struct {
         };
         self.handleDispatchResult(command_id, result);
         if (std.meta.activeTag(result) == .completed) {
-            if (std.mem.eql(u8, command_id, "debug.data_inspect")) {
-                self.quick_panel.close();
-            } else {
+            if (!std.mem.eql(u8, command_id, "debug.data_inspect")) {
                 self.quick_panel.rebuild(&self.app) catch |err| {
                     self.setError(err) catch {};
                     return;
@@ -3122,6 +3120,15 @@ const GuiState = struct {
             self.appendOutput(.stderr, "debug pump failed: {s}\n", .{@errorName(err)});
             return true;
         };
+        if (result.frames > 0 and self.quick_panel.visible and self.quick_panel.mode == .debug_data) {
+            const selected = self.quick_panel.selected_index;
+            self.quick_panel.rebuild(&self.app) catch |err| {
+                self.setError(err) catch {};
+                return true;
+            };
+            const count = self.quick_panel.itemCount();
+            self.quick_panel.selected_index = if (count == 0) 0 else @min(selected, count - 1);
+        }
         return result.frames > 0 or result.stderr_bytes > 0 or result.protocol_violation or result.adapter_closed;
     }
 
@@ -5530,7 +5537,7 @@ fn drawDebugPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
         session.unsupportedFunctionBreakpointCount(),
         session.data_breakpoints.items.len,
         @tagName(session.dataBreakpointCapability()),
-        session.unsupportedDataBreakpointCount(),
+        session.withheldDataBreakpointCount(),
         if (session.data_breakpoint_candidate != null) "staged" else "none",
         session.selectedExceptionFilterCount(),
         session.exception_filters.items.len,
@@ -6665,7 +6672,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
             session.variables.items.len,
             if (session.data_breakpoint_candidate != null) "staged" else "none",
             @tagName(session.dataBreakpointCapability()),
-            session.unsupportedDataBreakpointCount(),
+            session.withheldDataBreakpointCount(),
             session.rejected_data_breakpoint_metadata,
         }) catch "data breakpoint boundary";
         drawTextClipped(hdc, panel.left + 16, panel.top + 44, query_right, rgb(180, 190, 200), summary);
@@ -6939,13 +6946,14 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                     if (relative >= session.data_breakpoints.items.len) break :data;
                     const breakpoint = session.data_breakpoints.items[relative];
                     var breakpoint_buf: [1500]u8 = undefined;
-                    const label = std.fmt.bufPrint(&breakpoint_buf, "REMOVE {d}  {s}  access:{s}  {s}{s}{s}", .{
+                    const label = std.fmt.bufPrint(&breakpoint_buf, "REMOVE {d}  {s}  adapter:{s}  access:{s}  {s}{s}{s}", .{
                         relative + 1,
                         breakpoint.description,
+                        breakpoint.adapter_key,
                         if (breakpoint.access_type) |access_type| access_type.protocolName() else "adapter-default",
                         if (breakpoint.can_persist) "persisted" else "session-only",
                         if (breakpoint.verified) |verified| if (verified) "  verified" else "  rejected" else "  pending",
-                        if (session.unsupportedDataBreakpointCount() > 0) "  withheld" else "",
+                        if (!session.dataBreakpointsSupported() or session.active_adapter_key == null or !std.mem.eql(u8, breakpoint.adapter_key, session.active_adapter_key.?)) "  withheld" else "",
                     }) catch breakpoint.description;
                     drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
                     break :data;

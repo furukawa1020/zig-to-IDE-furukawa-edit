@@ -2313,6 +2313,7 @@ fn inspectDebugDataBreakpoint(app: *app_mod.App, argument: ?[]const u8) !Result 
         error.StaleVariableReference => "debug variable reference belongs to an earlier suspended state; refresh variables",
         error.InvalidVariableReference => "selected variable has no valid parent container reference",
         error.DataBreakpointsUnsupported => "active debug adapter does not support data breakpoints",
+        error.DebugAdapterIdentityUnavailable => "active debug adapter identity is unavailable",
         error.DebuggeeNotPaused => "debuggee must be paused to inspect a data breakpoint",
         error.EmptyDataBreakpointText,
         error.DataBreakpointTextTooLong,
@@ -2340,7 +2341,8 @@ fn commitDebugDataBreakpoint(app: *app_mod.App, argument: ?[]const u8) !Result {
     const update = session.commitDataBreakpoint(access_type) catch |err| return .{ .blocked = switch (err) {
         error.NoDataBreakpointCandidate => "no data breakpoint candidate is staged",
         error.StaleDataBreakpointCandidate => "data breakpoint candidate belongs to an earlier suspended state; inspect the variable again",
-        error.DataBreakpointUnavailable => candidate.description,
+        error.DataBreakpointUnavailable => if (candidate.description.len > 0) candidate.description else "adapter reported that this variable cannot be watched",
+        error.DataBreakpointsUnsupported => "active debug adapter no longer supports data breakpoints; inspect the variable again if support returns",
         error.DataBreakpointAccessRequired => "choose one of the access types advertised by the active adapter",
         error.DataBreakpointAccessNotAdvertised => "selected access type was not advertised for this variable",
         error.TooManyDataBreakpoints => "data breakpoint limit reached (128)",
@@ -2450,7 +2452,7 @@ fn sendDebugDataBreakpoints(app: *app_mod.App) !void {
     const session = &app.debug_manager.session;
     if (!app.debug_manager.isRunning() or !session.acceptsBreakpointConfiguration()) return;
     if (!session.dataBreakpointsSupported()) {
-        const withheld = session.unsupportedDataBreakpointCount();
+        const withheld = session.withheldDataBreakpointCount();
         if (withheld > 0) {
             try appendConsole(app, .stderr, "debug adapter capability boundary: {d} data breakpoint(s) withheld; opaque IDs were not reinterpreted or downgraded\n", .{withheld});
         }
@@ -2788,14 +2790,15 @@ fn renderDebugStatus(app: *app_mod.App) !void {
     try writer.print("data-breakpoints: {d} capability={s} withheld={d} rejected-metadata={d} opaque-id=true two-stage=true pause-generation={d}\n", .{
         session.data_breakpoints.items.len,
         @tagName(session.dataBreakpointCapability()),
-        session.unsupportedDataBreakpointCount(),
+        session.withheldDataBreakpointCount(),
         session.rejected_data_breakpoint_metadata,
         session.pause_generation,
     });
     for (session.data_breakpoints.items, 1..) |breakpoint, index| {
-        try writer.print("  [{d}] {s} access={s} persist={} verified={any} adapter-id={any} {s}\n", .{
+        try writer.print("  [{d}] {s} adapter={s} access={s} persist={} verified={any} runtime-id={any} {s}\n", .{
             index,
             breakpoint.description,
+            breakpoint.adapter_key,
             if (breakpoint.access_type) |access_type| access_type.protocolName() else "adapter-default",
             breakpoint.can_persist,
             breakpoint.verified,
@@ -2804,8 +2807,9 @@ fn renderDebugStatus(app: *app_mod.App) !void {
         });
     }
     if (session.data_breakpoint_candidate) |candidate| {
-        try writer.print("data-candidate: variable={s} available={} persist={} access=read:{} write:{} readWrite:{} generation={d} description={s}\n", .{
+        try writer.print("data-candidate: variable={s} adapter={s} available={} persist={} access=read:{} write:{} readWrite:{} generation={d} description={s}\n", .{
             candidate.variable_name,
+            candidate.adapter_key,
             candidate.data_id != null,
             candidate.can_persist,
             candidate.access_types.read,
@@ -5392,7 +5396,10 @@ test "data breakpoint commands require staged advertised access and persist only
 
     app.debug_manager.session.state = .paused;
     app.debug_manager.session.pause_generation = 8;
+    app.debug_manager.session.capabilities.supports_data_breakpoints = true;
+    app.debug_manager.session.active_adapter_key = try std.testing.allocator.dupe(u8, "lldb");
     app.debug_manager.session.data_breakpoint_candidate = .{
+        .adapter_key = try std.testing.allocator.dupe(u8, "lldb"),
         .data_id = try std.testing.allocator.dupe(u8, "opaque:counter"),
         .description = try std.testing.allocator.dupe(u8, "counter storage"),
         .variable_name = try std.testing.allocator.dupe(u8, "counter"),

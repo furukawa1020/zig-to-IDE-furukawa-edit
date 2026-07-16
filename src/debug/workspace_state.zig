@@ -247,6 +247,10 @@ pub fn load(allocator: std.mem.Allocator, workspace_root: []const u8, session: *
                 report.entries_rejected += 1;
                 continue;
             };
+            const adapter_id = stringField(object, "adapter_id") orelse {
+                report.entries_rejected += 1;
+                continue;
+            };
             const description = stringField(object, "description") orelse {
                 report.entries_rejected += 1;
                 continue;
@@ -259,7 +263,7 @@ pub fn load(allocator: std.mem.Allocator, workspace_root: []const u8, session: *
                 report.entries_rejected += 1;
                 continue;
             } else null;
-            const added = staged.addPersistedDataBreakpoint(data_id, description, access_type) catch |err| switch (err) {
+            const added = staged.addPersistedDataBreakpoint(adapter_id, data_id, description, access_type) catch |err| switch (err) {
                 error.EmptyDataBreakpointText,
                 error.DataBreakpointTextTooLong,
                 error.InvalidDataBreakpointUtf8,
@@ -394,11 +398,17 @@ pub fn save(allocator: std.mem.Allocator, workspace_root: []const u8, session: *
                 report.data_breakpoints_skipped += 1;
                 continue;
             };
+            _ = debug_data.validate(.variable_name, breakpoint.adapter_key) catch {
+                report.data_breakpoints_skipped += 1;
+                continue;
+            };
             _ = debug_data.validate(.description, breakpoint.description) catch {
                 report.data_breakpoints_skipped += 1;
                 continue;
             };
             try json.beginObject();
+            try json.objectField("adapter_id");
+            try json.write(breakpoint.adapter_key);
             try json.objectField("data_id");
             try json.write(breakpoint.data_id);
             try json.objectField("description");
@@ -558,8 +568,9 @@ test "debug workspace state v2 round trips restricted advanced breakpoints" {
         .log_message = "admin {user.name}",
     });
     try std.testing.expect(try source.addFunctionBreakpoint("std::vector<int>::push_back"));
-    try std.testing.expect(try source.addPersistedDataBreakpoint("opaque:counter", "counter storage", .write));
+    try std.testing.expect(try source.addPersistedDataBreakpoint("lldb", "opaque:counter", "counter storage", .write));
     try source.data_breakpoints.append(.{
+        .adapter_key = try std.testing.allocator.dupe(u8, "lldb"),
         .data_id = try std.testing.allocator.dupe(u8, "session:temporary"),
         .description = try std.testing.allocator.dupe(u8, "temporary storage"),
         .access_type = .read,
@@ -587,6 +598,7 @@ test "debug workspace state v2 round trips restricted advanced breakpoints" {
     try std.testing.expectEqualStrings("std::vector<int>::push_back", restored.function_breakpoints.items[0].name);
     try std.testing.expectEqual(@as(usize, 1), loaded.data_breakpoints_loaded);
     try std.testing.expectEqualStrings("opaque:counter", restored.data_breakpoints.items[0].data_id);
+    try std.testing.expectEqualStrings("lldb", restored.data_breakpoints.items[0].adapter_key);
     try std.testing.expectEqual(session_mod.DataBreakpointAccessType.write, restored.data_breakpoints.items[0].access_type.?);
     try std.testing.expect(restored.data_breakpoints.items[0].can_persist);
     try std.testing.expectEqual(@as(usize, 1), loaded.exception_filters_loaded);
@@ -600,7 +612,7 @@ test "debug workspace state rejects duplicate hidden and unknown-access data bre
     try tmp.dir.writeFile(std.Options.debug_io, .{
         .sub_path = relative_path,
         .data =
-        \\{"version":2,"watches":[],"breakpoints":[],"data_breakpoints":[{"data_id":"opaque:ok","description":"counter","access_type":"write"},{"data_id":"opaque:ok","description":"duplicate"},{"data_id":"bad\nID","description":"hidden"},{"data_id":"opaque:mode","description":"mode","access_type":"execute"}]}
+        \\{"version":2,"watches":[],"breakpoints":[],"data_breakpoints":[{"adapter_id":"lldb","data_id":"opaque:ok","description":"counter","access_type":"write"},{"adapter_id":"lldb","data_id":"opaque:ok","description":"duplicate"},{"adapter_id":"lldb","data_id":"bad\nID","description":"hidden"},{"adapter_id":"lldb","data_id":"opaque:mode","description":"mode","access_type":"execute"}]}
         ,
     });
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;

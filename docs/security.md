@@ -113,6 +113,23 @@ Zig、C/C++、Rust、Go、Python、Javaなどの関数・メソッドを、sourc
 
 関数名の解釈と探索範囲はadapter実装に依存し、ZIDEの検証はadapter内部の副作用不在を証明しない。DAPの全置換、capability、応答順は[公式仕様](https://microsoft.github.io/debug-adapter-protocol/specification#Requests_SetFunctionBreakpoints)に従う。
 
+### データブレークポイント境界
+
+停止中の変数に対するread/write監視は、DAP `dataBreakpointInfo` と `setDataBreakpoints` を分離した二段階操作にする。変数を選んだだけでは監視を設定せず、adapterが返した説明とaccess typeをGUIで確認してから明示的にcommitする。
+
+- `supportsDataBreakpoints` がtrueのadapterにだけ問い合わせ、非対応時は式評価、source breakpoint、memory addressへ変換せずwithholdする
+- `variablesReference` は現在の停止状態で取得した親containerだけを使い、各変数とpending requestへ停止世代を記録する。continue、step、次のstopで候補と古いobject referenceを失効させる
+- 遅延したvariables応答や `dataBreakpointInfo` 応答は、停止世代とstateが一致しなければ採用しない
+- `dataId` は最大4096 byteのopaqueなadapter IDとして扱い、ZIDEで式評価、address解釈、shell連結、path解釈をしない
+- data ID、description、variable nameは有効UTF-8、control/C1、bidi、default-ignorable、不可視whitespace、個数上限をZig側で検査する
+- `read` / `write` / `readWrite` はadapterが候補ごとに広告した値だけをcommitできる。広告がない場合だけaccess typeを省略したadapter defaultを選べる
+- `setDataBreakpoints` は空配列による全消去を含む全置換として送り、要求ごとのdata ID snapshotで遅延応答を現在の別項目へ誤対応させない
+- adapterが `canPersist: true` と明示したIDだけを状態ファイルへ保存し、取得元のDAP `adapterID` にスコープする。別adapterでは同じopaque IDを送らずwithholdする。それ以外はdebug session終了時に破棄し、variable name、value、停止世代、verified、runtime breakpoint ID、messageは保存しない
+- DAP `capabilities` eventは含まれたfieldだけを更新し、省略fieldをfalseへ戻さない。能力変更後は現在のsource/function/data/exception設定を各capability境界でもう一度同期する
+- Windows/Linux GUIは同じcore commandとstate machineを使い、変数選択、候補確認、access commit/cancel、remove/clear、capability/withheld/persistenceを同じ順序で表示する
+
+data breakpointはdebuggeeのmemory accessを停止させる強い操作であり、adapter自体の安全性や監視実装の副作用不在をZIDEが証明するものではない。IDの寿命、access type、永続可否、全置換の意味は[公式DAP仕様](https://microsoft.github.io/debug-adapter-protocol/specification#Requests_DataBreakpointInfo)に従う。
+
 ### 例外ブレークポイント境界
 
 DAP adapterが初期化応答の `exceptionBreakpointFilters` で広告したフィルターだけを選択できる。adapter由来のメタデータも信頼済みUI文字列として扱わない。
@@ -130,7 +147,7 @@ DAPの初期化順序、フィルター、要求引数、応答順は[公式仕�
 
 ### デバッグ状態ファイル
 
-ウォッチ、source breakpoint、function breakpoint selector、選択済みexception filter IDは `.zide/debug-state.json` に保存する。このファイルはユーザーごとの状態なのでGit管理から除外する。
+ウォッチ、source breakpoint、function breakpoint selector、永続可能なdata breakpoint、選択済みexception filter IDは `.zide/debug-state.json` に保存する。このファイルはユーザーごとの状態なのでGit管理から除外する。
 
 - 読み込みは1 MiBまで、通常ファイルかつno-followのワークスペース能力経由に限定する
 - 保存先の親ディレクトリをコンポーネントごとにno-followで開き、同じディレクトリ能力内の一時ファイルから原子的にrenameする
@@ -141,6 +158,7 @@ DAPの初期化順序、フィルター、要求引数、応答順は[公式仕�
 - condition、hit condition、log messageは読み込み時にも上記の検証を通し、1項目でも不正ならそのブレークポイント全体を拒否する
 - exception filter IDは読み込み時にも境界検証し、重複、hidden control、上限超過を個別に拒否する
 - function selectorは読み込み時にも同じmulti-language境界検証を通し、重複、pattern、hidden control、上限超過を個別に拒否する
+- data breakpointは `canPersist` が確認済みのadapter ID、opaque ID、description、access typeだけを保存し、読み込み時に再検証する。取得元adapterが一致しない項目は送信せず、session限定IDは保存件数と分けてreportする
 - 任意のadapter引数やruntime responseは状態ファイルから読み込まない
 - 状態を変更するブレークポイント／ウォッチコマンドは `workspace_write` capabilityを持ち、LOCKED_DOWNでは実行前に拒否する
 - 保存失敗は `store:dirty` / `store:save-error` としてGUIへ露出し、メモリ上だけの変更になったことを隠さない

@@ -672,6 +672,7 @@ const QuickPanelMode = enum {
     debug_breakpoint_condition,
     debug_breakpoint_hit,
     debug_breakpoint_log,
+    debug_exceptions,
 };
 
 const ReplaceRequest = struct {
@@ -785,6 +786,8 @@ const QuickPanel = struct {
     lsp_hover_line_count: usize = 0,
     code_action_count: usize = 0,
     debug_watch_count: usize = 0,
+    debug_exception_count: usize = 0,
+    debug_exception_selected_count: usize = 0,
     completion_replace_start: usize = 0,
     completion_replace_end: usize = 0,
 
@@ -870,8 +873,9 @@ const QuickPanel = struct {
             .code_actions => self.code_action_count,
             .language_mode => if (self.language_matches) |items| items.len else 0,
             .debug_watch => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else self.debug_watch_count,
-            .debug_breakpoint => 4,
+            .debug_breakpoint => 5,
             .debug_breakpoint_condition, .debug_breakpoint_hit, .debug_breakpoint_log => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else 0,
+            .debug_exceptions => self.debug_exception_count + @intFromBool(self.debug_exception_selected_count > 0),
         };
     }
 
@@ -976,6 +980,10 @@ const QuickPanel = struct {
             .new_file, .new_folder, .rename_path, .delete_path => {},
             .debug_watch => self.debug_watch_count = app.debug_manager.session.watches.items.len,
             .debug_breakpoint, .debug_breakpoint_condition, .debug_breakpoint_hit, .debug_breakpoint_log => {},
+            .debug_exceptions => {
+                self.debug_exception_count = app.debug_manager.session.exceptionFilterDisplayCount();
+                self.debug_exception_selected_count = app.debug_manager.session.selectedExceptionFilterCount();
+            },
             .run_task => {
                 var registry = try task_registry.loadProjectTasks(self.allocator, app.workspace.root_path);
                 defer registry.deinit();
@@ -1151,6 +1159,8 @@ const QuickPanel = struct {
         self.lsp_hover_line_count = 0;
         self.code_action_count = 0;
         self.debug_watch_count = 0;
+        self.debug_exception_count = 0;
+        self.debug_exception_selected_count = 0;
         if (self.language_matches) |items| {
             self.allocator.free(items);
             self.language_matches = null;
@@ -3393,6 +3403,10 @@ const LinuxGuiState = struct {
             self.openBreakpointValueEditor(.debug_breakpoint_log);
             return;
         }
+        if (std.mem.eql(u8, id, "debug.exception_toggle")) {
+            self.openQuickPanel(.debug_exceptions);
+            return;
+        }
         if (std.mem.eql(u8, id, "view.command_palette")) {
             self.quick_panel.close();
             self.app.palette.open() catch |err| {
@@ -3830,7 +3844,7 @@ const LinuxGuiState = struct {
     }
 
     fn executeBreakpointMenuItem(self: *LinuxGuiState) void {
-        switch (@min(self.quick_panel.selected_index, @as(usize, 3))) {
+        switch (@min(self.quick_panel.selected_index, @as(usize, 4))) {
             0 => self.openBreakpointValueEditor(.debug_breakpoint_condition),
             1 => self.openBreakpointValueEditor(.debug_breakpoint_hit),
             2 => self.openBreakpointValueEditor(.debug_breakpoint_log),
@@ -3842,6 +3856,33 @@ const LinuxGuiState = struct {
                 self.handleDispatchResult("debug.breakpoint_clear_advanced", result);
                 if (std.meta.activeTag(result) == .completed) self.quick_panel.close();
             },
+            4 => self.openQuickPanel(.debug_exceptions),
+            else => unreachable,
+        }
+        self.bottom_panel = .debug;
+        self.terminal_focused = false;
+    }
+
+    fn executeExceptionFilterItem(self: *LinuxGuiState) void {
+        const filter_count = self.quick_panel.debug_exception_count;
+        const selected_index = self.quick_panel.selected_index;
+        const command_id: []const u8 = if (selected_index >= filter_count) "debug.exception_clear" else "debug.exception_toggle";
+        const owned_filter_id: ?[]u8 = if (selected_index < filter_count) blk: {
+            const filter = self.app.debug_manager.session.exceptionFilterDisplayAt(selected_index) orelse return self.message("no exception filter selected", .{});
+            break :blk self.allocator.dupe(u8, filter.id) catch |err| return self.message("exception filter failed: {s}", .{@errorName(err)});
+        } else null;
+        defer if (owned_filter_id) |filter_id| self.allocator.free(filter_id);
+
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = command_id,
+            .argument = owned_filter_id,
+            .source = .command_palette,
+        }) catch |err| return self.message("exception filter failed: {s}", .{@errorName(err)});
+        self.handleDispatchResult(command_id, result);
+        if (std.meta.activeTag(result) == .completed) {
+            self.quick_panel.rebuild(&self.app) catch |err| return self.message("exception filter panel failed: {s}", .{@errorName(err)});
+            const count = self.quick_panel.itemCount();
+            self.quick_panel.selected_index = if (count == 0) 0 else @min(selected_index, count - 1);
         }
         self.bottom_panel = .debug;
         self.terminal_focused = false;
@@ -4166,6 +4207,7 @@ const LinuxGuiState = struct {
     }
 
     fn quickPanelInsertText(self: *LinuxGuiState, bytes: []const u8) void {
+        if (isReadOnlyQuickPanelMode(self.quick_panel.mode)) return;
         self.quick_panel.insertText(&self.app, bytes) catch |err| {
             self.message("panel failed: {s}", .{@errorName(err)});
             return;
@@ -4175,6 +4217,7 @@ const LinuxGuiState = struct {
     }
 
     fn quickPanelDeleteBackward(self: *LinuxGuiState) void {
+        if (isReadOnlyQuickPanelMode(self.quick_panel.mode)) return;
         self.quick_panel.deleteBackward(&self.app) catch |err| {
             self.message("panel failed: {s}", .{@errorName(err)});
             return;
@@ -4498,6 +4541,7 @@ const LinuxGuiState = struct {
             },
             .debug_breakpoint => self.executeBreakpointMenuItem(),
             .debug_breakpoint_condition, .debug_breakpoint_hit, .debug_breakpoint_log => self.applyBreakpointValueEditor(self.quick_panel.mode),
+            .debug_exceptions => self.executeExceptionFilterItem(),
         }
     }
 
@@ -6028,8 +6072,8 @@ const LinuxGuiState = struct {
             const row = @divTrunc(@as(isize, y - row_top), LINE_HEIGHT + 4);
             if (row >= 0) {
                 const index: usize = @intCast(row);
-                if (index < self.quick_panel.itemCount()) {
-                    self.quick_panel.selected_index = index;
+                if (index < @min(@as(usize, 12), self.quick_panel.itemCount())) {
+                    self.quick_panel.selected_index = quickPanelVisibleStart(&self.quick_panel, 12) + index;
                     self.executeSelectedQuickPanelItem();
                     return true;
                 }
@@ -6725,10 +6769,13 @@ fn drawDebugPanel(x11: *X11, state: *LinuxGuiState) !void {
     try x11.text(state_gc, 18, bottom + 58, header);
 
     var policy_buf: [720]u8 = undefined;
-    const policy = std.fmt.bufPrint(policy_buf[0..], "ADV c:{d} h:{d} log:{d}  DATA threads:{d} stack:{d} scopes:{d} vars:{d}  BOUNDARY env:{s} fs:{s} net:{s} reverse-launch:deny frame:8MiB", .{
+    const policy = std.fmt.bufPrint(policy_buf[0..], "ADV c:{d} h:{d} log:{d} exc:{d}/{d} withheld:{d}  DATA threads:{d} stack:{d} scopes:{d} vars:{d}  BOUNDARY env:{s} fs:{s} net:{s} reverse-launch:deny frame:8MiB", .{
         advanced.conditions,
         advanced.hit_conditions,
         advanced.logpoints,
+        session.selectedExceptionFilterCount(),
+        session.exception_filters.items.len,
+        session.withheldExceptionFilterCount(),
         session.threads.items.len,
         session.stack_frames.items.len,
         session.scopes.items.len,
@@ -7442,7 +7489,17 @@ fn drawQuickPanel(x11: *X11, state: *LinuxGuiState) !void {
     try x11.text(x11.gc.green, left + 18, top + 34, quickPanelTitle(state.quick_panel.mode));
 
     var query_buf: [520]u8 = undefined;
-    try x11.text(x11.gc.text, left + 18, top + 66, asciiInto(query_buf[0..], state.quick_panel.query.items));
+    const query_line = if (state.quick_panel.mode == .debug_exceptions) blk: {
+        const session = &state.app.debug_manager.session;
+        break :blk std.fmt.bufPrint(query_buf[0..], "selected:{d} advertised:{d} active:{d} withheld:{d} metadata-rejected:{d}", .{
+            session.selectedExceptionFilterCount(),
+            session.exception_filters.items.len,
+            session.selectedAdvertisedExceptionFilterCount(),
+            session.withheldExceptionFilterCount(),
+            session.rejected_exception_filter_metadata,
+        }) catch "exception filter boundary";
+    } else asciiInto(query_buf[0..], state.quick_panel.query.items);
+    try x11.text(x11.gc.text, left + 18, top + 66, query_line);
 
     var meta_buf: [160]u8 = undefined;
     const meta = std.fmt.bufPrint(meta_buf[0..], "{d} item(s)", .{state.quick_panel.itemCount()}) catch "";
@@ -7476,11 +7533,13 @@ fn drawQuickPanel(x11: *X11, state: *LinuxGuiState) !void {
 
     var y: i16 = top + 104;
     const limit = @min(state.quick_panel.itemCount(), @as(usize, 12));
+    const start = quickPanelVisibleStart(&state.quick_panel, 12);
     var row: usize = 0;
     while (row < limit) : (row += 1) {
-        const selected = row == state.quick_panel.selected_index;
+        const item_index = start + row;
+        const selected = item_index == state.quick_panel.selected_index;
         if (selected) try x11.fillRect(x11.gc.panel_2, left + 10, y - 15, width - 20, LINE_HEIGHT + 2);
-        try drawQuickPanelRow(x11, state, left + 18, y, row, selected);
+        try drawQuickPanelRow(x11, state, left + 18, y, item_index, selected);
         y += LINE_HEIGHT + 4;
     }
     if (state.quick_panel.itemCount() == 0) {
@@ -7489,6 +7548,7 @@ fn drawQuickPanel(x11: *X11, state: *LinuxGuiState) !void {
             .debug_breakpoint_condition => "Enter a comparison predicate",
             .debug_breakpoint_hit => "Enter a positive hit count",
             .debug_breakpoint_log => "Enter a log message",
+            .debug_exceptions => "Start a debug adapter to discover bounded exception filters",
             else => "No matches",
         };
         try x11.text(x11.gc.muted, left + 18, y, empty_text);
@@ -7646,12 +7706,26 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
                 1 => std.fmt.bufPrint(text_buf[0..], "HIT COUNT  {s}", .{if (breakpoint) |item| item.hit_condition orelse "(not set)" else "(not set)"}) catch "HIT COUNT",
                 2 => std.fmt.bufPrint(text_buf[0..], "LOGPOINT  {s}", .{if (breakpoint) |item| item.log_message orelse "(not set)" else "(not set)"}) catch "LOGPOINT",
                 3 => "CLEAR ADVANCED SETTINGS",
+                4 => "EXCEPTION FILTERS  adapter-advertised / explicit-only",
                 else => "",
             };
         },
         .debug_breakpoint_condition => "SET RESTRICTED CONDITION",
         .debug_breakpoint_hit => "SET HIT COUNT",
         .debug_breakpoint_log => "SET RESTRICTED LOGPOINT",
+        .debug_exceptions => blk: {
+            if (row >= state.quick_panel.debug_exception_count) break :blk "CLEAR ALL SELECTED EXCEPTION FILTERS";
+            const filter = state.app.debug_manager.session.exceptionFilterDisplayAt(row) orelse break :blk "";
+            break :blk std.fmt.bufPrint(text_buf[0..], "[{s}] {s}  id:{s}{s}{s}{s}{s}", .{
+                if (filter.selected) "x" else " ",
+                filter.label,
+                filter.id,
+                if (filter.default_enabled) "  adapter-default" else "",
+                if (filter.supports_condition) "  condition-capable/ZIDE-locked" else "",
+                if (!filter.advertised) "  saved-only/withheld" else "",
+                if (filter.verified) |verified| if (verified) "  verified" else "  rejected" else "",
+            }) catch filter.label;
+        },
     };
     var ascii_buf: [720]u8 = undefined;
     try x11.text(color, x, y, asciiInto(ascii_buf[0..], text));
@@ -8703,6 +8777,17 @@ fn isDocumentSearchMode(mode: QuickPanelMode) bool {
     return mode == .find_document or mode == .replace_document;
 }
 
+fn isReadOnlyQuickPanelMode(mode: QuickPanelMode) bool {
+    return mode == .debug_breakpoint or mode == .debug_exceptions or mode == .lsp_hover;
+}
+
+fn quickPanelVisibleStart(panel: *const QuickPanel, max_visible: usize) usize {
+    if (panel.mode != .debug_exceptions or max_visible == 0) return 0;
+    const count = panel.itemCount();
+    if (count <= max_visible or panel.selected_index < max_visible) return 0;
+    return @min(panel.selected_index + 1 - max_visible, count - max_visible);
+}
+
 fn containsOffset(offsets: []const usize, target: usize) bool {
     for (offsets) |offset| if (offset == target) return true;
     return false;
@@ -8916,6 +9001,7 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .debug_breakpoint_condition => "CONDITION  bounded predicate / no calls or assignments",
         .debug_breakpoint_hit => "HIT COUNT  positive decimal",
         .debug_breakpoint_log => "LOGPOINT  restricted {inspection} interpolation",
+        .debug_exceptions => "EXCEPTION BREAKPOINTS  explicit selection / adapter defaults never auto-enable",
     };
 }
 

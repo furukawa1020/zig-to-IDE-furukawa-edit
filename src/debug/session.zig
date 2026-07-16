@@ -1,6 +1,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const debug_breakpoint = @import("../security/debug_breakpoint.zig");
+const debug_exception = @import("../security/debug_exception.zig");
 
 const max_collection_items: usize = 4096;
 const max_event_text_bytes: usize = 64 * 1024;
@@ -27,6 +28,7 @@ pub const RequestKind = enum {
     initialize,
     launch,
     set_breakpoints,
+    set_exception_breakpoints,
     configuration_done,
     disconnect,
     continue_execution,
@@ -69,6 +71,45 @@ pub const Capabilities = struct {
     supports_restart_request: bool = false,
     supports_step_back: bool = false,
     supports_set_variable: bool = false,
+    supports_exception_filter_options: bool = false,
+};
+
+pub const ExceptionFilter = struct {
+    id: []u8,
+    label: []u8,
+    description: ?[]u8 = null,
+    default_enabled: bool = false,
+    supports_condition: bool = false,
+    verified: ?bool = null,
+    adapter_id: ?i64 = null,
+    message: ?[]u8 = null,
+
+    fn clearRuntime(self: *ExceptionFilter, allocator: std.mem.Allocator) void {
+        if (self.message) |value| allocator.free(value);
+        self.verified = null;
+        self.adapter_id = null;
+        self.message = null;
+    }
+
+    fn deinit(self: *ExceptionFilter, allocator: std.mem.Allocator) void {
+        self.clearRuntime(allocator);
+        allocator.free(self.id);
+        allocator.free(self.label);
+        if (self.description) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const ExceptionFilterView = struct {
+    id: []const u8,
+    label: []const u8,
+    description: ?[]const u8,
+    default_enabled: bool,
+    supports_condition: bool,
+    selected: bool,
+    advertised: bool,
+    verified: ?bool,
+    message: ?[]const u8,
 };
 
 pub const Breakpoint = struct {
@@ -180,9 +221,14 @@ pub const Pending = struct {
     kind: RequestKind,
     path: ?[]u8 = null,
     watch_id: ?u64 = null,
+    exception_filter_ids: ?[][]u8 = null,
 
     fn deinit(self: *Pending, allocator: std.mem.Allocator) void {
         if (self.path) |path| allocator.free(path);
+        if (self.exception_filter_ids) |filter_ids| {
+            for (filter_ids) |filter_id| allocator.free(filter_id);
+            allocator.free(filter_ids);
+        }
         self.* = undefined;
     }
 };
@@ -237,9 +283,13 @@ pub const Session = struct {
     allocator: std.mem.Allocator,
     workspace_root: []u8,
     state: DebugState = .idle,
+    configuration_ready: bool = false,
     next_seq: i64 = 1,
     pending: std.array_list.Managed(Pending),
     breakpoints: std.array_list.Managed(Breakpoint),
+    exception_filters: std.array_list.Managed(ExceptionFilter),
+    selected_exception_filter_ids: std.array_list.Managed([]u8),
+    rejected_exception_filter_metadata: usize = 0,
     threads: std.array_list.Managed(Thread),
     stack_frames: std.array_list.Managed(StackFrame),
     scopes: std.array_list.Managed(Scope),
@@ -262,6 +312,8 @@ pub const Session = struct {
             .workspace_root = try allocator.dupe(u8, workspace_root),
             .pending = std.array_list.Managed(Pending).init(allocator),
             .breakpoints = std.array_list.Managed(Breakpoint).init(allocator),
+            .exception_filters = std.array_list.Managed(ExceptionFilter).init(allocator),
+            .selected_exception_filter_ids = std.array_list.Managed([]u8).init(allocator),
             .threads = std.array_list.Managed(Thread).init(allocator),
             .stack_frames = std.array_list.Managed(StackFrame).init(allocator),
             .scopes = std.array_list.Managed(Scope).init(allocator),
@@ -273,8 +325,12 @@ pub const Session = struct {
     pub fn deinit(self: *Session) void {
         self.clearRuntimeData();
         for (self.breakpoints.items) |*item| item.deinit(self.allocator);
+        for (self.exception_filters.items) |*item| item.deinit(self.allocator);
+        for (self.selected_exception_filter_ids.items) |filter_id| self.allocator.free(filter_id);
         for (self.watches.items) |*item| item.deinit(self.allocator);
         self.breakpoints.deinit();
+        self.exception_filters.deinit();
+        self.selected_exception_filter_ids.deinit();
         self.watches.deinit();
         self.variables.deinit();
         self.scopes.deinit();
@@ -288,8 +344,11 @@ pub const Session = struct {
     pub fn reset(self: *Session) void {
         self.clearRuntimeData();
         self.state = .idle;
+        self.configuration_ready = false;
         self.next_seq = 1;
         self.capabilities = .{};
+        clearExceptionFilters(self);
+        self.rejected_exception_filter_metadata = 0;
         self.exit_code = null;
         for (self.breakpoints.items) |*breakpoint| {
             breakpoint.verified = false;
@@ -456,6 +515,14 @@ pub const Session = struct {
         };
     }
 
+    pub fn acceptsBreakpointConfiguration(self: *const Session) bool {
+        if (!self.configuration_ready) return false;
+        return switch (self.state) {
+            .terminating, .terminated, .failed => false,
+            else => true,
+        };
+    }
+
     pub fn breakpointSupported(self: *const Session, breakpoint: Breakpoint) bool {
         if (!self.capabilitiesKnown()) return true;
         if (breakpoint.condition != null and !self.capabilities.supports_conditional_breakpoints) return false;
@@ -477,6 +544,104 @@ pub const Session = struct {
     pub fn clearBreakpoints(self: *Session) void {
         for (self.breakpoints.items) |*breakpoint| breakpoint.deinit(self.allocator);
         self.breakpoints.clearRetainingCapacity();
+    }
+
+    pub fn addConfiguredExceptionFilter(self: *Session, raw_filter_id: []const u8) !bool {
+        const filter_id = try debug_exception.validate(.filter_id, raw_filter_id);
+        if (self.isExceptionFilterSelected(filter_id)) return false;
+        if (self.selected_exception_filter_ids.items.len >= debug_exception.max_filters) return error.TooManyExceptionFilters;
+        try self.selected_exception_filter_ids.append(try self.allocator.dupe(u8, filter_id));
+        return true;
+    }
+
+    pub fn toggleExceptionFilter(self: *Session, raw_filter_id: []const u8) !ToggleResult {
+        const filter_id = try debug_exception.validate(.filter_id, raw_filter_id);
+        for (self.selected_exception_filter_ids.items, 0..) |selected, index| {
+            if (!std.mem.eql(u8, selected, filter_id)) continue;
+            self.allocator.free(self.selected_exception_filter_ids.orderedRemove(index));
+            return .removed;
+        }
+        if (self.findExceptionFilter(filter_id) == null) return error.ExceptionFilterNotAdvertised;
+        if (self.selected_exception_filter_ids.items.len >= debug_exception.max_filters) return error.TooManyExceptionFilters;
+        try self.selected_exception_filter_ids.append(try self.allocator.dupe(u8, filter_id));
+        return .added;
+    }
+
+    pub fn clearSelectedExceptionFilters(self: *Session) bool {
+        if (self.selected_exception_filter_ids.items.len == 0) return false;
+        for (self.selected_exception_filter_ids.items) |filter_id| self.allocator.free(filter_id);
+        self.selected_exception_filter_ids.clearRetainingCapacity();
+        return true;
+    }
+
+    pub fn isExceptionFilterSelected(self: *const Session, filter_id: []const u8) bool {
+        for (self.selected_exception_filter_ids.items) |selected| {
+            if (std.mem.eql(u8, selected, filter_id)) return true;
+        }
+        return false;
+    }
+
+    pub fn hasAdvertisedExceptionFilters(self: *const Session) bool {
+        return self.exception_filters.items.len > 0;
+    }
+
+    pub fn selectedExceptionFilterCount(self: *const Session) usize {
+        return self.selected_exception_filter_ids.items.len;
+    }
+
+    pub fn selectedAdvertisedExceptionFilterCount(self: *const Session) usize {
+        var count: usize = 0;
+        for (self.exception_filters.items) |filter| {
+            if (self.isExceptionFilterSelected(filter.id)) count += 1;
+        }
+        return count;
+    }
+
+    pub fn withheldExceptionFilterCount(self: *const Session) usize {
+        if (!self.capabilitiesKnown()) return 0;
+        var count: usize = 0;
+        for (self.selected_exception_filter_ids.items) |filter_id| {
+            if (self.findExceptionFilter(filter_id) == null) count += 1;
+        }
+        return count;
+    }
+
+    pub fn exceptionFilterDisplayCount(self: *const Session) usize {
+        return if (self.exception_filters.items.len > 0)
+            self.exception_filters.items.len
+        else
+            self.selected_exception_filter_ids.items.len;
+    }
+
+    pub fn exceptionFilterDisplayAt(self: *const Session, index: usize) ?ExceptionFilterView {
+        if (self.exception_filters.items.len > 0) {
+            if (index >= self.exception_filters.items.len) return null;
+            const filter = self.exception_filters.items[index];
+            return .{
+                .id = filter.id,
+                .label = filter.label,
+                .description = filter.description,
+                .default_enabled = filter.default_enabled,
+                .supports_condition = filter.supports_condition,
+                .selected = self.isExceptionFilterSelected(filter.id),
+                .advertised = true,
+                .verified = filter.verified,
+                .message = filter.message,
+            };
+        }
+        if (index >= self.selected_exception_filter_ids.items.len) return null;
+        const filter_id = self.selected_exception_filter_ids.items[index];
+        return .{
+            .id = filter_id,
+            .label = filter_id,
+            .description = null,
+            .default_enabled = false,
+            .supports_condition = false,
+            .selected = true,
+            .advertised = false,
+            .verified = null,
+            .message = null,
+        };
     }
 
     pub fn makeInitialize(self: *Session, adapter_id: []const u8) !Outbound {
@@ -509,6 +674,18 @@ pub const Session = struct {
         const seq = self.takeSeq();
         const payload = try protocol.makeSetBreakpointsRequest(self.allocator, seq, path, items.items);
         return self.wrapRequest(payload, seq, .set_breakpoints, path);
+    }
+
+    pub fn makeSetExceptionBreakpoints(self: *Session) !Outbound {
+        var selected = std.array_list.Managed([]const u8).init(self.allocator);
+        defer selected.deinit();
+        for (self.exception_filters.items) |*filter| {
+            filter.clearRuntime(self.allocator);
+            if (self.isExceptionFilterSelected(filter.id)) try selected.append(filter.id);
+        }
+        const seq = self.takeSeq();
+        const payload = try protocol.makeSetExceptionBreakpointsRequest(self.allocator, seq, selected.items);
+        return self.wrapExceptionRequest(payload, seq, selected.items);
     }
 
     pub fn makeConfigurationDone(self: *Session) !Outbound {
@@ -631,13 +808,17 @@ pub const Session = struct {
         const body = objectField(object, "body");
         switch (pending.kind) {
             .initialize => {
-                if (body) |value| self.parseCapabilities(value);
+                if (body) |value| try self.parseCapabilities(value);
                 self.state = .initialized;
             },
             .launch => self.state = .configuring,
             .set_breakpoints => if (pending.path) |path| if (body) |value| try self.parseBreakpointsResponse(path, value),
+            .set_exception_breakpoints => if (pending.exception_filter_ids) |filter_ids| if (body) |value| try self.parseExceptionBreakpointsResponse(filter_ids, value),
             .configuration_done => self.state = .running,
-            .disconnect => self.state = .terminated,
+            .disconnect => {
+                self.state = .terminated;
+                self.configuration_ready = false;
+            },
             .continue_execution, .next, .step_in, .step_out => self.state = .running,
             .pause => {},
             .threads => if (body) |value| try self.parseThreads(value),
@@ -660,6 +841,7 @@ pub const Session = struct {
         const body = objectField(object, "body");
         if (std.mem.eql(u8, event_name, "initialized")) {
             self.state = .configuring;
+            self.configuration_ready = true;
             return .{ .event = .initialized };
         }
         if (std.mem.eql(u8, event_name, "stopped")) {
@@ -676,10 +858,12 @@ pub const Session = struct {
         }
         if (std.mem.eql(u8, event_name, "terminated")) {
             self.state = .terminated;
+            self.configuration_ready = false;
             return .{ .event = .terminated };
         }
         if (std.mem.eql(u8, event_name, "exited")) {
             self.state = .terminated;
+            self.configuration_ready = false;
             self.exit_code = if (body) |value| intField(value, "exitCode") else null;
             return .{ .event = .exited };
         }
@@ -708,8 +892,80 @@ pub const Session = struct {
         return .{ .reverse_request = .{ .request_seq = request_seq, .kind = kind } };
     }
 
-    fn parseCapabilities(self: *Session, body: std.json.ObjectMap) void {
-        self.capabilities = .{
+    fn parseCapabilities(self: *Session, body: std.json.ObjectMap) !void {
+        var parsed_filters = std.array_list.Managed(ExceptionFilter).init(self.allocator);
+        errdefer {
+            for (parsed_filters.items) |*filter| filter.deinit(self.allocator);
+            parsed_filters.deinit();
+        }
+        var rejected: usize = 0;
+        if (arrayField(body, "exceptionBreakpointFilters")) |values| {
+            const limit = @min(values.items.len, debug_exception.max_filters);
+            rejected += values.items.len - limit;
+            for (values.items[0..limit]) |value| {
+                const object = switch (value) {
+                    .object => |item| item,
+                    else => {
+                        rejected += 1;
+                        continue;
+                    },
+                };
+                const id = stringField(object, "filter") orelse {
+                    rejected += 1;
+                    continue;
+                };
+                const label = stringField(object, "label") orelse {
+                    rejected += 1;
+                    continue;
+                };
+                const description: ?[]const u8 = if (object.get("description")) |description_value| switch (description_value) {
+                    .string => |text| text,
+                    else => {
+                        rejected += 1;
+                        continue;
+                    },
+                } else null;
+                _ = debug_exception.validate(.filter_id, id) catch {
+                    rejected += 1;
+                    continue;
+                };
+                _ = debug_exception.validate(.label, label) catch {
+                    rejected += 1;
+                    continue;
+                };
+                if (description) |text| _ = debug_exception.validate(.description, text) catch {
+                    rejected += 1;
+                    continue;
+                };
+                var duplicate = false;
+                for (parsed_filters.items) |filter| {
+                    if (std.mem.eql(u8, filter.id, id)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) {
+                    rejected += 1;
+                    continue;
+                }
+
+                const owned_id = try self.allocator.dupe(u8, id);
+                errdefer self.allocator.free(owned_id);
+                const owned_label = try self.allocator.dupe(u8, label);
+                errdefer self.allocator.free(owned_label);
+                const owned_description = if (description) |text| try self.allocator.dupe(u8, text) else null;
+                errdefer if (owned_description) |text| self.allocator.free(text);
+                try parsed_filters.append(.{
+                    .id = owned_id,
+                    .label = owned_label,
+                    .description = owned_description,
+                    .default_enabled = boolField(object, "default", false),
+                    .supports_condition = boolField(object, "supportsCondition", false),
+                });
+            }
+        }
+
+        const parsed_capabilities: Capabilities = .{
             .supports_configuration_done_request = boolField(body, "supportsConfigurationDoneRequest", false),
             .supports_conditional_breakpoints = boolField(body, "supportsConditionalBreakpoints", false),
             .supports_hit_conditional_breakpoints = boolField(body, "supportsHitConditionalBreakpoints", false),
@@ -719,7 +975,13 @@ pub const Session = struct {
             .supports_restart_request = boolField(body, "supportsRestartRequest", false),
             .supports_step_back = boolField(body, "supportsStepBack", false),
             .supports_set_variable = boolField(body, "supportsSetVariable", false),
+            .supports_exception_filter_options = boolField(body, "supportsExceptionFilterOptions", false),
         };
+        clearExceptionFilters(self);
+        std.mem.swap(@TypeOf(self.exception_filters), &self.exception_filters, &parsed_filters);
+        parsed_filters.deinit();
+        self.capabilities = parsed_capabilities;
+        self.rejected_exception_filter_metadata = rejected;
     }
 
     fn parseBreakpointsResponse(self: *Session, path: []const u8, body: std.json.ObjectMap) !void {
@@ -727,6 +989,7 @@ pub const Session = struct {
         var response_index: usize = 0;
         for (self.breakpoints.items) |*breakpoint| {
             if (!breakpoint.enabled or !pathEquals(breakpoint.path, path)) continue;
+            if (!self.breakpointSupported(breakpoint.*)) continue;
             if (response_index >= values.items.len) break;
             const object = switch (values.items[response_index]) {
                 .object => |item| item,
@@ -741,6 +1004,25 @@ pub const Session = struct {
             breakpoint.resolved_line = usizeField(object, "line");
             if (breakpoint.message) |message| self.allocator.free(message);
             breakpoint.message = if (stringField(object, "message")) |message|
+                try dupeLimited(self.allocator, message, 4096)
+            else
+                null;
+        }
+    }
+
+    fn parseExceptionBreakpointsResponse(self: *Session, filter_ids: [][]u8, body: std.json.ObjectMap) !void {
+        const values = arrayField(body, "breakpoints") orelse return;
+        for (filter_ids, 0..) |filter_id, index| {
+            if (index >= values.items.len) break;
+            const filter = self.findExceptionFilterMut(filter_id) orelse continue;
+            const object = switch (values.items[index]) {
+                .object => |item| item,
+                else => continue,
+            };
+            filter.clearRuntime(self.allocator);
+            filter.verified = boolField(object, "verified", false);
+            filter.adapter_id = intField(object, "id");
+            filter.message = if (stringField(object, "message")) |message|
                 try dupeLimited(self.allocator, message, 4096)
             else
                 null;
@@ -873,6 +1155,20 @@ pub const Session = struct {
         return null;
     }
 
+    fn findExceptionFilter(self: *const Session, filter_id: []const u8) ?*const ExceptionFilter {
+        for (self.exception_filters.items) |*filter| {
+            if (std.mem.eql(u8, filter.id, filter_id)) return filter;
+        }
+        return null;
+    }
+
+    fn findExceptionFilterMut(self: *Session, filter_id: []const u8) ?*ExceptionFilter {
+        for (self.exception_filters.items) |*filter| {
+            if (std.mem.eql(u8, filter.id, filter_id)) return filter;
+        }
+        return null;
+    }
+
     fn wrapRequest(self: *Session, payload: []u8, seq: i64, kind: RequestKind, path: ?[]const u8) !Outbound {
         errdefer self.allocator.free(payload);
         const framed = try protocol.makeFramed(self.allocator, payload);
@@ -889,6 +1185,34 @@ pub const Session = struct {
         errdefer self.allocator.free(framed);
         try self.pending.append(.{ .seq = seq, .kind = .evaluate, .watch_id = watch_id });
         return .{ .allocator = self.allocator, .seq = seq, .kind = .evaluate, .payload = payload, .framed = framed };
+    }
+
+    fn wrapExceptionRequest(self: *Session, payload: []u8, seq: i64, filter_ids: []const []const u8) !Outbound {
+        errdefer self.allocator.free(payload);
+        const framed = try protocol.makeFramed(self.allocator, payload);
+        errdefer self.allocator.free(framed);
+        const owned_filter_ids = try self.allocator.alloc([]u8, filter_ids.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned_filter_ids[0..initialized]) |filter_id| self.allocator.free(filter_id);
+            self.allocator.free(owned_filter_ids);
+        }
+        for (filter_ids) |filter_id| {
+            owned_filter_ids[initialized] = try self.allocator.dupe(u8, filter_id);
+            initialized += 1;
+        }
+        try self.pending.append(.{
+            .seq = seq,
+            .kind = .set_exception_breakpoints,
+            .exception_filter_ids = owned_filter_ids,
+        });
+        return .{
+            .allocator = self.allocator,
+            .seq = seq,
+            .kind = .set_exception_breakpoints,
+            .payload = payload,
+            .framed = framed,
+        };
     }
 
     fn takeSeq(self: *Session) i64 {
@@ -975,6 +1299,11 @@ fn clearVariables(self: *Session) void {
     self.variables.clearRetainingCapacity();
 }
 
+fn clearExceptionFilters(self: *Session) void {
+    for (self.exception_filters.items) |*filter| filter.deinit(self.allocator);
+    self.exception_filters.clearRetainingCapacity();
+}
+
 fn objectField(object: std.json.ObjectMap, name: []const u8) ?std.json.ObjectMap {
     const value = object.get(name) orelse return null;
     return switch (value) {
@@ -1051,6 +1380,46 @@ test "DAP session tracks requests and initialize capabilities" {
     try std.testing.expectEqual(DebugState.initialized, session.state);
     try std.testing.expect(session.capabilities.supports_configuration_done_request);
     try std.testing.expect(session.capabilities.supports_conditional_breakpoints);
+    try std.testing.expect(!session.acceptsBreakpointConfiguration());
+    const initialized = try session.ingestPayload(
+        \\{"seq":2,"type":"event","event":"initialized"}
+    );
+    try std.testing.expectEqual(EventKind.initialized, initialized.event);
+    try std.testing.expect(session.acceptsBreakpointConfiguration());
+}
+
+test "DAP session bounds advertises selects and verifies exception filters" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+
+    var initialize = try session.makeInitialize("lldb");
+    defer initialize.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"exceptionBreakpointFilters":[{"filter":"all","label":"All exceptions","default":true},{"filter":"uncaught","label":"Uncaught","description":"Only uncaught exceptions"},{"filter":"all","label":"Duplicate"},{"filter":"hidden","label":"Bad\nlabel"}]}}
+    );
+    try std.testing.expectEqual(@as(usize, 2), session.exception_filters.items.len);
+    try std.testing.expectEqual(@as(usize, 2), session.rejected_exception_filter_metadata);
+    try std.testing.expect(session.exception_filters.items[0].default_enabled);
+    try std.testing.expectEqual(@as(usize, 0), session.selectedExceptionFilterCount());
+
+    try std.testing.expectEqual(ToggleResult.added, try session.toggleExceptionFilter("all"));
+    try std.testing.expectError(error.ExceptionFilterNotAdvertised, session.toggleExceptionFilter("future"));
+    try std.testing.expect(try session.addConfiguredExceptionFilter("stale"));
+    try std.testing.expectEqual(@as(usize, 1), session.withheldExceptionFilterCount());
+
+    var outbound = try session.makeSetExceptionBreakpoints();
+    defer outbound.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "\"filters\":[\"all\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "stale") == null);
+    _ = try session.ingestPayload(
+        \\{"seq":2,"type":"response","request_seq":2,"success":true,"command":"setExceptionBreakpoints","body":{"breakpoints":[{"id":41,"verified":true}]}}
+    );
+    try std.testing.expectEqual(@as(?bool, true), session.exception_filters.items[0].verified);
+    try std.testing.expectEqual(@as(?i64, 41), session.exception_filters.items[0].adapter_id);
+
+    session.reset();
+    try std.testing.expectEqual(@as(usize, 0), session.exception_filters.items.len);
+    try std.testing.expectEqual(@as(usize, 2), session.selectedExceptionFilterCount());
 }
 
 test "DAP session ingests stopped stack scopes and variables" {

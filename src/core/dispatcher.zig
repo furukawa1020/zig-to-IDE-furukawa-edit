@@ -39,6 +39,7 @@ const debug_launch_plan = @import("../debug/launch_plan.zig");
 const debug_protocol = @import("../debug/protocol.zig");
 const debug_session = @import("../debug/session.zig");
 const debug_breakpoint = @import("../security/debug_breakpoint.zig");
+const debug_exception = @import("../security/debug_exception.zig");
 const debug_expression = @import("../security/debug_expression.zig");
 
 pub const LspPumpResult = struct {
@@ -526,6 +527,14 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
 
     if (std.mem.eql(u8, definition.id, "debug.breakpoint_clear_advanced")) {
         return try clearAdvancedDebugBreakpoint(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.exception_toggle")) {
+        return try toggleDebugExceptionFilter(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.exception_clear")) {
+        return try clearDebugExceptionFilters(app);
     }
 
     if (std.mem.eql(u8, definition.id, "debug.status")) {
@@ -2196,9 +2205,56 @@ fn clearAdvancedDebugBreakpoint(app: *app_mod.App) !Result {
         "advanced breakpoint settings cleared for this session only" };
 }
 
+fn toggleDebugExceptionFilter(app: *app_mod.App, argument: ?[]const u8) !Result {
+    const filter_id = argument orelse return .{ .blocked = "debug.exception_toggle requires an adapter-advertised filter ID" };
+    const session = &app.debug_manager.session;
+    const toggled = session.toggleExceptionFilter(filter_id) catch |err| return .{ .blocked = switch (err) {
+        error.ExceptionFilterNotAdvertised => "exception filter is not advertised by the active adapter; start debugging to discover filters",
+        error.TooManyExceptionFilters => "exception filter selection limit reached (64)",
+        error.EmptyExceptionFilterText,
+        error.ExceptionFilterTextTooLong,
+        error.InvalidExceptionFilterUtf8,
+        error.HiddenExceptionFilterControl,
+        => debug_exception.rejectionMessage(err),
+        else => return err,
+    } };
+    const persisted = try persistDebugState(app);
+    try sendDebugExceptionBreakpoints(app);
+    try appendConsole(app, .stdout, "debug exception filter {s}: {s}\n", .{ @tagName(toggled), filter_id });
+    return .{ .completed = switch (toggled) {
+        .added => if (persisted) "exception breakpoint enabled and saved" else "exception breakpoint enabled for this session only",
+        .removed => if (persisted) "exception breakpoint disabled and saved" else "exception breakpoint disabled for this session only",
+    } };
+}
+
+fn clearDebugExceptionFilters(app: *app_mod.App) !Result {
+    if (!app.debug_manager.session.clearSelectedExceptionFilters()) {
+        return .{ .completed = "exception breakpoints already clear" };
+    }
+    const persisted = try persistDebugState(app);
+    try sendDebugExceptionBreakpoints(app);
+    try appendConsole(app, .stdout, "debug exception filters cleared\n", .{});
+    return .{ .completed = if (persisted)
+        "exception breakpoints cleared and saved"
+    else
+        "exception breakpoints cleared for this session only" };
+}
+
+fn sendDebugExceptionBreakpoints(app: *app_mod.App) !void {
+    const session = &app.debug_manager.session;
+    if (!app.debug_manager.isRunning() or !session.acceptsBreakpointConfiguration() or !session.hasAdvertisedExceptionFilters()) return;
+    const withheld = session.withheldExceptionFilterCount();
+    if (withheld > 0) {
+        try appendConsole(app, .stderr, "debug adapter capability boundary: {d} persisted exception filter(s) withheld because this adapter did not advertise them\n", .{withheld});
+    }
+    var outbound = try session.makeSetExceptionBreakpoints();
+    defer outbound.deinit();
+    try app.debug_manager.send(&outbound);
+}
+
 fn sendDebugBreakpointsForPath(app: *app_mod.App, path: []const u8) !void {
     const session = &app.debug_manager.session;
-    if (!app.debug_manager.isRunning() or !session.capabilitiesKnown()) return;
+    if (!app.debug_manager.isRunning() or !session.acceptsBreakpointConfiguration()) return;
     const unsupported = session.unsupportedBreakpointCountForPath(path);
     if (unsupported > 0) {
         try appendConsole(app, .stderr, "debug adapter capability boundary: {d} advanced breakpoint(s) withheld for {s}; none were downgraded\n", .{ unsupported, path });
@@ -2362,6 +2418,7 @@ fn advanceDebugHandshake(app: *app_mod.App, result: debug_session.IngestResult) 
                     if (!breakpoint.enabled or hasEarlierBreakpointPath(session.breakpoints.items, index, breakpoint.path)) continue;
                     try sendDebugBreakpointsForPath(app, breakpoint.path);
                 }
+                try sendDebugExceptionBreakpoints(app);
                 if (session.capabilities.supports_configuration_done_request) {
                     var configured = try session.makeConfigurationDone();
                     defer configured.deinit();
@@ -2442,15 +2499,18 @@ fn renderDebugStatus(app: *app_mod.App) !void {
         @tagName(manager.fs_policy),
         @tagName(manager.network_policy),
     });
-    try writer.print("state-file: {s} store={s} loaded={d}/{d} rejected={d} saved={d}/{d} skipped={d} bytes={d}\n", .{
+    try writer.print("state-file: {s} store={s} loaded watch={d} bp={d} exc={d} rejected={d} saved watch={d} bp={d} exc={d} skipped bp={d} exc={d} bytes={d}\n", .{
         @import("../debug/workspace_state.zig").relative_path,
         debugStateStoreLabel(manager),
         manager.state_load_report.watches_loaded,
         manager.state_load_report.breakpoints_loaded,
+        manager.state_load_report.exception_filters_loaded,
         manager.state_load_report.entries_rejected,
         manager.state_save_report.watches_saved,
         manager.state_save_report.breakpoints_saved,
+        manager.state_save_report.exception_filters_saved,
         manager.state_save_report.breakpoints_skipped,
+        manager.state_save_report.exception_filters_skipped,
         manager.state_save_report.bytes_written,
     });
     if (manager.state_load_error) |err| try writer.print("state-load-error: {s}\n", .{@errorName(err)});
@@ -2469,6 +2529,25 @@ fn renderDebugStatus(app: *app_mod.App) !void {
             breakpoint.hit_condition orelse "",
             breakpoint.log_message orelse "",
             breakpoint.message orelse "",
+        });
+    }
+    try writer.print("exception-filters: selected={d} advertised={d} active={d} withheld={d} rejected-metadata={d} explicit-only=true\n", .{
+        session.selectedExceptionFilterCount(),
+        session.exception_filters.items.len,
+        session.selectedAdvertisedExceptionFilterCount(),
+        session.withheldExceptionFilterCount(),
+        session.rejected_exception_filter_metadata,
+    });
+    for (session.exception_filters.items) |filter| {
+        try writer.print("  [{s}] {s} id={s} default={} condition={} verified={any} adapter-id={any} {s}\n", .{
+            if (session.isExceptionFilterSelected(filter.id)) "x" else " ",
+            filter.label,
+            filter.id,
+            filter.default_enabled,
+            filter.supports_condition,
+            filter.verified,
+            filter.adapter_id,
+            filter.message orelse "",
         });
     }
     try writer.print("threads: {d} active={any}\n", .{ session.threads.items.len, session.active_thread_id });
@@ -4951,6 +5030,36 @@ test "advanced breakpoint commands validate persist and clear current line setti
     try std.testing.expect(app.debug_manager.session.breakpoints.items[0].condition == null);
     try std.testing.expect(app.debug_manager.session.breakpoints.items[0].hit_condition == null);
     try std.testing.expect(app.debug_manager.session.breakpoints.items[0].log_message == null);
+}
+
+test "exception breakpoint commands require advertised IDs and persist explicit selections" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buf);
+    const root = root_buf[0..root_len];
+    var app = try app_mod.App.init(std.testing.allocator, root);
+    defer app.deinit();
+
+    var initialize = try app.debug_manager.session.makeInitialize("lldb");
+    defer initialize.deinit();
+    _ = try app.debug_manager.session.ingestPayload(
+        \\{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"exceptionBreakpointFilters":[{"filter":"all","label":"All exceptions","default":true},{"filter":"uncaught","label":"Uncaught exceptions"}]}}
+    );
+
+    const unknown = try dispatch(&app, .{ .id = "debug.exception_toggle", .argument = "future" });
+    try std.testing.expect(std.meta.activeTag(unknown) == .blocked);
+    const enabled = try dispatch(&app, .{ .id = "debug.exception_toggle", .argument = "uncaught" });
+    try std.testing.expect(std.meta.activeTag(enabled) == .completed);
+    try std.testing.expect(app.debug_manager.session.isExceptionFilterSelected("uncaught"));
+
+    var restored = try app_mod.App.init(std.testing.allocator, root);
+    defer restored.deinit();
+    try std.testing.expect(restored.debug_manager.session.isExceptionFilterSelected("uncaught"));
+
+    const cleared = try dispatch(&app, .{ .id = "debug.exception_clear" });
+    try std.testing.expect(std.meta.activeTag(cleared) == .completed);
+    try std.testing.expectEqual(@as(usize, 0), app.debug_manager.session.selectedExceptionFilterCount());
 }
 
 test "open selected workspace file activates editor focus" {

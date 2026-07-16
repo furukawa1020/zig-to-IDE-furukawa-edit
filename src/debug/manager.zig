@@ -101,7 +101,7 @@ pub const Manager = struct {
         self.state_save_report = report;
         self.state_load_error = null;
         self.state_save_error = null;
-        self.state_dirty = report.breakpoints_skipped > 0;
+        self.state_dirty = report.breakpoints_skipped > 0 or report.exception_filters_skipped > 0;
         return report;
     }
 
@@ -116,6 +116,7 @@ pub const Manager = struct {
     pub fn finishClosedTransport(self: *Manager) bool {
         if (self.transport == null) return false;
         self.closeTransport();
+        self.session.configuration_ready = false;
         if (self.session.state != .terminated and self.session.state != .failed) {
             self.session.state = .failed;
         }

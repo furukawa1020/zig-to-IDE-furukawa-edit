@@ -1,6 +1,7 @@
 const std = @import("std");
 const editor_save = @import("../editor/save.zig");
 const debug_breakpoint = @import("../security/debug_breakpoint.zig");
+const debug_exception = @import("../security/debug_exception.zig");
 const debug_expression = @import("../security/debug_expression.zig");
 const workspace_io = @import("../security/workspace_io.zig");
 const session_mod = @import("session.zig");
@@ -11,11 +12,13 @@ const legacy_schema_version: i64 = 1;
 pub const max_state_bytes: usize = 1024 * 1024;
 const max_stored_watches: usize = 64;
 const max_stored_breakpoints: usize = 4096;
+const max_stored_exception_filters: usize = debug_exception.max_filters;
 
 pub const LoadReport = struct {
     found: bool = false,
     watches_loaded: usize = 0,
     breakpoints_loaded: usize = 0,
+    exception_filters_loaded: usize = 0,
     entries_rejected: usize = 0,
 };
 
@@ -23,6 +26,8 @@ pub const SaveReport = struct {
     watches_saved: usize = 0,
     breakpoints_saved: usize = 0,
     breakpoints_skipped: usize = 0,
+    exception_filters_saved: usize = 0,
+    exception_filters_skipped: usize = 0,
     bytes_written: usize = 0,
 };
 
@@ -45,6 +50,13 @@ pub fn load(allocator: std.mem.Allocator, workspace_root: []const u8, session: *
     if (version != legacy_schema_version and version != schema_version) return error.UnsupportedDebugStateVersion;
     const stored_watches = arrayField(root, "watches") orelse return error.InvalidDebugState;
     const stored_breakpoints = arrayField(root, "breakpoints") orelse return error.InvalidDebugState;
+    const stored_exception_filters: ?std.json.Array = if (version == schema_version)
+        if (root.get("exception_filters")) |value| switch (value) {
+            .array => |array| array,
+            else => return error.InvalidDebugState,
+        } else null
+    else
+        null;
 
     var staged = try session_mod.Session.init(allocator, workspace_root);
     defer staged.deinit();
@@ -162,8 +174,40 @@ pub fn load(allocator: std.mem.Allocator, workspace_root: []const u8, session: *
         }
     }
 
+    if (stored_exception_filters) |filters| {
+        const limit = @min(filters.items.len, max_stored_exception_filters);
+        report.entries_rejected += filters.items.len - limit;
+        for (filters.items[0..limit]) |value| {
+            const filter_id = switch (value) {
+                .string => |text| text,
+                else => {
+                    report.entries_rejected += 1;
+                    continue;
+                },
+            };
+            const added = staged.addConfiguredExceptionFilter(filter_id) catch |err| switch (err) {
+                error.EmptyExceptionFilterText,
+                error.ExceptionFilterTextTooLong,
+                error.InvalidExceptionFilterUtf8,
+                error.HiddenExceptionFilterControl,
+                error.TooManyExceptionFilters,
+                => {
+                    report.entries_rejected += 1;
+                    continue;
+                },
+                else => return err,
+            };
+            if (added) {
+                report.exception_filters_loaded += 1;
+            } else {
+                report.entries_rejected += 1;
+            }
+        }
+    }
+
     std.mem.swap(@TypeOf(session.watches), &session.watches, &staged.watches);
     std.mem.swap(@TypeOf(session.breakpoints), &session.breakpoints, &staged.breakpoints);
+    std.mem.swap(@TypeOf(session.selected_exception_filter_ids), &session.selected_exception_filter_ids, &staged.selected_exception_filter_ids);
     std.mem.swap(u64, &session.next_watch_id, &staged.next_watch_id);
     return report;
 }
@@ -218,6 +262,18 @@ pub fn save(allocator: std.mem.Allocator, workspace_root: []const u8, session: *
             try json.endObject();
             report.breakpoints_saved += 1;
         }
+        try json.endArray();
+        try json.objectField("exception_filters");
+        try json.beginArray();
+        for (session.selected_exception_filter_ids.items[0..@min(session.selected_exception_filter_ids.items.len, max_stored_exception_filters)]) |filter_id| {
+            _ = debug_exception.validate(.filter_id, filter_id) catch {
+                report.exception_filters_skipped += 1;
+                continue;
+            };
+            try json.write(filter_id);
+            report.exception_filters_saved += 1;
+        }
+        report.exception_filters_skipped += session.selected_exception_filter_ids.items.len - @min(session.selected_exception_filter_ids.items.len, max_stored_exception_filters);
         try json.endArray();
         try json.endObject();
     }
@@ -352,10 +408,12 @@ test "debug workspace state v2 round trips restricted advanced breakpoints" {
         .hit_condition = "3",
         .log_message = "admin {user.name}",
     });
+    try std.testing.expect(try source.addConfiguredExceptionFilter("uncaught"));
 
     const saved = try save(std.testing.allocator, root, &source);
     try std.testing.expectEqual(@as(usize, 1), saved.breakpoints_saved);
     try std.testing.expectEqual(@as(usize, 0), saved.breakpoints_skipped);
+    try std.testing.expectEqual(@as(usize, 1), saved.exception_filters_saved);
 
     var restored = try session_mod.Session.init(std.testing.allocator, root);
     defer restored.deinit();
@@ -364,6 +422,29 @@ test "debug workspace state v2 round trips restricted advanced breakpoints" {
     try std.testing.expectEqualStrings("user.is_admin == true", restored.breakpoints.items[0].condition.?);
     try std.testing.expectEqualStrings("3", restored.breakpoints.items[0].hit_condition.?);
     try std.testing.expectEqualStrings("admin {user.name}", restored.breakpoints.items[0].log_message.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.exception_filters_loaded);
+    try std.testing.expectEqualStrings("uncaught", restored.selected_exception_filter_ids.items[0]);
+}
+
+test "debug workspace state rejects duplicate and hidden exception filter IDs" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.Options.debug_io, ".zide");
+    try tmp.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = relative_path,
+        .data =
+        \\{"version":2,"watches":[],"breakpoints":[],"exception_filters":["uncaught","uncaught","bad\nid"]}
+        ,
+    });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buf);
+
+    var session = try session_mod.Session.init(std.testing.allocator, root_buf[0..root_len]);
+    defer session.deinit();
+    const report = try load(std.testing.allocator, root_buf[0..root_len], &session);
+    try std.testing.expectEqual(@as(usize, 1), report.exception_filters_loaded);
+    try std.testing.expectEqual(@as(usize, 2), report.entries_rejected);
+    try std.testing.expectEqualStrings("uncaught", session.selected_exception_filter_ids.items[0]);
 }
 
 test "debug workspace state rejects unsafe advanced breakpoint fields transactionally" {

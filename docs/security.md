@@ -99,9 +99,24 @@ DAPの `SourceBreakpoint` が持つ `condition` / `hitCondition` / `logMessage` 
 
 この制限も副作用の不在を証明しない。比較対象のproperty/indexerやdebuggerの式評価器がコードを実行する可能性は残る。adapterは引き続き信頼境界内であり、GUIには「restricted adapter evaluation」として露出する。DAPのフィールドとcapabilityの意味は[公式仕様](https://microsoft.github.io/debug-adapter-protocol/specification#Types_SourceBreakpoint)に従う。
 
+### 例外ブレークポイント境界
+
+DAP adapterが初期化応答の `exceptionBreakpointFilters` で広告したフィルターだけを選択できる。adapter由来のメタデータも信頼済みUI文字列として扱わない。
+
+- filter ID、label、descriptionは有効UTF-8、hidden/control character、個数、バイト数をZig側で上限検査する
+- 重複ID、不正な要素、64件を超える広告は拒否数として記録し、GUIと `debug.status` へ露出する
+- adapterの `default: true` は表示だけに使い、自動有効化しない。停止点の追加はユーザーの明示選択だけで行う
+- initialize応答で一覧を受け取っても、adapterの `initialized` eventまでは設定要求を送らない
+- 状態ファイルには選択済みIDだけを保存し、adapterのlabel、description、応答、式を保存しない
+- 保存済みIDを次のadapterが広告しなければwithholdし、`setExceptionBreakpoints` へ送らない
+- 要求ごとに送信IDのowned snapshotを保持し、遅延応答を現在の選択順へ誤対応させない
+- 現段階では `supportsCondition` を表示するだけで、例外conditionをadapterへ渡さない。条件対応はrestricted expression境界を別途設計してから有効化する
+
+DAPの初期化順序、フィルター、要求引数、応答順は[公式仕様](https://microsoft.github.io/debug-adapter-protocol/specification#Requests_SetExceptionBreakpoints)に従う。
+
 ### デバッグ状態ファイル
 
-ウォッチとsource breakpointは `.zide/debug-state.json` に保存する。このファイルはユーザーごとの状態なのでGit管理から除外する。
+ウォッチ、source breakpoint、選択済みexception filter IDは `.zide/debug-state.json` に保存する。このファイルはユーザーごとの状態なのでGit管理から除外する。
 
 - 読み込みは1 MiBまで、通常ファイルかつno-followのワークスペース能力経由に限定する
 - 保存先の親ディレクトリをコンポーネントごとにno-followで開き、同じディレクトリ能力内の一時ファイルから原子的にrenameする
@@ -110,6 +125,7 @@ DAPの `SourceBreakpoint` が持つ `condition` / `hitCondition` / `logMessage` 
 - 読み込みは一時Sessionへステージングし、検証と確保が完了してから現在のリストと交換する
 - v1の通常ブレークポイントを読み込める一方、高度設定を含む保存形式はv2とし、古いbinaryによる無条件BPへの誤変換を防ぐ
 - condition、hit condition、log messageは読み込み時にも上記の検証を通し、1項目でも不正ならそのブレークポイント全体を拒否する
+- exception filter IDは読み込み時にも境界検証し、重複、hidden control、上限超過を個別に拒否する
 - 任意のadapter引数やruntime responseは状態ファイルから読み込まない
 - 状態を変更するブレークポイント／ウォッチコマンドは `workspace_write` capabilityを持ち、LOCKED_DOWNでは実行前に拒否する
 - 保存失敗は `store:dirty` / `store:save-error` としてGUIへ露出し、メモリ上だけの変更になったことを隠さない

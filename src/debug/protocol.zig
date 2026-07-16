@@ -112,6 +112,28 @@ pub fn makeSetBreakpointsRequest(
     return out.toOwnedSlice();
 }
 
+pub fn makeSetExceptionBreakpointsRequest(
+    allocator: std.mem.Allocator,
+    seq: i64,
+    filter_ids: []const []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, seq, "setExceptionBreakpoints");
+        try json.objectField("arguments");
+        try json.beginObject();
+        try json.objectField("filters");
+        try json.beginArray();
+        for (filter_ids) |filter_id| try json.write(filter_id);
+        try json.endArray();
+        try json.endObject();
+        try json.endObject();
+    }
+    return out.toOwnedSlice();
+}
+
 pub fn makeConfigurationDoneRequest(allocator: std.mem.Allocator, seq: i64) ![]u8 {
     return makeEmptyArgumentsRequest(allocator, seq, "configurationDone");
 }
@@ -330,6 +352,13 @@ test "build DAP breakpoint and reverse-request rejection" {
     const denied = try makeErrorResponse(std.testing.allocator, 4, 99, "runInTerminal", "blocked by ZIDE policy");
     defer std.testing.allocator.free(denied);
     try std.testing.expect(std.mem.indexOf(u8, denied, "\"success\":false") != null);
+}
+
+test "build DAP exception breakpoint request from selected filter IDs" {
+    const request = try makeSetExceptionBreakpointsRequest(std.testing.allocator, 5, &.{ "all", "uncaught" });
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"command\":\"setExceptionBreakpoints\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"filters\":[\"all\",\"uncaught\"]") != null);
 }
 
 test "build DAP watch evaluation request" {

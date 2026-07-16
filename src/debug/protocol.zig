@@ -1,6 +1,7 @@
 const std = @import("std");
 const framing = @import("framing.zig");
 const debug_data = @import("../security/debug_data.zig");
+const debug_memory = @import("../security/debug_memory.zig");
 
 pub const LaunchArguments = struct {
     adapter_id: []const u8,
@@ -36,6 +37,27 @@ pub const DataBreakpoint = struct {
     hit_condition: ?[]const u8 = null,
 };
 
+pub const InstructionBreakpoint = struct {
+    instruction_reference: []const u8,
+    offset: ?i64 = null,
+    condition: ?[]const u8 = null,
+    hit_condition: ?[]const u8 = null,
+};
+
+pub const ReadMemoryArguments = struct {
+    memory_reference: []const u8,
+    offset: i64 = 0,
+    count: usize,
+};
+
+pub const DisassembleArguments = struct {
+    memory_reference: []const u8,
+    offset: i64 = 0,
+    instruction_offset: i64 = 0,
+    instruction_count: usize,
+    resolve_symbols: bool = true,
+};
+
 pub const EvaluateArguments = struct {
     expression: []const u8,
     frame_id: ?i64 = null,
@@ -58,6 +80,7 @@ pub fn makeInitializeRequest(allocator: std.mem.Allocator, seq: i64, adapter_id:
         try field(&json, "columnsStartAt1", true);
         try field(&json, "supportsVariableType", true);
         try field(&json, "supportsVariablePaging", true);
+        try field(&json, "supportsMemoryReferences", true);
         try field(&json, "supportsRunInTerminalRequest", false);
         try field(&json, "locale", "en-US");
         try json.endObject();
@@ -226,6 +249,80 @@ pub fn makeSetDataBreakpointsRequest(
             try json.endObject();
         }
         try json.endArray();
+        try json.endObject();
+        try json.endObject();
+    }
+    return out.toOwnedSlice();
+}
+
+pub fn makeSetInstructionBreakpointsRequest(
+    allocator: std.mem.Allocator,
+    seq: i64,
+    breakpoints: []const InstructionBreakpoint,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, seq, "setInstructionBreakpoints");
+        try json.objectField("arguments");
+        try json.beginObject();
+        try json.objectField("breakpoints");
+        try json.beginArray();
+        for (breakpoints) |breakpoint| {
+            _ = try debug_memory.validateText(.memory_reference, breakpoint.instruction_reference);
+            if (breakpoint.offset) |offset| _ = try debug_memory.validateByteOffset(offset);
+            try json.beginObject();
+            try field(&json, "instructionReference", breakpoint.instruction_reference);
+            if (breakpoint.offset) |offset| try field(&json, "offset", offset);
+            if (breakpoint.condition) |condition| try field(&json, "condition", condition);
+            if (breakpoint.hit_condition) |hit_condition| try field(&json, "hitCondition", hit_condition);
+            try json.endObject();
+        }
+        try json.endArray();
+        try json.endObject();
+        try json.endObject();
+    }
+    return out.toOwnedSlice();
+}
+
+pub fn makeReadMemoryRequest(allocator: std.mem.Allocator, seq: i64, arguments: ReadMemoryArguments) ![]u8 {
+    _ = try debug_memory.validateText(.memory_reference, arguments.memory_reference);
+    _ = try debug_memory.validateByteOffset(arguments.offset);
+    _ = try debug_memory.validateReadCount(arguments.count);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, seq, "readMemory");
+        try json.objectField("arguments");
+        try json.beginObject();
+        try field(&json, "memoryReference", arguments.memory_reference);
+        if (arguments.offset != 0) try field(&json, "offset", arguments.offset);
+        try field(&json, "count", arguments.count);
+        try json.endObject();
+        try json.endObject();
+    }
+    return out.toOwnedSlice();
+}
+
+pub fn makeDisassembleRequest(allocator: std.mem.Allocator, seq: i64, arguments: DisassembleArguments) ![]u8 {
+    _ = try debug_memory.validateText(.memory_reference, arguments.memory_reference);
+    _ = try debug_memory.validateByteOffset(arguments.offset);
+    _ = try debug_memory.validateInstructionOffset(arguments.instruction_offset);
+    _ = try debug_memory.validateInstructionCount(arguments.instruction_count);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, seq, "disassemble");
+        try json.objectField("arguments");
+        try json.beginObject();
+        try field(&json, "memoryReference", arguments.memory_reference);
+        if (arguments.offset != 0) try field(&json, "offset", arguments.offset);
+        if (arguments.instruction_offset != 0) try field(&json, "instructionOffset", arguments.instruction_offset);
+        try field(&json, "instructionCount", arguments.instruction_count);
+        try field(&json, "resolveSymbols", arguments.resolve_symbols);
         try json.endObject();
         try json.endObject();
     }

@@ -39,8 +39,10 @@ const debug_launch_plan = @import("../debug/launch_plan.zig");
 const debug_protocol = @import("../debug/protocol.zig");
 const debug_session = @import("../debug/session.zig");
 const debug_breakpoint = @import("../security/debug_breakpoint.zig");
+const debug_data = @import("../security/debug_data.zig");
 const debug_exception = @import("../security/debug_exception.zig");
 const debug_expression = @import("../security/debug_expression.zig");
+const debug_function = @import("../security/debug_function.zig");
 
 pub const LspPumpResult = struct {
     frames: usize = 0,
@@ -527,6 +529,41 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
 
     if (std.mem.eql(u8, definition.id, "debug.breakpoint_clear_advanced")) {
         return try clearAdvancedDebugBreakpoint(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.function_add")) {
+        return try addDebugFunctionBreakpoint(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.function_remove")) {
+        return try removeDebugFunctionBreakpoint(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.function_clear")) {
+        return try clearDebugFunctionBreakpoints(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.data_inspect")) {
+        return try inspectDebugDataBreakpoint(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.data_commit")) {
+        return try commitDebugDataBreakpoint(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.data_cancel")) {
+        return if (app.debug_manager.session.cancelDataBreakpointCandidate())
+            .{ .completed = "data breakpoint candidate cancelled" }
+        else
+            .{ .blocked = "no data breakpoint candidate is staged" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.data_remove")) {
+        return try removeDebugDataBreakpoint(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.data_clear")) {
+        return try clearDebugDataBreakpoints(app);
     }
 
     if (std.mem.eql(u8, definition.id, "debug.exception_toggle")) {
@@ -2205,6 +2242,148 @@ fn clearAdvancedDebugBreakpoint(app: *app_mod.App) !Result {
         "advanced breakpoint settings cleared for this session only" };
 }
 
+fn addDebugFunctionBreakpoint(app: *app_mod.App, argument: ?[]const u8) !Result {
+    const raw_name = argument orelse return .{ .blocked = "debug.function_add requires an explicit symbol or signature" };
+    const session = &app.debug_manager.session;
+    const added = session.addFunctionBreakpoint(raw_name) catch |err| return .{ .blocked = switch (err) {
+        error.TooManyFunctionBreakpoints => "function breakpoint limit reached (256)",
+        error.EmptyFunctionSelector,
+        error.FunctionSelectorTooLong,
+        error.InvalidFunctionSelectorUtf8,
+        error.HiddenFunctionSelectorControl,
+        error.UnsafeFunctionSelector,
+        error.UnbalancedFunctionSelector,
+        => debug_function.rejectionMessage(err),
+        else => return err,
+    } };
+    if (!added) {
+        const persisted = try persistDebugState(app);
+        return .{ .completed = if (persisted)
+            "function breakpoint already exists; state saved"
+        else
+            "function breakpoint already exists in this session" };
+    }
+    const persisted = try persistDebugState(app);
+    try sendDebugFunctionBreakpoints(app);
+    try appendConsole(app, .stdout, "function breakpoint added: {s}\n", .{session.function_breakpoints.items[session.function_breakpoints.items.len - 1].name});
+    return .{ .completed = if (persisted)
+        "function breakpoint added and saved"
+    else
+        "function breakpoint added for this session only" };
+}
+
+fn removeDebugFunctionBreakpoint(app: *app_mod.App, argument: ?[]const u8) !Result {
+    const one_based = parseDebugReference(argument) orelse return .{ .blocked = "debug.function_remove requires a one-based function breakpoint index" };
+    const index = std.math.cast(usize, one_based - 1) orelse return .{ .blocked = "function breakpoint index is out of range" };
+    if (!app.debug_manager.session.removeFunctionBreakpointAt(index)) return .{ .blocked = "function breakpoint index is out of range" };
+    const persisted = try persistDebugState(app);
+    try sendDebugFunctionBreakpoints(app);
+    return .{ .completed = if (persisted)
+        "function breakpoint removed and state saved"
+    else
+        "function breakpoint removed for this session only" };
+}
+
+fn clearDebugFunctionBreakpoints(app: *app_mod.App) !Result {
+    if (!app.debug_manager.session.clearFunctionBreakpoints()) {
+        const persisted = try persistDebugState(app);
+        return .{ .completed = if (persisted)
+            "function breakpoints already clear; state saved"
+        else
+            "function breakpoints already clear in this session" };
+    }
+    const persisted = try persistDebugState(app);
+    try sendDebugFunctionBreakpoints(app);
+    try appendConsole(app, .stdout, "debug function breakpoints cleared\n", .{});
+    return .{ .completed = if (persisted)
+        "function breakpoints cleared and state saved"
+    else
+        "function breakpoints cleared for this session only" };
+}
+
+fn inspectDebugDataBreakpoint(app: *app_mod.App, argument: ?[]const u8) !Result {
+    if (!app.debug_manager.isRunning()) return .{ .blocked = "no debug adapter is running" };
+    const session = &app.debug_manager.session;
+    if (session.state != .paused) return .{ .blocked = "debuggee must be paused to inspect a data breakpoint" };
+    if (!session.dataBreakpointsSupported()) return .{ .blocked = "active debug adapter does not support data breakpoints" };
+    const one_based = parseDebugReference(argument) orelse return .{ .blocked = "debug.data_inspect requires a one-based variable index" };
+    const index = std.math.cast(usize, one_based - 1) orelse return .{ .blocked = "debug variable index is out of range" };
+    var outbound = session.makeDataBreakpointInfo(index) catch |err| return .{ .blocked = switch (err) {
+        error.UnknownVariable => "debug variable index is out of range",
+        error.StaleVariableReference => "debug variable reference belongs to an earlier suspended state; refresh variables",
+        error.InvalidVariableReference => "selected variable has no valid parent container reference",
+        error.DataBreakpointsUnsupported => "active debug adapter does not support data breakpoints",
+        error.DebuggeeNotPaused => "debuggee must be paused to inspect a data breakpoint",
+        error.EmptyDataBreakpointText,
+        error.DataBreakpointTextTooLong,
+        error.InvalidDataBreakpointUtf8,
+        error.HiddenDataBreakpointControl,
+        => debug_data.rejectionMessage(err),
+        else => return err,
+    } };
+    defer outbound.deinit();
+    try app.debug_manager.send(&outbound);
+    return .{ .completed = "data breakpoint metadata requested; review the staged candidate before committing" };
+}
+
+fn commitDebugDataBreakpoint(app: *app_mod.App, argument: ?[]const u8) !Result {
+    const session = &app.debug_manager.session;
+    const candidate = session.data_breakpoint_candidate orelse return .{ .blocked = "no data breakpoint candidate is staged" };
+    const persistent = candidate.can_persist;
+    const description = try app.allocator.dupe(u8, candidate.description);
+    defer app.allocator.free(description);
+    const access_type: ?debug_data.AccessType = if (argument) |raw| blk: {
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(value, "default")) break :blk null;
+        break :blk debug_data.parseAccessArgument(value) orelse return .{ .blocked = "data breakpoint access must be default, read, write, or readWrite" };
+    } else null;
+    const update = session.commitDataBreakpoint(access_type) catch |err| return .{ .blocked = switch (err) {
+        error.NoDataBreakpointCandidate => "no data breakpoint candidate is staged",
+        error.StaleDataBreakpointCandidate => "data breakpoint candidate belongs to an earlier suspended state; inspect the variable again",
+        error.DataBreakpointUnavailable => candidate.description,
+        error.DataBreakpointAccessRequired => "choose one of the access types advertised by the active adapter",
+        error.DataBreakpointAccessNotAdvertised => "selected access type was not advertised for this variable",
+        error.TooManyDataBreakpoints => "data breakpoint limit reached (128)",
+        else => return err,
+    } };
+    const persisted = try persistDebugState(app);
+    try sendDebugDataBreakpoints(app);
+    try appendConsole(app, .stdout, "data breakpoint {s}: {s} access={s} persistence={s}\n", .{
+        @tagName(update),
+        description,
+        if (access_type) |value| value.protocolName() else "adapter-default",
+        if (persistent) "workspace" else "debug-session",
+    });
+    return .{ .completed = if (persistent and persisted)
+        "data breakpoint committed and saved"
+    else
+        "data breakpoint committed for this debug session only" };
+}
+
+fn removeDebugDataBreakpoint(app: *app_mod.App, argument: ?[]const u8) !Result {
+    const one_based = parseDebugReference(argument) orelse return .{ .blocked = "debug.data_remove requires a one-based data breakpoint index" };
+    const index = std.math.cast(usize, one_based - 1) orelse return .{ .blocked = "data breakpoint index is out of range" };
+    if (!app.debug_manager.session.removeDataBreakpointAt(index)) return .{ .blocked = "data breakpoint index is out of range" };
+    const persisted = try persistDebugState(app);
+    try sendDebugDataBreakpoints(app);
+    return .{ .completed = if (persisted)
+        "data breakpoint removed and state saved"
+    else
+        "data breakpoint removed for this session only" };
+}
+
+fn clearDebugDataBreakpoints(app: *app_mod.App) !Result {
+    const changed = app.debug_manager.session.clearDataBreakpoints();
+    const persisted = try persistDebugState(app);
+    try sendDebugDataBreakpoints(app);
+    return .{ .completed = if (!changed)
+        "data breakpoints already clear"
+    else if (persisted)
+        "data breakpoints cleared and state saved"
+    else
+        "data breakpoints cleared for this session only" };
+}
+
 fn toggleDebugExceptionFilter(app: *app_mod.App, argument: ?[]const u8) !Result {
     const filter_id = argument orelse return .{ .blocked = "debug.exception_toggle requires an adapter-advertised filter ID" };
     const session = &app.debug_manager.session;
@@ -2248,6 +2427,36 @@ fn sendDebugExceptionBreakpoints(app: *app_mod.App) !void {
         try appendConsole(app, .stderr, "debug adapter capability boundary: {d} persisted exception filter(s) withheld because this adapter did not advertise them\n", .{withheld});
     }
     var outbound = try session.makeSetExceptionBreakpoints();
+    defer outbound.deinit();
+    try app.debug_manager.send(&outbound);
+}
+
+fn sendDebugFunctionBreakpoints(app: *app_mod.App) !void {
+    const session = &app.debug_manager.session;
+    if (!app.debug_manager.isRunning() or !session.acceptsBreakpointConfiguration()) return;
+    if (!session.functionBreakpointsSupported()) {
+        const withheld = session.unsupportedFunctionBreakpointCount();
+        if (withheld > 0) {
+            try appendConsole(app, .stderr, "debug adapter capability boundary: {d} function breakpoint(s) withheld; none were converted to source breakpoints\n", .{withheld});
+        }
+        return;
+    }
+    var outbound = try session.makeSetFunctionBreakpoints();
+    defer outbound.deinit();
+    try app.debug_manager.send(&outbound);
+}
+
+fn sendDebugDataBreakpoints(app: *app_mod.App) !void {
+    const session = &app.debug_manager.session;
+    if (!app.debug_manager.isRunning() or !session.acceptsBreakpointConfiguration()) return;
+    if (!session.dataBreakpointsSupported()) {
+        const withheld = session.unsupportedDataBreakpointCount();
+        if (withheld > 0) {
+            try appendConsole(app, .stderr, "debug adapter capability boundary: {d} data breakpoint(s) withheld; opaque IDs were not reinterpreted or downgraded\n", .{withheld});
+        }
+        return;
+    }
+    var outbound = try session.makeSetDataBreakpoints();
     defer outbound.deinit();
     try app.debug_manager.send(&outbound);
 }
@@ -2299,7 +2508,19 @@ fn persistDebugState(app: *app_mod.App) !bool {
     if (report.breakpoints_skipped > 0) {
         try appendConsole(app, .stderr, "debug state skipped {d} breakpoint(s) with an invalid field or path outside this workspace\n", .{report.breakpoints_skipped});
     }
-    return report.breakpoints_skipped == 0;
+    if (report.function_breakpoints_skipped > 0) {
+        try appendConsole(app, .stderr, "debug state skipped {d} invalid function breakpoint selector(s)\n", .{report.function_breakpoints_skipped});
+    }
+    if (report.data_breakpoints_skipped > 0) {
+        try appendConsole(app, .stderr, "debug state skipped {d} invalid or excess persistent data breakpoint(s)\n", .{report.data_breakpoints_skipped});
+    }
+    if (report.exception_filters_skipped > 0) {
+        try appendConsole(app, .stderr, "debug state skipped {d} invalid exception filter ID(s)\n", .{report.exception_filters_skipped});
+    }
+    return report.breakpoints_skipped == 0 and
+        report.function_breakpoints_skipped == 0 and
+        report.data_breakpoints_skipped == 0 and
+        report.exception_filters_skipped == 0;
 }
 
 fn ingestDebugPayload(app: *app_mod.App, payload: []const u8) !Result {
@@ -2418,6 +2639,8 @@ fn advanceDebugHandshake(app: *app_mod.App, result: debug_session.IngestResult) 
                     if (!breakpoint.enabled or hasEarlierBreakpointPath(session.breakpoints.items, index, breakpoint.path)) continue;
                     try sendDebugBreakpointsForPath(app, breakpoint.path);
                 }
+                try sendDebugFunctionBreakpoints(app);
+                try sendDebugDataBreakpoints(app);
                 try sendDebugExceptionBreakpoints(app);
                 if (session.capabilities.supports_configuration_done_request) {
                     var configured = try session.makeConfigurationDone();
@@ -2435,6 +2658,17 @@ fn advanceDebugHandshake(app: *app_mod.App, result: debug_session.IngestResult) 
                     var stack = try session.makeStackTrace(thread_id);
                     defer stack.deinit();
                     try app.debug_manager.send(&stack);
+                }
+            },
+            .capabilities => {
+                if (session.acceptsBreakpointConfiguration()) {
+                    for (session.breakpoints.items, 0..) |breakpoint, index| {
+                        if (!breakpoint.enabled or hasEarlierBreakpointPath(session.breakpoints.items, index, breakpoint.path)) continue;
+                        try sendDebugBreakpointsForPath(app, breakpoint.path);
+                    }
+                    try sendDebugFunctionBreakpoints(app);
+                    try sendDebugDataBreakpoints(app);
+                    try sendDebugExceptionBreakpoints(app);
                 }
             },
             else => {},
@@ -2499,18 +2733,25 @@ fn renderDebugStatus(app: *app_mod.App) !void {
         @tagName(manager.fs_policy),
         @tagName(manager.network_policy),
     });
-    try writer.print("state-file: {s} store={s} loaded watch={d} bp={d} exc={d} rejected={d} saved watch={d} bp={d} exc={d} skipped bp={d} exc={d} bytes={d}\n", .{
+    try writer.print("state-file: {s} store={s} loaded watch={d} bp={d} fn={d} data={d} exc={d} rejected={d} saved watch={d} bp={d} fn={d} data={d} exc={d} skipped bp={d} fn={d} data={d} exc={d} session-only-data={d} bytes={d}\n", .{
         @import("../debug/workspace_state.zig").relative_path,
         debugStateStoreLabel(manager),
         manager.state_load_report.watches_loaded,
         manager.state_load_report.breakpoints_loaded,
+        manager.state_load_report.function_breakpoints_loaded,
+        manager.state_load_report.data_breakpoints_loaded,
         manager.state_load_report.exception_filters_loaded,
         manager.state_load_report.entries_rejected,
         manager.state_save_report.watches_saved,
         manager.state_save_report.breakpoints_saved,
+        manager.state_save_report.function_breakpoints_saved,
+        manager.state_save_report.data_breakpoints_saved,
         manager.state_save_report.exception_filters_saved,
         manager.state_save_report.breakpoints_skipped,
+        manager.state_save_report.function_breakpoints_skipped,
+        manager.state_save_report.data_breakpoints_skipped,
         manager.state_save_report.exception_filters_skipped,
+        manager.state_save_report.data_breakpoints_session_only,
         manager.state_save_report.bytes_written,
     });
     if (manager.state_load_error) |err| try writer.print("state-load-error: {s}\n", .{@errorName(err)});
@@ -2529,6 +2770,49 @@ fn renderDebugStatus(app: *app_mod.App) !void {
             breakpoint.hit_condition orelse "",
             breakpoint.log_message orelse "",
             breakpoint.message orelse "",
+        });
+    }
+    try writer.print("function-breakpoints: {d} capability={s} withheld={d} explicit-selector=true\n", .{
+        session.function_breakpoints.items.len,
+        @tagName(session.functionBreakpointCapability()),
+        session.unsupportedFunctionBreakpointCount(),
+    });
+    for (session.function_breakpoints.items) |breakpoint| {
+        try writer.print("  {s} verified={any} adapter-id={any} {s}\n", .{
+            breakpoint.name,
+            breakpoint.verified,
+            breakpoint.adapter_id,
+            breakpoint.message orelse "",
+        });
+    }
+    try writer.print("data-breakpoints: {d} capability={s} withheld={d} rejected-metadata={d} opaque-id=true two-stage=true pause-generation={d}\n", .{
+        session.data_breakpoints.items.len,
+        @tagName(session.dataBreakpointCapability()),
+        session.unsupportedDataBreakpointCount(),
+        session.rejected_data_breakpoint_metadata,
+        session.pause_generation,
+    });
+    for (session.data_breakpoints.items, 1..) |breakpoint, index| {
+        try writer.print("  [{d}] {s} access={s} persist={} verified={any} adapter-id={any} {s}\n", .{
+            index,
+            breakpoint.description,
+            if (breakpoint.access_type) |access_type| access_type.protocolName() else "adapter-default",
+            breakpoint.can_persist,
+            breakpoint.verified,
+            breakpoint.adapter_id,
+            breakpoint.message orelse "",
+        });
+    }
+    if (session.data_breakpoint_candidate) |candidate| {
+        try writer.print("data-candidate: variable={s} available={} persist={} access=read:{} write:{} readWrite:{} generation={d} description={s}\n", .{
+            candidate.variable_name,
+            candidate.data_id != null,
+            candidate.can_persist,
+            candidate.access_types.read,
+            candidate.access_types.write,
+            candidate.access_types.read_write,
+            candidate.pause_generation,
+            candidate.description,
         });
     }
     try writer.print("exception-filters: selected={d} advertised={d} active={d} withheld={d} rejected-metadata={d} explicit-only=true\n", .{
@@ -5060,6 +5344,81 @@ test "exception breakpoint commands require advertised IDs and persist explicit 
     const cleared = try dispatch(&app, .{ .id = "debug.exception_clear" });
     try std.testing.expect(std.meta.activeTag(cleared) == .completed);
     try std.testing.expectEqual(@as(usize, 0), app.debug_manager.session.selectedExceptionFilterCount());
+}
+
+test "function breakpoint commands validate persist remove and honor workspace lock" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buf);
+    const root = root_buf[0..root_len];
+    var app = try app_mod.App.init(std.testing.allocator, root);
+    defer app.deinit();
+
+    app.runtime.trust_state = .locked_down;
+    const locked = try dispatch(&app, .{ .id = "debug.function_add", .argument = "pkg.worker.run" });
+    try std.testing.expect(std.meta.activeTag(locked) == .blocked);
+    try std.testing.expectEqual(@as(usize, 0), app.debug_manager.session.function_breakpoints.items.len);
+    app.runtime.trust_state = .untrusted;
+
+    const added = try dispatch(&app, .{ .id = "debug.function_add", .argument = "std::vector<int>::push_back" });
+    try std.testing.expect(std.meta.activeTag(added) == .completed);
+    const duplicate = try dispatch(&app, .{ .id = "debug.function_add", .argument = "std::vector<int>::push_back" });
+    try std.testing.expect(std.meta.activeTag(duplicate) == .completed);
+    const rejected = try dispatch(&app, .{ .id = "debug.function_add", .argument = "pkg.*" });
+    try std.testing.expect(std.meta.activeTag(rejected) == .blocked);
+    try std.testing.expectEqual(@as(usize, 1), app.debug_manager.session.function_breakpoints.items.len);
+
+    var restored = try app_mod.App.init(std.testing.allocator, root);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(usize, 1), restored.debug_manager.session.function_breakpoints.items.len);
+    try std.testing.expectEqualStrings("std::vector<int>::push_back", restored.debug_manager.session.function_breakpoints.items[0].name);
+
+    const removed = try dispatch(&app, .{ .id = "debug.function_remove", .argument = "1" });
+    try std.testing.expect(std.meta.activeTag(removed) == .completed);
+    try std.testing.expectEqual(@as(usize, 0), app.debug_manager.session.function_breakpoints.items.len);
+    const cleared = try dispatch(&app, .{ .id = "debug.function_clear" });
+    try std.testing.expect(std.meta.activeTag(cleared) == .completed);
+}
+
+test "data breakpoint commands require staged advertised access and persist only approved IDs" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buf);
+    const root = root_buf[0..root_len];
+    var app = try app_mod.App.init(std.testing.allocator, root);
+    defer app.deinit();
+
+    app.debug_manager.session.state = .paused;
+    app.debug_manager.session.pause_generation = 8;
+    app.debug_manager.session.data_breakpoint_candidate = .{
+        .data_id = try std.testing.allocator.dupe(u8, "opaque:counter"),
+        .description = try std.testing.allocator.dupe(u8, "counter storage"),
+        .variable_name = try std.testing.allocator.dupe(u8, "counter"),
+        .access_types = .{ .write = true },
+        .can_persist = true,
+        .pause_generation = 8,
+    };
+
+    const rejected = try dispatch(&app, .{ .id = "debug.data_commit", .argument = "read" });
+    try std.testing.expect(std.meta.activeTag(rejected) == .blocked);
+    try std.testing.expect(app.debug_manager.session.data_breakpoint_candidate != null);
+    const committed = try dispatch(&app, .{ .id = "debug.data_commit", .argument = "write" });
+    try std.testing.expect(std.meta.activeTag(committed) == .completed);
+    try std.testing.expectEqual(@as(usize, 1), app.debug_manager.session.data_breakpoints.items.len);
+
+    var restored = try app_mod.App.init(std.testing.allocator, root);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(usize, 1), restored.debug_manager.session.data_breakpoints.items.len);
+    try std.testing.expectEqualStrings("opaque:counter", restored.debug_manager.session.data_breakpoints.items[0].data_id);
+    try std.testing.expect(restored.debug_manager.session.data_breakpoints.items[0].can_persist);
+
+    const removed = try dispatch(&app, .{ .id = "debug.data_remove", .argument = "1" });
+    try std.testing.expect(std.meta.activeTag(removed) == .completed);
+    try std.testing.expectEqual(@as(usize, 0), app.debug_manager.session.data_breakpoints.items.len);
+    const cleared = try dispatch(&app, .{ .id = "debug.data_clear" });
+    try std.testing.expect(std.meta.activeTag(cleared) == .completed);
 }
 
 test "open selected workspace file activates editor focus" {

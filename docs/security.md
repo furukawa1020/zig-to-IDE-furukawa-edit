@@ -99,6 +99,20 @@ DAPの `SourceBreakpoint` が持つ `condition` / `hitCondition` / `logMessage` 
 
 この制限も副作用の不在を証明しない。比較対象のproperty/indexerやdebuggerの式評価器がコードを実行する可能性は残る。adapterは引き続き信頼境界内であり、GUIには「restricted adapter evaluation」として露出する。DAPのフィールドとcapabilityの意味は[公式仕様](https://microsoft.github.io/debug-adapter-protocol/specification#Types_SourceBreakpoint)に従う。
 
+### 関数ブレークポイント境界
+
+Zig、C/C++、Rust、Go、Python、Javaなどの関数・メソッドを、source lineとは独立したDAP `FunctionBreakpoint.name` として指定できる。ただしZIDE自身はこの文字列を評価せず、シェルcommandへ連結しない。
+
+- selectorは256件、1件1024 byte、group depth 16までに制限し、有効UTF-8、hidden/control character、区切りの釣り合いを検査する
+- qualified symbol、namespace、module path、型付きsignatureに必要な限定文字だけを受理し、トップレベルwildcard、文区切り、quote、式構文を拒否する
+- adapterの `supportsFunctionBreakpoints` がtrueのときだけ `setFunctionBreakpoints` を送り、非対応時はsource breakpointへ格下げせず保存状態のままwithholdする
+- DAPの全置換契約に従い、空配列による全消去を含め、`initialized` event後かつ `configurationDone` 前に送る
+- 要求ごとに関数名のowned snapshotを保持し、追加・削除後に古い応答が届いても現在の別項目へ検証結果を誤対応させない
+- 状態ファイルには検証済みselectorだけを保存し、adapter ID、verified、messageなどのruntime responseは保存しない
+- Windows/Linux GUIは同じcore command、検証器、永続化形式を使い、configured、capability、withheld、verified/rejectedを同じ操作面に表示する
+
+関数名の解釈と探索範囲はadapter実装に依存し、ZIDEの検証はadapter内部の副作用不在を証明しない。DAPの全置換、capability、応答順は[公式仕様](https://microsoft.github.io/debug-adapter-protocol/specification#Requests_SetFunctionBreakpoints)に従う。
+
 ### 例外ブレークポイント境界
 
 DAP adapterが初期化応答の `exceptionBreakpointFilters` で広告したフィルターだけを選択できる。adapter由来のメタデータも信頼済みUI文字列として扱わない。
@@ -116,7 +130,7 @@ DAPの初期化順序、フィルター、要求引数、応答順は[公式仕�
 
 ### デバッグ状態ファイル
 
-ウォッチ、source breakpoint、選択済みexception filter IDは `.zide/debug-state.json` に保存する。このファイルはユーザーごとの状態なのでGit管理から除外する。
+ウォッチ、source breakpoint、function breakpoint selector、選択済みexception filter IDは `.zide/debug-state.json` に保存する。このファイルはユーザーごとの状態なのでGit管理から除外する。
 
 - 読み込みは1 MiBまで、通常ファイルかつno-followのワークスペース能力経由に限定する
 - 保存先の親ディレクトリをコンポーネントごとにno-followで開き、同じディレクトリ能力内の一時ファイルから原子的にrenameする
@@ -126,6 +140,7 @@ DAPの初期化順序、フィルター、要求引数、応答順は[公式仕�
 - v1の通常ブレークポイントを読み込める一方、高度設定を含む保存形式はv2とし、古いbinaryによる無条件BPへの誤変換を防ぐ
 - condition、hit condition、log messageは読み込み時にも上記の検証を通し、1項目でも不正ならそのブレークポイント全体を拒否する
 - exception filter IDは読み込み時にも境界検証し、重複、hidden control、上限超過を個別に拒否する
+- function selectorは読み込み時にも同じmulti-language境界検証を通し、重複、pattern、hidden control、上限超過を個別に拒否する
 - 任意のadapter引数やruntime responseは状態ファイルから読み込まない
 - 状態を変更するブレークポイント／ウォッチコマンドは `workspace_write` capabilityを持ち、LOCKED_DOWNでは実行前に拒否する
 - 保存失敗は `store:dirty` / `store:save-error` としてGUIへ露出し、メモリ上だけの変更になったことを隠さない

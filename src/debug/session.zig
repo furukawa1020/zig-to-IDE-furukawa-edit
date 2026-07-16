@@ -1,7 +1,9 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const debug_breakpoint = @import("../security/debug_breakpoint.zig");
+const debug_data = @import("../security/debug_data.zig");
 const debug_exception = @import("../security/debug_exception.zig");
+const debug_function = @import("../security/debug_function.zig");
 
 const max_collection_items: usize = 4096;
 const max_event_text_bytes: usize = 64 * 1024;
@@ -28,6 +30,9 @@ pub const RequestKind = enum {
     initialize,
     launch,
     set_breakpoints,
+    set_function_breakpoints,
+    data_breakpoint_info,
+    set_data_breakpoints,
     set_exception_breakpoints,
     configuration_done,
     disconnect,
@@ -45,6 +50,7 @@ pub const RequestKind = enum {
 
 pub const EventKind = enum {
     initialized,
+    capabilities,
     stopped,
     continued,
     terminated,
@@ -66,6 +72,7 @@ pub const Capabilities = struct {
     supports_conditional_breakpoints: bool = false,
     supports_hit_conditional_breakpoints: bool = false,
     supports_function_breakpoints: bool = false,
+    supports_data_breakpoints: bool = false,
     supports_log_points: bool = false,
     supports_terminate_request: bool = false,
     supports_restart_request: bool = false,
@@ -110,6 +117,97 @@ pub const ExceptionFilterView = struct {
     advertised: bool,
     verified: ?bool,
     message: ?[]const u8,
+};
+
+pub const FunctionBreakpoint = struct {
+    name: []u8,
+    verified: ?bool = null,
+    adapter_id: ?i64 = null,
+    message: ?[]u8 = null,
+
+    fn clearRuntime(self: *FunctionBreakpoint, allocator: std.mem.Allocator) void {
+        if (self.message) |value| allocator.free(value);
+        self.verified = null;
+        self.adapter_id = null;
+        self.message = null;
+    }
+
+    fn deinit(self: *FunctionBreakpoint, allocator: std.mem.Allocator) void {
+        self.clearRuntime(allocator);
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
+pub const DataAccessSet = struct {
+    read: bool = false,
+    write: bool = false,
+    read_write: bool = false,
+
+    pub fn count(self: DataAccessSet) usize {
+        return @as(usize, @intFromBool(self.read)) +
+            @as(usize, @intFromBool(self.write)) +
+            @as(usize, @intFromBool(self.read_write));
+    }
+
+    pub fn allows(self: DataAccessSet, access_type: debug_data.AccessType) bool {
+        return switch (access_type) {
+            .read => self.read,
+            .write => self.write,
+            .read_write => self.read_write,
+        };
+    }
+
+    fn insert(self: *DataAccessSet, access_type: debug_data.AccessType) bool {
+        const flag = switch (access_type) {
+            .read => &self.read,
+            .write => &self.write,
+            .read_write => &self.read_write,
+        };
+        if (flag.*) return false;
+        flag.* = true;
+        return true;
+    }
+};
+
+pub const DataBreakpointCandidate = struct {
+    data_id: ?[]u8,
+    description: []u8,
+    variable_name: []u8,
+    access_types: DataAccessSet = .{},
+    can_persist: bool = false,
+    pause_generation: u64,
+
+    fn deinit(self: *DataBreakpointCandidate, allocator: std.mem.Allocator) void {
+        if (self.data_id) |data_id| allocator.free(data_id);
+        allocator.free(self.description);
+        allocator.free(self.variable_name);
+        self.* = undefined;
+    }
+};
+
+pub const DataBreakpoint = struct {
+    data_id: []u8,
+    description: []u8,
+    access_type: ?debug_data.AccessType = null,
+    can_persist: bool = false,
+    verified: ?bool = null,
+    adapter_id: ?i64 = null,
+    message: ?[]u8 = null,
+
+    fn clearRuntime(self: *DataBreakpoint, allocator: std.mem.Allocator) void {
+        if (self.message) |value| allocator.free(value);
+        self.verified = null;
+        self.adapter_id = null;
+        self.message = null;
+    }
+
+    fn deinit(self: *DataBreakpoint, allocator: std.mem.Allocator) void {
+        self.clearRuntime(allocator);
+        allocator.free(self.data_id);
+        allocator.free(self.description);
+        self.* = undefined;
+    }
 };
 
 pub const Breakpoint = struct {
@@ -179,6 +277,9 @@ pub const Variable = struct {
     variables_reference: i64,
     named_variables: ?usize,
     indexed_variables: ?usize,
+    parent_variables_reference: i64,
+    frame_id: ?i64,
+    pause_generation: u64,
 
     fn deinit(self: *Variable, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -221,14 +322,29 @@ pub const Pending = struct {
     kind: RequestKind,
     path: ?[]u8 = null,
     watch_id: ?u64 = null,
+    function_names: ?[][]u8 = null,
+    data_ids: ?[][]u8 = null,
     exception_filter_ids: ?[][]u8 = null,
+    variable_name: ?[]u8 = null,
+    variables_reference: ?i64 = null,
+    frame_id: ?i64 = null,
+    pause_generation: ?u64 = null,
 
     fn deinit(self: *Pending, allocator: std.mem.Allocator) void {
         if (self.path) |path| allocator.free(path);
+        if (self.function_names) |function_names| {
+            for (function_names) |name| allocator.free(name);
+            allocator.free(function_names);
+        }
+        if (self.data_ids) |data_ids| {
+            for (data_ids) |data_id| allocator.free(data_id);
+            allocator.free(data_ids);
+        }
         if (self.exception_filter_ids) |filter_ids| {
             for (filter_ids) |filter_id| allocator.free(filter_id);
             allocator.free(filter_ids);
         }
+        if (self.variable_name) |variable_name| allocator.free(variable_name);
         self.* = undefined;
     }
 };
@@ -262,7 +378,50 @@ pub const IngestResult = union(enum) {
 
 pub const ToggleResult = enum { added, removed };
 
+pub const FunctionBreakpointCapability = enum {
+    unknown,
+    supported,
+    unsupported,
+};
+
+pub const DataBreakpointCapability = enum {
+    unknown,
+    supported,
+    unsupported,
+};
+
+pub const DataBreakpointUpdateResult = enum {
+    added,
+    updated,
+    unchanged,
+};
+
+pub const DataBreakpointCommitChoice = enum {
+    adapter_default,
+    read,
+    write,
+    read_write,
+
+    pub fn accessType(self: DataBreakpointCommitChoice) ?debug_data.AccessType {
+        return switch (self) {
+            .adapter_default => null,
+            .read => .read,
+            .write => .write,
+            .read_write => .read_write,
+        };
+    }
+
+    pub fn commandArgument(self: DataBreakpointCommitChoice) []const u8 {
+        return if (self.accessType()) |access_type| access_type.protocolName() else "default";
+    }
+
+    pub fn displayName(self: DataBreakpointCommitChoice) []const u8 {
+        return if (self.accessType()) |access_type| access_type.displayName() else "ADAPTER DEFAULT";
+    }
+};
+
 pub const BreakpointProperty = debug_breakpoint.Property;
+pub const DataBreakpointAccessType = debug_data.AccessType;
 
 pub const BreakpointUpdateResult = enum {
     created,
@@ -287,9 +446,13 @@ pub const Session = struct {
     next_seq: i64 = 1,
     pending: std.array_list.Managed(Pending),
     breakpoints: std.array_list.Managed(Breakpoint),
+    function_breakpoints: std.array_list.Managed(FunctionBreakpoint),
+    data_breakpoints: std.array_list.Managed(DataBreakpoint),
+    data_breakpoint_candidate: ?DataBreakpointCandidate = null,
     exception_filters: std.array_list.Managed(ExceptionFilter),
     selected_exception_filter_ids: std.array_list.Managed([]u8),
     rejected_exception_filter_metadata: usize = 0,
+    rejected_data_breakpoint_metadata: usize = 0,
     threads: std.array_list.Managed(Thread),
     stack_frames: std.array_list.Managed(StackFrame),
     scopes: std.array_list.Managed(Scope),
@@ -299,6 +462,7 @@ pub const Session = struct {
     capabilities: Capabilities = .{},
     active_thread_id: ?i64 = null,
     active_frame_id: ?i64 = null,
+    pause_generation: u64 = 0,
     stop_reason: ?[]u8 = null,
     last_output: ?[]u8 = null,
     last_output_category: ?[]u8 = null,
@@ -312,6 +476,8 @@ pub const Session = struct {
             .workspace_root = try allocator.dupe(u8, workspace_root),
             .pending = std.array_list.Managed(Pending).init(allocator),
             .breakpoints = std.array_list.Managed(Breakpoint).init(allocator),
+            .function_breakpoints = std.array_list.Managed(FunctionBreakpoint).init(allocator),
+            .data_breakpoints = std.array_list.Managed(DataBreakpoint).init(allocator),
             .exception_filters = std.array_list.Managed(ExceptionFilter).init(allocator),
             .selected_exception_filter_ids = std.array_list.Managed([]u8).init(allocator),
             .threads = std.array_list.Managed(Thread).init(allocator),
@@ -325,10 +491,15 @@ pub const Session = struct {
     pub fn deinit(self: *Session) void {
         self.clearRuntimeData();
         for (self.breakpoints.items) |*item| item.deinit(self.allocator);
+        for (self.function_breakpoints.items) |*item| item.deinit(self.allocator);
+        for (self.data_breakpoints.items) |*item| item.deinit(self.allocator);
+        self.clearDataBreakpointCandidate();
         for (self.exception_filters.items) |*item| item.deinit(self.allocator);
         for (self.selected_exception_filter_ids.items) |filter_id| self.allocator.free(filter_id);
         for (self.watches.items) |*item| item.deinit(self.allocator);
         self.breakpoints.deinit();
+        self.function_breakpoints.deinit();
+        self.data_breakpoints.deinit();
         self.exception_filters.deinit();
         self.selected_exception_filter_ids.deinit();
         self.watches.deinit();
@@ -349,6 +520,7 @@ pub const Session = struct {
         self.capabilities = .{};
         clearExceptionFilters(self);
         self.rejected_exception_filter_metadata = 0;
+        self.rejected_data_breakpoint_metadata = 0;
         self.exit_code = null;
         for (self.breakpoints.items) |*breakpoint| {
             breakpoint.verified = false;
@@ -356,6 +528,18 @@ pub const Session = struct {
             breakpoint.resolved_line = null;
             if (breakpoint.message) |message| self.allocator.free(message);
             breakpoint.message = null;
+        }
+        for (self.function_breakpoints.items) |*breakpoint| breakpoint.clearRuntime(self.allocator);
+        self.clearDataBreakpointCandidate();
+        var data_index: usize = 0;
+        while (data_index < self.data_breakpoints.items.len) {
+            if (!self.data_breakpoints.items[data_index].can_persist) {
+                var breakpoint = self.data_breakpoints.orderedRemove(data_index);
+                breakpoint.deinit(self.allocator);
+                continue;
+            }
+            self.data_breakpoints.items[data_index].clearRuntime(self.allocator);
+            data_index += 1;
         }
     }
 
@@ -546,6 +730,173 @@ pub const Session = struct {
         self.breakpoints.clearRetainingCapacity();
     }
 
+    pub fn addFunctionBreakpoint(self: *Session, raw_name: []const u8) !bool {
+        const name = try debug_function.validate(raw_name);
+        if (self.findFunctionBreakpoint(name) != null) return false;
+        if (self.function_breakpoints.items.len >= debug_function.max_breakpoints) return error.TooManyFunctionBreakpoints;
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        try self.function_breakpoints.append(.{ .name = owned_name });
+        return true;
+    }
+
+    pub fn removeFunctionBreakpointAt(self: *Session, index: usize) bool {
+        if (index >= self.function_breakpoints.items.len) return false;
+        var breakpoint = self.function_breakpoints.orderedRemove(index);
+        breakpoint.deinit(self.allocator);
+        return true;
+    }
+
+    pub fn clearFunctionBreakpoints(self: *Session) bool {
+        if (self.function_breakpoints.items.len == 0) return false;
+        for (self.function_breakpoints.items) |*breakpoint| breakpoint.deinit(self.allocator);
+        self.function_breakpoints.clearRetainingCapacity();
+        return true;
+    }
+
+    pub fn functionBreakpointsSupported(self: *const Session) bool {
+        return self.functionBreakpointCapability() == .supported;
+    }
+
+    pub fn functionBreakpointCapability(self: *const Session) FunctionBreakpointCapability {
+        if (!self.capabilitiesKnown()) return .unknown;
+        return if (self.capabilities.supports_function_breakpoints) .supported else .unsupported;
+    }
+
+    pub fn unsupportedFunctionBreakpointCount(self: *const Session) usize {
+        if (self.functionBreakpointCapability() != .unsupported) return 0;
+        return self.function_breakpoints.items.len;
+    }
+
+    pub fn dataBreakpointsSupported(self: *const Session) bool {
+        return self.dataBreakpointCapability() == .supported;
+    }
+
+    pub fn dataBreakpointCapability(self: *const Session) DataBreakpointCapability {
+        if (!self.capabilitiesKnown()) return .unknown;
+        return if (self.capabilities.supports_data_breakpoints) .supported else .unsupported;
+    }
+
+    pub fn unsupportedDataBreakpointCount(self: *const Session) usize {
+        if (self.dataBreakpointCapability() != .unsupported) return 0;
+        return self.data_breakpoints.items.len;
+    }
+
+    pub fn dataBreakpointCandidateCommitChoiceCount(self: *const Session) usize {
+        const candidate = self.data_breakpoint_candidate orelse return 0;
+        if (candidate.data_id == null) return 0;
+        const advertised = candidate.access_types.count();
+        return if (advertised == 0) 1 else advertised;
+    }
+
+    pub fn dataBreakpointCandidateCommitChoiceAt(self: *const Session, index: usize) ?DataBreakpointCommitChoice {
+        const candidate = self.data_breakpoint_candidate orelse return null;
+        if (candidate.data_id == null) return null;
+        if (candidate.access_types.count() == 0) return if (index == 0) .adapter_default else null;
+        var current: usize = 0;
+        if (candidate.access_types.read) {
+            if (current == index) return .read;
+            current += 1;
+        }
+        if (candidate.access_types.write) {
+            if (current == index) return .write;
+            current += 1;
+        }
+        if (candidate.access_types.read_write and current == index) return .read_write;
+        return null;
+    }
+
+    pub fn addPersistedDataBreakpoint(
+        self: *Session,
+        raw_data_id: []const u8,
+        raw_description: []const u8,
+        access_type: ?debug_data.AccessType,
+    ) !bool {
+        const data_id = try debug_data.validate(.data_id, raw_data_id);
+        const description = try debug_data.validate(.description, raw_description);
+        if (self.findDataBreakpoint(data_id) != null) return false;
+        if (self.data_breakpoints.items.len >= debug_data.max_breakpoints) return error.TooManyDataBreakpoints;
+
+        const owned_id = try self.allocator.dupe(u8, data_id);
+        errdefer self.allocator.free(owned_id);
+        const owned_description = try self.allocator.dupe(u8, description);
+        errdefer self.allocator.free(owned_description);
+        try self.data_breakpoints.append(.{
+            .data_id = owned_id,
+            .description = owned_description,
+            .access_type = access_type,
+            .can_persist = true,
+        });
+        return true;
+    }
+
+    pub fn commitDataBreakpoint(
+        self: *Session,
+        access_type: ?debug_data.AccessType,
+    ) !DataBreakpointUpdateResult {
+        const candidate = if (self.data_breakpoint_candidate) |*value| value else return error.NoDataBreakpointCandidate;
+        if (self.state != .paused or candidate.pause_generation != self.pause_generation) return error.StaleDataBreakpointCandidate;
+        const data_id = candidate.data_id orelse return error.DataBreakpointUnavailable;
+        if (candidate.access_types.count() == 0) {
+            if (access_type != null) return error.DataBreakpointAccessNotAdvertised;
+        } else {
+            const selected = access_type orelse return error.DataBreakpointAccessRequired;
+            if (!candidate.access_types.allows(selected)) return error.DataBreakpointAccessNotAdvertised;
+        }
+
+        if (self.findDataBreakpointMut(data_id)) |existing| {
+            if (existing.access_type == access_type and
+                existing.can_persist == candidate.can_persist and
+                std.mem.eql(u8, existing.description, candidate.description))
+            {
+                self.clearDataBreakpointCandidate();
+                return .unchanged;
+            }
+            const description = try self.allocator.dupe(u8, candidate.description);
+            self.allocator.free(existing.description);
+            existing.description = description;
+            existing.access_type = access_type;
+            existing.can_persist = existing.can_persist or candidate.can_persist;
+            existing.clearRuntime(self.allocator);
+            self.clearDataBreakpointCandidate();
+            return .updated;
+        }
+
+        if (self.data_breakpoints.items.len >= debug_data.max_breakpoints) return error.TooManyDataBreakpoints;
+        const owned_id = try self.allocator.dupe(u8, data_id);
+        errdefer self.allocator.free(owned_id);
+        const owned_description = try self.allocator.dupe(u8, candidate.description);
+        errdefer self.allocator.free(owned_description);
+        try self.data_breakpoints.append(.{
+            .data_id = owned_id,
+            .description = owned_description,
+            .access_type = access_type,
+            .can_persist = candidate.can_persist,
+        });
+        self.clearDataBreakpointCandidate();
+        return .added;
+    }
+
+    pub fn cancelDataBreakpointCandidate(self: *Session) bool {
+        if (self.data_breakpoint_candidate == null) return false;
+        self.clearDataBreakpointCandidate();
+        return true;
+    }
+
+    pub fn removeDataBreakpointAt(self: *Session, index: usize) bool {
+        if (index >= self.data_breakpoints.items.len) return false;
+        var breakpoint = self.data_breakpoints.orderedRemove(index);
+        breakpoint.deinit(self.allocator);
+        return true;
+    }
+
+    pub fn clearDataBreakpoints(self: *Session) bool {
+        if (self.data_breakpoints.items.len == 0) return false;
+        for (self.data_breakpoints.items) |*breakpoint| breakpoint.deinit(self.allocator);
+        self.data_breakpoints.clearRetainingCapacity();
+        return true;
+    }
+
     pub fn addConfiguredExceptionFilter(self: *Session, raw_filter_id: []const u8) !bool {
         const filter_id = try debug_exception.validate(.filter_id, raw_filter_id);
         if (self.isExceptionFilterSelected(filter_id)) return false;
@@ -676,6 +1027,60 @@ pub const Session = struct {
         return self.wrapRequest(payload, seq, .set_breakpoints, path);
     }
 
+    pub fn makeSetFunctionBreakpoints(self: *Session) !Outbound {
+        if (!self.functionBreakpointsSupported()) return error.FunctionBreakpointsUnsupported;
+        var items = std.array_list.Managed(protocol.FunctionBreakpoint).init(self.allocator);
+        defer items.deinit();
+        for (self.function_breakpoints.items) |*breakpoint| {
+            breakpoint.clearRuntime(self.allocator);
+            try items.append(.{ .name = breakpoint.name });
+        }
+        const seq = self.takeSeq();
+        const payload = try protocol.makeSetFunctionBreakpointsRequest(self.allocator, seq, items.items);
+        return self.wrapFunctionRequest(payload, seq, items.items);
+    }
+
+    pub fn makeDataBreakpointInfo(self: *Session, variable_index: usize) !Outbound {
+        if (!self.dataBreakpointsSupported()) return error.DataBreakpointsUnsupported;
+        if (self.state != .paused) return error.DebuggeeNotPaused;
+        if (variable_index >= self.variables.items.len) return error.UnknownVariable;
+        const variable = self.variables.items[variable_index];
+        if (variable.pause_generation != self.pause_generation) return error.StaleVariableReference;
+        if (variable.parent_variables_reference <= 0) return error.InvalidVariableReference;
+        const variable_name = try debug_data.validate(.variable_name, variable.name);
+
+        self.clearDataBreakpointCandidate();
+        const seq = self.takeSeq();
+        const payload = try protocol.makeDataBreakpointInfoRequest(self.allocator, seq, .{
+            .variables_reference = variable.parent_variables_reference,
+            .name = variable_name,
+        });
+        return self.wrapDataBreakpointInfoRequest(
+            payload,
+            seq,
+            variable_name,
+            variable.parent_variables_reference,
+            variable.frame_id,
+            variable.pause_generation,
+        );
+    }
+
+    pub fn makeSetDataBreakpoints(self: *Session) !Outbound {
+        if (!self.dataBreakpointsSupported()) return error.DataBreakpointsUnsupported;
+        var items = std.array_list.Managed(protocol.DataBreakpoint).init(self.allocator);
+        defer items.deinit();
+        for (self.data_breakpoints.items) |*breakpoint| {
+            breakpoint.clearRuntime(self.allocator);
+            try items.append(.{
+                .data_id = breakpoint.data_id,
+                .access_type = breakpoint.access_type,
+            });
+        }
+        const seq = self.takeSeq();
+        const payload = try protocol.makeSetDataBreakpointsRequest(self.allocator, seq, items.items);
+        return self.wrapDataBreakpointRequest(payload, seq, items.items);
+    }
+
     pub fn makeSetExceptionBreakpoints(self: *Session) !Outbound {
         var selected = std.array_list.Managed([]const u8).init(self.allocator);
         defer selected.deinit();
@@ -711,7 +1116,8 @@ pub const Session = struct {
 
     pub fn makeVariables(self: *Session, reference: i64) !Outbound {
         const seq = self.takeSeq();
-        return self.wrapRequest(try protocol.makeVariablesRequest(self.allocator, seq, reference, 0, 1000), seq, .variables, null);
+        const payload = try protocol.makeVariablesRequest(self.allocator, seq, reference, 0, 1000);
+        return self.wrapVariablesRequest(payload, seq, reference, self.active_frame_id, self.pause_generation);
     }
 
     pub fn makeEvaluateWatch(self: *Session, watch_id: u64, frame_id: i64) !Outbound {
@@ -813,18 +1219,24 @@ pub const Session = struct {
             },
             .launch => self.state = .configuring,
             .set_breakpoints => if (pending.path) |path| if (body) |value| try self.parseBreakpointsResponse(path, value),
+            .set_function_breakpoints => if (pending.function_names) |function_names| if (body) |value| try self.parseFunctionBreakpointsResponse(function_names, value),
+            .data_breakpoint_info => if (body) |value| try self.parseDataBreakpointInfo(pending, value),
+            .set_data_breakpoints => if (pending.data_ids) |data_ids| if (body) |value| try self.parseDataBreakpointsResponse(data_ids, value),
             .set_exception_breakpoints => if (pending.exception_filter_ids) |filter_ids| if (body) |value| try self.parseExceptionBreakpointsResponse(filter_ids, value),
             .configuration_done => self.state = .running,
             .disconnect => {
                 self.state = .terminated;
                 self.configuration_ready = false;
             },
-            .continue_execution, .next, .step_in, .step_out => self.state = .running,
+            .continue_execution, .next, .step_in, .step_out => {
+                self.state = .running;
+                self.invalidatePausedReferences();
+            },
             .pause => {},
             .threads => if (body) |value| try self.parseThreads(value),
             .stack_trace => if (body) |value| try self.parseStackFrames(value),
             .scopes => if (body) |value| try self.parseScopes(value),
-            .variables => if (body) |value| try self.parseVariables(value),
+            .variables => if (body) |value| try self.parseVariables(pending, value),
             .evaluate => if (pending.watch_id) |watch_id| {
                 if (body) |value|
                     try self.parseWatchEvaluation(watch_id, request_seq, value)
@@ -844,7 +1256,14 @@ pub const Session = struct {
             self.configuration_ready = true;
             return .{ .event = .initialized };
         }
+        if (std.mem.eql(u8, event_name, "capabilities")) {
+            if (body) |value| if (objectField(value, "capabilities")) |capabilities| try self.parseCapabilitiesUpdate(capabilities);
+            return .{ .event = .capabilities };
+        }
         if (std.mem.eql(u8, event_name, "stopped")) {
+            self.invalidatePausedReferences();
+            self.pause_generation +%= 1;
+            if (self.pause_generation == 0) self.pause_generation = 1;
             self.state = .paused;
             self.active_thread_id = if (body) |value| intField(value, "threadId") else null;
             const reason = if (body) |value| stringField(value, "reason") orelse "paused" else "paused";
@@ -854,6 +1273,7 @@ pub const Session = struct {
         if (std.mem.eql(u8, event_name, "continued")) {
             self.state = .running;
             self.active_thread_id = if (body) |value| intField(value, "threadId") else self.active_thread_id;
+            self.invalidatePausedReferences();
             return .{ .event = .continued };
         }
         if (std.mem.eql(u8, event_name, "terminated")) {
@@ -893,6 +1313,38 @@ pub const Session = struct {
     }
 
     fn parseCapabilities(self: *Session, body: std.json.ObjectMap) !void {
+        try self.replaceExceptionFilters(body);
+        self.capabilities = .{
+            .supports_configuration_done_request = boolField(body, "supportsConfigurationDoneRequest", false),
+            .supports_conditional_breakpoints = boolField(body, "supportsConditionalBreakpoints", false),
+            .supports_hit_conditional_breakpoints = boolField(body, "supportsHitConditionalBreakpoints", false),
+            .supports_function_breakpoints = boolField(body, "supportsFunctionBreakpoints", false),
+            .supports_data_breakpoints = boolField(body, "supportsDataBreakpoints", false),
+            .supports_log_points = boolField(body, "supportsLogPoints", false),
+            .supports_terminate_request = boolField(body, "supportsTerminateRequest", false),
+            .supports_restart_request = boolField(body, "supportsRestartRequest", false),
+            .supports_step_back = boolField(body, "supportsStepBack", false),
+            .supports_set_variable = boolField(body, "supportsSetVariable", false),
+            .supports_exception_filter_options = boolField(body, "supportsExceptionFilterOptions", false),
+        };
+    }
+
+    fn parseCapabilitiesUpdate(self: *Session, body: std.json.ObjectMap) !void {
+        updateBoolField(body, "supportsConfigurationDoneRequest", &self.capabilities.supports_configuration_done_request);
+        updateBoolField(body, "supportsConditionalBreakpoints", &self.capabilities.supports_conditional_breakpoints);
+        updateBoolField(body, "supportsHitConditionalBreakpoints", &self.capabilities.supports_hit_conditional_breakpoints);
+        updateBoolField(body, "supportsFunctionBreakpoints", &self.capabilities.supports_function_breakpoints);
+        updateBoolField(body, "supportsDataBreakpoints", &self.capabilities.supports_data_breakpoints);
+        updateBoolField(body, "supportsLogPoints", &self.capabilities.supports_log_points);
+        updateBoolField(body, "supportsTerminateRequest", &self.capabilities.supports_terminate_request);
+        updateBoolField(body, "supportsRestartRequest", &self.capabilities.supports_restart_request);
+        updateBoolField(body, "supportsStepBack", &self.capabilities.supports_step_back);
+        updateBoolField(body, "supportsSetVariable", &self.capabilities.supports_set_variable);
+        updateBoolField(body, "supportsExceptionFilterOptions", &self.capabilities.supports_exception_filter_options);
+        if (body.contains("exceptionBreakpointFilters")) try self.replaceExceptionFilters(body);
+    }
+
+    fn replaceExceptionFilters(self: *Session, body: std.json.ObjectMap) !void {
         var parsed_filters = std.array_list.Managed(ExceptionFilter).init(self.allocator);
         errdefer {
             for (parsed_filters.items) |*filter| filter.deinit(self.allocator);
@@ -965,22 +1417,9 @@ pub const Session = struct {
             }
         }
 
-        const parsed_capabilities: Capabilities = .{
-            .supports_configuration_done_request = boolField(body, "supportsConfigurationDoneRequest", false),
-            .supports_conditional_breakpoints = boolField(body, "supportsConditionalBreakpoints", false),
-            .supports_hit_conditional_breakpoints = boolField(body, "supportsHitConditionalBreakpoints", false),
-            .supports_function_breakpoints = boolField(body, "supportsFunctionBreakpoints", false),
-            .supports_log_points = boolField(body, "supportsLogPoints", false),
-            .supports_terminate_request = boolField(body, "supportsTerminateRequest", false),
-            .supports_restart_request = boolField(body, "supportsRestartRequest", false),
-            .supports_step_back = boolField(body, "supportsStepBack", false),
-            .supports_set_variable = boolField(body, "supportsSetVariable", false),
-            .supports_exception_filter_options = boolField(body, "supportsExceptionFilterOptions", false),
-        };
         clearExceptionFilters(self);
         std.mem.swap(@TypeOf(self.exception_filters), &self.exception_filters, &parsed_filters);
         parsed_filters.deinit();
-        self.capabilities = parsed_capabilities;
         self.rejected_exception_filter_metadata = rejected;
     }
 
@@ -1024,6 +1463,133 @@ pub const Session = struct {
             filter.adapter_id = intField(object, "id");
             filter.message = if (stringField(object, "message")) |message|
                 try dupeLimited(self.allocator, message, 4096)
+            else
+                null;
+        }
+    }
+
+    fn parseFunctionBreakpointsResponse(self: *Session, function_names: [][]u8, body: std.json.ObjectMap) !void {
+        const values = arrayField(body, "breakpoints") orelse return;
+        for (function_names, 0..) |name, index| {
+            if (index >= values.items.len) break;
+            const breakpoint = self.findFunctionBreakpointMut(name) orelse continue;
+            const object = switch (values.items[index]) {
+                .object => |item| item,
+                else => continue,
+            };
+            breakpoint.clearRuntime(self.allocator);
+            breakpoint.verified = boolField(object, "verified", false);
+            breakpoint.adapter_id = intField(object, "id");
+            breakpoint.message = if (stringField(object, "message")) |message|
+                try dupeLimited(self.allocator, message, 4096)
+            else
+                null;
+        }
+    }
+
+    fn parseDataBreakpointInfo(self: *Session, pending: Pending, body: std.json.ObjectMap) !void {
+        const generation = pending.pause_generation orelse return;
+        if (self.state != .paused or generation != self.pause_generation) return;
+        const variable_name = pending.variable_name orelse return;
+
+        const data_value = body.get("dataId") orelse {
+            self.rejectDataBreakpointMetadata();
+            return;
+        };
+        const raw_data_id: ?[]const u8 = switch (data_value) {
+            .string => |value| value,
+            .null => null,
+            else => {
+                self.rejectDataBreakpointMetadata();
+                return;
+            },
+        };
+        const raw_description = stringField(body, "description") orelse {
+            self.rejectDataBreakpointMetadata();
+            return;
+        };
+        _ = debug_data.validate(.variable_name, variable_name) catch {
+            self.rejectDataBreakpointMetadata();
+            return;
+        };
+        if (raw_data_id) |data_id| _ = debug_data.validate(.data_id, data_id) catch {
+            self.rejectDataBreakpointMetadata();
+            return;
+        };
+        _ = debug_data.validate(.description, raw_description) catch {
+            self.rejectDataBreakpointMetadata();
+            return;
+        };
+
+        var access_types: DataAccessSet = .{};
+        if (body.get("accessTypes")) |access_value| {
+            const values = switch (access_value) {
+                .array => |items| items,
+                else => {
+                    self.rejectDataBreakpointMetadata();
+                    return;
+                },
+            };
+            if (values.items.len > 3) {
+                self.rejectDataBreakpointMetadata();
+                return;
+            }
+            for (values.items) |value| {
+                const name = switch (value) {
+                    .string => |text| text,
+                    else => {
+                        self.rejectDataBreakpointMetadata();
+                        return;
+                    },
+                };
+                const access_type = debug_data.parseAccessType(name) orelse {
+                    self.rejectDataBreakpointMetadata();
+                    return;
+                };
+                if (!access_types.insert(access_type)) {
+                    self.rejectDataBreakpointMetadata();
+                    return;
+                }
+            }
+        }
+        const can_persist = optionalStrictBoolField(body, "canPersist") orelse false;
+        if (body.contains("canPersist") and optionalStrictBoolField(body, "canPersist") == null) {
+            self.rejectDataBreakpointMetadata();
+            return;
+        }
+
+        const owned_data_id = if (raw_data_id) |data_id| try self.allocator.dupe(u8, data_id) else null;
+        errdefer if (owned_data_id) |data_id| self.allocator.free(data_id);
+        const owned_description = try self.allocator.dupe(u8, raw_description);
+        errdefer self.allocator.free(owned_description);
+        const owned_variable_name = try self.allocator.dupe(u8, variable_name);
+        errdefer self.allocator.free(owned_variable_name);
+
+        self.clearDataBreakpointCandidate();
+        self.data_breakpoint_candidate = .{
+            .data_id = owned_data_id,
+            .description = owned_description,
+            .variable_name = owned_variable_name,
+            .access_types = access_types,
+            .can_persist = can_persist and raw_data_id != null,
+            .pause_generation = generation,
+        };
+    }
+
+    fn parseDataBreakpointsResponse(self: *Session, data_ids: [][]u8, body: std.json.ObjectMap) !void {
+        const values = arrayField(body, "breakpoints") orelse return;
+        for (data_ids, 0..) |data_id, index| {
+            if (index >= values.items.len) break;
+            const breakpoint = self.findDataBreakpointMut(data_id) orelse continue;
+            const object = switch (values.items[index]) {
+                .object => |item| item,
+                else => continue,
+            };
+            breakpoint.clearRuntime(self.allocator);
+            breakpoint.verified = boolField(object, "verified", false);
+            breakpoint.adapter_id = intField(object, "id");
+            breakpoint.message = if (stringField(object, "message")) |message|
+                try dupeLimited(self.allocator, message, debug_data.max_description_bytes)
             else
                 null;
         }
@@ -1094,7 +1660,10 @@ pub const Session = struct {
         }
     }
 
-    fn parseVariables(self: *Session, body: std.json.ObjectMap) !void {
+    fn parseVariables(self: *Session, pending: Pending, body: std.json.ObjectMap) !void {
+        const generation = pending.pause_generation orelse return;
+        const parent_reference = pending.variables_reference orelse return;
+        if (self.state != .paused or generation != self.pause_generation) return;
         clearVariables(self);
         const values = arrayField(body, "variables") orelse return;
         for (values.items[0..@min(values.items.len, max_collection_items)]) |value| {
@@ -1112,6 +1681,9 @@ pub const Session = struct {
                 .variables_reference = intField(object, "variablesReference") orelse 0,
                 .named_variables = usizeField(object, "namedVariables"),
                 .indexed_variables = usizeField(object, "indexedVariables"),
+                .parent_variables_reference = parent_reference,
+                .frame_id = pending.frame_id,
+                .pause_generation = generation,
             };
             errdefer variable.deinit(self.allocator);
             variable.value = try dupeLimited(self.allocator, display_value, max_event_text_bytes);
@@ -1162,6 +1734,34 @@ pub const Session = struct {
         return null;
     }
 
+    fn findFunctionBreakpoint(self: *const Session, name: []const u8) ?*const FunctionBreakpoint {
+        for (self.function_breakpoints.items) |*breakpoint| {
+            if (std.mem.eql(u8, breakpoint.name, name)) return breakpoint;
+        }
+        return null;
+    }
+
+    fn findFunctionBreakpointMut(self: *Session, name: []const u8) ?*FunctionBreakpoint {
+        for (self.function_breakpoints.items) |*breakpoint| {
+            if (std.mem.eql(u8, breakpoint.name, name)) return breakpoint;
+        }
+        return null;
+    }
+
+    fn findDataBreakpoint(self: *const Session, data_id: []const u8) ?*const DataBreakpoint {
+        for (self.data_breakpoints.items) |*breakpoint| {
+            if (std.mem.eql(u8, breakpoint.data_id, data_id)) return breakpoint;
+        }
+        return null;
+    }
+
+    fn findDataBreakpointMut(self: *Session, data_id: []const u8) ?*DataBreakpoint {
+        for (self.data_breakpoints.items) |*breakpoint| {
+            if (std.mem.eql(u8, breakpoint.data_id, data_id)) return breakpoint;
+        }
+        return null;
+    }
+
     fn findExceptionFilterMut(self: *Session, filter_id: []const u8) ?*ExceptionFilter {
         for (self.exception_filters.items) |*filter| {
             if (std.mem.eql(u8, filter.id, filter_id)) return filter;
@@ -1185,6 +1785,119 @@ pub const Session = struct {
         errdefer self.allocator.free(framed);
         try self.pending.append(.{ .seq = seq, .kind = .evaluate, .watch_id = watch_id });
         return .{ .allocator = self.allocator, .seq = seq, .kind = .evaluate, .payload = payload, .framed = framed };
+    }
+
+    fn wrapVariablesRequest(
+        self: *Session,
+        payload: []u8,
+        seq: i64,
+        variables_reference: i64,
+        frame_id: ?i64,
+        pause_generation: u64,
+    ) !Outbound {
+        errdefer self.allocator.free(payload);
+        const framed = try protocol.makeFramed(self.allocator, payload);
+        errdefer self.allocator.free(framed);
+        try self.pending.append(.{
+            .seq = seq,
+            .kind = .variables,
+            .variables_reference = variables_reference,
+            .frame_id = frame_id,
+            .pause_generation = pause_generation,
+        });
+        return .{ .allocator = self.allocator, .seq = seq, .kind = .variables, .payload = payload, .framed = framed };
+    }
+
+    fn wrapDataBreakpointInfoRequest(
+        self: *Session,
+        payload: []u8,
+        seq: i64,
+        variable_name: []const u8,
+        variables_reference: i64,
+        frame_id: ?i64,
+        pause_generation: u64,
+    ) !Outbound {
+        errdefer self.allocator.free(payload);
+        const framed = try protocol.makeFramed(self.allocator, payload);
+        errdefer self.allocator.free(framed);
+        const owned_name = try self.allocator.dupe(u8, variable_name);
+        errdefer self.allocator.free(owned_name);
+        try self.pending.append(.{
+            .seq = seq,
+            .kind = .data_breakpoint_info,
+            .variable_name = owned_name,
+            .variables_reference = variables_reference,
+            .frame_id = frame_id,
+            .pause_generation = pause_generation,
+        });
+        return .{
+            .allocator = self.allocator,
+            .seq = seq,
+            .kind = .data_breakpoint_info,
+            .payload = payload,
+            .framed = framed,
+        };
+    }
+
+    fn wrapDataBreakpointRequest(
+        self: *Session,
+        payload: []u8,
+        seq: i64,
+        breakpoints: []const protocol.DataBreakpoint,
+    ) !Outbound {
+        errdefer self.allocator.free(payload);
+        const framed = try protocol.makeFramed(self.allocator, payload);
+        errdefer self.allocator.free(framed);
+        const owned_ids = try self.allocator.alloc([]u8, breakpoints.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned_ids[0..initialized]) |data_id| self.allocator.free(data_id);
+            self.allocator.free(owned_ids);
+        }
+        for (breakpoints) |breakpoint| {
+            owned_ids[initialized] = try self.allocator.dupe(u8, breakpoint.data_id);
+            initialized += 1;
+        }
+        try self.pending.append(.{
+            .seq = seq,
+            .kind = .set_data_breakpoints,
+            .data_ids = owned_ids,
+        });
+        return .{
+            .allocator = self.allocator,
+            .seq = seq,
+            .kind = .set_data_breakpoints,
+            .payload = payload,
+            .framed = framed,
+        };
+    }
+
+    fn wrapFunctionRequest(self: *Session, payload: []u8, seq: i64, breakpoints: []const protocol.FunctionBreakpoint) !Outbound {
+        errdefer self.allocator.free(payload);
+        const framed = try protocol.makeFramed(self.allocator, payload);
+        errdefer self.allocator.free(framed);
+        const owned_names = try self.allocator.alloc([]u8, breakpoints.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned_names[0..initialized]) |name| self.allocator.free(name);
+            self.allocator.free(owned_names);
+        }
+        for (breakpoints) |breakpoint| {
+            owned_names[initialized] = try self.allocator.dupe(u8, breakpoint.name);
+            initialized += 1;
+        }
+        try self.pending.append(.{
+            .seq = seq,
+            .kind = .set_function_breakpoints,
+            .function_names = owned_names,
+        });
+        return .{
+            .allocator = self.allocator,
+            .seq = seq,
+            .kind = .set_function_breakpoints,
+            .payload = payload,
+            .framed = framed,
+        };
     }
 
     fn wrapExceptionRequest(self: *Session, payload: []u8, seq: i64, filter_ids: []const []const u8) !Outbound {
@@ -1236,6 +1949,7 @@ pub const Session = struct {
         clearStackFrames(self);
         clearScopes(self);
         clearVariables(self);
+        self.clearDataBreakpointCandidate();
         for (self.watches.items) |*watch| watch.clearRuntime(self.allocator);
         self.active_thread_id = null;
         self.active_frame_id = null;
@@ -1249,6 +1963,26 @@ pub const Session = struct {
         self.last_output_category = null;
         self.last_error = null;
         self.last_reverse_command = null;
+    }
+
+    fn clearDataBreakpointCandidate(self: *Session) void {
+        if (self.data_breakpoint_candidate) |*candidate| candidate.deinit(self.allocator);
+        self.data_breakpoint_candidate = null;
+    }
+
+    fn invalidatePausedReferences(self: *Session) void {
+        clearStackFrames(self);
+        clearScopes(self);
+        clearVariables(self);
+        self.clearDataBreakpointCandidate();
+        for (self.watches.items) |*watch| watch.clearRuntime(self.allocator);
+    }
+
+    fn rejectDataBreakpointMetadata(self: *Session) void {
+        self.clearDataBreakpointCandidate();
+        if (self.rejected_data_breakpoint_metadata < std.math.maxInt(usize)) {
+            self.rejected_data_breakpoint_metadata += 1;
+        }
     }
 
     fn setStopReason(self: *Session, reason: []const u8) !void {
@@ -1336,6 +2070,22 @@ fn boolField(object: std.json.ObjectMap, name: []const u8, fallback: bool) bool 
     };
 }
 
+fn optionalStrictBoolField(object: std.json.ObjectMap, name: []const u8) ?bool {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .bool => |flag| flag,
+        else => null,
+    };
+}
+
+fn updateBoolField(object: std.json.ObjectMap, name: []const u8, destination: *bool) void {
+    const value = object.get(name) orelse return;
+    switch (value) {
+        .bool => |flag| destination.* = flag,
+        else => {},
+    }
+}
+
 fn intField(object: std.json.ObjectMap, name: []const u8) ?i64 {
     const value = object.get(name) orelse return null;
     return switch (value) {
@@ -1374,12 +2124,13 @@ test "DAP session tracks requests and initialize capabilities" {
     try std.testing.expectEqual(@as(usize, 1), session.pendingCount());
 
     const result = try session.ingestPayload(
-        \\{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"supportsConfigurationDoneRequest":true,"supportsConditionalBreakpoints":true}}
+        \\{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"supportsConfigurationDoneRequest":true,"supportsConditionalBreakpoints":true,"supportsFunctionBreakpoints":true}}
     );
     try std.testing.expectEqual(RequestKind.initialize, result.acknowledged);
     try std.testing.expectEqual(DebugState.initialized, session.state);
     try std.testing.expect(session.capabilities.supports_configuration_done_request);
     try std.testing.expect(session.capabilities.supports_conditional_breakpoints);
+    try std.testing.expect(session.functionBreakpointsSupported());
     try std.testing.expect(!session.acceptsBreakpointConfiguration());
     const initialized = try session.ingestPayload(
         \\{"seq":2,"type":"event","event":"initialized"}
@@ -1420,6 +2171,61 @@ test "DAP session bounds advertises selects and verifies exception filters" {
     session.reset();
     try std.testing.expectEqual(@as(usize, 0), session.exception_filters.items.len);
     try std.testing.expectEqual(@as(usize, 2), session.selectedExceptionFilterCount());
+}
+
+test "DAP session validates persists and aligns delayed function breakpoint responses" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+
+    try std.testing.expectEqual(FunctionBreakpointCapability.unknown, session.functionBreakpointCapability());
+
+    try std.testing.expect(try session.addFunctionBreakpoint(" std::vector<int>::push_back "));
+    try std.testing.expect(try session.addFunctionBreakpoint("pkg.worker.run"));
+    try std.testing.expect(!try session.addFunctionBreakpoint("pkg.worker.run"));
+    try std.testing.expectError(error.UnsafeFunctionSelector, session.addFunctionBreakpoint("pkg.*"));
+    try std.testing.expectEqual(@as(usize, 0), session.unsupportedFunctionBreakpointCount());
+
+    session.state = .initialized;
+    session.capabilities.supports_function_breakpoints = true;
+    try std.testing.expectEqual(FunctionBreakpointCapability.supported, session.functionBreakpointCapability());
+    var outbound = try session.makeSetFunctionBreakpoints();
+    defer outbound.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "std::vector<int>::push_back") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outbound.payload, "pkg.worker.run") != null);
+
+    try std.testing.expect(session.removeFunctionBreakpointAt(0));
+    try std.testing.expect(try session.addFunctionBreakpoint("crate::worker::latest"));
+    const result = try session.ingestPayload(
+        \\{"seq":2,"type":"response","request_seq":1,"success":true,"command":"setFunctionBreakpoints","body":{"breakpoints":[{"id":10,"verified":true},{"id":20,"verified":false,"message":"symbol not loaded"}]}}
+    );
+    try std.testing.expectEqual(RequestKind.set_function_breakpoints, result.acknowledged);
+    try std.testing.expectEqualStrings("pkg.worker.run", session.function_breakpoints.items[0].name);
+    try std.testing.expectEqual(@as(?bool, false), session.function_breakpoints.items[0].verified);
+    try std.testing.expectEqual(@as(?i64, 20), session.function_breakpoints.items[0].adapter_id);
+    try std.testing.expectEqualStrings("symbol not loaded", session.function_breakpoints.items[0].message.?);
+    try std.testing.expect(session.function_breakpoints.items[1].verified == null);
+
+    session.reset();
+    try std.testing.expectEqual(@as(usize, 2), session.function_breakpoints.items.len);
+    try std.testing.expect(session.function_breakpoints.items[0].verified == null);
+    session.state = .initialized;
+    try std.testing.expectEqual(FunctionBreakpointCapability.unsupported, session.functionBreakpointCapability());
+    try std.testing.expectEqual(@as(usize, 2), session.unsupportedFunctionBreakpointCount());
+    try std.testing.expectError(error.FunctionBreakpointsUnsupported, session.makeSetFunctionBreakpoints());
+    try std.testing.expect(session.clearFunctionBreakpoints());
+    try std.testing.expect(!session.clearFunctionBreakpoints());
+}
+
+test "DAP session bounds function breakpoint count" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+
+    var name_buf: [48]u8 = undefined;
+    for (0..debug_function.max_breakpoints) |index| {
+        const name = try std.fmt.bufPrint(&name_buf, "pkg.worker_{d}", .{index});
+        try std.testing.expect(try session.addFunctionBreakpoint(name));
+    }
+    try std.testing.expectError(error.TooManyFunctionBreakpoints, session.addFunctionBreakpoint("pkg.one_too_many"));
 }
 
 test "DAP session ingests stopped stack scopes and variables" {
@@ -1586,4 +2392,124 @@ test "DAP session bounds automatic watch count" {
         _ = try session.addWatch(expression);
     }
     try std.testing.expectError(error.TooManyWatches, session.addWatch("one_too_many"));
+}
+
+test "DAP session stages commits verifies and persists adapter-approved data breakpoints" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+
+    var initialize = try session.makeInitialize("lldb");
+    defer initialize.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"supportsDataBreakpoints":true}}
+    );
+    try std.testing.expectEqual(DataBreakpointCapability.supported, session.dataBreakpointCapability());
+    _ = try session.ingestPayload(
+        \\{"seq":2,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":7}}
+    );
+    session.active_frame_id = 91;
+
+    var variables = try session.makeVariables(42);
+    defer variables.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":3,"type":"response","request_seq":2,"success":true,"command":"variables","body":{"variables":[{"name":"counter","value":"3","type":"usize","variablesReference":0}]}}
+    );
+    try std.testing.expectEqual(@as(usize, 1), session.variables.items.len);
+    try std.testing.expectEqual(@as(i64, 42), session.variables.items[0].parent_variables_reference);
+    try std.testing.expectEqual(@as(?i64, 91), session.variables.items[0].frame_id);
+
+    var info = try session.makeDataBreakpointInfo(0);
+    defer info.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, info.payload, "\"variablesReference\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info.payload, "\"name\":\"counter\"") != null);
+    _ = try session.ingestPayload(
+        \\{"seq":4,"type":"response","request_seq":3,"success":true,"command":"dataBreakpointInfo","body":{"dataId":"opaque:counter","description":"counter storage","accessTypes":["read","write","readWrite"],"canPersist":true}}
+    );
+    const candidate = session.data_breakpoint_candidate.?;
+    try std.testing.expectEqualStrings("counter", candidate.variable_name);
+    try std.testing.expect(candidate.access_types.allows(.write));
+    try std.testing.expect(candidate.can_persist);
+
+    try std.testing.expectEqual(DataBreakpointUpdateResult.added, try session.commitDataBreakpoint(.write));
+    try std.testing.expect(session.data_breakpoint_candidate == null);
+    try std.testing.expectEqual(@as(usize, 1), session.data_breakpoints.items.len);
+    try std.testing.expect(session.data_breakpoints.items[0].can_persist);
+
+    var set = try session.makeSetDataBreakpoints();
+    defer set.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, set.payload, "\"accessType\":\"write\"") != null);
+    const result = try session.ingestPayload(
+        \\{"seq":5,"type":"response","request_seq":4,"success":true,"command":"setDataBreakpoints","body":{"breakpoints":[{"id":88,"verified":true}]}}
+    );
+    try std.testing.expectEqual(RequestKind.set_data_breakpoints, result.acknowledged);
+    try std.testing.expectEqual(@as(?bool, true), session.data_breakpoints.items[0].verified);
+    try std.testing.expectEqual(@as(?i64, 88), session.data_breakpoints.items[0].adapter_id);
+
+    session.reset();
+    try std.testing.expectEqual(@as(usize, 1), session.data_breakpoints.items.len);
+    try std.testing.expect(session.data_breakpoints.items[0].verified == null);
+}
+
+test "DAP session rejects stale or malformed data breakpoint metadata" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+    session.state = .paused;
+    session.pause_generation = 4;
+    session.capabilities.supports_data_breakpoints = true;
+    try session.variables.append(.{
+        .name = try std.testing.allocator.dupe(u8, "value"),
+        .value = try std.testing.allocator.dupe(u8, "1"),
+        .type_name = null,
+        .evaluate_name = null,
+        .variables_reference = 0,
+        .named_variables = null,
+        .indexed_variables = null,
+        .parent_variables_reference = 20,
+        .frame_id = 3,
+        .pause_generation = 4,
+    });
+
+    var info = try session.makeDataBreakpointInfo(0);
+    defer info.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":1,"type":"response","request_seq":1,"success":true,"command":"dataBreakpointInfo","body":{"dataId":"unsafe\nID","description":"bad","accessTypes":["write"]}}
+    );
+    try std.testing.expect(session.data_breakpoint_candidate == null);
+    try std.testing.expectEqual(@as(usize, 1), session.rejected_data_breakpoint_metadata);
+
+    var delayed = try session.makeDataBreakpointInfo(0);
+    defer delayed.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":2,"type":"event","event":"continued","body":{"threadId":7}}
+    );
+    _ = try session.ingestPayload(
+        \\{"seq":3,"type":"response","request_seq":2,"success":true,"command":"dataBreakpointInfo","body":{"dataId":"opaque:stale","description":"stale","accessTypes":["write"]}}
+    );
+    try std.testing.expect(session.data_breakpoint_candidate == null);
+    try std.testing.expectEqual(@as(usize, 0), session.variables.items.len);
+}
+
+test "DAP capabilities events update only advertised fields" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+    var initialize = try session.makeInitialize("lldb");
+    defer initialize.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"supportsFunctionBreakpoints":true,"supportsDataBreakpoints":true,"supportsLogPoints":true,"exceptionBreakpointFilters":[{"filter":"all","label":"All"}]}}
+    );
+
+    const result = try session.ingestPayload(
+        \\{"seq":2,"type":"event","event":"capabilities","body":{"capabilities":{"supportsDataBreakpoints":false}}}
+    );
+    try std.testing.expectEqual(EventKind.capabilities, result.event);
+    try std.testing.expect(!session.capabilities.supports_data_breakpoints);
+    try std.testing.expect(session.capabilities.supports_function_breakpoints);
+    try std.testing.expect(session.capabilities.supports_log_points);
+    try std.testing.expectEqual(@as(usize, 1), session.exception_filters.items.len);
+
+    _ = try session.ingestPayload(
+        \\{"seq":3,"type":"event","event":"capabilities","body":{"capabilities":{"supportsDataBreakpoints":true,"exceptionBreakpointFilters":[{"filter":"uncaught","label":"Uncaught"}]}}}
+    );
+    try std.testing.expect(session.capabilities.supports_data_breakpoints);
+    try std.testing.expectEqualStrings("uncaught", session.exception_filters.items[0].id);
 }

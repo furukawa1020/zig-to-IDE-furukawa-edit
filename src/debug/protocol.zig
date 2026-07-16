@@ -1,5 +1,6 @@
 const std = @import("std");
 const framing = @import("framing.zig");
+const debug_data = @import("../security/debug_data.zig");
 
 pub const LaunchArguments = struct {
     adapter_id: []const u8,
@@ -14,6 +15,25 @@ pub const SourceBreakpoint = struct {
     condition: ?[]const u8 = null,
     hit_condition: ?[]const u8 = null,
     log_message: ?[]const u8 = null,
+};
+
+pub const FunctionBreakpoint = struct {
+    name: []const u8,
+    condition: ?[]const u8 = null,
+    hit_condition: ?[]const u8 = null,
+};
+
+pub const DataBreakpointInfoArguments = struct {
+    variables_reference: ?i64 = null,
+    name: []const u8,
+    frame_id: ?i64 = null,
+};
+
+pub const DataBreakpoint = struct {
+    data_id: []const u8,
+    access_type: ?debug_data.AccessType = null,
+    condition: ?[]const u8 = null,
+    hit_condition: ?[]const u8 = null,
 };
 
 pub const EvaluateArguments = struct {
@@ -127,6 +147,84 @@ pub fn makeSetExceptionBreakpointsRequest(
         try json.objectField("filters");
         try json.beginArray();
         for (filter_ids) |filter_id| try json.write(filter_id);
+        try json.endArray();
+        try json.endObject();
+        try json.endObject();
+    }
+    return out.toOwnedSlice();
+}
+
+pub fn makeSetFunctionBreakpointsRequest(
+    allocator: std.mem.Allocator,
+    seq: i64,
+    breakpoints: []const FunctionBreakpoint,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, seq, "setFunctionBreakpoints");
+        try json.objectField("arguments");
+        try json.beginObject();
+        try json.objectField("breakpoints");
+        try json.beginArray();
+        for (breakpoints) |breakpoint| {
+            try json.beginObject();
+            try field(&json, "name", breakpoint.name);
+            if (breakpoint.condition) |condition| try field(&json, "condition", condition);
+            if (breakpoint.hit_condition) |hit_condition| try field(&json, "hitCondition", hit_condition);
+            try json.endObject();
+        }
+        try json.endArray();
+        try json.endObject();
+        try json.endObject();
+    }
+    return out.toOwnedSlice();
+}
+
+pub fn makeDataBreakpointInfoRequest(
+    allocator: std.mem.Allocator,
+    seq: i64,
+    arguments: DataBreakpointInfoArguments,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, seq, "dataBreakpointInfo");
+        try json.objectField("arguments");
+        try json.beginObject();
+        if (arguments.variables_reference) |reference| try field(&json, "variablesReference", reference);
+        try field(&json, "name", arguments.name);
+        if (arguments.frame_id) |frame_id| try field(&json, "frameId", frame_id);
+        try json.endObject();
+        try json.endObject();
+    }
+    return out.toOwnedSlice();
+}
+
+pub fn makeSetDataBreakpointsRequest(
+    allocator: std.mem.Allocator,
+    seq: i64,
+    breakpoints: []const DataBreakpoint,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    {
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try beginRequest(&json, seq, "setDataBreakpoints");
+        try json.objectField("arguments");
+        try json.beginObject();
+        try json.objectField("breakpoints");
+        try json.beginArray();
+        for (breakpoints) |breakpoint| {
+            try json.beginObject();
+            try field(&json, "dataId", breakpoint.data_id);
+            if (breakpoint.access_type) |access_type| try field(&json, "accessType", access_type.protocolName());
+            if (breakpoint.condition) |condition| try field(&json, "condition", condition);
+            if (breakpoint.hit_condition) |hit_condition| try field(&json, "hitCondition", hit_condition);
+            try json.endObject();
+        }
         try json.endArray();
         try json.endObject();
         try json.endObject();
@@ -359,6 +457,47 @@ test "build DAP exception breakpoint request from selected filter IDs" {
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"command\":\"setExceptionBreakpoints\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"filters\":[\"all\",\"uncaught\"]") != null);
+}
+
+test "build DAP function breakpoint full-replacement request" {
+    const request = try makeSetFunctionBreakpointsRequest(std.testing.allocator, 6, &.{
+        .{ .name = "std::vector<int>::push_back" },
+        .{ .name = "pkg.worker.run", .condition = "ready == true", .hit_condition = "3" },
+    });
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"command\":\"setFunctionBreakpoints\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"name\":\"std::vector<int>::push_back\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"condition\":\"ready == true\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"hitCondition\":\"3\"") != null);
+
+    const clear = try makeSetFunctionBreakpointsRequest(std.testing.allocator, 7, &.{});
+    defer std.testing.allocator.free(clear);
+    try std.testing.expect(std.mem.indexOf(u8, clear, "\"breakpoints\":[]") != null);
+}
+
+test "build DAP data breakpoint two-stage and full-replacement requests" {
+    const info = try makeDataBreakpointInfoRequest(std.testing.allocator, 8, .{
+        .variables_reference = 42,
+        .name = "counter",
+    });
+    defer std.testing.allocator.free(info);
+    try std.testing.expect(std.mem.indexOf(u8, info, "\"command\":\"dataBreakpointInfo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info, "\"variablesReference\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info, "\"name\":\"counter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info, "frameId") == null);
+
+    const set = try makeSetDataBreakpointsRequest(std.testing.allocator, 9, &.{
+        .{ .data_id = "opaque:counter", .access_type = .write },
+        .{ .data_id = "opaque:state", .access_type = .read_write },
+    });
+    defer std.testing.allocator.free(set);
+    try std.testing.expect(std.mem.indexOf(u8, set, "\"command\":\"setDataBreakpoints\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set, "\"dataId\":\"opaque:counter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set, "\"accessType\":\"readWrite\"") != null);
+
+    const clear = try makeSetDataBreakpointsRequest(std.testing.allocator, 10, &.{});
+    defer std.testing.allocator.free(clear);
+    try std.testing.expect(std.mem.indexOf(u8, clear, "\"breakpoints\":[]") != null);
 }
 
 test "build DAP watch evaluation request" {

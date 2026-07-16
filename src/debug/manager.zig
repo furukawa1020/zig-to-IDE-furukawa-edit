@@ -101,7 +101,10 @@ pub const Manager = struct {
         self.state_save_report = report;
         self.state_load_error = null;
         self.state_save_error = null;
-        self.state_dirty = report.breakpoints_skipped > 0 or report.exception_filters_skipped > 0;
+        self.state_dirty = report.breakpoints_skipped > 0 or
+            report.function_breakpoints_skipped > 0 or
+            report.data_breakpoints_skipped > 0 or
+            report.exception_filters_skipped > 0;
         return report;
     }
 

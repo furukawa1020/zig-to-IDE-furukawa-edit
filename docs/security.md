@@ -145,6 +145,23 @@ DAP adapterが初期化応答の `exceptionBreakpointFilters` で広告したフ
 
 DAPの初期化順序、フィルター、要求引数、応答順は[公式仕様](https://microsoft.github.io/debug-adapter-protocol/specification#Requests_SetExceptionBreakpoints)に従う。
 
+### 低レベルデバッグ境界
+
+DAPのmemory referenceとinstruction referenceを使い、停止中のmemory表示、逆アセンブル、instruction breakpointを扱う。adapterがmemory書き込み能力を広告しても、ZIDEは `writeMemory` を実装せず、GUIにも書き込み操作を作らない。
+
+- `memoryReference` と `instructionPointerReference` は最大4096 byteのopaque IDとして扱い、ZIDEでaddress計算、式評価、path解釈、shell連結をしない
+- memory readは1要求256 byteまで、逆アセンブルは既定64命令かつ最大128命令までに固定し、offsetと応答文字列にもZig側の上限を置く
+- memory応答のbase64はencoded長とdecoded長を送信時の要求件数に照らして検査し、不正な応答では以前のsnapshotを部分更新しない
+- address、instruction、symbol、source path、instruction bytesは有効UTF-8、control/C1、bidi、default-ignorable、個数、バイト数を検査してから表示する
+- stack frame、variable、memory snapshot、disassembly、pending requestへ停止世代を記録する。continue、step、次のstop、`memory` eventで古い参照と表示を破棄し、遅延応答を採用しない
+- instruction breakpointは現在のadapterとdebug sessionだけにスコープし、ASLRや再起動後に意味が変わるaddressを `.zide/debug-state.json` へ保存しない
+- `setInstructionBreakpoints` は空配列による全消去を含む全置換として送り、要求ごとのinstruction reference snapshotで遅延応答を別項目へ誤対応させない
+- adapterがread、write、disassemble、instruction breakpoint capabilityを動的変更した場合、含まれたfieldだけを更新する。read/disassembleが無効になった時点で対応snapshotを破棄する
+- Windows/Linux GUIは同じcore commandとstate machineを使い、frame/variable参照、hex/ASCII memory表示、disassembly、instruction breakpoint、capability、拒否件数を同じ順序で表示する
+- adapterの `supportsWriteMemoryRequest` は診断情報として `adapter:true/false` を表示するだけで、ZIDE側は常に `write:LOCKED` と表示する
+
+read-onlyはZIDEが送るDAP要求についての保証であり、debug adapterやdebuggee自体の安全性を証明しない。memory referenceの寿命と要求形式は[公式DAP仕様](https://microsoft.github.io/debug-adapter-protocol/specification#Requests_ReadMemory)、逆アセンブルは[Disassemble](https://microsoft.github.io/debug-adapter-protocol/specification#Requests_Disassemble)、命令ブレークポイントは[SetInstructionBreakpoints](https://microsoft.github.io/debug-adapter-protocol/specification#Requests_SetInstructionBreakpoints)に従う。
+
 ### デバッグ状態ファイル
 
 ウォッチ、source breakpoint、function breakpoint selector、永続可能なdata breakpoint、選択済みexception filter IDは `.zide/debug-state.json` に保存する。このファイルはユーザーごとの状態なのでGit管理から除外する。

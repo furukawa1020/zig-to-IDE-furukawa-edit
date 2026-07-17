@@ -4,6 +4,7 @@ const debug_breakpoint = @import("../security/debug_breakpoint.zig");
 const debug_data = @import("../security/debug_data.zig");
 const debug_exception = @import("../security/debug_exception.zig");
 const debug_function = @import("../security/debug_function.zig");
+const debug_memory = @import("../security/debug_memory.zig");
 
 const max_collection_items: usize = 4096;
 const max_event_text_bytes: usize = 64 * 1024;
@@ -33,6 +34,7 @@ pub const RequestKind = enum {
     set_function_breakpoints,
     data_breakpoint_info,
     set_data_breakpoints,
+    set_instruction_breakpoints,
     set_exception_breakpoints,
     configuration_done,
     disconnect,
@@ -46,6 +48,8 @@ pub const RequestKind = enum {
     scopes,
     variables,
     evaluate,
+    read_memory,
+    disassemble,
 };
 
 pub const EventKind = enum {
@@ -58,6 +62,7 @@ pub const EventKind = enum {
     output,
     thread,
     breakpoint,
+    memory,
     unknown,
 };
 
@@ -73,6 +78,10 @@ pub const Capabilities = struct {
     supports_hit_conditional_breakpoints: bool = false,
     supports_function_breakpoints: bool = false,
     supports_data_breakpoints: bool = false,
+    supports_read_memory_request: bool = false,
+    supports_write_memory_request: bool = false,
+    supports_disassemble_request: bool = false,
+    supports_instruction_breakpoints: bool = false,
     supports_log_points: bool = false,
     supports_terminate_request: bool = false,
     supports_restart_request: bool = false,
@@ -214,6 +223,67 @@ pub const DataBreakpoint = struct {
     }
 };
 
+pub const InstructionBreakpoint = struct {
+    adapter_key: []u8,
+    instruction_reference: []u8,
+    label: []u8,
+    verified: ?bool = null,
+    adapter_id: ?i64 = null,
+    message: ?[]u8 = null,
+
+    fn clearRuntime(self: *InstructionBreakpoint, allocator: std.mem.Allocator) void {
+        if (self.message) |value| allocator.free(value);
+        self.verified = null;
+        self.adapter_id = null;
+        self.message = null;
+    }
+
+    fn deinit(self: *InstructionBreakpoint, allocator: std.mem.Allocator) void {
+        self.clearRuntime(allocator);
+        allocator.free(self.adapter_key);
+        allocator.free(self.instruction_reference);
+        allocator.free(self.label);
+        self.* = undefined;
+    }
+};
+
+pub const MemorySnapshot = struct {
+    memory_reference: []u8,
+    address: []u8,
+    bytes: []u8,
+    offset: i64,
+    unreadable_bytes: usize,
+    pause_generation: u64,
+
+    fn deinit(self: *MemorySnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.memory_reference);
+        allocator.free(self.address);
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+pub const DisassembledInstruction = struct {
+    address: []u8,
+    instruction_bytes: ?[]u8,
+    instruction: []u8,
+    symbol: ?[]u8,
+    source_path: ?[]u8,
+    line: ?usize,
+    column: ?usize,
+    invalid: bool,
+    pause_generation: u64,
+
+    fn deinit(self: *DisassembledInstruction, allocator: std.mem.Allocator) void {
+        allocator.free(self.address);
+        if (self.instruction_bytes) |value| allocator.free(value);
+        allocator.free(self.instruction);
+        if (self.symbol) |value| allocator.free(value);
+        if (self.source_path) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
 pub const Breakpoint = struct {
     path: []u8,
     line: usize,
@@ -252,10 +322,13 @@ pub const StackFrame = struct {
     path: ?[]u8,
     line: usize,
     column: usize,
+    instruction_pointer_reference: ?[]u8,
+    pause_generation: u64,
 
     fn deinit(self: *StackFrame, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         if (self.path) |value| allocator.free(value);
+        if (self.instruction_pointer_reference) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -281,6 +354,7 @@ pub const Variable = struct {
     variables_reference: i64,
     named_variables: ?usize,
     indexed_variables: ?usize,
+    memory_reference: ?[]u8,
     parent_variables_reference: i64,
     frame_id: ?i64,
     pause_generation: u64,
@@ -290,6 +364,7 @@ pub const Variable = struct {
         allocator.free(self.value);
         if (self.type_name) |item| allocator.free(item);
         if (self.evaluate_name) |item| allocator.free(item);
+        if (self.memory_reference) |item| allocator.free(item);
         self.* = undefined;
     }
 };
@@ -329,9 +404,14 @@ pub const Pending = struct {
     function_names: ?[][]u8 = null,
     data_ids: ?[][]u8 = null,
     exception_filter_ids: ?[][]u8 = null,
+    instruction_references: ?[][]u8 = null,
     variable_name: ?[]u8 = null,
+    memory_reference: ?[]u8 = null,
     variables_reference: ?i64 = null,
     frame_id: ?i64 = null,
+    memory_offset: ?i64 = null,
+    memory_count: ?usize = null,
+    instruction_count: ?usize = null,
     pause_generation: ?u64 = null,
 
     fn deinit(self: *Pending, allocator: std.mem.Allocator) void {
@@ -348,7 +428,12 @@ pub const Pending = struct {
             for (filter_ids) |filter_id| allocator.free(filter_id);
             allocator.free(filter_ids);
         }
+        if (self.instruction_references) |references| {
+            for (references) |reference| allocator.free(reference);
+            allocator.free(references);
+        }
         if (self.variable_name) |variable_name| allocator.free(variable_name);
+        if (self.memory_reference) |memory_reference| allocator.free(memory_reference);
         self.* = undefined;
     }
 };
@@ -389,6 +474,12 @@ pub const FunctionBreakpointCapability = enum {
 };
 
 pub const DataBreakpointCapability = enum {
+    unknown,
+    supported,
+    unsupported,
+};
+
+pub const LowLevelCapability = enum {
     unknown,
     supported,
     unsupported,
@@ -453,14 +544,18 @@ pub const Session = struct {
     function_breakpoints: std.array_list.Managed(FunctionBreakpoint),
     data_breakpoints: std.array_list.Managed(DataBreakpoint),
     data_breakpoint_candidate: ?DataBreakpointCandidate = null,
+    instruction_breakpoints: std.array_list.Managed(InstructionBreakpoint),
     exception_filters: std.array_list.Managed(ExceptionFilter),
     selected_exception_filter_ids: std.array_list.Managed([]u8),
     rejected_exception_filter_metadata: usize = 0,
     rejected_data_breakpoint_metadata: usize = 0,
+    rejected_low_level_metadata: usize = 0,
     threads: std.array_list.Managed(Thread),
     stack_frames: std.array_list.Managed(StackFrame),
     scopes: std.array_list.Managed(Scope),
     variables: std.array_list.Managed(Variable),
+    disassembled_instructions: std.array_list.Managed(DisassembledInstruction),
+    memory_snapshot: ?MemorySnapshot = null,
     watches: std.array_list.Managed(Watch),
     next_watch_id: u64 = 1,
     capabilities: Capabilities = .{},
@@ -483,12 +578,14 @@ pub const Session = struct {
             .breakpoints = std.array_list.Managed(Breakpoint).init(allocator),
             .function_breakpoints = std.array_list.Managed(FunctionBreakpoint).init(allocator),
             .data_breakpoints = std.array_list.Managed(DataBreakpoint).init(allocator),
+            .instruction_breakpoints = std.array_list.Managed(InstructionBreakpoint).init(allocator),
             .exception_filters = std.array_list.Managed(ExceptionFilter).init(allocator),
             .selected_exception_filter_ids = std.array_list.Managed([]u8).init(allocator),
             .threads = std.array_list.Managed(Thread).init(allocator),
             .stack_frames = std.array_list.Managed(StackFrame).init(allocator),
             .scopes = std.array_list.Managed(Scope).init(allocator),
             .variables = std.array_list.Managed(Variable).init(allocator),
+            .disassembled_instructions = std.array_list.Managed(DisassembledInstruction).init(allocator),
             .watches = std.array_list.Managed(Watch).init(allocator),
         };
     }
@@ -498,6 +595,7 @@ pub const Session = struct {
         for (self.breakpoints.items) |*item| item.deinit(self.allocator);
         for (self.function_breakpoints.items) |*item| item.deinit(self.allocator);
         for (self.data_breakpoints.items) |*item| item.deinit(self.allocator);
+        for (self.instruction_breakpoints.items) |*item| item.deinit(self.allocator);
         self.clearDataBreakpointCandidate();
         for (self.exception_filters.items) |*item| item.deinit(self.allocator);
         for (self.selected_exception_filter_ids.items) |filter_id| self.allocator.free(filter_id);
@@ -505,10 +603,12 @@ pub const Session = struct {
         self.breakpoints.deinit();
         self.function_breakpoints.deinit();
         self.data_breakpoints.deinit();
+        self.instruction_breakpoints.deinit();
         self.exception_filters.deinit();
         self.selected_exception_filter_ids.deinit();
         self.watches.deinit();
         self.variables.deinit();
+        self.disassembled_instructions.deinit();
         self.scopes.deinit();
         self.stack_frames.deinit();
         self.threads.deinit();
@@ -526,6 +626,7 @@ pub const Session = struct {
         clearExceptionFilters(self);
         self.rejected_exception_filter_metadata = 0;
         self.rejected_data_breakpoint_metadata = 0;
+        self.rejected_low_level_metadata = 0;
         self.exit_code = null;
         for (self.breakpoints.items) |*breakpoint| {
             breakpoint.verified = false;
@@ -535,6 +636,7 @@ pub const Session = struct {
             breakpoint.message = null;
         }
         for (self.function_breakpoints.items) |*breakpoint| breakpoint.clearRuntime(self.allocator);
+        _ = self.clearInstructionBreakpoints();
         self.clearDataBreakpointCandidate();
         var data_index: usize = 0;
         while (data_index < self.data_breakpoints.items.len) {
@@ -924,6 +1026,123 @@ pub const Session = struct {
         return true;
     }
 
+    pub fn memoryReadCapability(self: *const Session) LowLevelCapability {
+        if (!self.capabilitiesKnown()) return .unknown;
+        return if (self.capabilities.supports_read_memory_request) .supported else .unsupported;
+    }
+
+    pub fn disassemblyCapability(self: *const Session) LowLevelCapability {
+        if (!self.capabilitiesKnown()) return .unknown;
+        return if (self.capabilities.supports_disassemble_request) .supported else .unsupported;
+    }
+
+    pub fn instructionBreakpointCapability(self: *const Session) LowLevelCapability {
+        if (!self.capabilitiesKnown()) return .unknown;
+        return if (self.capabilities.supports_instruction_breakpoints) .supported else .unsupported;
+    }
+
+    pub fn stackFrameInstructionReferenceCount(self: *const Session) usize {
+        var count: usize = 0;
+        for (self.stack_frames.items) |frame| if (frame.instruction_pointer_reference != null) {
+            count += 1;
+        };
+        return count;
+    }
+
+    pub fn stackFrameInstructionReferenceIndexAt(self: *const Session, display_index: usize) ?usize {
+        var current: usize = 0;
+        for (self.stack_frames.items, 0..) |frame, index| {
+            if (frame.instruction_pointer_reference == null) continue;
+            if (current == display_index) return index;
+            current += 1;
+        }
+        return null;
+    }
+
+    pub fn variableMemoryReferenceCount(self: *const Session) usize {
+        var count: usize = 0;
+        for (self.variables.items) |variable| if (variable.memory_reference != null) {
+            count += 1;
+        };
+        return count;
+    }
+
+    pub fn variableMemoryReferenceIndexAt(self: *const Session, display_index: usize) ?usize {
+        var current: usize = 0;
+        for (self.variables.items, 0..) |variable, index| {
+            if (variable.memory_reference == null) continue;
+            if (current == display_index) return index;
+            current += 1;
+        }
+        return null;
+    }
+
+    pub fn toggleInstructionBreakpointAt(self: *Session, instruction_index: usize) !ToggleResult {
+        if (!self.capabilities.supports_instruction_breakpoints) return error.InstructionBreakpointsUnsupported;
+        if (self.state != .paused) return error.DebuggeeNotPaused;
+        if (instruction_index >= self.disassembled_instructions.items.len) return error.UnknownDisassembledInstruction;
+        const instruction = self.disassembled_instructions.items[instruction_index];
+        if (instruction.pause_generation != self.pause_generation) return error.StaleDisassembly;
+        const adapter_key = self.active_adapter_key orelse return error.DebugAdapterIdentityUnavailable;
+
+        for (self.instruction_breakpoints.items, 0..) |breakpoint, index| {
+            if (!std.mem.eql(u8, breakpoint.adapter_key, adapter_key) or
+                !std.mem.eql(u8, breakpoint.instruction_reference, instruction.address)) continue;
+            var removed = self.instruction_breakpoints.orderedRemove(index);
+            removed.deinit(self.allocator);
+            return .removed;
+        }
+        if (self.instruction_breakpoints.items.len >= debug_memory.max_instruction_breakpoints) return error.TooManyInstructionBreakpoints;
+
+        const owned_adapter_key = try self.allocator.dupe(u8, adapter_key);
+        errdefer self.allocator.free(owned_adapter_key);
+        const owned_reference = try self.allocator.dupe(u8, instruction.address);
+        errdefer self.allocator.free(owned_reference);
+        const label_source = instruction.symbol orelse instruction.instruction;
+        const owned_label = try self.allocator.dupe(u8, label_source);
+        errdefer self.allocator.free(owned_label);
+        try self.instruction_breakpoints.append(.{
+            .adapter_key = owned_adapter_key,
+            .instruction_reference = owned_reference,
+            .label = owned_label,
+        });
+        return .added;
+    }
+
+    pub fn removeInstructionBreakpointAt(self: *Session, index: usize) bool {
+        if (index >= self.instruction_breakpoints.items.len) return false;
+        var removed = self.instruction_breakpoints.orderedRemove(index);
+        removed.deinit(self.allocator);
+        return true;
+    }
+
+    pub fn clearInstructionBreakpoints(self: *Session) bool {
+        if (self.instruction_breakpoints.items.len == 0) return false;
+        for (self.instruction_breakpoints.items) |*breakpoint| breakpoint.deinit(self.allocator);
+        self.instruction_breakpoints.clearRetainingCapacity();
+        return true;
+    }
+
+    pub fn instructionBreakpointSet(self: *const Session, instruction_reference: []const u8) bool {
+        const adapter_key = self.active_adapter_key orelse return false;
+        for (self.instruction_breakpoints.items) |breakpoint| {
+            if (std.mem.eql(u8, breakpoint.adapter_key, adapter_key) and
+                std.mem.eql(u8, breakpoint.instruction_reference, instruction_reference)) return true;
+        }
+        return false;
+    }
+
+    pub fn withheldInstructionBreakpointCount(self: *const Session) usize {
+        if (!self.capabilitiesKnown()) return 0;
+        if (!self.capabilities.supports_instruction_breakpoints) return self.instruction_breakpoints.items.len;
+        const adapter_key = self.active_adapter_key orelse return self.instruction_breakpoints.items.len;
+        var count: usize = 0;
+        for (self.instruction_breakpoints.items) |breakpoint| {
+            if (!std.mem.eql(u8, breakpoint.adapter_key, adapter_key)) count += 1;
+        }
+        return count;
+    }
+
     pub fn addConfiguredExceptionFilter(self: *Session, raw_filter_id: []const u8) !bool {
         const filter_id = try debug_exception.validate(.filter_id, raw_filter_id);
         if (self.isExceptionFilterSelected(filter_id)) return false;
@@ -1119,6 +1338,21 @@ pub const Session = struct {
         return self.wrapDataBreakpointRequest(payload, seq, items.items);
     }
 
+    pub fn makeSetInstructionBreakpoints(self: *Session) !Outbound {
+        if (!self.capabilities.supports_instruction_breakpoints) return error.InstructionBreakpointsUnsupported;
+        const adapter_key = self.active_adapter_key orelse return error.DebugAdapterIdentityUnavailable;
+        var items = std.array_list.Managed(protocol.InstructionBreakpoint).init(self.allocator);
+        defer items.deinit();
+        for (self.instruction_breakpoints.items) |*breakpoint| {
+            if (!std.mem.eql(u8, breakpoint.adapter_key, adapter_key)) continue;
+            breakpoint.clearRuntime(self.allocator);
+            try items.append(.{ .instruction_reference = breakpoint.instruction_reference });
+        }
+        const seq = self.takeSeq();
+        const payload = try protocol.makeSetInstructionBreakpointsRequest(self.allocator, seq, items.items);
+        return self.wrapInstructionBreakpointRequest(payload, seq, items.items);
+    }
+
     pub fn makeSetExceptionBreakpoints(self: *Session) !Outbound {
         var selected = std.array_list.Managed([]const u8).init(self.allocator);
         defer selected.deinit();
@@ -1143,19 +1377,93 @@ pub const Session = struct {
     }
 
     pub fn makeStackTrace(self: *Session, thread_id: i64) !Outbound {
+        if (self.state != .paused) return error.DebuggeeNotPaused;
         const seq = self.takeSeq();
-        return self.wrapRequest(try protocol.makeStackTraceRequest(self.allocator, seq, thread_id, 0, 200), seq, .stack_trace, null);
+        return self.wrapPausedRequest(try protocol.makeStackTraceRequest(self.allocator, seq, thread_id, 0, 200), seq, .stack_trace, self.pause_generation);
     }
 
     pub fn makeScopes(self: *Session, frame_id: i64) !Outbound {
+        if (self.state != .paused) return error.DebuggeeNotPaused;
         const seq = self.takeSeq();
-        return self.wrapRequest(try protocol.makeScopesRequest(self.allocator, seq, frame_id), seq, .scopes, null);
+        return self.wrapPausedRequest(try protocol.makeScopesRequest(self.allocator, seq, frame_id), seq, .scopes, self.pause_generation);
     }
 
     pub fn makeVariables(self: *Session, reference: i64) !Outbound {
         const seq = self.takeSeq();
         const payload = try protocol.makeVariablesRequest(self.allocator, seq, reference, 0, 1000);
         return self.wrapVariablesRequest(payload, seq, reference, self.active_frame_id, self.pause_generation);
+    }
+
+    pub fn makeReadMemoryForVariable(self: *Session, variable_index: usize) !Outbound {
+        if (!self.capabilities.supports_read_memory_request) return error.ReadMemoryUnsupported;
+        if (self.state != .paused) return error.DebuggeeNotPaused;
+        if (variable_index >= self.variables.items.len) return error.UnknownVariable;
+        const variable = self.variables.items[variable_index];
+        if (variable.pause_generation != self.pause_generation) return error.StaleVariableReference;
+        const memory_reference = variable.memory_reference orelse return error.MemoryReferenceUnavailable;
+        return self.makeReadMemoryReference(memory_reference, 0, debug_memory.max_memory_bytes);
+    }
+
+    pub fn makeRefreshMemory(self: *Session) !Outbound {
+        if (!self.capabilities.supports_read_memory_request) return error.ReadMemoryUnsupported;
+        if (self.state != .paused) return error.DebuggeeNotPaused;
+        const snapshot = self.memory_snapshot orelse return error.MemorySnapshotUnavailable;
+        if (snapshot.pause_generation != self.pause_generation) return error.StaleMemoryReference;
+        return self.makeReadMemoryReference(snapshot.memory_reference, snapshot.offset, debug_memory.max_memory_bytes);
+    }
+
+    pub fn makeDisassembleForFrame(self: *Session, frame_index: usize) !Outbound {
+        if (!self.capabilities.supports_disassemble_request) return error.DisassemblyUnsupported;
+        if (self.state != .paused) return error.DebuggeeNotPaused;
+        if (frame_index >= self.stack_frames.items.len) return error.UnknownStackFrame;
+        const frame = self.stack_frames.items[frame_index];
+        if (frame.pause_generation != self.pause_generation) return error.StaleStackFrame;
+        const memory_reference = frame.instruction_pointer_reference orelse return error.InstructionReferenceUnavailable;
+        const instruction_offset: i64 = -16;
+        const instruction_count: usize = 64;
+        const seq = self.takeSeq();
+        const payload = try protocol.makeDisassembleRequest(self.allocator, seq, .{
+            .memory_reference = memory_reference,
+            .instruction_offset = instruction_offset,
+            .instruction_count = instruction_count,
+            .resolve_symbols = true,
+        });
+        const outbound = try self.wrapLowLevelRequest(
+            payload,
+            seq,
+            .disassemble,
+            memory_reference,
+            0,
+            null,
+            instruction_count,
+            self.pause_generation,
+        );
+        self.clearDisassembledInstructions();
+        return outbound;
+    }
+
+    fn makeReadMemoryReference(self: *Session, memory_reference: []const u8, offset: i64, count: usize) !Outbound {
+        _ = try debug_memory.validateText(.memory_reference, memory_reference);
+        _ = try debug_memory.validateByteOffset(offset);
+        _ = try debug_memory.validateReadCount(count);
+        const seq = self.takeSeq();
+        const payload = try protocol.makeReadMemoryRequest(self.allocator, seq, .{
+            .memory_reference = memory_reference,
+            .offset = offset,
+            .count = count,
+        });
+        const outbound = try self.wrapLowLevelRequest(
+            payload,
+            seq,
+            .read_memory,
+            memory_reference,
+            offset,
+            count,
+            null,
+            self.pause_generation,
+        );
+        self.clearMemorySnapshot();
+        return outbound;
     }
 
     pub fn makeEvaluateWatch(self: *Session, watch_id: u64, frame_id: i64) !Outbound {
@@ -1174,7 +1482,10 @@ pub const Session = struct {
 
     pub fn makeContinue(self: *Session, thread_id: i64) !Outbound {
         const seq = self.takeSeq();
-        return self.wrapRequest(try protocol.makeContinueRequest(self.allocator, seq, thread_id), seq, .continue_execution, null);
+        const outbound = try self.wrapRequest(try protocol.makeContinueRequest(self.allocator, seq, thread_id), seq, .continue_execution, null);
+        self.state = .running;
+        self.invalidatePausedReferences();
+        return outbound;
     }
 
     pub fn makePause(self: *Session, thread_id: i64) !Outbound {
@@ -1184,17 +1495,26 @@ pub const Session = struct {
 
     pub fn makeNext(self: *Session, thread_id: i64) !Outbound {
         const seq = self.takeSeq();
-        return self.wrapRequest(try protocol.makeNextRequest(self.allocator, seq, thread_id), seq, .next, null);
+        const outbound = try self.wrapRequest(try protocol.makeNextRequest(self.allocator, seq, thread_id), seq, .next, null);
+        self.state = .running;
+        self.invalidatePausedReferences();
+        return outbound;
     }
 
     pub fn makeStepIn(self: *Session, thread_id: i64) !Outbound {
         const seq = self.takeSeq();
-        return self.wrapRequest(try protocol.makeStepInRequest(self.allocator, seq, thread_id), seq, .step_in, null);
+        const outbound = try self.wrapRequest(try protocol.makeStepInRequest(self.allocator, seq, thread_id), seq, .step_in, null);
+        self.state = .running;
+        self.invalidatePausedReferences();
+        return outbound;
     }
 
     pub fn makeStepOut(self: *Session, thread_id: i64) !Outbound {
         const seq = self.takeSeq();
-        return self.wrapRequest(try protocol.makeStepOutRequest(self.allocator, seq, thread_id), seq, .step_out, null);
+        const outbound = try self.wrapRequest(try protocol.makeStepOutRequest(self.allocator, seq, thread_id), seq, .step_out, null);
+        self.state = .running;
+        self.invalidatePausedReferences();
+        return outbound;
     }
 
     pub fn makeDisconnect(self: *Session, terminate_debuggee: bool) !Outbound {
@@ -1260,6 +1580,7 @@ pub const Session = struct {
             .set_function_breakpoints => if (pending.function_names) |function_names| if (body) |value| try self.parseFunctionBreakpointsResponse(function_names, value),
             .data_breakpoint_info => if (body) |value| try self.parseDataBreakpointInfo(pending, value),
             .set_data_breakpoints => if (pending.data_ids) |data_ids| if (body) |value| try self.parseDataBreakpointsResponse(data_ids, value),
+            .set_instruction_breakpoints => if (pending.instruction_references) |references| if (body) |value| try self.parseInstructionBreakpointsResponse(references, value),
             .set_exception_breakpoints => if (pending.exception_filter_ids) |filter_ids| if (body) |value| try self.parseExceptionBreakpointsResponse(filter_ids, value),
             .configuration_done => self.state = .running,
             .disconnect => {
@@ -1273,8 +1594,8 @@ pub const Session = struct {
             },
             .pause => {},
             .threads => if (body) |value| try self.parseThreads(value),
-            .stack_trace => if (body) |value| try self.parseStackFrames(value),
-            .scopes => if (body) |value| try self.parseScopes(value),
+            .stack_trace => if (body) |value| try self.parseStackFrames(pending, value),
+            .scopes => if (body) |value| try self.parseScopes(pending, value),
             .variables => if (body) |value| try self.parseVariables(pending, value),
             .evaluate => if (pending.watch_id) |watch_id| {
                 if (body) |value|
@@ -1282,6 +1603,8 @@ pub const Session = struct {
                 else
                     try self.setWatchError(watch_id, request_seq, "debug adapter returned no evaluation body");
             },
+            .read_memory => if (body) |value| try self.parseReadMemory(pending, value),
+            .disassemble => if (body) |value| try self.parseDisassembly(pending, value),
         }
         self.clearLastError();
         return .{ .acknowledged = pending.kind };
@@ -1336,6 +1659,11 @@ pub const Session = struct {
         }
         if (std.mem.eql(u8, event_name, "thread")) return .{ .event = .thread };
         if (std.mem.eql(u8, event_name, "breakpoint")) return .{ .event = .breakpoint };
+        if (std.mem.eql(u8, event_name, "memory")) {
+            self.clearMemorySnapshot();
+            self.clearDisassembledInstructions();
+            return .{ .event = .memory };
+        }
         return .{ .event = .unknown };
     }
 
@@ -1361,6 +1689,10 @@ pub const Session = struct {
             .supports_hit_conditional_breakpoints = boolField(body, "supportsHitConditionalBreakpoints", false),
             .supports_function_breakpoints = boolField(body, "supportsFunctionBreakpoints", false),
             .supports_data_breakpoints = boolField(body, "supportsDataBreakpoints", false),
+            .supports_read_memory_request = boolField(body, "supportsReadMemoryRequest", false),
+            .supports_write_memory_request = boolField(body, "supportsWriteMemoryRequest", false),
+            .supports_disassemble_request = boolField(body, "supportsDisassembleRequest", false),
+            .supports_instruction_breakpoints = boolField(body, "supportsInstructionBreakpoints", false),
             .supports_log_points = boolField(body, "supportsLogPoints", false),
             .supports_terminate_request = boolField(body, "supportsTerminateRequest", false),
             .supports_restart_request = boolField(body, "supportsRestartRequest", false),
@@ -1372,11 +1704,17 @@ pub const Session = struct {
 
     fn parseCapabilitiesUpdate(self: *Session, body: std.json.ObjectMap) !void {
         const supported_data_before = self.capabilities.supports_data_breakpoints;
+        const supported_memory_before = self.capabilities.supports_read_memory_request;
+        const supported_disassembly_before = self.capabilities.supports_disassemble_request;
         updateBoolField(body, "supportsConfigurationDoneRequest", &self.capabilities.supports_configuration_done_request);
         updateBoolField(body, "supportsConditionalBreakpoints", &self.capabilities.supports_conditional_breakpoints);
         updateBoolField(body, "supportsHitConditionalBreakpoints", &self.capabilities.supports_hit_conditional_breakpoints);
         updateBoolField(body, "supportsFunctionBreakpoints", &self.capabilities.supports_function_breakpoints);
         updateBoolField(body, "supportsDataBreakpoints", &self.capabilities.supports_data_breakpoints);
+        updateBoolField(body, "supportsReadMemoryRequest", &self.capabilities.supports_read_memory_request);
+        updateBoolField(body, "supportsWriteMemoryRequest", &self.capabilities.supports_write_memory_request);
+        updateBoolField(body, "supportsDisassembleRequest", &self.capabilities.supports_disassemble_request);
+        updateBoolField(body, "supportsInstructionBreakpoints", &self.capabilities.supports_instruction_breakpoints);
         updateBoolField(body, "supportsLogPoints", &self.capabilities.supports_log_points);
         updateBoolField(body, "supportsTerminateRequest", &self.capabilities.supports_terminate_request);
         updateBoolField(body, "supportsRestartRequest", &self.capabilities.supports_restart_request);
@@ -1384,6 +1722,8 @@ pub const Session = struct {
         updateBoolField(body, "supportsSetVariable", &self.capabilities.supports_set_variable);
         updateBoolField(body, "supportsExceptionFilterOptions", &self.capabilities.supports_exception_filter_options);
         if (supported_data_before and !self.capabilities.supports_data_breakpoints) self.clearDataBreakpointCandidate();
+        if (supported_memory_before and !self.capabilities.supports_read_memory_request) self.clearMemorySnapshot();
+        if (supported_disassembly_before and !self.capabilities.supports_disassemble_request) self.clearDisassembledInstructions();
         if (body.contains("exceptionBreakpointFilters")) try self.replaceExceptionFilters(body);
     }
 
@@ -1647,6 +1987,234 @@ pub const Session = struct {
         }
     }
 
+    fn parseInstructionBreakpointsResponse(self: *Session, references: [][]u8, body: std.json.ObjectMap) !void {
+        const adapter_key = self.active_adapter_key orelse return;
+        const values = arrayField(body, "breakpoints") orelse return;
+        if (values.items.len != references.len) self.countRejectedLowLevelMetadata();
+        for (references, 0..) |reference, index| {
+            if (index >= values.items.len) break;
+            const breakpoint = self.findInstructionBreakpointMut(adapter_key, reference) orelse continue;
+            const object = switch (values.items[index]) {
+                .object => |item| item,
+                else => {
+                    self.countRejectedLowLevelMetadata();
+                    continue;
+                },
+            };
+            const verified = optionalStrictBoolField(object, "verified") orelse {
+                self.countRejectedLowLevelMetadata();
+                continue;
+            };
+            const adapter_id = if (object.contains("id")) intField(object, "id") orelse {
+                self.countRejectedLowLevelMetadata();
+                continue;
+            } else null;
+            const raw_message: ?[]const u8 = if (object.get("message")) |message_value| switch (message_value) {
+                .string => |message| message,
+                else => {
+                    self.countRejectedLowLevelMetadata();
+                    continue;
+                },
+            } else null;
+            if (raw_message) |message| _ = debug_memory.validateText(.message, message) catch {
+                self.countRejectedLowLevelMetadata();
+                continue;
+            };
+            const owned_message = if (raw_message) |message| try self.allocator.dupe(u8, message) else null;
+            errdefer if (owned_message) |message| self.allocator.free(message);
+
+            breakpoint.clearRuntime(self.allocator);
+            breakpoint.verified = verified;
+            breakpoint.adapter_id = adapter_id;
+            breakpoint.message = owned_message;
+        }
+    }
+
+    fn parseReadMemory(self: *Session, pending: Pending, body: std.json.ObjectMap) !void {
+        const generation = pending.pause_generation orelse return;
+        const memory_reference = pending.memory_reference orelse return;
+        const requested_count = pending.memory_count orelse return;
+        const offset = pending.memory_offset orelse 0;
+        if (self.state != .paused or generation != self.pause_generation) return;
+        if (!self.capabilities.supports_read_memory_request) return;
+
+        const address = stringField(body, "address") orelse {
+            self.countRejectedLowLevelMetadata();
+            return;
+        };
+        _ = debug_memory.validateText(.address, address) catch {
+            self.countRejectedLowLevelMetadata();
+            return;
+        };
+        const unreadable_bytes = if (body.contains("unreadableBytes")) usizeField(body, "unreadableBytes") orelse {
+            self.countRejectedLowLevelMetadata();
+            return;
+        } else 0;
+        if (unreadable_bytes > requested_count) {
+            self.countRejectedLowLevelMetadata();
+            return;
+        }
+        const encoded = if (body.get("data")) |value| switch (value) {
+            .string => |text| text,
+            else => {
+                self.countRejectedLowLevelMetadata();
+                return;
+            },
+        } else "";
+        const decoded_size = debug_memory.decodedMemorySize(encoded) catch {
+            self.countRejectedLowLevelMetadata();
+            return;
+        };
+        if (decoded_size > requested_count - unreadable_bytes) {
+            self.countRejectedLowLevelMetadata();
+            return;
+        }
+
+        const owned_reference = try self.allocator.dupe(u8, memory_reference);
+        errdefer self.allocator.free(owned_reference);
+        const owned_address = try self.allocator.dupe(u8, address);
+        errdefer self.allocator.free(owned_address);
+        const decoded = try self.allocator.alloc(u8, decoded_size);
+        errdefer self.allocator.free(decoded);
+        std.base64.standard.Decoder.decode(decoded, encoded) catch {
+            self.allocator.free(decoded);
+            self.allocator.free(owned_address);
+            self.allocator.free(owned_reference);
+            self.countRejectedLowLevelMetadata();
+            return;
+        };
+
+        self.clearMemorySnapshot();
+        self.memory_snapshot = .{
+            .memory_reference = owned_reference,
+            .address = owned_address,
+            .bytes = decoded,
+            .offset = offset,
+            .unreadable_bytes = unreadable_bytes,
+            .pause_generation = generation,
+        };
+    }
+
+    fn parseDisassembly(self: *Session, pending: Pending, body: std.json.ObjectMap) !void {
+        const generation = pending.pause_generation orelse return;
+        const requested_count = pending.instruction_count orelse return;
+        if (self.state != .paused or generation != self.pause_generation) return;
+        if (!self.capabilities.supports_disassemble_request) return;
+        const values = arrayField(body, "instructions") orelse {
+            self.countRejectedLowLevelMetadata();
+            return;
+        };
+
+        var parsed = std.array_list.Managed(DisassembledInstruction).init(self.allocator);
+        errdefer {
+            for (parsed.items) |*instruction| instruction.deinit(self.allocator);
+            parsed.deinit();
+        }
+        const limit = @min(values.items.len, requested_count);
+        if (values.items.len != requested_count) self.countRejectedLowLevelMetadata();
+        for (values.items[0..limit]) |value| {
+            const object = switch (value) {
+                .object => |item| item,
+                else => {
+                    self.countRejectedLowLevelMetadata();
+                    continue;
+                },
+            };
+            const address = stringField(object, "address") orelse {
+                self.countRejectedLowLevelMetadata();
+                continue;
+            };
+            const instruction_text = stringField(object, "instruction") orelse {
+                self.countRejectedLowLevelMetadata();
+                continue;
+            };
+            _ = debug_memory.validateText(.address, address) catch {
+                self.countRejectedLowLevelMetadata();
+                continue;
+            };
+            _ = debug_memory.validateText(.memory_reference, address) catch {
+                self.countRejectedLowLevelMetadata();
+                continue;
+            };
+            _ = debug_memory.validateText(.instruction, instruction_text) catch {
+                self.countRejectedLowLevelMetadata();
+                continue;
+            };
+
+            const raw_instruction_bytes: ?[]const u8 = if (object.get("instructionBytes")) |bytes_value| switch (bytes_value) {
+                .string => |text| text,
+                else => {
+                    self.countRejectedLowLevelMetadata();
+                    continue;
+                },
+            } else null;
+            if (raw_instruction_bytes) |text| _ = debug_memory.validateText(.instruction_bytes, text) catch {
+                self.countRejectedLowLevelMetadata();
+                continue;
+            };
+            const raw_symbol: ?[]const u8 = if (object.get("symbol")) |symbol_value| switch (symbol_value) {
+                .string => |text| text,
+                else => {
+                    self.countRejectedLowLevelMetadata();
+                    continue;
+                },
+            } else null;
+            if (raw_symbol) |text| _ = debug_memory.validateText(.symbol, text) catch {
+                self.countRejectedLowLevelMetadata();
+                continue;
+            };
+            const invalid = if (object.get("presentationHint")) |hint_value| hint: {
+                const hint_text = switch (hint_value) {
+                    .string => |text| text,
+                    else => {
+                        self.countRejectedLowLevelMetadata();
+                        continue;
+                    },
+                };
+                if (std.mem.eql(u8, hint_text, "invalid")) break :hint true;
+                if (std.mem.eql(u8, hint_text, "normal")) break :hint false;
+                self.countRejectedLowLevelMetadata();
+                continue;
+            } else false;
+
+            var source_path: ?[]u8 = null;
+            if (objectField(object, "location")) |location| {
+                if (stringField(location, "path")) |path| {
+                    _ = debug_memory.validateText(.source_path, path) catch {
+                        self.countRejectedLowLevelMetadata();
+                        source_path = null;
+                        continue;
+                    };
+                    source_path = try self.allocator.dupe(u8, path);
+                }
+            }
+            errdefer if (source_path) |path| self.allocator.free(path);
+            const owned_address = try self.allocator.dupe(u8, address);
+            errdefer self.allocator.free(owned_address);
+            const owned_instruction_bytes = if (raw_instruction_bytes) |text| try self.allocator.dupe(u8, text) else null;
+            errdefer if (owned_instruction_bytes) |text| self.allocator.free(text);
+            const owned_instruction = try dupeNormalizedInstruction(self.allocator, instruction_text);
+            errdefer self.allocator.free(owned_instruction);
+            const owned_symbol = if (raw_symbol) |text| try self.allocator.dupe(u8, text) else null;
+            errdefer if (owned_symbol) |text| self.allocator.free(text);
+            try parsed.append(.{
+                .address = owned_address,
+                .instruction_bytes = owned_instruction_bytes,
+                .instruction = owned_instruction,
+                .symbol = owned_symbol,
+                .source_path = source_path,
+                .line = usizeField(object, "line"),
+                .column = usizeField(object, "column"),
+                .invalid = invalid,
+                .pause_generation = generation,
+            });
+        }
+
+        self.clearDisassembledInstructions();
+        std.mem.swap(@TypeOf(self.disassembled_instructions), &self.disassembled_instructions, &parsed);
+        parsed.deinit();
+    }
+
     fn parseThreads(self: *Session, body: std.json.ObjectMap) !void {
         clearThreads(self);
         const values = arrayField(body, "threads") orelse return;
@@ -1662,7 +2230,9 @@ pub const Session = struct {
         if (self.active_thread_id == null and self.threads.items.len > 0) self.active_thread_id = self.threads.items[0].id;
     }
 
-    fn parseStackFrames(self: *Session, body: std.json.ObjectMap) !void {
+    fn parseStackFrames(self: *Session, pending: Pending, body: std.json.ObjectMap) !void {
+        const generation = pending.pause_generation orelse return;
+        if (self.state != .paused or generation != self.pause_generation) return;
         clearStackFrames(self);
         clearScopes(self);
         clearVariables(self);
@@ -1680,18 +2250,36 @@ pub const Session = struct {
             else
                 null else null;
             errdefer if (path) |owned| self.allocator.free(owned);
+            const instruction_reference = if (object.contains("instructionPointerReference")) reference_block: {
+                const reference = stringField(object, "instructionPointerReference") orelse {
+                    self.countRejectedLowLevelMetadata();
+                    break :reference_block null;
+                };
+                _ = debug_memory.validateText(.memory_reference, reference) catch {
+                    self.countRejectedLowLevelMetadata();
+                    break :reference_block null;
+                };
+                break :reference_block try self.allocator.dupe(u8, reference);
+            } else null;
+            errdefer if (instruction_reference) |owned| self.allocator.free(owned);
+            const owned_name = try dupeLimited(self.allocator, name, 4096);
+            errdefer self.allocator.free(owned_name);
             try self.stack_frames.append(.{
                 .id = id,
-                .name = try dupeLimited(self.allocator, name, 4096),
+                .name = owned_name,
                 .path = path,
                 .line = usizeField(object, "line") orelse 1,
                 .column = usizeField(object, "column") orelse 1,
+                .instruction_pointer_reference = instruction_reference,
+                .pause_generation = generation,
             });
         }
         self.active_frame_id = if (self.stack_frames.items.len > 0) self.stack_frames.items[0].id else null;
     }
 
-    fn parseScopes(self: *Session, body: std.json.ObjectMap) !void {
+    fn parseScopes(self: *Session, pending: Pending, body: std.json.ObjectMap) !void {
+        const generation = pending.pause_generation orelse return;
+        if (self.state != .paused or generation != self.pause_generation) return;
         clearScopes(self);
         clearVariables(self);
         const values = arrayField(body, "scopes") orelse return;
@@ -1725,23 +2313,39 @@ pub const Session = struct {
             };
             const name = stringField(object, "name") orelse continue;
             const display_value = stringField(object, "value") orelse "";
-            var variable = Variable{
-                .name = try dupeLimited(self.allocator, name, 4096),
-                .value = undefined,
-                .type_name = null,
-                .evaluate_name = null,
+            const owned_name = try dupeLimited(self.allocator, name, 4096);
+            errdefer self.allocator.free(owned_name);
+            const owned_value = try dupeLimited(self.allocator, display_value, max_event_text_bytes);
+            errdefer self.allocator.free(owned_value);
+            const owned_type = if (stringField(object, "type")) |type_name| try dupeLimited(self.allocator, type_name, 4096) else null;
+            errdefer if (owned_type) |type_value| self.allocator.free(type_value);
+            const owned_evaluate_name = if (stringField(object, "evaluateName")) |evaluate_name| try dupeLimited(self.allocator, evaluate_name, 4096) else null;
+            errdefer if (owned_evaluate_name) |evaluate_value| self.allocator.free(evaluate_value);
+            const owned_memory_reference = if (object.contains("memoryReference")) reference_block: {
+                const reference = stringField(object, "memoryReference") orelse {
+                    self.countRejectedLowLevelMetadata();
+                    break :reference_block null;
+                };
+                _ = debug_memory.validateText(.memory_reference, reference) catch {
+                    self.countRejectedLowLevelMetadata();
+                    break :reference_block null;
+                };
+                break :reference_block try self.allocator.dupe(u8, reference);
+            } else null;
+            errdefer if (owned_memory_reference) |reference_value| self.allocator.free(reference_value);
+            try self.variables.append(.{
+                .name = owned_name,
+                .value = owned_value,
+                .type_name = owned_type,
+                .evaluate_name = owned_evaluate_name,
                 .variables_reference = intField(object, "variablesReference") orelse 0,
                 .named_variables = usizeField(object, "namedVariables"),
                 .indexed_variables = usizeField(object, "indexedVariables"),
+                .memory_reference = owned_memory_reference,
                 .parent_variables_reference = parent_reference,
                 .frame_id = pending.frame_id,
                 .pause_generation = generation,
-            };
-            errdefer variable.deinit(self.allocator);
-            variable.value = try dupeLimited(self.allocator, display_value, max_event_text_bytes);
-            if (stringField(object, "type")) |type_name| variable.type_name = try dupeLimited(self.allocator, type_name, 4096);
-            if (stringField(object, "evaluateName")) |evaluate_name| variable.evaluate_name = try dupeLimited(self.allocator, evaluate_name, 4096);
-            try self.variables.append(variable);
+            });
         }
     }
 
@@ -1814,6 +2418,14 @@ pub const Session = struct {
         return null;
     }
 
+    fn findInstructionBreakpointMut(self: *Session, adapter_key: []const u8, instruction_reference: []const u8) ?*InstructionBreakpoint {
+        for (self.instruction_breakpoints.items) |*breakpoint| {
+            if (std.mem.eql(u8, breakpoint.adapter_key, adapter_key) and
+                std.mem.eql(u8, breakpoint.instruction_reference, instruction_reference)) return breakpoint;
+        }
+        return null;
+    }
+
     fn findExceptionFilterMut(self: *Session, filter_id: []const u8) ?*ExceptionFilter {
         for (self.exception_filters.items) |*filter| {
             if (std.mem.eql(u8, filter.id, filter_id)) return filter;
@@ -1828,6 +2440,18 @@ pub const Session = struct {
         const owned_path = if (path) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (owned_path) |value| self.allocator.free(value);
         try self.pending.append(.{ .seq = seq, .kind = kind, .path = owned_path });
+        return .{ .allocator = self.allocator, .seq = seq, .kind = kind, .payload = payload, .framed = framed };
+    }
+
+    fn wrapPausedRequest(self: *Session, payload: []u8, seq: i64, kind: RequestKind, pause_generation: u64) !Outbound {
+        errdefer self.allocator.free(payload);
+        const framed = try protocol.makeFramed(self.allocator, payload);
+        errdefer self.allocator.free(framed);
+        try self.pending.append(.{
+            .seq = seq,
+            .kind = kind,
+            .pause_generation = pause_generation,
+        });
         return .{ .allocator = self.allocator, .seq = seq, .kind = kind, .payload = payload, .framed = framed };
     }
 
@@ -1924,6 +2548,67 @@ pub const Session = struct {
         };
     }
 
+    fn wrapInstructionBreakpointRequest(
+        self: *Session,
+        payload: []u8,
+        seq: i64,
+        breakpoints: []const protocol.InstructionBreakpoint,
+    ) !Outbound {
+        errdefer self.allocator.free(payload);
+        const framed = try protocol.makeFramed(self.allocator, payload);
+        errdefer self.allocator.free(framed);
+        const owned_references = try self.allocator.alloc([]u8, breakpoints.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned_references[0..initialized]) |reference| self.allocator.free(reference);
+            self.allocator.free(owned_references);
+        }
+        for (breakpoints) |breakpoint| {
+            owned_references[initialized] = try self.allocator.dupe(u8, breakpoint.instruction_reference);
+            initialized += 1;
+        }
+        try self.pending.append(.{
+            .seq = seq,
+            .kind = .set_instruction_breakpoints,
+            .instruction_references = owned_references,
+        });
+        return .{
+            .allocator = self.allocator,
+            .seq = seq,
+            .kind = .set_instruction_breakpoints,
+            .payload = payload,
+            .framed = framed,
+        };
+    }
+
+    fn wrapLowLevelRequest(
+        self: *Session,
+        payload: []u8,
+        seq: i64,
+        kind: RequestKind,
+        memory_reference: []const u8,
+        memory_offset: i64,
+        memory_count: ?usize,
+        instruction_count: ?usize,
+        pause_generation: u64,
+    ) !Outbound {
+        errdefer self.allocator.free(payload);
+        const framed = try protocol.makeFramed(self.allocator, payload);
+        errdefer self.allocator.free(framed);
+        const owned_reference = try self.allocator.dupe(u8, memory_reference);
+        errdefer self.allocator.free(owned_reference);
+        try self.pending.append(.{
+            .seq = seq,
+            .kind = kind,
+            .memory_reference = owned_reference,
+            .memory_offset = memory_offset,
+            .memory_count = memory_count,
+            .instruction_count = instruction_count,
+            .pause_generation = pause_generation,
+        });
+        return .{ .allocator = self.allocator, .seq = seq, .kind = kind, .payload = payload, .framed = framed };
+    }
+
     fn wrapFunctionRequest(self: *Session, payload: []u8, seq: i64, breakpoints: []const protocol.FunctionBreakpoint) !Outbound {
         errdefer self.allocator.free(payload);
         const framed = try protocol.makeFramed(self.allocator, payload);
@@ -2001,6 +2686,8 @@ pub const Session = struct {
         clearStackFrames(self);
         clearScopes(self);
         clearVariables(self);
+        self.clearMemorySnapshot();
+        self.clearDisassembledInstructions();
         self.clearDataBreakpointCandidate();
         for (self.watches.items) |*watch| watch.clearRuntime(self.allocator);
         self.active_thread_id = null;
@@ -2024,10 +2711,22 @@ pub const Session = struct {
         self.data_breakpoint_candidate = null;
     }
 
+    fn clearMemorySnapshot(self: *Session) void {
+        if (self.memory_snapshot) |*snapshot| snapshot.deinit(self.allocator);
+        self.memory_snapshot = null;
+    }
+
+    fn clearDisassembledInstructions(self: *Session) void {
+        for (self.disassembled_instructions.items) |*instruction| instruction.deinit(self.allocator);
+        self.disassembled_instructions.clearRetainingCapacity();
+    }
+
     fn invalidatePausedReferences(self: *Session) void {
         clearStackFrames(self);
         clearScopes(self);
         clearVariables(self);
+        self.clearMemorySnapshot();
+        self.clearDisassembledInstructions();
         self.clearDataBreakpointCandidate();
         for (self.watches.items) |*watch| watch.clearRuntime(self.allocator);
     }
@@ -2040,6 +2739,12 @@ pub const Session = struct {
     fn countRejectedDataBreakpointMetadata(self: *Session) void {
         if (self.rejected_data_breakpoint_metadata < std.math.maxInt(usize)) {
             self.rejected_data_breakpoint_metadata += 1;
+        }
+    }
+
+    fn countRejectedLowLevelMetadata(self: *Session) void {
+        if (self.rejected_low_level_metadata < std.math.maxInt(usize)) {
+            self.rejected_low_level_metadata += 1;
         }
     }
 
@@ -2159,6 +2864,15 @@ fn usizeField(object: std.json.ObjectMap, name: []const u8) ?usize {
 
 fn dupeLimited(allocator: std.mem.Allocator, value: []const u8, limit: usize) ![]u8 {
     return allocator.dupe(u8, value[0..@min(value.len, limit)]);
+}
+
+fn dupeNormalizedInstruction(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    _ = try debug_memory.validateText(.instruction, value);
+    const owned = try allocator.dupe(u8, value);
+    for (owned) |*byte| if (byte.* == '\t') {
+        byte.* = ' ';
+    };
+    return owned;
 }
 
 fn pathEquals(a: []const u8, b: []const u8) bool {
@@ -2520,6 +3234,187 @@ test "DAP session stages commits verifies and persists adapter-approved data bre
     try std.testing.expect(std.mem.indexOf(u8, gdb_set.payload, "opaque:counter") == null);
 }
 
+test "DAP session reads bounded memory disassembles and manages session-only instruction breakpoints" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+
+    var initialize = try session.makeInitialize("lldb");
+    defer initialize.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"supportsReadMemoryRequest":true,"supportsWriteMemoryRequest":true,"supportsDisassembleRequest":true,"supportsInstructionBreakpoints":true}}
+    );
+    try std.testing.expectEqual(LowLevelCapability.supported, session.memoryReadCapability());
+    try std.testing.expect(session.capabilities.supports_write_memory_request);
+    try std.testing.expectEqual(LowLevelCapability.supported, session.disassemblyCapability());
+    try std.testing.expectEqual(LowLevelCapability.supported, session.instructionBreakpointCapability());
+
+    _ = try session.ingestPayload(
+        \\{"seq":2,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":7}}
+    );
+    var stack = try session.makeStackTrace(7);
+    defer stack.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":3,"type":"response","request_seq":2,"success":true,"command":"stackTrace","body":{"stackFrames":[{"id":42,"name":"main","source":{"path":"/repo/main.zig"},"line":9,"column":3,"instructionPointerReference":"opaque:ip:main"}]}}
+    );
+    try std.testing.expectEqual(@as(usize, 1), session.stackFrameInstructionReferenceCount());
+    try std.testing.expectEqualStrings("opaque:ip:main", session.stack_frames.items[0].instruction_pointer_reference.?);
+
+    session.active_frame_id = 42;
+    var variables = try session.makeVariables(12);
+    defer variables.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":4,"type":"response","request_seq":3,"success":true,"command":"variables","body":{"variables":[{"name":"buffer","value":"0x401000","type":"[*]u8","variablesReference":0,"memoryReference":"opaque:pointer:buffer"}]}}
+    );
+    try std.testing.expectEqual(@as(usize, 1), session.variableMemoryReferenceCount());
+    try std.testing.expectEqualStrings("opaque:pointer:buffer", session.variables.items[0].memory_reference.?);
+
+    var read = try session.makeReadMemoryForVariable(0);
+    defer read.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, read.payload, "\"count\":256") != null);
+    _ = try session.ingestPayload(
+        \\{"seq":5,"type":"response","request_seq":4,"success":true,"command":"readMemory","body":{"address":"0x401000","unreadableBytes":0,"data":"AAECAwQFBgcICQoLDA0ODw=="}}
+    );
+    const snapshot = session.memory_snapshot.?;
+    try std.testing.expectEqualStrings("opaque:pointer:buffer", snapshot.memory_reference);
+    try std.testing.expectEqualStrings("0x401000", snapshot.address);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, snapshot.bytes);
+
+    var disassemble = try session.makeDisassembleForFrame(0);
+    defer disassemble.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, disassemble.payload, "\"instructionOffset\":-16") != null);
+    _ = try session.ingestPayload(
+        \\{"seq":6,"type":"response","request_seq":5,"success":true,"command":"disassemble","body":{"instructions":[{"address":"0x401020","instructionBytes":"48 89 d8","instruction":"mov\trax, rbx","symbol":"main+4","location":{"path":"/repo/main.zig"},"line":9,"column":3},{"address":"0x401023","instructionBytes":"c3","instruction":"ret","presentationHint":"normal"}]}}
+    );
+    try std.testing.expectEqual(@as(usize, 2), session.disassembled_instructions.items.len);
+    try std.testing.expectEqualStrings("mov rax, rbx", session.disassembled_instructions.items[0].instruction);
+    try std.testing.expectEqualStrings("main+4", session.disassembled_instructions.items[0].symbol.?);
+
+    try std.testing.expectEqual(ToggleResult.added, try session.toggleInstructionBreakpointAt(0));
+    try std.testing.expect(session.instructionBreakpointSet("0x401020"));
+    var set_instruction = try session.makeSetInstructionBreakpoints();
+    defer set_instruction.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, set_instruction.payload, "\"instructionReference\":\"0x401020\"") != null);
+    _ = try session.ingestPayload(
+        \\{"seq":7,"type":"response","request_seq":6,"success":true,"command":"setInstructionBreakpoints","body":{"breakpoints":[{"id":91,"verified":true}]}}
+    );
+    try std.testing.expectEqual(@as(?bool, true), session.instruction_breakpoints.items[0].verified);
+    try std.testing.expectEqual(@as(?i64, 91), session.instruction_breakpoints.items[0].adapter_id);
+
+    var continuation = try session.makeContinue(7);
+    defer continuation.deinit();
+    try std.testing.expectEqual(State.running, session.state);
+    try std.testing.expect(session.memory_snapshot == null);
+    try std.testing.expectEqual(@as(usize, 0), session.disassembled_instructions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), session.instruction_breakpoints.items.len);
+    _ = try session.ingestPayload(
+        \\{"seq":8,"type":"response","request_seq":7,"success":true,"command":"continue"}
+    );
+    try std.testing.expect(session.memory_snapshot == null);
+    try std.testing.expectEqual(@as(usize, 0), session.disassembled_instructions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), session.instruction_breakpoints.items.len);
+    session.reset();
+    try std.testing.expectEqual(@as(usize, 0), session.instruction_breakpoints.items.len);
+}
+
+test "DAP session rejects malformed and delayed memory responses" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+
+    var initialize = try session.makeInitialize("lldb");
+    defer initialize.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"supportsReadMemoryRequest":true}}
+    );
+    _ = try session.ingestPayload(
+        \\{"seq":2,"type":"event","event":"stopped","body":{"reason":"pause","threadId":1}}
+    );
+    var variables = try session.makeVariables(4);
+    defer variables.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":3,"type":"response","request_seq":2,"success":true,"command":"variables","body":{"variables":[{"name":"p","value":"ptr","variablesReference":0,"memoryReference":"opaque:p"}]}}
+    );
+
+    var malformed = try session.makeReadMemoryForVariable(0);
+    defer malformed.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":4,"type":"response","request_seq":3,"success":true,"command":"readMemory","body":{"address":"0x10","data":"not base64"}}
+    );
+    try std.testing.expect(session.memory_snapshot == null);
+    try std.testing.expectEqual(@as(usize, 1), session.rejected_low_level_metadata);
+
+    var inconsistent = try session.makeReadMemoryForVariable(0);
+    defer inconsistent.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":5,"type":"response","request_seq":4,"success":true,"command":"readMemory","body":{"address":"0x10","unreadableBytes":255,"data":"AQIDBA=="}}
+    );
+    try std.testing.expect(session.memory_snapshot == null);
+    try std.testing.expectEqual(@as(usize, 2), session.rejected_low_level_metadata);
+
+    var delayed = try session.makeReadMemoryForVariable(0);
+    defer delayed.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":6,"type":"event","event":"continued","body":{"threadId":1}}
+    );
+    _ = try session.ingestPayload(
+        \\{"seq":7,"type":"response","request_seq":5,"success":true,"command":"readMemory","body":{"address":"0x10","data":"AQIDBA=="}}
+    );
+    try std.testing.expect(session.memory_snapshot == null);
+}
+
+test "DAP memory event invalidates cached memory and disassembly" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+    session.state = .paused;
+    session.pause_generation = 3;
+    session.memory_snapshot = .{
+        .memory_reference = try std.testing.allocator.dupe(u8, "opaque:data"),
+        .address = try std.testing.allocator.dupe(u8, "0x1000"),
+        .bytes = try std.testing.allocator.dupe(u8, &.{ 1, 2, 3, 4 }),
+        .offset = 0,
+        .unreadable_bytes = 0,
+        .pause_generation = 3,
+    };
+    try session.disassembled_instructions.append(.{
+        .address = try std.testing.allocator.dupe(u8, "0x1000"),
+        .instruction_bytes = try std.testing.allocator.dupe(u8, "90"),
+        .instruction = try std.testing.allocator.dupe(u8, "nop"),
+        .symbol = null,
+        .source_path = null,
+        .line = null,
+        .column = null,
+        .invalid = false,
+        .pause_generation = 3,
+    });
+
+    const result = try session.ingestPayload(
+        \\{"seq":1,"type":"event","event":"memory","body":{"memoryReference":"opaque:data","offset":0,"count":4}}
+    );
+    try std.testing.expectEqual(EventKind.memory, result.event);
+    try std.testing.expect(session.memory_snapshot == null);
+    try std.testing.expectEqual(@as(usize, 0), session.disassembled_instructions.items.len);
+}
+
+test "DAP instruction breakpoint response rejects malformed runtime metadata" {
+    var session = try Session.init(std.testing.allocator, "/repo");
+    defer session.deinit();
+    session.capabilities.supports_instruction_breakpoints = true;
+    session.active_adapter_key = try std.testing.allocator.dupe(u8, "lldb");
+    try session.instruction_breakpoints.append(.{
+        .adapter_key = try std.testing.allocator.dupe(u8, "lldb"),
+        .instruction_reference = try std.testing.allocator.dupe(u8, "0x1000"),
+        .label = try std.testing.allocator.dupe(u8, "nop"),
+    });
+
+    var set = try session.makeSetInstructionBreakpoints();
+    defer set.deinit();
+    _ = try session.ingestPayload(
+        \\{"seq":2,"type":"response","request_seq":1,"success":true,"command":"setInstructionBreakpoints","body":{"breakpoints":[{"verified":"yes","id":7}]}}
+    );
+    try std.testing.expectEqual(@as(usize, 1), session.rejected_low_level_metadata);
+    try std.testing.expect(session.instruction_breakpoints.items[0].verified == null);
+    try std.testing.expect(session.instruction_breakpoints.items[0].adapter_id == null);
+}
+
 test "DAP session rejects stale or malformed data breakpoint metadata" {
     var session = try Session.init(std.testing.allocator, "/repo");
     defer session.deinit();
@@ -2535,6 +3430,7 @@ test "DAP session rejects stale or malformed data breakpoint metadata" {
         .variables_reference = 0,
         .named_variables = null,
         .indexed_variables = null,
+        .memory_reference = null,
         .parent_variables_reference = 20,
         .frame_id = 3,
         .pause_generation = 4,

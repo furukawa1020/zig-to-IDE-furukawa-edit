@@ -40,8 +40,6 @@ pub const DataBreakpoint = struct {
 pub const InstructionBreakpoint = struct {
     instruction_reference: []const u8,
     offset: ?i64 = null,
-    condition: ?[]const u8 = null,
-    hit_condition: ?[]const u8 = null,
 };
 
 pub const ReadMemoryArguments = struct {
@@ -275,8 +273,6 @@ pub fn makeSetInstructionBreakpointsRequest(
             try json.beginObject();
             try field(&json, "instructionReference", breakpoint.instruction_reference);
             if (breakpoint.offset) |offset| try field(&json, "offset", offset);
-            if (breakpoint.condition) |condition| try field(&json, "condition", condition);
-            if (breakpoint.hit_condition) |hit_condition| try field(&json, "hitCondition", hit_condition);
             try json.endObject();
         }
         try json.endArray();
@@ -520,6 +516,7 @@ test "build DAP initialize and launch requests" {
     defer std.testing.allocator.free(initialize);
     try std.testing.expect(std.mem.indexOf(u8, initialize, "\"command\":\"initialize\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, initialize, "\"supportsRunInTerminalRequest\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, initialize, "\"supportsMemoryReferences\":true") != null);
 
     const launch = try makeLaunchRequest(std.testing.allocator, 2, .{
         .adapter_id = "lldb",
@@ -593,6 +590,43 @@ test "build DAP data breakpoint two-stage and full-replacement requests" {
     try std.testing.expect(std.mem.indexOf(u8, set, "\"accessType\":\"readWrite\"") != null);
 
     const clear = try makeSetDataBreakpointsRequest(std.testing.allocator, 10, &.{});
+    defer std.testing.allocator.free(clear);
+    try std.testing.expect(std.mem.indexOf(u8, clear, "\"breakpoints\":[]") != null);
+}
+
+test "build bounded DAP memory disassembly and instruction breakpoint requests" {
+    const memory = try makeReadMemoryRequest(std.testing.allocator, 11, .{
+        .memory_reference = "opaque:pointer:7",
+        .offset = -16,
+        .count = 128,
+    });
+    defer std.testing.allocator.free(memory);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "\"command\":\"readMemory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "\"memoryReference\":\"opaque:pointer:7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "\"offset\":-16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "\"count\":128") != null);
+
+    const disassembly = try makeDisassembleRequest(std.testing.allocator, 12, .{
+        .memory_reference = "opaque:ip:main",
+        .instruction_offset = -16,
+        .instruction_count = 64,
+    });
+    defer std.testing.allocator.free(disassembly);
+    try std.testing.expect(std.mem.indexOf(u8, disassembly, "\"command\":\"disassemble\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, disassembly, "\"instructionOffset\":-16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, disassembly, "\"instructionCount\":64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, disassembly, "\"resolveSymbols\":true") != null);
+
+    const set = try makeSetInstructionBreakpointsRequest(std.testing.allocator, 13, &.{
+        .{ .instruction_reference = "0x401020" },
+        .{ .instruction_reference = "opaque:instruction:2", .offset = 4 },
+    });
+    defer std.testing.allocator.free(set);
+    try std.testing.expect(std.mem.indexOf(u8, set, "\"command\":\"setInstructionBreakpoints\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set, "\"instructionReference\":\"0x401020\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set, "\"offset\":4") != null);
+
+    const clear = try makeSetInstructionBreakpointsRequest(std.testing.allocator, 14, &.{});
     defer std.testing.allocator.free(clear);
     try std.testing.expect(std.mem.indexOf(u8, clear, "\"breakpoints\":[]") != null);
 }

@@ -59,6 +59,7 @@ const QuickPanelMode = enum {
     debug_breakpoint_log,
     debug_functions,
     debug_data,
+    debug_low_level,
     debug_exceptions,
 };
 
@@ -83,6 +84,7 @@ const DebugPanelAction = enum {
     step_out,
     breakpoint,
     advanced_breakpoint,
+    low_level,
     watch,
     stop,
     status,
@@ -254,6 +256,12 @@ const QuickPanel = struct {
     debug_data_variable_count: usize = 0,
     debug_data_breakpoint_count: usize = 0,
     debug_data_has_candidate: bool = false,
+    debug_low_frame_count: usize = 0,
+    debug_low_variable_count: usize = 0,
+    debug_low_has_memory: bool = false,
+    debug_low_memory_line_count: usize = 0,
+    debug_low_instruction_count: usize = 0,
+    debug_low_breakpoint_count: usize = 0,
     debug_exception_count: usize = 0,
     debug_exception_selected_count: usize = 0,
     completion_replace_start: usize = 0,
@@ -339,7 +347,7 @@ const QuickPanel = struct {
             .code_actions => self.code_action_count,
             .language_mode => if (self.language_matches) |items| items.len else 0,
             .debug_watch => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else self.debug_watch_count,
-            .debug_breakpoint => 7,
+            .debug_breakpoint => 8,
             .debug_breakpoint_condition, .debug_breakpoint_hit, .debug_breakpoint_log => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else 0,
             .debug_functions => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else self.debug_function_count + @intFromBool(self.debug_function_count > 0),
             .debug_data => self.debug_data_commit_count +
@@ -347,6 +355,13 @@ const QuickPanel = struct {
                 self.debug_data_variable_count +
                 self.debug_data_breakpoint_count +
                 @intFromBool(self.debug_data_breakpoint_count > 0),
+            .debug_low_level => self.debug_low_frame_count +
+                self.debug_low_variable_count +
+                @intFromBool(self.debug_low_has_memory) +
+                self.debug_low_memory_line_count +
+                self.debug_low_instruction_count +
+                self.debug_low_breakpoint_count +
+                @intFromBool(self.debug_low_breakpoint_count > 0),
             .debug_exceptions => self.debug_exception_count + @intFromBool(self.debug_exception_selected_count > 0),
         };
     }
@@ -479,6 +494,15 @@ const QuickPanel = struct {
                 self.debug_data_has_candidate = session.data_breakpoint_candidate != null;
                 self.debug_data_variable_count = if (session.state == .paused and session.dataBreakpointsSupported()) session.variables.items.len else 0;
                 self.debug_data_breakpoint_count = session.data_breakpoints.items.len;
+            },
+            .debug_low_level => {
+                const session = &app.debug_manager.session;
+                self.debug_low_frame_count = if (session.state == .paused and session.capabilities.supports_disassemble_request) session.stackFrameInstructionReferenceCount() else 0;
+                self.debug_low_variable_count = if (session.state == .paused and session.capabilities.supports_read_memory_request) session.variableMemoryReferenceCount() else 0;
+                self.debug_low_has_memory = session.memory_snapshot != null;
+                self.debug_low_memory_line_count = if (session.memory_snapshot) |snapshot| (snapshot.bytes.len + 15) / 16 else 0;
+                self.debug_low_instruction_count = session.disassembled_instructions.items.len;
+                self.debug_low_breakpoint_count = session.instruction_breakpoints.items.len;
             },
             .debug_breakpoint, .debug_breakpoint_condition, .debug_breakpoint_hit, .debug_breakpoint_log => {},
             .debug_exceptions => {
@@ -644,6 +668,12 @@ const QuickPanel = struct {
         self.debug_data_variable_count = 0;
         self.debug_data_breakpoint_count = 0;
         self.debug_data_has_candidate = false;
+        self.debug_low_frame_count = 0;
+        self.debug_low_variable_count = 0;
+        self.debug_low_has_memory = false;
+        self.debug_low_memory_line_count = 0;
+        self.debug_low_instruction_count = 0;
+        self.debug_low_breakpoint_count = 0;
         self.debug_exception_count = 0;
         self.debug_exception_selected_count = 0;
         if (self.language_matches) |items| {
@@ -1106,6 +1136,14 @@ const GuiState = struct {
             self.openQuickPanel(.debug_data);
             return;
         }
+        if (std.mem.eql(u8, id, "debug.low_level") or
+            std.mem.eql(u8, id, "debug.disassemble") or
+            std.mem.startsWith(u8, id, "debug.memory_") or
+            std.mem.startsWith(u8, id, "debug.instruction_"))
+        {
+            self.openQuickPanel(.debug_low_level);
+            return;
+        }
         if (std.mem.eql(u8, id, "debug.exception_toggle")) {
             self.openQuickPanel(.debug_exceptions);
             return;
@@ -1301,6 +1339,12 @@ const GuiState = struct {
             self.bottom_panel = .debug;
             return;
         }
+        if (action == .low_level) {
+            self.openQuickPanel(.debug_low_level);
+            self.show_output = true;
+            self.bottom_panel = .debug;
+            return;
+        }
         const id = switch (action) {
             .configure => "debug.create_config",
             .start => "debug.start",
@@ -1311,6 +1355,7 @@ const GuiState = struct {
             .step_out => "debug.step_out",
             .breakpoint => "debug.toggle_breakpoint",
             .advanced_breakpoint => unreachable,
+            .low_level => unreachable,
             .watch => unreachable,
             .stop => "debug.stop",
             .status => "debug.status",
@@ -1348,7 +1393,7 @@ const GuiState = struct {
     }
 
     fn executeBreakpointMenuItem(self: *GuiState) void {
-        switch (@min(self.quick_panel.selected_index, @as(usize, 6))) {
+        switch (@min(self.quick_panel.selected_index, @as(usize, 7))) {
             0 => self.openBreakpointValueEditor(.debug_breakpoint_condition),
             1 => self.openBreakpointValueEditor(.debug_breakpoint_hit),
             2 => self.openBreakpointValueEditor(.debug_breakpoint_log),
@@ -1363,7 +1408,7 @@ const GuiState = struct {
             4 => self.openQuickPanel(.debug_exceptions),
             5 => self.openQuickPanel(.debug_functions),
             6 => self.openQuickPanel(.debug_data),
-            else => unreachable,
+            7 => self.openQuickPanel(.debug_low_level),
         }
         self.show_output = true;
         self.bottom_panel = .debug;
@@ -1514,6 +1559,78 @@ const GuiState = struct {
                 const count = self.quick_panel.itemCount();
                 self.quick_panel.selected_index = if (count == 0) 0 else @min(selected_index, count - 1);
             }
+        }
+        self.show_output = true;
+        self.bottom_panel = .debug;
+    }
+
+    fn executeLowLevelItem(self: *GuiState) void {
+        const selected_index = self.quick_panel.selected_index;
+        var relative = selected_index;
+        var index_buf: [32]u8 = undefined;
+        var command_id: []const u8 = "";
+        var argument: ?[]const u8 = null;
+        const session = &self.app.debug_manager.session;
+
+        if (relative < self.quick_panel.debug_low_frame_count) {
+            const frame_index = session.stackFrameInstructionReferenceIndexAt(relative) orelse return;
+            command_id = "debug.disassemble";
+            argument = std.fmt.bufPrint(&index_buf, "{d}", .{frame_index + 1}) catch return;
+        } else {
+            relative -= self.quick_panel.debug_low_frame_count;
+            if (relative < self.quick_panel.debug_low_variable_count) {
+                const variable_index = session.variableMemoryReferenceIndexAt(relative) orelse return;
+                command_id = "debug.memory_read";
+                argument = std.fmt.bufPrint(&index_buf, "{d}", .{variable_index + 1}) catch return;
+            } else {
+                relative -= self.quick_panel.debug_low_variable_count;
+                if (self.quick_panel.debug_low_has_memory) {
+                    if (relative == 0) {
+                        command_id = "debug.memory_refresh";
+                    } else {
+                        relative -= 1;
+                    }
+                }
+                if (command_id.len == 0) {
+                    if (relative < self.quick_panel.debug_low_memory_line_count) {
+                        self.setMessage("Read-only memory row; select REFRESH or another reference") catch {};
+                        return;
+                    }
+                    relative -= self.quick_panel.debug_low_memory_line_count;
+                    if (relative < self.quick_panel.debug_low_instruction_count) {
+                        command_id = "debug.instruction_toggle";
+                        argument = std.fmt.bufPrint(&index_buf, "{d}", .{relative + 1}) catch return;
+                    } else {
+                        relative -= self.quick_panel.debug_low_instruction_count;
+                        if (relative < self.quick_panel.debug_low_breakpoint_count) {
+                            command_id = "debug.instruction_remove";
+                            argument = std.fmt.bufPrint(&index_buf, "{d}", .{relative + 1}) catch return;
+                        } else if (self.quick_panel.debug_low_breakpoint_count > 0 and relative == self.quick_panel.debug_low_breakpoint_count) {
+                            command_id = "debug.instruction_clear";
+                        } else {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = command_id,
+            .argument = argument,
+            .source = .command_palette,
+        }) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        self.handleDispatchResult(command_id, result);
+        if (std.meta.activeTag(result) == .completed) {
+            self.quick_panel.rebuild(&self.app) catch |err| {
+                self.setError(err) catch {};
+                return;
+            };
+            const count = self.quick_panel.itemCount();
+            self.quick_panel.selected_index = if (count == 0) 0 else @min(selected_index, count - 1);
         }
         self.show_output = true;
         self.bottom_panel = .debug;
@@ -1912,6 +2029,7 @@ const GuiState = struct {
             .debug_breakpoint_log => "Restricted logpoint",
             .debug_functions => "Function breakpoints",
             .debug_data => "Data breakpoints",
+            .debug_low_level => "Read-only memory and disassembly",
             .debug_exceptions => "Exception breakpoints",
         }) catch {};
         if (mode == .completion and !self.requestCompletionFromLsp()) self.ensureLspForFeature("completion", .completion);
@@ -2380,6 +2498,7 @@ const GuiState = struct {
             .debug_breakpoint_condition, .debug_breakpoint_hit, .debug_breakpoint_log => self.applyBreakpointValueEditor(self.quick_panel.mode),
             .debug_functions => self.executeFunctionBreakpointItem(),
             .debug_data => self.executeDataBreakpointItem(),
+            .debug_low_level => self.executeLowLevelItem(),
             .debug_exceptions => self.executeExceptionFilterItem(),
         }
     }
@@ -3120,7 +3239,9 @@ const GuiState = struct {
             self.appendOutput(.stderr, "debug pump failed: {s}\n", .{@errorName(err)});
             return true;
         };
-        if (result.frames > 0 and self.quick_panel.visible and self.quick_panel.mode == .debug_data) {
+        if (result.frames > 0 and self.quick_panel.visible and
+            (self.quick_panel.mode == .debug_data or self.quick_panel.mode == .debug_low_level))
+        {
             const selected = self.quick_panel.selected_index;
             self.quick_panel.rebuild(&self.app) catch |err| {
                 self.setError(err) catch {};
@@ -5680,19 +5801,19 @@ fn debugPanelDataRowAt(rect: RECT, y: c_int) ?usize {
 
 fn drawDebugPanelActions(hdc: windows.HDC, rect: RECT) void {
     if (!debugPanelHasActionButtons(rect)) return;
-    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .watch, .advanced_breakpoint, .breakpoint, .stop, .status };
+    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .watch, .low_level, .advanced_breakpoint, .breakpoint, .stop, .status };
     for (actions) |action| drawButton(hdc, debugPanelActionButtonRect(rect, action), debugPanelActionLabel(action));
 }
 
 fn debugPanelActionAt(rect: RECT, x: c_int, y: c_int) ?DebugPanelAction {
     if (!debugPanelHasActionButtons(rect) or y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .watch, .advanced_breakpoint, .breakpoint, .stop, .status };
+    const actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .watch, .low_level, .advanced_breakpoint, .breakpoint, .stop, .status };
     for (actions) |action| if (pointIn(debugPanelActionButtonRect(rect, action), x, y)) return action;
     return null;
 }
 
 fn debugPanelHasActionButtons(rect: RECT) bool {
-    return rect.right - rect.left >= 824;
+    return rect.right - rect.left >= 888;
 }
 
 fn debugPanelActionButtonRect(rect: RECT, action: DebugPanelAction) RECT {
@@ -5703,14 +5824,15 @@ fn debugPanelActionButtonRect(rect: RECT, action: DebugPanelAction) RECT {
         .stop => 1,
         .breakpoint => 2,
         .advanced_breakpoint => 3,
-        .watch => 4,
-        .step_out => 5,
-        .step_into => 6,
-        .step_over => 7,
-        .pause => 8,
-        .continue_execution => 9,
-        .start => 10,
-        .configure => 11,
+        .low_level => 4,
+        .watch => 5,
+        .step_out => 6,
+        .step_into => 7,
+        .step_over => 8,
+        .pause => 9,
+        .continue_execution => 10,
+        .start => 11,
+        .configure => 12,
     };
     const right = rect.right - 12 - slot * (width + gap);
     return .{ .left = right - width, .top = rect.top + 7, .right = right, .bottom = rect.top + 31 };
@@ -5727,6 +5849,7 @@ fn debugPanelActionLabel(action: DebugPanelAction) []const u8 {
         .step_out => "OUT",
         .breakpoint => "BP",
         .advanced_breakpoint => "ADV",
+        .low_level => "ASM",
         .watch => "WATCH",
         .stop => "STOP",
         .status => "INFO",
@@ -6613,6 +6736,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .debug_breakpoint_log => "LOGPOINT  restricted {inspection} interpolation",
         .debug_functions => "FUNCTION BREAKPOINTS  bounded explicit symbols / adapter-resolved",
         .debug_data => "DATA BREAKPOINTS  inspect current variable / explicit commit / opaque IDs",
+        .debug_low_level => "LOW LEVEL  read-only memory / disassembly / session-only instruction breakpoints",
         .debug_exceptions => "EXCEPTION BREAKPOINTS  explicit selection / adapter defaults never auto-enable",
     };
     drawText(hdc, panel.left + 16, panel.top + 14, rgb(79, 230, 226), title);
@@ -6675,6 +6799,19 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
             session.withheldDataBreakpointCount(),
             session.rejected_data_breakpoint_metadata,
         }) catch "data breakpoint boundary";
+        drawTextClipped(hdc, panel.left + 16, panel.top + 44, query_right, rgb(180, 190, 200), summary);
+    } else if (state.quick_panel.mode == .debug_low_level) {
+        const session = &state.app.debug_manager.session;
+        var summary_buf: [420]u8 = undefined;
+        const summary = std.fmt.bufPrint(&summary_buf, "memory:{s}  disasm:{s}  instruction-bp:{s}  refs frame:{d}/var:{d}  write:LOCKED(adapter:{})  rejected:{d}", .{
+            @tagName(session.memoryReadCapability()),
+            @tagName(session.disassemblyCapability()),
+            @tagName(session.instructionBreakpointCapability()),
+            session.stackFrameInstructionReferenceCount(),
+            session.variableMemoryReferenceCount(),
+            session.capabilities.supports_write_memory_request,
+            session.rejected_low_level_metadata,
+        }) catch "low-level boundary";
         drawTextClipped(hdc, panel.left + 16, panel.top + 44, query_right, rgb(180, 190, 200), summary);
     } else {
         drawTextClipped(hdc, panel.left + 16, panel.top + 44, query_right, rgb(235, 239, 244), state.quick_panel.query.items);
@@ -6870,6 +7007,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                     4 => "EXCEPTION FILTERS  adapter-advertised / explicit-only",
                     5 => "FUNCTION BREAKPOINTS  bounded explicit symbols",
                     6 => "DATA BREAKPOINTS  stopped variables / explicit access / opaque IDs",
+                    7 => "LOW LEVEL  read-only memory / disassembly / instruction breakpoints",
                     else => "",
                 };
                 drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
@@ -6963,6 +7101,90 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                     drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, "CLEAR ALL DATA BREAKPOINTS");
                 }
             },
+            .debug_low_level => low_level: {
+                const session = &state.app.debug_manager.session;
+                var relative = item_index;
+                if (relative < state.quick_panel.debug_low_frame_count) {
+                    const frame_index = session.stackFrameInstructionReferenceIndexAt(relative) orelse break :low_level;
+                    const frame = session.stack_frames.items[frame_index];
+                    var frame_buf: [1500]u8 = undefined;
+                    const label = std.fmt.bufPrint(&frame_buf, "DISASSEMBLE FRAME {d}  {s}  ip:{s}", .{
+                        frame_index + 1,
+                        frame.name,
+                        frame.instruction_pointer_reference.?,
+                    }) catch frame.name;
+                    drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
+                    break :low_level;
+                }
+                relative -= state.quick_panel.debug_low_frame_count;
+                if (relative < state.quick_panel.debug_low_variable_count) {
+                    const variable_index = session.variableMemoryReferenceIndexAt(relative) orelse break :low_level;
+                    const variable = session.variables.items[variable_index];
+                    var variable_buf: [1500]u8 = undefined;
+                    const label = std.fmt.bufPrint(&variable_buf, "READ MEMORY {d}  {s} = {s}  ref:{s}  max:256/read-only", .{
+                        variable_index + 1,
+                        variable.name,
+                        variable.value,
+                        variable.memory_reference.?,
+                    }) catch variable.name;
+                    drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
+                    break :low_level;
+                }
+                relative -= state.quick_panel.debug_low_variable_count;
+                if (state.quick_panel.debug_low_has_memory) {
+                    const snapshot = session.memory_snapshot orelse break :low_level;
+                    if (relative == 0) {
+                        var refresh_buf: [480]u8 = undefined;
+                        const label = std.fmt.bufPrint(&refresh_buf, "REFRESH READ-ONLY MEMORY  base:{s}  bytes:{d}  unreadable:{d}", .{
+                            snapshot.address,
+                            snapshot.bytes.len,
+                            snapshot.unreadable_bytes,
+                        }) catch "REFRESH READ-ONLY MEMORY";
+                        drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
+                        break :low_level;
+                    }
+                    relative -= 1;
+                    if (relative < state.quick_panel.debug_low_memory_line_count) {
+                        var memory_buf: [256]u8 = undefined;
+                        const label = formatMemoryHexRow(&memory_buf, snapshot.bytes, relative);
+                        drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, rgb(165, 214, 167), label);
+                        break :low_level;
+                    }
+                    relative -= state.quick_panel.debug_low_memory_line_count;
+                }
+                if (relative < state.quick_panel.debug_low_instruction_count) {
+                    const instruction = session.disassembled_instructions.items[relative];
+                    var instruction_buf: [1800]u8 = undefined;
+                    const label = std.fmt.bufPrint(&instruction_buf, "TOGGLE [{s}] {d}  {s}  {s}  {s}  {s}", .{
+                        if (session.instructionBreakpointSet(instruction.address)) "x" else " ",
+                        relative + 1,
+                        instruction.address,
+                        instruction.instruction_bytes orelse "",
+                        instruction.instruction,
+                        instruction.symbol orelse "",
+                    }) catch instruction.instruction;
+                    const instruction_color = if (instruction.invalid) rgb(126, 138, 150) else color;
+                    drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, instruction_color, label);
+                    break :low_level;
+                }
+                relative -= state.quick_panel.debug_low_instruction_count;
+                if (relative < state.quick_panel.debug_low_breakpoint_count) {
+                    const breakpoint = session.instruction_breakpoints.items[relative];
+                    var breakpoint_buf: [1500]u8 = undefined;
+                    const label = std.fmt.bufPrint(&breakpoint_buf, "REMOVE INSTRUCTION BP {d}  {s}  {s}{s}", .{
+                        relative + 1,
+                        breakpoint.instruction_reference,
+                        if (breakpoint.verified) |verified| if (verified) "verified" else "rejected" else "pending",
+                        if (session.withheldInstructionBreakpointCount() > 0) "  withheld" else "",
+                    }) catch breakpoint.instruction_reference;
+                    drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
+                    break :low_level;
+                }
+                relative -= state.quick_panel.debug_low_breakpoint_count;
+                if (state.quick_panel.debug_low_breakpoint_count > 0 and relative == 0) {
+                    drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, "CLEAR ALL SESSION-ONLY INSTRUCTION BREAKPOINTS");
+                }
+            },
             .debug_exceptions => {
                 if (item_index >= state.quick_panel.debug_exception_count) {
                     drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, "CLEAR ALL SELECTED EXCEPTION FILTERS");
@@ -6993,6 +7215,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
             .debug_breakpoint_log => "Enter a log message",
             .debug_functions => "Type an explicit qualified function symbol or signature",
             .debug_data => "Pause the debuggee and load variables, or start an adapter with data-breakpoint support",
+            .debug_low_level => "Pause the debuggee and load stack/variables from a low-level capable adapter",
             .debug_exceptions => "Start a debug adapter to discover bounded exception filters",
             else => "No matches",
         };
@@ -7105,12 +7328,52 @@ fn isDocumentSearchMode(mode: QuickPanelMode) bool {
     return mode == .find_document or mode == .replace_document;
 }
 
+fn formatMemoryHexRow(buffer: []u8, bytes: []const u8, row: usize) []const u8 {
+    const start = std.math.mul(usize, row, 16) catch return "";
+    if (start >= bytes.len) return "";
+
+    const prefix = std.fmt.bufPrint(buffer, "+{d:0>4}  ", .{start}) catch return "";
+    var cursor = prefix.len;
+    const hex = "0123456789abcdef";
+    var column: usize = 0;
+    while (column < 16) : (column += 1) {
+        if (cursor + 3 > buffer.len) return buffer[0..cursor];
+        const index = start + column;
+        if (index < bytes.len) {
+            const byte = bytes[index];
+            buffer[cursor] = hex[byte >> 4];
+            buffer[cursor + 1] = hex[byte & 0x0f];
+        } else {
+            buffer[cursor] = ' ';
+            buffer[cursor + 1] = ' ';
+        }
+        buffer[cursor + 2] = ' ';
+        cursor += 3;
+    }
+
+    if (cursor + 2 > buffer.len) return buffer[0..cursor];
+    buffer[cursor] = '|';
+    cursor += 1;
+    column = 0;
+    while (column < 16 and start + column < bytes.len) : (column += 1) {
+        if (cursor + 1 > buffer.len) return buffer[0..cursor];
+        const byte = bytes[start + column];
+        buffer[cursor] = if (byte >= 0x20 and byte <= 0x7e) byte else '.';
+        cursor += 1;
+    }
+    if (cursor < buffer.len) {
+        buffer[cursor] = '|';
+        cursor += 1;
+    }
+    return buffer[0..cursor];
+}
+
 fn isReadOnlyQuickPanelMode(mode: QuickPanelMode) bool {
-    return mode == .debug_breakpoint or mode == .debug_data or mode == .debug_exceptions or mode == .lsp_hover;
+    return mode == .debug_breakpoint or mode == .debug_data or mode == .debug_low_level or mode == .debug_exceptions or mode == .lsp_hover;
 }
 
 fn quickPanelVisibleStart(panel: *const QuickPanel, max_visible: usize) usize {
-    if ((panel.mode != .debug_exceptions and panel.mode != .debug_functions and panel.mode != .debug_data) or max_visible == 0) return 0;
+    if ((panel.mode != .debug_exceptions and panel.mode != .debug_functions and panel.mode != .debug_data and panel.mode != .debug_low_level) or max_visible == 0) return 0;
     const count = panel.itemCount();
     if (count <= max_visible or panel.selected_index < max_visible) return 0;
     return @min(panel.selected_index + 1 - max_visible, count - max_visible);

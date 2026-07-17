@@ -43,6 +43,7 @@ const debug_data = @import("../security/debug_data.zig");
 const debug_exception = @import("../security/debug_exception.zig");
 const debug_expression = @import("../security/debug_expression.zig");
 const debug_function = @import("../security/debug_function.zig");
+const debug_memory = @import("../security/debug_memory.zig");
 
 pub const LspPumpResult = struct {
     frames: usize = 0,
@@ -564,6 +565,35 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
 
     if (std.mem.eql(u8, definition.id, "debug.data_clear")) {
         return try clearDebugDataBreakpoints(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.low_level")) {
+        try renderDebugStatus(app);
+        return .{ .completed = "low-level debug status rendered" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.disassemble")) {
+        return try requestDebugDisassembly(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.memory_read")) {
+        return try readDebugMemory(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.memory_refresh")) {
+        return try refreshDebugMemory(app);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.instruction_toggle")) {
+        return try toggleDebugInstructionBreakpoint(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.instruction_remove")) {
+        return try removeDebugInstructionBreakpoint(app, request.argument);
+    }
+
+    if (std.mem.eql(u8, definition.id, "debug.instruction_clear")) {
+        return try clearDebugInstructionBreakpoints(app);
     }
 
     if (std.mem.eql(u8, definition.id, "debug.exception_toggle")) {
@@ -2386,6 +2416,108 @@ fn clearDebugDataBreakpoints(app: *app_mod.App) !Result {
         "data breakpoints cleared for this session only" };
 }
 
+fn requestDebugDisassembly(app: *app_mod.App, argument: ?[]const u8) !Result {
+    if (!app.debug_manager.isRunning()) return .{ .blocked = "no debug adapter is running" };
+    const session = &app.debug_manager.session;
+    const frame_index = if (parseDebugReference(argument)) |one_based|
+        std.math.cast(usize, one_based - 1) orelse return .{ .blocked = "stack frame index is out of range" }
+    else
+        activeDebugFrameIndex(session) orelse return .{ .blocked = "no stack frame exposes an instruction reference" };
+    var outbound = session.makeDisassembleForFrame(frame_index) catch |err| return .{ .blocked = lowLevelDebugErrorMessage(err) orelse return err };
+    defer outbound.deinit();
+    try app.debug_manager.send(&outbound);
+    try appendConsole(app, .stdout, "debug disassembly requested: frame-index={d} instructions=64 window=-16\n", .{frame_index + 1});
+    return .{ .completed = "bounded disassembly requested" };
+}
+
+fn readDebugMemory(app: *app_mod.App, argument: ?[]const u8) !Result {
+    if (!app.debug_manager.isRunning()) return .{ .blocked = "no debug adapter is running" };
+    const session = &app.debug_manager.session;
+    const variable_index = if (parseDebugReference(argument)) |one_based|
+        std.math.cast(usize, one_based - 1) orelse return .{ .blocked = "variable index is out of range" }
+    else
+        session.variableMemoryReferenceIndexAt(0) orelse return .{ .blocked = "no loaded variable exposes a memory reference" };
+    var outbound = session.makeReadMemoryForVariable(variable_index) catch |err| return .{ .blocked = lowLevelDebugErrorMessage(err) orelse return err };
+    defer outbound.deinit();
+    try app.debug_manager.send(&outbound);
+    try appendConsole(app, .stdout, "debug read-only memory requested: variable-index={d} max-bytes={d}\n", .{ variable_index + 1, debug_memory.max_memory_bytes });
+    return .{ .completed = "bounded read-only memory requested" };
+}
+
+fn refreshDebugMemory(app: *app_mod.App) !Result {
+    if (!app.debug_manager.isRunning()) return .{ .blocked = "no debug adapter is running" };
+    var outbound = app.debug_manager.session.makeRefreshMemory() catch |err| return .{ .blocked = lowLevelDebugErrorMessage(err) orelse return err };
+    defer outbound.deinit();
+    try app.debug_manager.send(&outbound);
+    return .{ .completed = "bounded read-only memory refresh requested" };
+}
+
+fn toggleDebugInstructionBreakpoint(app: *app_mod.App, argument: ?[]const u8) !Result {
+    const one_based = parseDebugReference(argument) orelse return .{ .blocked = "debug.instruction_toggle requires a one-based disassembly index" };
+    const index = std.math.cast(usize, one_based - 1) orelse return .{ .blocked = "disassembly index is out of range" };
+    const toggled = app.debug_manager.session.toggleInstructionBreakpointAt(index) catch |err| return .{ .blocked = lowLevelDebugErrorMessage(err) orelse return err };
+    try sendDebugInstructionBreakpoints(app);
+    try appendConsole(app, .stdout, "session-only instruction breakpoint {s}: disassembly-index={d}\n", .{ @tagName(toggled), one_based });
+    return .{ .completed = switch (toggled) {
+        .added => "session-only instruction breakpoint added",
+        .removed => "session-only instruction breakpoint removed",
+    } };
+}
+
+fn removeDebugInstructionBreakpoint(app: *app_mod.App, argument: ?[]const u8) !Result {
+    const one_based = parseDebugReference(argument) orelse return .{ .blocked = "debug.instruction_remove requires a one-based breakpoint index" };
+    const index = std.math.cast(usize, one_based - 1) orelse return .{ .blocked = "instruction breakpoint index is out of range" };
+    if (!app.debug_manager.session.removeInstructionBreakpointAt(index)) return .{ .blocked = "instruction breakpoint index is out of range" };
+    try sendDebugInstructionBreakpoints(app);
+    return .{ .completed = "session-only instruction breakpoint removed" };
+}
+
+fn clearDebugInstructionBreakpoints(app: *app_mod.App) !Result {
+    const changed = app.debug_manager.session.clearInstructionBreakpoints();
+    try sendDebugInstructionBreakpoints(app);
+    return .{ .completed = if (changed) "session-only instruction breakpoints cleared" else "instruction breakpoints already clear" };
+}
+
+fn activeDebugFrameIndex(session: *const debug_session.Session) ?usize {
+    const active_frame_id = session.active_frame_id;
+    if (active_frame_id) |wanted| {
+        for (session.stack_frames.items, 0..) |frame, index| {
+            if (frame.id == wanted and frame.instruction_pointer_reference != null) return index;
+        }
+    }
+    return session.stackFrameInstructionReferenceIndexAt(0);
+}
+
+fn lowLevelDebugErrorMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.ReadMemoryUnsupported => "active debug adapter does not support read-only memory requests",
+        error.DisassemblyUnsupported => "active debug adapter does not support disassembly requests",
+        error.InstructionBreakpointsUnsupported => "active debug adapter does not support instruction breakpoints",
+        error.DebuggeeNotPaused => "debuggee must be paused for low-level inspection",
+        error.UnknownVariable => "selected variable is no longer available",
+        error.UnknownStackFrame => "selected stack frame is no longer available",
+        error.UnknownDisassembledInstruction => "selected disassembled instruction is no longer available",
+        error.MemoryReferenceUnavailable => "selected variable has no adapter-provided memory reference",
+        error.InstructionReferenceUnavailable => "selected stack frame has no adapter-provided instruction reference",
+        error.MemorySnapshotUnavailable => "no read-only memory snapshot is available to refresh",
+        error.StaleVariableReference, error.StaleMemoryReference, error.StaleStackFrame, error.StaleDisassembly => "low-level reference belongs to an earlier stopped state; request it again",
+        error.DebugAdapterIdentityUnavailable => "active debug adapter identity is unavailable",
+        error.TooManyInstructionBreakpoints => "instruction breakpoint limit reached (128)",
+        error.EmptyDebugMemoryText,
+        error.DebugMemoryTextTooLong,
+        error.InvalidDebugMemoryUtf8,
+        error.HiddenDebugMemoryControl,
+        error.DebugMemoryCountOutOfRange,
+        error.DebugInstructionCountOutOfRange,
+        error.DebugMemoryOffsetOutOfRange,
+        error.DebugInstructionOffsetOutOfRange,
+        error.DebugMemoryEncodingTooLarge,
+        error.InvalidDebugMemoryEncoding,
+        => debug_memory.rejectionMessage(err),
+        else => null,
+    };
+}
+
 fn toggleDebugExceptionFilter(app: *app_mod.App, argument: ?[]const u8) !Result {
     const filter_id = argument orelse return .{ .blocked = "debug.exception_toggle requires an adapter-advertised filter ID" };
     const session = &app.debug_manager.session;
@@ -2459,6 +2591,21 @@ fn sendDebugDataBreakpoints(app: *app_mod.App) !void {
         return;
     }
     var outbound = try session.makeSetDataBreakpoints();
+    defer outbound.deinit();
+    try app.debug_manager.send(&outbound);
+}
+
+fn sendDebugInstructionBreakpoints(app: *app_mod.App) !void {
+    const session = &app.debug_manager.session;
+    if (!app.debug_manager.isRunning() or !session.acceptsBreakpointConfiguration()) return;
+    if (!session.capabilities.supports_instruction_breakpoints) {
+        const withheld = session.withheldInstructionBreakpointCount();
+        if (withheld > 0) {
+            try appendConsole(app, .stderr, "debug adapter capability boundary: {d} session-only instruction breakpoint(s) withheld; references were not converted to source addresses\n", .{withheld});
+        }
+        return;
+    }
+    var outbound = try session.makeSetInstructionBreakpoints();
     defer outbound.deinit();
     try app.debug_manager.send(&outbound);
 }
@@ -2643,6 +2790,7 @@ fn advanceDebugHandshake(app: *app_mod.App, result: debug_session.IngestResult) 
                 }
                 try sendDebugFunctionBreakpoints(app);
                 try sendDebugDataBreakpoints(app);
+                try sendDebugInstructionBreakpoints(app);
                 try sendDebugExceptionBreakpoints(app);
                 if (session.capabilities.supports_configuration_done_request) {
                     var configured = try session.makeConfigurationDone();
@@ -2670,6 +2818,7 @@ fn advanceDebugHandshake(app: *app_mod.App, result: debug_session.IngestResult) 
                     }
                     try sendDebugFunctionBreakpoints(app);
                     try sendDebugDataBreakpoints(app);
+                    try sendDebugInstructionBreakpoints(app);
                     try sendDebugExceptionBreakpoints(app);
                 }
             },
@@ -2817,6 +2966,47 @@ fn renderDebugStatus(app: *app_mod.App) !void {
             candidate.access_types.read_write,
             candidate.pause_generation,
             candidate.description,
+        });
+    }
+    try writer.print("low-level: memory={s} disassembly={s} instruction-bp={s} adapter-write-memory={} zide-write-memory=false rejected-metadata={d} pause-generation={d}\n", .{
+        @tagName(session.memoryReadCapability()),
+        @tagName(session.disassemblyCapability()),
+        @tagName(session.instructionBreakpointCapability()),
+        session.capabilities.supports_write_memory_request,
+        session.rejected_low_level_metadata,
+        session.pause_generation,
+    });
+    if (session.memory_snapshot) |snapshot| {
+        try writer.print("memory-snapshot: address={s} bytes={d} unreadable={d} offset={d} generation={d} read-only=true\n", .{
+            snapshot.address,
+            snapshot.bytes.len,
+            snapshot.unreadable_bytes,
+            snapshot.offset,
+            snapshot.pause_generation,
+        });
+    }
+    try writer.print("disassembly: {d}\n", .{session.disassembled_instructions.items.len});
+    for (session.disassembled_instructions.items[0..@min(session.disassembled_instructions.items.len, 64)], 1..) |instruction, index| {
+        try writer.print("  [{d}] [{s}] {s}  {s}  {s}\n", .{
+            index,
+            if (session.instructionBreakpointSet(instruction.address)) "x" else " ",
+            instruction.address,
+            instruction.instruction,
+            instruction.symbol orelse "",
+        });
+    }
+    try writer.print("instruction-breakpoints: {d} withheld={d} persistence=session-only\n", .{
+        session.instruction_breakpoints.items.len,
+        session.withheldInstructionBreakpointCount(),
+    });
+    for (session.instruction_breakpoints.items, 1..) |breakpoint, index| {
+        try writer.print("  [{d}] {s} adapter={s} verified={any} runtime-id={any} {s}\n", .{
+            index,
+            breakpoint.instruction_reference,
+            breakpoint.adapter_key,
+            breakpoint.verified,
+            breakpoint.adapter_id,
+            breakpoint.message orelse breakpoint.label,
         });
     }
     try writer.print("exception-filters: selected={d} advertised={d} active={d} withheld={d} rejected-metadata={d} explicit-only=true\n", .{
@@ -5426,6 +5616,54 @@ test "data breakpoint commands require staged advertised access and persist only
     try std.testing.expectEqual(@as(usize, 0), app.debug_manager.session.data_breakpoints.items.len);
     const cleared = try dispatch(&app, .{ .id = "debug.data_clear" });
     try std.testing.expect(std.meta.activeTag(cleared) == .completed);
+}
+
+test "instruction breakpoint commands stay session-only and honor workspace lock" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buf);
+    const root = root_buf[0..root_len];
+    var app = try app_mod.App.init(std.testing.allocator, root);
+    defer app.deinit();
+
+    const session = &app.debug_manager.session;
+    session.state = .paused;
+    session.pause_generation = 9;
+    session.capabilities.supports_instruction_breakpoints = true;
+    session.active_adapter_key = try std.testing.allocator.dupe(u8, "lldb");
+    try session.disassembled_instructions.append(.{
+        .address = try std.testing.allocator.dupe(u8, "0x1000"),
+        .instruction_bytes = try std.testing.allocator.dupe(u8, "90"),
+        .instruction = try std.testing.allocator.dupe(u8, "nop"),
+        .symbol = try std.testing.allocator.dupe(u8, "main"),
+        .source_path = null,
+        .line = null,
+        .column = null,
+        .invalid = false,
+        .pause_generation = 9,
+    });
+
+    app.runtime.trust_state = .locked_down;
+    const locked = try dispatch(&app, .{ .id = "debug.instruction_toggle", .argument = "1" });
+    try std.testing.expect(std.meta.activeTag(locked) == .blocked);
+    try std.testing.expectEqual(@as(usize, 0), session.instruction_breakpoints.items.len);
+    app.runtime.trust_state = .untrusted;
+
+    const added = try dispatch(&app, .{ .id = "debug.instruction_toggle", .argument = "1" });
+    try std.testing.expect(std.meta.activeTag(added) == .completed);
+    try std.testing.expectEqual(@as(usize, 1), session.instruction_breakpoints.items.len);
+    try std.testing.expectEqualStrings("0x1000", session.instruction_breakpoints.items[0].instruction_reference);
+
+    var restored = try app_mod.App.init(std.testing.allocator, root);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(usize, 0), restored.debug_manager.session.instruction_breakpoints.items.len);
+
+    const removed = try dispatch(&app, .{ .id = "debug.instruction_toggle", .argument = "1" });
+    try std.testing.expect(std.meta.activeTag(removed) == .completed);
+    try std.testing.expectEqual(@as(usize, 0), session.instruction_breakpoints.items.len);
+    const invalid = try dispatch(&app, .{ .id = "debug.instruction_toggle", .argument = "2" });
+    try std.testing.expect(std.meta.activeTag(invalid) == .blocked);
 }
 
 test "open selected workspace file activates editor focus" {

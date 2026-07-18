@@ -216,6 +216,27 @@ pub fn openFileCapabilityCreateParents(root_path: []const u8, relative_path: []c
     return openFileCapabilityMode(root_path, relative_path, .create_parents);
 }
 
+/// Opens a workspace-relative directory for iteration while refusing every
+/// symlink in the path. The returned handle remains anchored to the workspace.
+pub fn openDirectoryCapability(root_path: []const u8, relative_path: []const u8) !std.Io.Dir {
+    try validateRelativeFilePath(relative_path);
+    if (!std.fs.path.isAbsolute(root_path)) return error.WorkspaceRootNotAbsolute;
+
+    var current = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .follow_symlinks = false });
+    errdefer current.close(io);
+
+    var components = std.mem.splitAny(u8, relative_path, "/\\");
+    while (components.next()) |component| {
+        const next = try std.Io.Dir.openDir(current, io, component, .{
+            .follow_symlinks = false,
+            .iterate = true,
+        });
+        current.close(io);
+        current = next;
+    }
+    return current;
+}
+
 pub fn createDirectoryPath(root_path: []const u8, relative_path: []const u8) !void {
     var capability = try openFileCapabilityMode(root_path, relative_path, .create_parents);
     defer capability.close();

@@ -138,6 +138,7 @@ pub const config = struct {
 pub const persistence = struct {
     pub const journal = @import("persistence/journal.zig");
     pub const paths = @import("persistence/paths.zig");
+    pub const recovery = @import("persistence/recovery.zig");
 };
 
 pub const debug_layer = struct {

@@ -47,6 +47,10 @@ pub const DocumentStore = struct {
         return existing;
     }
 
+    pub fn indexOfPath(self: *const DocumentStore, path: []const u8) ?usize {
+        return self.findByPath(path);
+    }
+
     pub fn createScratch(self: *DocumentStore, name: []const u8, bytes: []const u8) !usize {
         try self.documents.append(try document.Document.fromBytes(self.allocator, name, bytes));
         const index = self.documents.items.len - 1;
@@ -119,7 +123,7 @@ pub const DocumentStore = struct {
         const doc = self.active() orelse return error.NoActiveDocument;
         const path = doc.path orelse return error.DocumentHasNoPath;
         try save.saveBytes(self.allocator, path, doc.text.bytes, strategy);
-        doc.dirty = false;
+        doc.markSaved();
     }
 
     pub fn dirtyCount(self: *const DocumentStore) usize {

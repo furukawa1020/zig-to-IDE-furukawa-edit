@@ -5,6 +5,7 @@
 .zig-toolchain/
 .tools/
 .zide/audit/
+.zide/recovery/
 .zide/workbench.conf
 .zide/debug-state.json
 zig-cache/

@@ -52,6 +52,7 @@ const QuickPanelMode = enum {
     lsp_hover,
     code_actions,
     language_mode,
+    recovery,
     debug_watch,
     debug_breakpoint,
     debug_breakpoint_condition,
@@ -250,6 +251,8 @@ const QuickPanel = struct {
     lsp_location_count: usize = 0,
     lsp_hover_line_count: usize = 0,
     code_action_count: usize = 0,
+    recovery_count: usize = 0,
+    recovery_invalid_count: usize = 0,
     debug_watch_count: usize = 0,
     debug_function_count: usize = 0,
     debug_data_commit_count: usize = 0,
@@ -346,6 +349,7 @@ const QuickPanel = struct {
             .lsp_hover => self.lsp_hover_line_count,
             .code_actions => self.code_action_count,
             .language_mode => if (self.language_matches) |items| items.len else 0,
+            .recovery => self.recovery_count * 2 + @intFromBool(self.recovery_count > 0),
             .debug_watch => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else self.debug_watch_count,
             .debug_breakpoint => 8,
             .debug_breakpoint_condition, .debug_breakpoint_hit, .debug_breakpoint_log => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else 0,
@@ -612,6 +616,10 @@ const QuickPanel = struct {
                 }
                 self.language_matches = try matches.toOwnedSlice();
             },
+            .recovery => {
+                self.recovery_count = app.recovery_manager.entries.items.len;
+                self.recovery_invalid_count = app.recovery_manager.invalid_entries;
+            },
         }
         if (self.selected_index >= self.itemCount()) self.selected_index = 0;
     }
@@ -662,6 +670,8 @@ const QuickPanel = struct {
         self.lsp_location_count = 0;
         self.lsp_hover_line_count = 0;
         self.code_action_count = 0;
+        self.recovery_count = 0;
+        self.recovery_invalid_count = 0;
         self.debug_watch_count = 0;
         self.debug_function_count = 0;
         self.debug_data_commit_count = 0;
@@ -760,6 +770,7 @@ pub fn run(allocator: std.mem.Allocator, root_path: []const u8) !void {
     global_state = &state;
     defer global_state = null;
     state.runZigSecurityAudit("startup");
+    state.offerRecovery();
 
     const hmodule = GetModuleHandleW(null) orelse return error.GetModuleHandleFailed;
     const hinstance: windows.HINSTANCE = @ptrCast(hmodule);
@@ -848,6 +859,8 @@ const GuiState = struct {
     deferred_lsp_rename_name: std.array_list.Managed(u8),
     file_watcher: workspace_watcher.Poller,
     file_watch_ticks: u8 = 0,
+    recovery_ticks: u8 = 0,
+    recovery_error_reported: bool = false,
 
     fn init(allocator: std.mem.Allocator, root_path: []const u8) !GuiState {
         var app = try app_mod.App.init(allocator, root_path);
@@ -883,6 +896,7 @@ const GuiState = struct {
         };
         @memset(next_collapsed, false);
 
+        _ = self.checkpointRecovery();
         self.app.deinit();
         self.allocator.free(self.collapsed_dirs);
         self.app = next_app;
@@ -907,9 +921,12 @@ const GuiState = struct {
         self.deferred_lsp_rename_name.clearRetainingCapacity();
         self.file_watcher.clear();
         self.file_watch_ticks = 0;
+        self.recovery_ticks = 0;
+        self.recovery_error_reported = false;
         self.setMessage("Workspace opened") catch {};
         self.appendOutput(.stdout, "opened workspace: {s}\n", .{self.app.workspace.root_path});
         self.runZigSecurityAudit("workspace open");
+        self.offerRecovery();
     }
 
     fn syncCollapsedDirs(self: *GuiState) void {
@@ -987,6 +1004,7 @@ const GuiState = struct {
     }
 
     fn deinit(self: *GuiState) void {
+        _ = self.checkpointRecovery();
         if (self.text_font) |font| _ = DeleteObject(@ptrCast(font));
         if (self.last_error) |message| self.allocator.free(message);
         self.clearGitOverview();
@@ -999,6 +1017,36 @@ const GuiState = struct {
         self.last_document_search_query.deinit();
         self.allocator.free(self.collapsed_dirs);
         self.app.deinit();
+    }
+
+    fn offerRecovery(self: *GuiState) void {
+        const manager = &self.app.recovery_manager;
+        if (manager.entries.items.len == 0 and manager.invalid_entries == 0 and !manager.scan_truncated) return;
+        self.openQuickPanel(.recovery);
+        self.appendOutput(.stdout, "recovery center: {d} verified snapshot(s), {d} invalid, scan-truncated:{}\n", .{
+            manager.entries.items.len,
+            manager.invalid_entries,
+            manager.scan_truncated,
+        });
+    }
+
+    fn checkpointRecovery(self: *GuiState) bool {
+        const report = self.app.checkpointRecovery() catch |err| {
+            if (!self.recovery_error_reported) {
+                self.recovery_error_reported = true;
+                self.appendOutput(.stderr, "recovery checkpoint failed: {s}\n", .{@errorName(err)});
+            }
+            return false;
+        };
+        self.recovery_error_reported = false;
+        const changed = report.written > 0 or report.removed > 0;
+        if (changed and self.quick_panel.visible and self.quick_panel.mode == .recovery) {
+            self.quick_panel.rebuild(&self.app) catch |err| {
+                self.setError(err) catch {};
+                return true;
+            };
+        }
+        return changed;
     }
 
     fn moveSelection(self: *GuiState, delta: isize) void {

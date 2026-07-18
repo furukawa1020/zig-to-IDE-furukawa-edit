@@ -234,6 +234,51 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "saved all" };
     }
 
+    if (std.mem.eql(u8, definition.id, "recovery.open")) {
+        try renderRecoveryStatus(app);
+        return .{ .completed = "recovery center ready" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "recovery.restore")) {
+        const argument = request.argument orelse return .{ .unsupported = "recovery.restore requires a one-based snapshot index" };
+        const one_based = parseOneBasedIndex(argument) orelse return .{ .blocked = "recovery snapshot index must be a positive integer" };
+        const restored = app.recovery_manager.restore(one_based - 1, &app.documents) catch |err| switch (err) {
+            error.RecoveryIndexOutOfBounds => return .{ .blocked = "recovery snapshot index is out of bounds" },
+            error.RecoverySourceChanged => return .{ .blocked = "source file changed after the snapshot; recovery was preserved and not applied" },
+            error.DirtyDocumentRecoveryConflict => return .{ .blocked = "current editor has different unsaved edits; recovery was preserved and not applied" },
+            error.EditorRecoveryBaselineChanged => return .{ .blocked = "current editor no longer matches the verified disk baseline" },
+            error.InvalidRecoverySnapshot, error.InvalidRecoveryPath => return .{ .blocked = "recovery snapshot failed integrity or path validation" },
+            else => return err,
+        };
+        app.focus = .editor;
+        app.mode = .insert;
+        const doc = &app.documents.documents.items[restored.document_index];
+        _ = syncDocumentToRunningLsp(app, doc) catch false;
+        try appendConsole(app, .stdout, "recovered editor buffer: {s} ({d} bytes); save explicitly to write source\n", .{ restored.relative_path, restored.bytes_restored });
+        return .{ .completed = "recovered unsaved editor buffer" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "recovery.discard")) {
+        const argument = request.argument orelse return .{ .unsupported = "recovery.discard requires a one-based snapshot index" };
+        const one_based = parseOneBasedIndex(argument) orelse return .{ .blocked = "recovery snapshot index must be a positive integer" };
+        if (one_based > app.recovery_manager.entries.items.len) return .{ .blocked = "recovery snapshot index is out of bounds" };
+        const path = try app.allocator.dupe(u8, app.recovery_manager.entries.items[one_based - 1].relative_path);
+        defer app.allocator.free(path);
+        try app.recovery_manager.discardIndex(one_based - 1);
+        try appendConsole(app, .stdout, "discarded recovery snapshot: {s}\n", .{path});
+        return .{ .completed = "discarded recovery snapshot" };
+    }
+
+    if (std.mem.eql(u8, definition.id, "recovery.discard_all")) {
+        const confirmation = request.argument orelse return .{ .blocked = "type DISCARD ALL exactly to remove every recovery snapshot" };
+        if (!std.mem.eql(u8, std.mem.trim(u8, confirmation, " \t\r\n"), "DISCARD ALL")) {
+            return .{ .blocked = "type DISCARD ALL exactly to remove every recovery snapshot" };
+        }
+        const discarded = try app.recovery_manager.discardAll();
+        try appendConsole(app, .stdout, "discarded all recovery snapshots: {d}\n", .{discarded});
+        return .{ .completed = "discarded all recovery snapshots" };
+    }
+
     if (std.mem.eql(u8, definition.id, "file.new")) {
         const argument = request.argument orelse return .{ .unsupported = "file.new requires a workspace-relative path" };
         const relative = std.mem.trim(u8, argument, " \t\r\n");
@@ -986,7 +1031,28 @@ fn saveDocumentInWorkspace(
     var capability = try workspace_io.openFileCapability(app.workspace.root_path, relative_path);
     defer capability.close();
     try editor_save.saveBytesInDir(app.allocator, capability.parent, capability.name, doc.text.bytes, strategy);
-    doc.dirty = false;
+    doc.markSaved();
+    _ = app.recovery_manager.discardAbsolutePath(absolute_path) catch |err| cleanup_failed: {
+        appendConsole(app, .stderr, "saved source but recovery cleanup failed: {s}\n", .{@errorName(err)}) catch {};
+        break :cleanup_failed false;
+    };
+}
+
+fn renderRecoveryStatus(app: *app_mod.App) !void {
+    try appendConsole(app, .stdout, "recovery: {d} valid snapshot(s), {d} invalid, scan-truncated:{}\n", .{
+        app.recovery_manager.entries.items.len,
+        app.recovery_manager.invalid_entries,
+        app.recovery_manager.scan_truncated,
+    });
+    for (app.recovery_manager.entries.items, 0..) |entry, index| {
+        try appendConsole(app, .stdout, "  {d}. {s}  bytes:{d}  baseline:{s}  session:{s}\n", .{
+            index + 1,
+            entry.relative_path,
+            entry.content_len,
+            std.fmt.bytesToHex(entry.baseline_digest, .lower)[0..12],
+            if (entry.owned_by_session) "current" else "previous",
+        });
+    }
 }
 
 const MutationPathKind = enum { file, directory, either };
@@ -3400,7 +3466,8 @@ fn reloadWorkspaceReplacementDocuments(app: *app_mod.App, replacement_preview: *
                 const offset = try doc.text.lineColumnToOffset(line, column);
                 doc.cursor.position = try doc.positionFromOffset(offset);
             }
-            doc.dirty = false;
+            doc.markSaved();
+            _ = app.recovery_manager.discardAbsolutePath(document_path) catch false;
             _ = syncDocumentToRunningLsp(app, doc) catch false;
             _ = notifyDocumentSavedToRunningLsp(app, doc) catch false;
             updated += 1;

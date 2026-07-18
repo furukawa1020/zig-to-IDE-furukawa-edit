@@ -44,9 +44,7 @@ pub fn openFileNoFollow(
         .follow_symlinks = false,
         .resolve_beneath = true,
     });
-    errdefer file.close(io);
     if (builtin.os.tag == .windows) file.flags.nonblocking = true;
-    if ((try file.stat(io)).kind != .file) return error.NotRegularFile;
     return file;
 }
 
@@ -473,7 +471,10 @@ test "workspace file capability refuses an intermediate directory symlink" {
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "outside");
     try tmp.dir.writeFile(io, .{ .sub_path = "outside/secret.txt", .data = "secret" });
-    tmp.dir.symLink(io, "outside", "linked", .{ .is_directory = true }) catch return;
+    tmp.dir.symLink(io, "outside", "linked", .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
 
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(io, &root_buffer);

@@ -279,6 +279,19 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .completed = "discarded all recovery snapshots" };
     }
 
+    if (std.mem.eql(u8, definition.id, "recovery.purge_rejected")) {
+        const confirmation = request.argument orelse return .{ .blocked = "type PURGE REJECTED exactly to remove rejected recovery data" };
+        if (!std.mem.eql(u8, std.mem.trim(u8, confirmation, " \t\r\n"), "PURGE REJECTED")) {
+            return .{ .blocked = "type PURGE REJECTED exactly to remove rejected recovery data" };
+        }
+        const purged = app.recovery_manager.purgeRejected() catch |err| switch (err) {
+            error.RecoveryScanTruncated => return .{ .blocked = "recovery scan was truncated; rejected data was preserved" },
+            else => return err,
+        };
+        try appendConsole(app, .stdout, "purged rejected recovery envelopes: {d}\n", .{purged});
+        return .{ .completed = "purged rejected recovery data" };
+    }
+
     if (std.mem.eql(u8, definition.id, "file.new")) {
         const argument = request.argument orelse return .{ .unsupported = "file.new requires a workspace-relative path" };
         const relative = std.mem.trim(u8, argument, " \t\r\n");
@@ -1027,12 +1040,13 @@ fn saveDocumentInWorkspace(
     strategy: editor_save.SaveStrategy,
 ) !void {
     const absolute_path = doc.path orelse return error.DocumentHasNoPath;
+    const source_was_dirty = doc.dirty;
     const relative_path = try workspace_io.relativeFilePath(app.workspace.root_path, absolute_path);
     var capability = try workspace_io.openFileCapability(app.workspace.root_path, relative_path);
     defer capability.close();
     try editor_save.saveBytesInDir(app.allocator, capability.parent, capability.name, doc.text.bytes, strategy);
     doc.markSaved();
-    _ = app.recovery_manager.discardAbsolutePath(absolute_path) catch |err| cleanup_failed: {
+    _ = app.recovery_manager.discardAfterSave(absolute_path, source_was_dirty) catch |err| cleanup_failed: {
         appendConsole(app, .stderr, "saved source but recovery cleanup failed: {s}\n", .{@errorName(err)}) catch {};
         break :cleanup_failed false;
     };

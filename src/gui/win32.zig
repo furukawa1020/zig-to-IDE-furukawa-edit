@@ -349,7 +349,7 @@ const QuickPanel = struct {
             .lsp_hover => self.lsp_hover_line_count,
             .code_actions => self.code_action_count,
             .language_mode => if (self.language_matches) |items| items.len else 0,
-            .recovery => self.recovery_count * 2 + @intFromBool(self.recovery_count > 0),
+            .recovery => self.recovery_count * 2 + @intFromBool(self.recovery_count > 0) + @intFromBool(self.recovery_invalid_count > 0),
             .debug_watch => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else self.debug_watch_count,
             .debug_breakpoint => 8,
             .debug_breakpoint_condition, .debug_breakpoint_hit, .debug_breakpoint_log => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else 0,
@@ -1023,7 +1023,7 @@ const GuiState = struct {
         const manager = &self.app.recovery_manager;
         if (manager.entries.items.len == 0 and manager.invalid_entries == 0 and !manager.scan_truncated) return;
         self.openQuickPanel(.recovery);
-        self.appendOutput(.stdout, "recovery center: {d} verified snapshot(s), {d} invalid, scan-truncated:{}\n", .{
+        self.appendOutput(.stdout, "recovery center: {d} integrity-valid snapshot(s), {d} rejected, scan-truncated:{}\n", .{
             manager.entries.items.len,
             manager.invalid_entries,
             manager.scan_truncated,
@@ -1160,6 +1160,10 @@ const GuiState = struct {
     }
 
     fn executeCommand(self: *GuiState, id: []const u8) void {
+        if (std.mem.startsWith(u8, id, "recovery.")) {
+            self.openQuickPanel(.recovery);
+            return;
+        }
         if (std.mem.eql(u8, id, "debug.watch_add") or std.mem.eql(u8, id, "debug.watch_remove")) {
             self.openQuickPanel(.debug_watch);
             return;
@@ -2070,6 +2074,7 @@ const GuiState = struct {
             .lsp_hover => "LSP hover",
             .code_actions => "Quick Fix",
             .language_mode => "Language mode",
+            .recovery => "Recovery center",
             .debug_watch => "Add restricted debug watch",
             .debug_breakpoint => "Advanced breakpoint",
             .debug_breakpoint_condition => "Restricted breakpoint condition",
@@ -2502,6 +2507,7 @@ const GuiState = struct {
                 self.quick_panel.close();
                 self.setActiveDocumentLanguage(mode);
             },
+            .recovery => self.executeRecoveryItem(),
             .debug_watch => {
                 const expression = std.mem.trim(u8, self.quick_panel.query.items, " \t\r\n");
                 if (expression.len == 0) {
@@ -2549,6 +2555,52 @@ const GuiState = struct {
             .debug_low_level => self.executeLowLevelItem(),
             .debug_exceptions => self.executeExceptionFilterItem(),
         }
+    }
+
+    fn executeRecoveryItem(self: *GuiState) void {
+        const count = self.app.recovery_manager.entries.items.len;
+        const invalid_count = self.app.recovery_manager.invalid_entries;
+        const item_count = count * 2 + @intFromBool(count > 0) + @intFromBool(invalid_count > 0);
+        if (item_count == 0) {
+            self.setMessage(if (self.app.recovery_manager.invalid_entries > 0) "Invalid recovery envelopes were rejected" else "No recovery snapshots") catch {};
+            return;
+        }
+        const selected = @min(self.quick_panel.selected_index, item_count - 1);
+        var index_buffer: [32]u8 = undefined;
+        var id: []const u8 = "recovery.discard_all";
+        var argument: []const u8 = "DISCARD ALL";
+        if (selected < count * 2) {
+            const snapshot_index = selected / 2;
+            argument = std.fmt.bufPrint(&index_buffer, "{d}", .{snapshot_index + 1}) catch return;
+            id = if (selected % 2 == 0) "recovery.restore" else "recovery.discard";
+        } else if (count == 0 or selected > count * 2) {
+            id = "recovery.purge_rejected";
+            argument = "PURGE REJECTED";
+        }
+
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = id,
+            .argument = argument,
+            .source = .command_palette,
+        }) catch |err| {
+            self.setError(err) catch {};
+            self.appendOutput(.stderr, "recovery action failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult(id, result);
+        if (std.meta.activeTag(result) != .completed) return;
+
+        if (std.mem.eql(u8, id, "recovery.restore")) {
+            self.quick_panel.close();
+            self.clearSelection();
+            self.app.focus = .editor;
+            self.app.mode = .insert;
+            self.ensureCursorVisible();
+            self.refreshActiveSecurityFindings("Recovered unsaved buffer");
+            return;
+        }
+        self.quick_panel.rebuild(&self.app) catch |err| self.setError(err) catch {};
+        if (self.app.recovery_manager.entries.items.len == 0 and self.app.recovery_manager.invalid_entries == 0) self.quick_panel.close();
     }
 
     fn dispatchQuickPanelFileMutation(self: *GuiState, id: []const u8, error_label: []const u8) void {
@@ -4668,6 +4720,11 @@ fn windowProc(hwnd: windows.HWND, msg: windows.UINT, wparam: WPARAM, lparam: win
                         state.file_watch_ticks = 0;
                         redraw = state.pollExternalFileChanges() or redraw;
                     }
+                    state.recovery_ticks +%= 1;
+                    if (state.recovery_ticks >= 17) {
+                        state.recovery_ticks = 0;
+                        redraw = state.checkpointRecovery() or redraw;
+                    }
                     if (redraw) _ = InvalidateRect(hwnd, null, .FALSE);
                 }
                 return 0;
@@ -6777,6 +6834,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .lsp_hover => "HOVER  Enter closes",
         .code_actions => "QUICK FIX  Enter applies",
         .language_mode => "LANGUAGE MODE",
+        .recovery => "RECOVERY CENTER  hash-bound / source writes locked",
         .debug_watch => "RESTRICTED WATCH  type to add; Enter removes selected; calls and assignments blocked",
         .debug_breakpoint => "ADVANCED BREAKPOINTS  source + function + data + exception",
         .debug_breakpoint_condition => "CONDITION  bounded predicate / no calls or assignments",
@@ -6816,7 +6874,15 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         drawTextRight(hdc, panel.left + 260, panel.top + 14, panel.right - 16, rgb(180, 190, 200), options);
     }
     const query_right = if (state.quick_panel.mode == .replace_workspace) panel.left + 288 else panel.right - 16;
-    if (state.quick_panel.mode == .debug_exceptions) {
+    if (state.quick_panel.mode == .recovery) {
+        var summary_buf: [240]u8 = undefined;
+        const summary = std.fmt.bufPrint(&summary_buf, "integrity-valid:{d}  rejected:{d}  scan-truncated:{}  restore target:unsaved editor", .{
+            state.quick_panel.recovery_count,
+            state.quick_panel.recovery_invalid_count,
+            state.app.recovery_manager.scan_truncated,
+        }) catch "recovery integrity boundary";
+        drawTextClipped(hdc, panel.left + 16, panel.top + 44, query_right, rgb(180, 190, 200), summary);
+    } else if (state.quick_panel.mode == .debug_exceptions) {
         const session = &state.app.debug_manager.session;
         var summary_buf: [240]u8 = undefined;
         const summary = std.fmt.bufPrint(&summary_buf, "selected:{d}  advertised:{d}  active:{d}  withheld:{d}  metadata-rejected:{d}", .{
@@ -7032,6 +7098,34 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 drawTextClipped(hdc, panel.left + 18, y, panel.left + 180, color, modes.label(mode));
                 drawTextClipped(hdc, panel.left + 190, y, panel.left + 310, color, @tagName(modes.family(mode)));
                 drawTextClipped(hdc, panel.left + 320, y, panel.right - 16, color, modes.securityFocus(mode));
+            },
+            .recovery => recovery: {
+                const snapshot_count = state.app.recovery_manager.entries.items.len;
+                const discard_all_index = snapshot_count * 2;
+                if (snapshot_count > 0 and item_index == discard_all_index) {
+                    drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, if (selected) color else rgb(255, 148, 82), "DISCARD ALL INTEGRITY-VALID SNAPSHOTS");
+                    break :recovery;
+                }
+                const purge_index = discard_all_index + @intFromBool(snapshot_count > 0);
+                if (state.app.recovery_manager.invalid_entries > 0 and item_index == purge_index) {
+                    drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, if (selected) color else rgb(255, 118, 118), "PURGE REJECTED RECOVERY ENVELOPES");
+                    break :recovery;
+                }
+                const snapshot_index = item_index / 2;
+                if (snapshot_index >= snapshot_count) break :recovery;
+                const entry = state.app.recovery_manager.entries.items[snapshot_index];
+                const baseline_hex = std.fmt.bytesToHex(entry.baseline_digest, .lower);
+                var label_buf: [900]u8 = undefined;
+                const label = std.fmt.bufPrint(&label_buf, "{s} {d}  {s}  bytes:{d}  baseline:{s}  {s}", .{
+                    if (item_index % 2 == 0) "RESTORE" else "DISCARD",
+                    snapshot_index + 1,
+                    entry.relative_path,
+                    entry.content_len,
+                    baseline_hex[0..12],
+                    if (entry.owned_by_session) "current-session" else "previous-session",
+                }) catch entry.relative_path;
+                const row_color = if (!selected and item_index % 2 == 1) rgb(255, 184, 116) else color;
+                drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, row_color, label);
             },
             .debug_watch => {
                 if (std.mem.trim(u8, state.quick_panel.query.items, " \t\r\n").len > 0) {
@@ -7265,6 +7359,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
             .debug_data => "Pause the debuggee and load variables, or start an adapter with data-breakpoint support",
             .debug_low_level => "Pause the debuggee and load stack/variables from a low-level capable adapter",
             .debug_exceptions => "Start a debug adapter to discover bounded exception filters",
+            .recovery => if (state.quick_panel.recovery_invalid_count > 0) "No valid snapshots; malformed or tampered envelopes were rejected" else "No recovery snapshots",
             else => "No matches",
         };
         drawText(hdc, panel.left + 18, y, rgb(126, 138, 150), empty_text);
@@ -7417,7 +7512,7 @@ fn formatMemoryHexRow(buffer: []u8, bytes: []const u8, row: usize) []const u8 {
 }
 
 fn isReadOnlyQuickPanelMode(mode: QuickPanelMode) bool {
-    return mode == .debug_breakpoint or mode == .debug_data or mode == .debug_low_level or mode == .debug_exceptions or mode == .lsp_hover;
+    return mode == .recovery or mode == .debug_breakpoint or mode == .debug_data or mode == .debug_low_level or mode == .debug_exceptions or mode == .lsp_hover;
 }
 
 fn quickPanelVisibleStart(panel: *const QuickPanel, max_visible: usize) usize {

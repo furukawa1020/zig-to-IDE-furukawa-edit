@@ -44,8 +44,35 @@ pub fn openFileNoFollow(
         .follow_symlinks = false,
         .resolve_beneath = true,
     });
+    errdefer file.close(io);
     if (builtin.os.tag == .windows) file.flags.nonblocking = true;
+    if ((try file.stat(io)).kind != .file) return error.NotRegularFile;
     return file;
+}
+
+fn openDirectoryAbsoluteNoFollow(path: []const u8, iterate: bool) !std.Io.Dir {
+    const dir = try std.Io.Dir.openDirAbsolute(io, path, .{
+        .follow_symlinks = false,
+        .iterate = iterate,
+    });
+    return verifyOpenedDirectory(dir);
+}
+
+fn openDirectoryNoFollow(parent: std.Io.Dir, name: []const u8, iterate: bool) !std.Io.Dir {
+    const dir = try std.Io.Dir.openDir(parent, io, name, .{
+        .follow_symlinks = false,
+        .iterate = iterate,
+    });
+    return verifyOpenedDirectory(dir);
+}
+
+/// Windows opens a directory reparse point itself when no-follow is requested.
+/// Verify the returned handle so links and every other reparse-point kind are
+/// rejected without a path-based time-of-check/time-of-use gap.
+fn verifyOpenedDirectory(opened: std.Io.Dir) !std.Io.Dir {
+    errdefer opened.close(io);
+    if ((try opened.stat(io)).kind != .directory) return error.WorkspacePathIsLink;
+    return opened;
 }
 
 /// Reads a stable-size snapshot from an already-open no-follow file handle.
@@ -222,15 +249,12 @@ pub fn openDirectoryCapability(root_path: []const u8, relative_path: []const u8)
     try validateRelativeFilePath(relative_path);
     if (!std.fs.path.isAbsolute(root_path)) return error.WorkspaceRootNotAbsolute;
 
-    var current = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .follow_symlinks = false });
+    var current = try openDirectoryAbsoluteNoFollow(root_path, false);
     errdefer current.close(io);
 
     var components = std.mem.splitAny(u8, relative_path, "/\\");
     while (components.next()) |component| {
-        const next = try std.Io.Dir.openDir(current, io, component, .{
-            .follow_symlinks = false,
-            .iterate = true,
-        });
+        const next = try openDirectoryNoFollow(current, component, true);
         current.close(io);
         current = next;
     }
@@ -294,7 +318,7 @@ fn openFileCapabilityMode(
     try validateRelativeFilePath(relative_path);
     if (!std.fs.path.isAbsolute(root_path)) return error.WorkspaceRootNotAbsolute;
 
-    var current = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .follow_symlinks = false });
+    var current = try openDirectoryAbsoluteNoFollow(root_path, false);
     errdefer current.close(io);
 
     const separator_index = std.mem.lastIndexOfAny(u8, relative_path, "/\\");
@@ -304,13 +328,13 @@ fn openFileCapabilityMode(
     var components = std.mem.splitAny(u8, parent_path, "/\\");
     while (components.next()) |component| {
         if (component.len == 0) continue;
-        const next = std.Io.Dir.openDir(current, io, component, .{ .follow_symlinks = false }) catch |err| opened: {
+        const next = openDirectoryNoFollow(current, component, false) catch |err| opened: {
             if (mode != .create_parents or err != error.FileNotFound) return err;
             std.Io.Dir.createDir(current, io, component, .default_dir) catch |create_err| switch (create_err) {
                 error.PathAlreadyExists => {},
                 else => return create_err,
             };
-            break :opened try std.Io.Dir.openDir(current, io, component, .{ .follow_symlinks = false });
+            break :opened try openDirectoryNoFollow(current, component, false);
         };
         current.close(io);
         current = next;
@@ -456,6 +480,11 @@ test "workspace file capability refuses an intermediate directory symlink" {
     if (openFileCapability(root_buffer[0..root_len], "linked/secret.txt")) |capability_value| {
         var capability = capability_value;
         capability.close();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+
+    if (openDirectoryCapability(root_buffer[0..root_len], "linked")) |directory_value| {
+        directory_value.close(io);
         return error.TestUnexpectedResult;
     } else |_| {}
 }

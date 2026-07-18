@@ -668,6 +668,7 @@ const QuickPanelMode = enum {
     lsp_hover,
     code_actions,
     language_mode,
+    recovery,
     debug_watch,
     debug_breakpoint,
     debug_breakpoint_condition,
@@ -789,6 +790,8 @@ const QuickPanel = struct {
     lsp_location_count: usize = 0,
     lsp_hover_line_count: usize = 0,
     code_action_count: usize = 0,
+    recovery_count: usize = 0,
+    recovery_invalid_count: usize = 0,
     debug_watch_count: usize = 0,
     debug_function_count: usize = 0,
     debug_data_commit_count: usize = 0,
@@ -887,6 +890,7 @@ const QuickPanel = struct {
             .lsp_hover => self.lsp_hover_line_count,
             .code_actions => self.code_action_count,
             .language_mode => if (self.language_matches) |items| items.len else 0,
+            .recovery => self.recovery_count * 2 + @intFromBool(self.recovery_count > 0) + @intFromBool(self.recovery_invalid_count > 0),
             .debug_watch => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else self.debug_watch_count,
             .debug_breakpoint => 8,
             .debug_breakpoint_condition, .debug_breakpoint_hit, .debug_breakpoint_log => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else 0,
@@ -1153,6 +1157,10 @@ const QuickPanel = struct {
                 }
                 self.language_matches = try matches.toOwnedSlice();
             },
+            .recovery => {
+                self.recovery_count = app.recovery_manager.entries.items.len;
+                self.recovery_invalid_count = app.recovery_manager.invalid_entries;
+            },
         }
         if (self.selected_index >= self.itemCount()) self.selected_index = 0;
     }
@@ -1203,6 +1211,8 @@ const QuickPanel = struct {
         self.lsp_location_count = 0;
         self.lsp_hover_line_count = 0;
         self.code_action_count = 0;
+        self.recovery_count = 0;
+        self.recovery_invalid_count = 0;
         self.debug_watch_count = 0;
         self.debug_function_count = 0;
         self.debug_data_commit_count = 0;
@@ -1302,6 +1312,8 @@ const LinuxGuiState = struct {
     deferred_lsp_rename_name: std.array_list.Managed(u8),
     file_watcher: workspace_watcher.Poller,
     last_file_watch_ms: i64 = 0,
+    last_recovery_ms: i64 = 0,
+    recovery_error_reported: bool = false,
     clipboard: std.array_list.Managed(u8),
     primary_selection: std.array_list.Managed(u8),
     clipboard_owned: bool = false,
@@ -1358,6 +1370,7 @@ const LinuxGuiState = struct {
     }
 
     fn deinit(self: *LinuxGuiState) void {
+        _ = self.checkpointRecovery(true);
         self.closePtySession();
         self.clearExtensionsRegistry();
         self.clearGitOverview();
@@ -1372,6 +1385,39 @@ const LinuxGuiState = struct {
         self.allocator.free(self.collapsed_dirs);
         self.app.deinit();
         self.* = undefined;
+    }
+
+    fn offerRecovery(self: *LinuxGuiState) void {
+        const manager = &self.app.recovery_manager;
+        if (manager.entries.items.len == 0 and manager.invalid_entries == 0 and !manager.scan_truncated) return;
+        self.openQuickPanel(.recovery);
+        self.appendOutput(.stdout, "recovery center: {d} integrity-valid snapshot(s), {d} rejected, scan-truncated:{}\n", .{
+            manager.entries.items.len,
+            manager.invalid_entries,
+            manager.scan_truncated,
+        });
+    }
+
+    fn checkpointRecovery(self: *LinuxGuiState, force: bool) bool {
+        const now = monotonicMillis();
+        if (!force and now - self.last_recovery_ms < 2000) return false;
+        self.last_recovery_ms = now;
+        const report = self.app.checkpointRecovery() catch |err| {
+            if (!self.recovery_error_reported) {
+                self.recovery_error_reported = true;
+                self.appendOutput(.stderr, "recovery checkpoint failed: {s}\n", .{@errorName(err)});
+            }
+            return false;
+        };
+        self.recovery_error_reported = false;
+        const changed = report.written > 0 or report.removed > 0;
+        if (changed and self.quick_panel.visible and self.quick_panel.mode == .recovery) {
+            self.quick_panel.rebuild(&self.app) catch |err| {
+                self.message("recovery panel refresh failed: {s}", .{@errorName(err)});
+                return true;
+            };
+        }
+        return changed;
     }
 
     fn message(self: *LinuxGuiState, comptime fmt: []const u8, args: anytype) void {
@@ -3454,6 +3500,10 @@ const LinuxGuiState = struct {
     }
 
     fn execute(self: *LinuxGuiState, id: []const u8, source: command_mod.Source) void {
+        if (std.mem.startsWith(u8, id, "recovery.")) {
+            self.openQuickPanel(.recovery);
+            return;
+        }
         if (std.mem.eql(u8, id, "debug.watch_add") or std.mem.eql(u8, id, "debug.watch_remove")) {
             self.openQuickPanel(.debug_watch);
             return;
@@ -4761,6 +4811,7 @@ const LinuxGuiState = struct {
                 self.quick_panel.close();
                 self.setActiveDocumentLanguage(mode);
             },
+            .recovery => self.executeRecoveryItem(),
             .debug_watch => {
                 const expression = std.mem.trim(u8, self.quick_panel.query.items, " \t\r\n");
                 if (expression.len == 0) {
@@ -4802,6 +4853,54 @@ const LinuxGuiState = struct {
             .debug_low_level => self.executeLowLevelItem(),
             .debug_exceptions => self.executeExceptionFilterItem(),
         }
+    }
+
+    fn executeRecoveryItem(self: *LinuxGuiState) void {
+        const count = self.app.recovery_manager.entries.items.len;
+        const invalid_count = self.app.recovery_manager.invalid_entries;
+        const item_count = count * 2 + @intFromBool(count > 0) + @intFromBool(invalid_count > 0);
+        if (item_count == 0) {
+            if (self.app.recovery_manager.invalid_entries > 0) {
+                return self.message("invalid recovery envelopes were rejected", .{});
+            }
+            return self.message("no recovery snapshots", .{});
+        }
+        const selected = @min(self.quick_panel.selected_index, item_count - 1);
+        var index_buffer: [32]u8 = undefined;
+        var id: []const u8 = "recovery.discard_all";
+        var argument: []const u8 = "DISCARD ALL";
+        if (selected < count * 2) {
+            const snapshot_index = selected / 2;
+            argument = std.fmt.bufPrint(&index_buffer, "{d}", .{snapshot_index + 1}) catch return;
+            id = if (selected % 2 == 0) "recovery.restore" else "recovery.discard";
+        } else if (count == 0 or selected > count * 2) {
+            id = "recovery.purge_rejected";
+            argument = "PURGE REJECTED";
+        }
+
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = id,
+            .argument = argument,
+            .source = .command_palette,
+        }) catch |err| {
+            self.message("recovery action failed: {s}", .{@errorName(err)});
+            self.appendOutput(.stderr, "recovery action failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.handleDispatchResult(id, result);
+        if (std.meta.activeTag(result) != .completed) return;
+
+        if (std.mem.eql(u8, id, "recovery.restore")) {
+            self.quick_panel.close();
+            self.clearSelection();
+            self.app.focus = .editor;
+            self.app.mode = .insert;
+            self.ensureEditorCursorVisible();
+            self.refreshActiveSecurityFindings("recovered unsaved buffer");
+            return;
+        }
+        self.quick_panel.rebuild(&self.app) catch |err| return self.message("recovery panel failed: {s}", .{@errorName(err)});
+        if (self.app.recovery_manager.entries.items.len == 0 and self.app.recovery_manager.invalid_entries == 0) self.quick_panel.close();
     }
 
     fn dispatchQuickPanelFileMutation(self: *LinuxGuiState, id: []const u8, label: []const u8) void {
@@ -5292,6 +5391,7 @@ const LinuxGuiState = struct {
         };
         @memset(next_collapsed, false);
         self.closePtySession();
+        _ = self.checkpointRecovery(true);
         self.app.deinit();
         self.allocator.free(self.collapsed_dirs);
         self.app = next;
@@ -5304,6 +5404,8 @@ const LinuxGuiState = struct {
         self.deferred_lsp_rename_name.clearRetainingCapacity();
         self.file_watcher.clear();
         self.last_file_watch_ms = 0;
+        self.last_recovery_ms = 0;
+        self.recovery_error_reported = false;
         self.file_scroll_line = 0;
         self.editor_scroll_line = 0;
         self.output_scroll_line = 0;
@@ -5323,6 +5425,7 @@ const LinuxGuiState = struct {
         self.refreshGitOverview();
         self.execute("security.audit_workspace", .startup);
         self.loadWorkbenchSettings();
+        self.offerRecovery();
     }
 
     fn handleKey(self: *LinuxGuiState, x11: *X11, key: event_mod.KeyEvent) void {
@@ -6521,6 +6624,7 @@ pub fn run(
     state.refreshGitOverview();
     state.execute("security.audit_workspace", .startup);
     state.loadWorkbenchSettings();
+    state.offerRecovery();
 
     var x11 = try X11.connect(allocator, environ_map);
     defer x11.close();
@@ -6544,6 +6648,7 @@ pub fn run(
         needs_draw = state.pumpLsp() or needs_draw;
         needs_draw = state.pumpDebug() or needs_draw;
         needs_draw = state.pollExternalFileChanges() or needs_draw;
+        needs_draw = state.checkpointRecovery(false) or needs_draw;
         const pty_ready_mask: i16 = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR;
         if (pty_poll_index) |index| {
             if ((fds[index].revents & pty_ready_mask) != 0) {
@@ -7756,7 +7861,13 @@ fn drawQuickPanel(x11: *X11, state: *LinuxGuiState) !void {
     try x11.text(x11.gc.green, left + 18, top + 34, title[0..@min(title.len, 76)]);
 
     var query_buf: [520]u8 = undefined;
-    const query_line = if (state.quick_panel.mode == .debug_exceptions) blk: {
+    const query_line = if (state.quick_panel.mode == .recovery) blk: {
+        break :blk std.fmt.bufPrint(query_buf[0..], "integrity-valid:{d} rejected:{d} scan-truncated:{} restore-target:unsaved-editor", .{
+            state.quick_panel.recovery_count,
+            state.quick_panel.recovery_invalid_count,
+            state.app.recovery_manager.scan_truncated,
+        }) catch "recovery integrity boundary";
+    } else if (state.quick_panel.mode == .debug_exceptions) blk: {
         const session = &state.app.debug_manager.session;
         break :blk std.fmt.bufPrint(query_buf[0..], "selected:{d} advertised:{d} active:{d} withheld:{d} metadata-rejected:{d}", .{
             session.selectedExceptionFilterCount(),
@@ -7849,6 +7960,7 @@ fn drawQuickPanel(x11: *X11, state: *LinuxGuiState) !void {
             .debug_data => "Pause the debuggee and load variables, or start an adapter with data-breakpoint support",
             .debug_low_level => "Pause the debuggee and load stack/variables from a low-level capable adapter",
             .debug_exceptions => "Start a debug adapter to discover bounded exception filters",
+            .recovery => if (state.quick_panel.recovery_invalid_count > 0) "No valid snapshots; malformed or tampered envelopes were rejected" else "No recovery snapshots",
             else => "No matches",
         };
         try x11.text(x11.gc.muted, left + 18, y, empty_text);
@@ -7990,6 +8102,25 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
                 @tagName(modes.family(mode)),
                 modes.securityFocus(mode),
             }) catch modes.label(mode);
+        },
+        .recovery => blk: {
+            const snapshot_count = state.app.recovery_manager.entries.items.len;
+            const discard_all_index = snapshot_count * 2;
+            if (snapshot_count > 0 and row == discard_all_index) break :blk "DISCARD ALL INTEGRITY-VALID SNAPSHOTS";
+            const purge_index = discard_all_index + @intFromBool(snapshot_count > 0);
+            if (state.app.recovery_manager.invalid_entries > 0 and row == purge_index) break :blk "PURGE REJECTED RECOVERY ENVELOPES";
+            const snapshot_index = row / 2;
+            if (snapshot_index >= snapshot_count) break :blk "";
+            const entry = state.app.recovery_manager.entries.items[snapshot_index];
+            const baseline_hex = std.fmt.bytesToHex(entry.baseline_digest, .lower);
+            break :blk std.fmt.bufPrint(text_buf[0..], "{s} {d}  {s}  bytes:{d}  baseline:{s}  {s}", .{
+                if (row % 2 == 0) "RESTORE" else "DISCARD",
+                snapshot_index + 1,
+                entry.relative_path,
+                entry.content_len,
+                baseline_hex[0..12],
+                if (entry.owned_by_session) "current-session" else "previous-session",
+            }) catch entry.relative_path;
         },
         .debug_watch => blk: {
             if (std.mem.trim(u8, state.quick_panel.query.items, " \t\r\n").len > 0) break :blk "ADD  session inspection watch";
@@ -9256,7 +9387,7 @@ fn formatMemoryHexRow(buffer: []u8, bytes: []const u8, row: usize) []const u8 {
 }
 
 fn isReadOnlyQuickPanelMode(mode: QuickPanelMode) bool {
-    return mode == .debug_breakpoint or mode == .debug_data or mode == .debug_low_level or mode == .debug_exceptions or mode == .lsp_hover;
+    return mode == .recovery or mode == .debug_breakpoint or mode == .debug_data or mode == .debug_low_level or mode == .debug_exceptions or mode == .lsp_hover;
 }
 
 fn quickPanelVisibleStart(panel: *const QuickPanel, max_visible: usize) usize {
@@ -9474,6 +9605,7 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .lsp_hover => "HOVER  Enter closes",
         .code_actions => "QUICK FIX  Enter applies",
         .language_mode => "LANGUAGE MODE",
+        .recovery => "RECOVERY CENTER  hash-bound / source writes locked",
         .debug_watch => "RESTRICTED WATCH  type to add; Enter removes selected; calls and assignments blocked",
         .debug_breakpoint => "ADVANCED BREAKPOINTS  source + function + data + exception",
         .debug_breakpoint_condition => "CONDITION  bounded predicate / no calls or assignments",

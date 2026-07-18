@@ -66,6 +66,7 @@ const definitions = [_]Definition{
     .{ .id = "recovery.restore", .title = "Restore Recovery Snapshot", .description = "Restore a one-based snapshot into an unsaved editor buffer after source-hash verification.", .default_key = "", .scope = .file, .capability = .safe },
     .{ .id = "recovery.discard", .title = "Discard Recovery Snapshot", .description = "Delete one bounded internal recovery snapshot by one-based index.", .default_key = "", .scope = .file, .capability = .safe },
     .{ .id = "recovery.discard_all", .title = "Discard All Recovery Snapshots", .description = "Delete all internal recovery snapshots only when the exact DISCARD ALL confirmation is supplied.", .default_key = "", .scope = .file, .capability = .safe },
+    .{ .id = "recovery.purge_rejected", .title = "Purge Rejected Recovery Data", .description = "Delete only rejected recovery envelopes after a complete bounded directory scan and exact confirmation.", .default_key = "", .scope = .file, .capability = .safe },
     .{ .id = "editor.enter_insert", .title = "Enter Insert Mode", .description = "Switch to insert mode.", .default_key = "i", .scope = .editor, .capability = .safe },
     .{ .id = "editor.exit_insert", .title = "Exit Insert Mode", .description = "Switch back to normal mode.", .default_key = "escape", .scope = .editor, .capability = .safe },
     .{ .id = "editor.insert", .title = "Insert Text", .description = "Insert UTF-8 bytes into the current buffer.", .default_key = "", .scope = .editor, .capability = .safe },

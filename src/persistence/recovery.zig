@@ -133,14 +133,18 @@ pub const Manager = struct {
                 break;
             }
 
-            try self.entries.append(.{
-                .relative_path = try self.allocator.dupe(u8, parsed.relative_path),
+            const owned_path = try self.allocator.dupe(u8, parsed.relative_path);
+            self.entries.append(.{
+                .relative_path = owned_path,
                 .file_name = expected_name,
                 .content_len = parsed.content.len,
                 .cursor_offset = parsed.cursor_offset,
                 .baseline_digest = parsed.baseline_digest,
                 .content_digest = parsed.content_digest,
-            });
+            }) catch |err| {
+                self.allocator.free(owned_path);
+                return err;
+            };
         }
 
         std.mem.sort(Entry, self.entries.items, {}, entryLessThan);
@@ -208,15 +212,19 @@ pub const Manager = struct {
                 continue;
             }
             try self.writeSnapshot(relative_path, doc);
-            try self.entries.append(.{
-                .relative_path = try self.allocator.dupe(u8, relative_path),
+            const owned_path = try self.allocator.dupe(u8, relative_path);
+            self.entries.append(.{
+                .relative_path = owned_path,
                 .file_name = snapshotFileName(relative_path),
                 .content_len = doc.text.bytes.len,
                 .cursor_offset = doc.cursor.position.byte_offset,
                 .baseline_digest = doc.saved_digest,
                 .content_digest = content_digest,
                 .owned_by_session = true,
-            });
+            }) catch |err| {
+                self.allocator.free(owned_path);
+                return err;
+            };
             report.written += 1;
         }
         std.mem.sort(Entry, self.entries.items, {}, entryLessThan);
@@ -302,6 +310,59 @@ pub const Manager = struct {
         return discarded;
     }
 
+    pub fn purgeRejected(self: *Manager) !usize {
+        if (self.scan_truncated) return error.RecoveryScanTruncated;
+        var names = std.array_list.Managed([]u8).init(self.allocator);
+        defer {
+            for (names.items) |name| self.allocator.free(name);
+            names.deinit();
+        }
+
+        {
+            var dir = workspace_io.openDirectoryCapability(self.workspace_root, storage_directory) catch |err| switch (err) {
+                error.FileNotFound => return 0,
+                else => return err,
+            };
+            defer dir.close(io);
+            var iterator = dir.iterate();
+            var scanned: usize = 0;
+            while (try iterator.next(io)) |directory_entry| {
+                if (scanned >= max_scanned_entries) return error.RecoveryScanTruncated;
+                scanned += 1;
+                if (directory_entry.kind != .file or !std.mem.endsWith(u8, directory_entry.name, snapshot_extension)) continue;
+                if (self.containsFileName(directory_entry.name)) continue;
+                const owned_name = try self.allocator.dupe(u8, directory_entry.name);
+                names.append(owned_name) catch |err| {
+                    self.allocator.free(owned_name);
+                    return err;
+                };
+            }
+        }
+
+        var purged: usize = 0;
+        for (names.items) |name| {
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ storage_directory, name });
+            defer self.allocator.free(path);
+            _ = workspace_io.deleteFileOrEmptyDirectory(self.workspace_root, path) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            purged += 1;
+            self.invalid_entries -|= 1;
+        }
+        return purged;
+    }
+
+    pub fn discardAfterSave(self: *Manager, absolute_path: []const u8, source_was_dirty: bool) !bool {
+        const relative = workspace_io.relativeFilePath(self.workspace_root, absolute_path) catch return false;
+        const canonical = try canonicalRelativePathAlloc(self.allocator, relative);
+        defer self.allocator.free(canonical);
+        const index = self.findIndex(canonical) orelse return false;
+        if (!source_was_dirty and !self.entries.items[index].owned_by_session) return false;
+        try self.discardIndex(index);
+        return true;
+    }
+
     pub fn discardAbsolutePath(self: *Manager, absolute_path: []const u8) !bool {
         const relative = workspace_io.relativeFilePath(self.workspace_root, absolute_path) catch return false;
         return self.discardRelativePath(relative);
@@ -318,7 +379,7 @@ pub const Manager = struct {
     fn writeSnapshot(self: *Manager, relative_path: []const u8, doc: *const document_mod.Document) !void {
         var bytes: std.Io.Writer.Allocating = .init(self.allocator);
         defer bytes.deinit();
-        try encodeSnapshot(self.allocator, &bytes.writer, relative_path, doc);
+        try encodeSnapshot(&bytes, relative_path, doc);
         if (bytes.written().len > maxSnapshotBytes()) return error.RecoverySnapshotTooLarge;
 
         const file_name = snapshotFileName(relative_path);
@@ -340,6 +401,13 @@ pub const Manager = struct {
         return null;
     }
 
+    fn containsFileName(self: *const Manager, name: []const u8) bool {
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.file_name[0..], name)) return true;
+        }
+        return false;
+    }
+
     fn clearEntries(self: *Manager) void {
         for (self.entries.items) |*entry| entry.deinit(self.allocator);
         self.entries.clearRetainingCapacity();
@@ -354,26 +422,25 @@ const ParsedSnapshot = struct {
     content_digest: document_mod.ContentDigest,
 };
 
-fn encodeSnapshot(allocator: std.mem.Allocator, writer: *std.Io.Writer, relative_path: []const u8, doc: *const document_mod.Document) !void {
-    if (relative_path.len == 0 or relative_path.len > max_relative_path_bytes) return error.InvalidRecoveryPath;
+fn encodeSnapshot(writer: *std.Io.Writer.Allocating, relative_path: []const u8, doc: *const document_mod.Document) !void {
+    if (relative_path.len == 0 or
+        relative_path.len > max_relative_path_bytes or
+        std.mem.indexOfScalar(u8, relative_path, '\\') != null) return error.InvalidRecoveryPath;
     if (doc.text.bytes.len > max_document_bytes) return error.RecoverySnapshotTooLarge;
     const content_digest = document_mod.contentDigest(doc.text.bytes);
 
-    var envelope: std.Io.Writer.Allocating = .init(allocator);
-    defer envelope.deinit();
-    try envelope.writer.writeAll(magic);
-    try envelope.writer.writeInt(u16, format_version, .little);
-    try envelope.writer.writeInt(u16, 0, .little);
-    try envelope.writer.writeInt(u32, @intCast(relative_path.len), .little);
-    try envelope.writer.writeInt(u64, @intCast(doc.text.bytes.len), .little);
-    try envelope.writer.writeInt(u64, @intCast(@min(doc.cursor.position.byte_offset, doc.text.bytes.len)), .little);
-    try envelope.writer.writeAll(&doc.saved_digest);
-    try envelope.writer.writeAll(&content_digest);
-    try envelope.writer.writeAll(relative_path);
-    try envelope.writer.writeAll(doc.text.bytes);
-    const digest = document_mod.contentDigest(envelope.written());
-    try envelope.writer.writeAll(&digest);
-    try writer.writeAll(envelope.written());
+    try writer.writer.writeAll(magic);
+    try writer.writer.writeInt(u16, format_version, .little);
+    try writer.writer.writeInt(u16, 0, .little);
+    try writer.writer.writeInt(u32, @intCast(relative_path.len), .little);
+    try writer.writer.writeInt(u64, @intCast(doc.text.bytes.len), .little);
+    try writer.writer.writeInt(u64, @intCast(@min(doc.cursor.position.byte_offset, doc.text.bytes.len)), .little);
+    try writer.writer.writeAll(&doc.saved_digest);
+    try writer.writer.writeAll(&content_digest);
+    try writer.writer.writeAll(relative_path);
+    try writer.writer.writeAll(doc.text.bytes);
+    const digest = document_mod.contentDigest(writer.written());
+    try writer.writer.writeAll(&digest);
 }
 
 fn parseSnapshot(bytes: []const u8) !ParsedSnapshot {
@@ -408,7 +475,9 @@ fn parseSnapshot(bytes: []const u8) !ParsedSnapshot {
     if (full_len != bytes.len) return error.InvalidRecoverySnapshot;
     const relative_path = bytes[offset .. offset + path_len];
     try workspace_io.validateRelativeFilePath(relative_path);
-    if (!std.unicode.utf8ValidateSlice(relative_path) or isRecoveryStoragePath(relative_path)) return error.InvalidRecoveryPath;
+    if (!std.unicode.utf8ValidateSlice(relative_path) or
+        std.mem.indexOfScalar(u8, relative_path, '\\') != null or
+        isRecoveryStoragePath(relative_path)) return error.InvalidRecoveryPath;
     offset += path_len;
     const content = bytes[offset .. offset + content_len];
 
@@ -545,15 +614,23 @@ test "recovery refuses changed source and preserves the snapshot" {
     _ = try documents.openBytes(absolute, baseline);
     try documents.active().?.insert(baseline.len, "unsaved\n");
 
-    var manager = try Manager.init(std.testing.allocator, root);
-    defer manager.deinit();
-    _ = try manager.checkpointDocuments(documents.documents.items);
+    {
+        var checkpoint_manager = try Manager.init(std.testing.allocator, root);
+        defer checkpoint_manager.deinit();
+        _ = try checkpoint_manager.checkpointDocuments(documents.documents.items);
+    }
     try tmp.dir.writeFile(io, .{ .sub_path = "main.txt", .data = "changed outside\n" });
 
+    var manager = try Manager.init(std.testing.allocator, root);
+    defer manager.deinit();
     var clean_documents = store_mod.DocumentStore.init(std.testing.allocator);
     defer clean_documents.deinit();
     try std.testing.expectError(error.RecoverySourceChanged, manager.restore(0, &clean_documents));
     try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
+    try std.testing.expect(!try manager.discardAfterSave(absolute, false));
+    try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
+    try std.testing.expect(try manager.discardAfterSave(absolute, true));
+    try std.testing.expectEqual(@as(usize, 0), manager.entries.items.len);
 }
 
 test "unresolved recovery is never overwritten by a new session checkpoint" {
@@ -608,4 +685,6 @@ test "corrupt recovery envelopes are reported but never loaded" {
     defer manager.deinit();
     try std.testing.expectEqual(@as(usize, 0), manager.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), manager.invalid_entries);
+    try std.testing.expectEqual(@as(usize, 1), try manager.purgeRejected());
+    try std.testing.expectEqual(@as(usize, 0), manager.invalid_entries);
 }

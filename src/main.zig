@@ -82,6 +82,7 @@ test {
     _ = @import("observability/log.zig");
     _ = @import("persistence/journal.zig");
     _ = @import("persistence/paths.zig");
+    _ = @import("persistence/recovery.zig");
     _ = @import("platform/fs.zig");
     _ = @import("platform/process.zig");
     _ = @import("platform/terminal.zig");

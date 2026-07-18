@@ -6,7 +6,10 @@ const multi_cursor = @import("multi_cursor.zig");
 const types = @import("../core/types.zig");
 const undo_mod = @import("undo.zig");
 
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
 pub const Newline = buffer.Newline;
+pub const ContentDigest = [Sha256.digest_length]u8;
 
 pub const Document = struct {
     allocator: std.mem.Allocator,
@@ -15,6 +18,7 @@ pub const Document = struct {
     text: buffer.TextBuffer,
     cursor: cursor.Cursor = .{},
     undo_stack: undo_mod.UndoStack,
+    saved_digest: ContentDigest,
     dirty: bool = false,
 
     pub fn fromBytes(allocator: std.mem.Allocator, path: ?[]const u8, bytes: []const u8) !Document {
@@ -24,6 +28,7 @@ pub const Document = struct {
             .language = if (path) |p| modes.detect(p) else .unknown,
             .text = try buffer.TextBuffer.initFromBytes(allocator, bytes),
             .undo_stack = undo_mod.UndoStack.init(allocator),
+            .saved_digest = contentDigest(bytes),
         };
     }
 
@@ -237,6 +242,12 @@ pub const Document = struct {
         self.text = next;
         self.undo_stack.clear();
         self.cursor.position = position;
+        self.saved_digest = contentDigest(bytes);
+        self.dirty = false;
+    }
+
+    pub fn markSaved(self: *Document) void {
+        self.saved_digest = contentDigest(self.text.bytes);
         self.dirty = false;
     }
 
@@ -525,6 +536,12 @@ pub const Document = struct {
         return .{ .start = start, .content_end = content_end, .end = end };
     }
 };
+
+pub fn contentDigest(bytes: []const u8) ContentDigest {
+    var digest: ContentDigest = undefined;
+    Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
 
 const LineRange = struct {
     start: usize,

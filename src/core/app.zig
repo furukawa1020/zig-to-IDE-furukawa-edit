@@ -14,6 +14,7 @@ const lsp_session = @import("../lsp/session.zig");
 const workspace = @import("../workspace/workspace.zig");
 const workspace_io = @import("../security/workspace_io.zig");
 const debug_manager = @import("../debug/manager.zig");
+const recovery_mod = @import("../persistence/recovery.zig");
 
 const max_document_bytes = 32 * 1024 * 1024;
 
@@ -45,6 +46,7 @@ pub const App = struct {
     process_console: console.ProcessConsole,
     lsp_manager: lsp_manager.Manager,
     debug_manager: debug_manager.Manager,
+    recovery_manager: recovery_mod.Manager,
     pending_build_consent: ?build_consent.Preview,
     pending_build_source_id: ?[]u8,
     pending_build_argument: ?[]u8,
@@ -73,6 +75,8 @@ pub const App = struct {
             errdefer language_servers.deinit();
             var debugger = try debug_manager.Manager.init(allocator, workspace_state.root_path);
             errdefer debugger.deinit();
+            var recovery = try recovery_mod.Manager.init(allocator, workspace_state.root_path);
+            errdefer recovery.deinit();
 
             break :initialized App{
                 .allocator = allocator,
@@ -90,6 +94,7 @@ pub const App = struct {
                 .process_console = console.ProcessConsole.init(allocator),
                 .lsp_manager = language_servers,
                 .debug_manager = debugger,
+                .recovery_manager = recovery,
                 .pending_build_consent = null,
                 .pending_build_source_id = null,
                 .pending_build_argument = null,
@@ -111,6 +116,7 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.clearPendingBuildConsent();
+        self.recovery_manager.deinit();
         self.debug_manager.deinit();
         self.lsp_manager.deinit();
         self.execution_queue.deinit();
@@ -120,6 +126,10 @@ pub const App = struct {
         self.palette.deinit();
         self.documents.deinit();
         self.workspace.deinit();
+    }
+
+    pub fn checkpointRecovery(self: *App) !recovery_mod.CheckpointReport {
+        return self.recovery_manager.checkpointDocuments(self.documents.documents.items);
     }
 
     pub fn render(self: *const App, stdout: anytype) !void {

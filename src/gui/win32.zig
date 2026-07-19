@@ -30,12 +30,14 @@ const text_integrity = @import("../security/text_integrity.zig");
 const console_mod = @import("../tasks/console.zig");
 const task_registry = @import("../tasks/registry.zig");
 const debug_session = @import("../debug/session.zig");
+const goto_line = @import("goto_line.zig");
 
 const QuickPanelMode = enum {
     find_file,
     find_document,
     replace_document,
     rename_symbol,
+    goto_line,
     search_workspace,
     replace_workspace,
     run_task,
@@ -71,6 +73,8 @@ const BottomPanel = enum {
     extensions,
     diagnostics,
     security,
+    settings,
+    keybindings,
     tutorial,
     publish,
 };
@@ -161,6 +165,13 @@ const TutorialLanguage = enum {
 const TutorialPanelAction = enum {
     ja,
     en,
+};
+
+const SettingsPanelAction = enum {
+    toggle_file_tree,
+    toggle_output,
+    tutorial_ja,
+    tutorial_en,
 };
 
 const PublishPanelAction = enum {
@@ -333,6 +344,7 @@ const QuickPanel = struct {
             .find_document => if (self.document_matches) |items| items.len else 0,
             .replace_document => if (self.document_matches) |items| items.len else 0,
             .rename_symbol => if (renameRequest(self.query.items)) |_| 1 else 0,
+            .goto_line => if (goto_line.parse(self.query.items)) |_| 1 else 0,
             .search_workspace => if (self.search_results) |items| items.len else 0,
             .replace_workspace => if (self.replacement_preview) |preview| preview.files.len else 0,
             .run_task => if (self.task_matches) |items| items.len else 0,
@@ -451,7 +463,7 @@ const QuickPanel = struct {
                     self.document_matches = try findDocumentMatches(self.allocator, doc, request.find, self.search_options, 128);
                 }
             },
-            .rename_symbol => {},
+            .rename_symbol, .goto_line => {},
             .search_workspace => {
                 if (self.query.items.len > 0) {
                     self.search_results = try workspace_search.search(self.allocator, &app.workspace, self.query.items, .{
@@ -840,6 +852,7 @@ const GuiState = struct {
     publish_scroll_line: usize = 0,
     git_scroll_line: usize = 0,
     extensions_scroll_line: usize = 0,
+    keybindings_scroll_line: usize = 0,
     selection_anchor: ?usize = null,
     secondary_cursors: std.array_list.Managed(usize),
     suppressed_char: ?u21 = null,
@@ -848,6 +861,7 @@ const GuiState = struct {
     last_document_search_query: std.array_list.Managed(u8),
     last_document_search_options: literal_search.Options = .{},
     show_output: bool = true,
+    show_file_tree: bool = true,
     bottom_panel: BottomPanel = .output,
     tutorial_language: TutorialLanguage = .ja,
     quick_panel: QuickPanel,
@@ -1283,6 +1297,22 @@ const GuiState = struct {
             self.openQuickPanel(.language_mode);
             return;
         }
+        if (std.mem.eql(u8, id, "editor.goto_line")) {
+            self.openQuickPanel(.goto_line);
+            return;
+        }
+        if (std.mem.eql(u8, id, "file.close")) {
+            self.closeActiveDocument();
+            return;
+        }
+        if (std.mem.eql(u8, id, "file.next_editor")) {
+            self.switchDocumentByDelta(1);
+            return;
+        }
+        if (std.mem.eql(u8, id, "file.previous_editor")) {
+            self.switchDocumentByDelta(-1);
+            return;
+        }
         if (std.mem.eql(u8, id, "editor.find_next")) {
             self.findLastDocumentSearch(.forward);
             return;
@@ -1339,6 +1369,12 @@ const GuiState = struct {
             self.openGitPanel();
             return;
         }
+        if (std.mem.eql(u8, id, "view.toggle_file_tree")) {
+            self.show_file_tree = !self.show_file_tree;
+            if (!self.show_file_tree) self.app.focus = .editor;
+            self.setMessage(if (self.show_file_tree) "File tree shown" else "File tree hidden") catch {};
+            return;
+        }
         if (std.mem.eql(u8, id, "view.toggle_diagnostics")) {
             self.openDiagnosticsPanel();
             return;
@@ -1353,6 +1389,18 @@ const GuiState = struct {
         }
         if (std.mem.eql(u8, id, "view.publish")) {
             self.openPublishPanel();
+            return;
+        }
+        if (std.mem.eql(u8, id, "preferences.open_settings")) {
+            self.show_output = true;
+            self.bottom_panel = .settings;
+            self.setMessage("Settings") catch {};
+            return;
+        }
+        if (std.mem.eql(u8, id, "preferences.open_keybindings")) {
+            self.show_output = true;
+            self.bottom_panel = .keybindings;
+            self.setMessage("Keyboard shortcuts") catch {};
             return;
         }
 
@@ -1370,6 +1418,10 @@ const GuiState = struct {
             self.bottom_panel = .output;
         }
         if (std.mem.startsWith(u8, id, "release.")) {
+            self.bottom_panel = .output;
+        }
+        if (std.mem.eql(u8, id, "demo.run")) {
+            self.show_output = true;
             self.bottom_panel = .output;
         }
         if (std.mem.startsWith(u8, id, "debug.")) {
@@ -1862,6 +1914,22 @@ const GuiState = struct {
         self.setMessage(if (self.tutorial_language == .ja) "チュートリアル: 日本語" else "Tutorial: English") catch {};
     }
 
+    fn executeSettingsPanelAction(self: *GuiState, action: SettingsPanelAction) void {
+        switch (action) {
+            .toggle_file_tree => {
+                self.show_file_tree = !self.show_file_tree;
+                if (!self.show_file_tree) self.app.focus = .editor;
+                self.setMessage(if (self.show_file_tree) "File tree shown" else "File tree hidden") catch {};
+            },
+            .toggle_output => {
+                self.show_output = !self.show_output;
+                self.setMessage(if (self.show_output) "Bottom panel shown" else "Bottom panel hidden") catch {};
+            },
+            .tutorial_ja => self.executeTutorialPanelAction(.ja),
+            .tutorial_en => self.executeTutorialPanelAction(.en),
+        }
+    }
+
     fn executePublishPanelAction(self: *GuiState, action: PublishPanelAction) void {
         const id = switch (action) {
             .checklist => "release.checklist",
@@ -2057,6 +2125,7 @@ const GuiState = struct {
             .find_file => "Find file",
             .find_document => "Find in file",
             .replace_document => "Replace in file",
+            .goto_line => "Go to line",
             .search_workspace => "Search workspace",
             .replace_workspace => "Replace in workspace",
             .run_task => "Run task",
@@ -2304,6 +2373,7 @@ const GuiState = struct {
                 self.deferred_lsp_rename_name.clearRetainingCapacity();
                 self.renameWorkspaceSymbol(old_name, new_name);
             },
+            .goto_line => self.gotoLineFromQuickPanel(),
             .search_workspace => {
                 const item = self.quick_panel.selectedSearchResult() orelse {
                     self.setMessage("No search match") catch {};
@@ -4097,6 +4167,34 @@ const GuiState = struct {
         }
     }
 
+    fn gotoLineFromQuickPanel(self: *GuiState) void {
+        const doc = self.app.documents.active() orelse {
+            self.setMessage("No active document") catch {};
+            return;
+        };
+        const target = goto_line.parse(self.quick_panel.query.items) orelse {
+            self.setMessage("Type line or line:column") catch {};
+            return;
+        };
+        const last_line = if (doc.text.lineCount() == 0) 0 else doc.text.lineCount() - 1;
+        const line = @min(target.line, last_line);
+        const column = @min(target.column, doc.text.lineSlice(line).len);
+        const offset = doc.text.lineColumnToOffset(line, column) catch |err| {
+            self.setError(err) catch {};
+            return;
+        };
+        navigation.setCursor(doc, doc.positionFromOffset(offset) catch doc.cursor.position);
+        self.clearSelection();
+        self.quick_panel.close();
+        self.app.focus = .editor;
+        self.app.mode = .insert;
+        self.ensureCursorVisible();
+
+        var message_buf: [64]u8 = undefined;
+        const message = std.fmt.bufPrint(&message_buf, "Line {d}:{d}", .{ line + 1, column + 1 }) catch "Line selected";
+        self.setMessage(message) catch {};
+    }
+
     fn closeActiveDocument(self: *GuiState) void {
         self.app.documents.closeActive(.deny_dirty) catch |err| {
             switch (err) {
@@ -4365,6 +4463,11 @@ const GuiState = struct {
                 const visible = securityPanelVisibleRows(bottomPanelContentRect(layout.output));
                 scrollIndex(&self.security_scroll_line, self.app.security_findings.items.items.len, visible, delta);
             },
+            .settings => {},
+            .keybindings => {
+                const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
+                scrollIndex(&self.keybindings_scroll_line, command_mod.all().len, visible, delta);
+            },
             .tutorial => {
                 const visible = bottomPanelVisibleRows(bottomPanelContentRect(layout.output));
                 scrollIndex(&self.tutorial_scroll_line, tutorialLineCount(self.tutorial_language), visible, delta);
@@ -4622,6 +4725,13 @@ const GuiState = struct {
                     return;
                 }
             }
+            if (self.bottom_panel == .settings) {
+                const content = bottomPanelContentRect(layout.output);
+                if (settingsPanelActionAt(content, x, y)) |action| {
+                    self.executeSettingsPanelAction(action);
+                    return;
+                }
+            }
             if (self.bottom_panel == .publish) {
                 const content = bottomPanelContentRect(layout.output);
                 if (publishPanelActionAt(content, x, y)) |action| {
@@ -4643,6 +4753,12 @@ const GuiState = struct {
                 .extensions => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.openExtensionPanelRow(self.extensions_scroll_line + row),
                 .diagnostics => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToDiagnostic(self.diagnostics_scroll_line + row),
                 .security => if (securityPanelFindingRowAt(bottomPanelContentRect(layout.output), y)) |row| self.jumpToSecurityFinding(self.security_scroll_line + row),
+                .settings => {},
+                .keybindings => if (bottomPanelRowAt(bottomPanelContentRect(layout.output), y)) |row| {
+                    const definitions = command_mod.all();
+                    const index = self.keybindings_scroll_line + row;
+                    if (index < definitions.len) self.executeCommand(definitions[index].id);
+                },
                 .tutorial => {},
                 .publish => {},
             }
@@ -4902,6 +5018,14 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         state.executeCommand("editor.delete_line");
         return;
     }
+    if (ctrl and key == 'K') {
+        state.executeCommand("preferences.open_keybindings");
+        return;
+    }
+    if (ctrl and key == VK_OEM_COMMA) {
+        state.executeCommand("preferences.open_settings");
+        return;
+    }
     if (ctrl and key == VK_OEM_2) {
         state.executeCommand("editor.toggle_comment");
         return;
@@ -4923,11 +5047,15 @@ fn handleKeyDown(hwnd: windows.HWND, state: *GuiState, key: WPARAM) void {
         return;
     }
     if (ctrl and shift and key == 'G') {
-        state.executeCommand("git.diff_current");
+        state.executeCommand("git.overview");
         return;
     }
     if (ctrl and key == 'G') {
-        state.executeCommand("git.overview");
+        state.executeCommand("editor.goto_line");
+        return;
+    }
+    if (ctrl and key == 'E') {
+        state.executeCommand("view.toggle_file_tree");
         return;
     }
     if (ctrl and key == 'O') {
@@ -5142,18 +5270,19 @@ fn paint(hwnd: windows.HWND) void {
 
     if (global_state) |state| {
         const layout = layoutForClient(client, state);
-        fillRect(hdc, layout.sidebar, rgb(15, 20, 24));
+        if (state.show_file_tree) fillRect(hdc, layout.sidebar, rgb(15, 20, 24));
         fillRect(hdc, layout.editor, rgb(11, 13, 17));
         if (state.show_output) fillRect(hdc, layout.output, rgb(10, 12, 14));
         fillRect(hdc, layout.status, rgb(35, 142, 203));
-        fillRect(hdc, RECT{ .left = layout.sidebar.right - 1, .top = 0, .right = layout.sidebar.right, .bottom = layout.status.top }, rgb(43, 53, 61));
-
-        drawText(hdc, 18, 15, rgb(79, 230, 226), "FILES");
-        drawButton(hdc, newFileButtonRect(layout), "NEW");
-        drawButton(hdc, openWorkspaceButtonRect(layout), "OPEN");
-        drawButton(hdc, gitAuditButtonRect(layout), "GIT");
-        drawSecurityStrip(hdc, state, layout);
-        drawFileList(hdc, state, layout);
+        if (state.show_file_tree) {
+            fillRect(hdc, RECT{ .left = layout.sidebar.right - 1, .top = 0, .right = layout.sidebar.right, .bottom = layout.status.top }, rgb(43, 53, 61));
+            drawText(hdc, 18, 15, rgb(79, 230, 226), "FILES");
+            drawButton(hdc, newFileButtonRect(layout), "NEW");
+            drawButton(hdc, openWorkspaceButtonRect(layout), "OPEN");
+            drawButton(hdc, gitAuditButtonRect(layout), "GIT");
+            drawSecurityStrip(hdc, state, layout);
+            drawFileList(hdc, state, layout);
+        }
         drawEditor(hdc, state, layout);
         if (state.show_output) drawOutput(hdc, state, layout);
         drawStatus(hdc, state, layout.status);
@@ -5681,6 +5810,8 @@ fn drawOutput(hdc: windows.HDC, state: *GuiState, layout: Layout) void {
         .extensions => drawExtensionsPanel(hdc, state, content),
         .diagnostics => drawDiagnosticsPanel(hdc, state, content),
         .security => drawSecurityPanel(hdc, state, content),
+        .settings => drawSettingsPanel(hdc, state, content),
+        .keybindings => drawKeybindingsPanel(hdc, state, content),
         .tutorial => drawTutorialPanel(hdc, state, content),
         .publish => drawPublishPanel(hdc, state, content),
     }
@@ -5695,6 +5826,8 @@ fn drawBottomPanelTabs(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     drawBottomPanelTab(hdc, rect, .extensions, state.bottom_panel == .extensions, "EXT");
     drawBottomPanelTab(hdc, rect, .diagnostics, state.bottom_panel == .diagnostics, "DIAG");
     drawBottomPanelTab(hdc, rect, .security, state.bottom_panel == .security, "SEC");
+    drawBottomPanelTab(hdc, rect, .settings, state.bottom_panel == .settings, "SET");
+    drawBottomPanelTab(hdc, rect, .keybindings, state.bottom_panel == .keybindings, "KEYS");
     drawBottomPanelTab(hdc, rect, .tutorial, state.bottom_panel == .tutorial, "HELP");
     drawBottomPanelTab(hdc, rect, .publish, state.bottom_panel == .publish, "SHIP");
 }
@@ -6437,6 +6570,88 @@ fn drawBoundaryStrip(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     drawTextClipped(hdc, rect.left + 16, rect.top + 3, rect.right - 16, rgb(180, 190, 200), text);
 }
 
+fn drawSettingsPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
+    fillRect(hdc, rect, rgb(10, 12, 14));
+    fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
+
+    var header_buf: [320]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "SETTINGS  tree:{s}  panel:{s}  tutorial:{s}  trust:{s}", .{
+        if (state.show_file_tree) "shown" else "hidden",
+        if (state.show_output) "shown" else "hidden",
+        @tagName(state.tutorial_language),
+        @tagName(state.app.runtime.trust_state),
+    }) catch "SETTINGS";
+    drawTextClipped(hdc, rect.left + 16, rect.top + 10, rect.right - 16, rgb(79, 230, 226), header);
+
+    const actions = [_]SettingsPanelAction{ .toggle_file_tree, .toggle_output, .tutorial_ja, .tutorial_en };
+    for (actions) |action| {
+        drawButton(hdc, settingsPanelActionButtonRect(rect, action), settingsPanelActionLabel(state, action));
+    }
+
+    drawTextClipped(hdc, rect.left + 16, rect.top + 82, rect.right - 16, rgb(180, 190, 200), "Workspace trust is never persisted here; execution permission must be earned again from the audited workspace.");
+}
+
+fn drawKeybindingsPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
+    fillRect(hdc, rect, rgb(10, 12, 14));
+    fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
+
+    const definitions = command_mod.all();
+    var header_buf: [120]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "KEYBOARD SHORTCUTS  {d} commands", .{definitions.len}) catch "KEYBOARD SHORTCUTS";
+    drawTextClipped(hdc, rect.left + 16, rect.top + 10, rect.right - 16, rgb(79, 230, 226), header);
+
+    const visible = bottomPanelVisibleRows(rect);
+    const start = @min(state.keybindings_scroll_line, if (definitions.len > visible) definitions.len - visible else 0);
+    const content_left = rect.left + 16;
+    const content_right = @max(content_left + 4, rect.right - 16);
+    const content_width = content_right - content_left;
+    const title_right = content_left + @divTrunc(content_width * 35, 100);
+    const id_right = content_left + @divTrunc(content_width * 65, 100);
+    const key_right = content_left + @divTrunc(content_width * 84, 100);
+    var row: usize = 0;
+    var y = rect.top + HEADER_HEIGHT;
+    while (row < visible and start + row < definitions.len) : (row += 1) {
+        const definition = definitions[start + row];
+        drawTextClipped(hdc, content_left, y, title_right - 6, rgb(220, 226, 232), definition.title);
+        drawTextClipped(hdc, title_right, y, id_right - 6, rgb(145, 158, 170), definition.id);
+        drawTextClipped(hdc, id_right, y, key_right - 6, rgb(255, 207, 92), if (definition.default_key.len == 0) "unbound" else definition.default_key);
+        drawTextClipped(hdc, key_right, y, content_right, commandCapabilityColor(definition.capability), commandCapabilityLabel(definition.capability));
+        y += ROW_HEIGHT;
+    }
+}
+
+fn settingsPanelActionButtonRect(rect: RECT, action: SettingsPanelAction) RECT {
+    const index: c_int = switch (action) {
+        .toggle_file_tree => 0,
+        .toggle_output => 1,
+        .tutorial_ja => 2,
+        .tutorial_en => 3,
+    };
+    const action_count: c_int = 4;
+    const gap: c_int = 8;
+    const available = @max(rect.right - rect.left - 32 - gap * (action_count - 1), action_count);
+    const width: c_int = @max(1, @min(142, @divTrunc(available, action_count)));
+    const left = rect.left + 16 + index * (width + gap);
+    return .{ .left = left, .top = rect.top + 42, .right = left + width, .bottom = rect.top + 68 };
+}
+
+fn settingsPanelActionAt(rect: RECT, x: c_int, y: c_int) ?SettingsPanelAction {
+    const actions = [_]SettingsPanelAction{ .toggle_file_tree, .toggle_output, .tutorial_ja, .tutorial_en };
+    for (actions) |action| {
+        if (pointIn(settingsPanelActionButtonRect(rect, action), x, y)) return action;
+    }
+    return null;
+}
+
+fn settingsPanelActionLabel(state: *const GuiState, action: SettingsPanelAction) []const u8 {
+    return switch (action) {
+        .toggle_file_tree => if (state.show_file_tree) "HIDE TREE" else "SHOW TREE",
+        .toggle_output => if (state.show_output) "HIDE PANEL" else "SHOW PANEL",
+        .tutorial_ja => "TUTORIAL JA",
+        .tutorial_en => "TUTORIAL EN",
+    };
+}
+
 fn drawTutorialPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
     fillRect(hdc, rect, rgb(10, 12, 14));
     fillRect(hdc, RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.top + 1 }, rgb(43, 53, 61));
@@ -6818,6 +7033,7 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
         .find_document => "FIND IN FILE",
         .replace_document => "REPLACE  search=>replacement",
         .rename_symbol => "RENAME  old=>new",
+        .goto_line => "GO TO LINE  line[:column]",
         .search_workspace => "SEARCH",
         .replace_workspace => "REPLACE WORKSPACE",
         .run_task => "TASKS",
@@ -6985,6 +7201,12 @@ fn drawQuickPanel(hdc: windows.HDC, state: *GuiState, client: RECT) void {
                 const request = pathMutationRequest(state.quick_panel.query.items) orelse break;
                 var rename_buf: [240]u8 = undefined;
                 const label = std.fmt.bufPrint(&rename_buf, "{s} -> {s}", .{ request.find, request.replace }) catch "Rename";
+                drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
+            },
+            .goto_line => {
+                const target = goto_line.parse(state.quick_panel.query.items) orelse break;
+                var target_buf: [96]u8 = undefined;
+                const label = std.fmt.bufPrint(&target_buf, "Jump to {d}:{d}", .{ target.line + 1, target.column + 1 }) catch "Jump";
                 drawTextClipped(hdc, panel.left + 18, y, panel.right - 16, color, label);
             },
             .run_task => {
@@ -7666,7 +7888,7 @@ fn layoutForWindow(hwnd: windows.HWND, state: *const GuiState) Layout {
 fn layoutForClient(client: RECT, state: *const GuiState) Layout {
     const width = client.right - client.left;
     const height = client.bottom - client.top;
-    const sidebar_width = @min(@max(@divTrunc(width, 4), 280), 380);
+    const sidebar_width = if (state.show_file_tree) @min(@max(@divTrunc(width, 4), 280), 380) else 0;
     const output_height = if (state.show_output) @min(@max(@divTrunc(height, 4), 150), 240) else 0;
     const status_top = height - STATUS_HEIGHT;
     const editor_bottom = status_top - output_height;
@@ -7858,8 +8080,12 @@ fn securityPanelFindingRowAt(rect: RECT, y: c_int) ?usize {
 }
 
 fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
-    const width: c_int = 82;
-    const gap: c_int = 6;
+    const panel_count: c_int = 10;
+    const rect_width = @max(rect.right - rect.left, panel_count);
+    const margin: c_int = if (rect_width >= 160) 8 else 0;
+    const gap: c_int = if (rect_width >= 400) 4 else 0;
+    const available = @max(rect_width - margin * 2 - gap * (panel_count - 1), panel_count);
+    const width: c_int = @max(1, @min(82, @divTrunc(available, panel_count)));
     const index: c_int = switch (panel) {
         .output => 0,
         .debug => 1,
@@ -7867,16 +8093,18 @@ fn bottomPanelTabRect(rect: RECT, panel: BottomPanel) RECT {
         .extensions => 3,
         .diagnostics => 4,
         .security => 5,
-        .tutorial => 6,
-        .publish => 7,
+        .settings => 6,
+        .keybindings => 7,
+        .tutorial => 8,
+        .publish => 9,
     };
-    const left = rect.left + 12 + index * (width + gap);
+    const left = rect.left + margin + index * (width + gap);
     return .{ .left = left, .top = rect.top + 9, .right = left + width, .bottom = rect.top + 33 };
 }
 
 fn bottomPanelTabAt(rect: RECT, x: c_int, y: c_int) ?BottomPanel {
     if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const panels = [_]BottomPanel{ .output, .debug, .git, .extensions, .diagnostics, .security, .tutorial, .publish };
+    const panels = [_]BottomPanel{ .output, .debug, .git, .extensions, .diagnostics, .security, .settings, .keybindings, .tutorial, .publish };
     for (panels) |panel| {
         if (pointIn(bottomPanelTabRect(rect, panel), x, y)) return panel;
     }
@@ -8667,6 +8895,7 @@ const VK_MENU: c_int = 0x12;
 const VK_ESCAPE: WPARAM = 0x1B;
 const VK_SPACE: WPARAM = 0x20;
 const VK_OEM_PERIOD: WPARAM = 0xBE;
+const VK_OEM_COMMA: WPARAM = 0xBC;
 const VK_OEM_2: WPARAM = 0xBF;
 const VK_PRIOR: WPARAM = 0x21;
 const VK_NEXT: WPARAM = 0x22;

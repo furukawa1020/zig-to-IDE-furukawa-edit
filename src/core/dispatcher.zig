@@ -967,6 +967,23 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         return .{ .external_command = zigCommand(app, .fmt) };
     }
 
+    if (std.mem.eql(u8, definition.id, "demo.run")) {
+        try appendConsole(app, .stdout,
+            \\ZIDE BUILT-IN DEMO
+            \\workspace: {s}
+            \\files: {d}  commands: {d}  trust: {s}
+            \\flow: edit -> static security scan -> consent preview -> bounded execution -> tamper-evident audit
+            \\tip: open Tutorial for the guided Japanese/English security tour.
+            \\
+        , .{
+            app.workspace.root_path,
+            app.workspace.entries.items.len,
+            command.all().len,
+            @tagName(app.runtime.trust_state),
+        });
+        return .{ .completed = "built-in demo rendered" };
+    }
+
     return .{ .unsupported = "command is registered but has no dispatcher yet" };
 }
 

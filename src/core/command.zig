@@ -202,9 +202,9 @@ const definitions = [_]Definition{
     .{ .id = "debug.watch_refresh", .title = "Refresh Debug Watches", .description = "Evaluate restricted watches in the selected paused stack frame.", .default_key = "", .scope = .debug, .capability = .safe },
     .{ .id = "debug.ingest_payload", .title = "Ingest DAP Payload", .description = "Ingest one DAP JSON message for protocol diagnostics and tests.", .default_key = "", .scope = .debug, .capability = .safe },
     .{ .id = "debug.drain", .title = "Drain Debug Adapter Frames", .description = "Process complete bounded DAP frames already buffered from the adapter.", .default_key = "", .scope = .debug, .capability = .safe },
-    .{ .id = "git.overview", .title = "Git and GitHub Overview", .description = "Read branch, remotes, GitHub links, and file changes without executing Git.", .default_key = "ctrl-g", .scope = .workspace, .capability = .safe },
+    .{ .id = "git.overview", .title = "Git and GitHub Overview", .description = "Read branch, remotes, GitHub links, and file changes without executing Git.", .default_key = "ctrl-shift-g", .scope = .workspace, .capability = .safe },
     .{ .id = "git.status", .title = "Git Security Status", .description = "Read Git metadata without executing Git hooks, filters, or fsmonitor.", .default_key = "", .scope = .workspace, .capability = .safe },
-    .{ .id = "git.diff_current", .title = "Preview Current Git Diff", .description = "Render a compact diff for the active file without running git diff.", .default_key = "ctrl-shift-g", .scope = .workspace, .capability = .safe },
+    .{ .id = "git.diff_current", .title = "Preview Current Git Diff", .description = "Render a compact diff for the active file without running git diff.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "github.overview", .title = "GitHub Overview", .description = "Show GitHub repository and Actions links inferred from local Git remotes.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "github.fetch", .title = "Fetch GitHub Live Overview", .description = "Fetch read-only GitHub repo, PR, and Actions data with optional GITHUB_TOKEN.", .default_key = "", .scope = .workspace, .capability = .network_read },
     .{ .id = "github.issues", .title = "Fetch GitHub Issues", .description = "Fetch open GitHub issues and pull requests for the current repository.", .default_key = "", .scope = .workspace, .capability = .network_read },
@@ -277,4 +277,12 @@ test "fuzzy score prefers consecutive matches" {
     const compact = fuzzyScore("zb", "zig.build").?;
     const distant = fuzzyScore("zb", "workspace.zig.build").?;
     try std.testing.expect(compact >= distant);
+}
+
+test "goto line and Git overview use distinct shortcuts" {
+    const goto = findById("editor.goto_line") orelse return error.ExpectedCommand;
+    const git = findById("git.overview") orelse return error.ExpectedCommand;
+    try std.testing.expectEqualStrings("ctrl-g", goto.default_key);
+    try std.testing.expectEqualStrings("ctrl-shift-g", git.default_key);
+    try std.testing.expect(!std.mem.eql(u8, goto.default_key, git.default_key));
 }

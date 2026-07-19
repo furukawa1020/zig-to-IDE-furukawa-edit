@@ -45,6 +45,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn generateSite(allocator: std.mem.Allocator, out_dir: []const u8) !void {
+    try resetGeneratedSiteOutput(allocator, out_dir);
     try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, out_dir);
     try createSubdir(allocator, out_dir, "assets");
     try createSubdir(allocator, out_dir, "download");
@@ -56,6 +57,32 @@ fn generateSite(allocator: std.mem.Allocator, out_dir: []const u8) !void {
     try writeHtml(allocator, out_dir, "index.html", downloads);
     try writeHtml(allocator, out_dir, "404.html", downloads);
     try writeManifest(allocator, out_dir, downloads);
+}
+
+fn resetGeneratedSiteOutput(allocator: std.mem.Allocator, out_dir: []const u8) !void {
+    if (out_dir.len == 0 or std.fs.path.isAbsolute(out_dir) or std.mem.eql(u8, out_dir, ".")) {
+        return error.UnsafeSiteOutputPath;
+    }
+
+    const marker_path = try std.fs.path.join(allocator, &.{ out_dir, "site-manifest.json" });
+    defer allocator.free(marker_path);
+    const marker = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, marker_path, allocator, .limited(128 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => {
+            var existing = std.Io.Dir.openDir(std.Io.Dir.cwd(), std.Options.debug_io, out_dir, .{}) catch |open_err| switch (open_err) {
+                error.FileNotFound => return,
+                else => return open_err,
+            };
+            existing.close(std.Options.debug_io);
+            return error.RefusingToReplaceUnmarkedSiteDirectory;
+        },
+        else => return err,
+    };
+    defer allocator.free(marker);
+
+    if (std.mem.indexOf(u8, marker, "\"generated_by\": \"tools/site_gen.zig\"") == null) {
+        return error.RefusingToReplaceUnmarkedSiteDirectory;
+    }
+    try std.Io.Dir.cwd().deleteTree(std.Options.debug_io, out_dir);
 }
 
 fn createSubdir(allocator: std.mem.Allocator, out_dir: []const u8, sub_path: []const u8) !void {

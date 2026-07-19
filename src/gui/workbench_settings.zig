@@ -31,6 +31,7 @@ pub const Settings = struct {
     launch_profile: LaunchProfile = .safe,
     tutorial_language: TutorialLanguage = .ja,
     bottom_panel: BottomPanel = .output,
+    show_file_tree: bool = true,
 };
 
 pub fn parse(source: []const u8) Settings {
@@ -54,6 +55,8 @@ pub fn parse(source: []const u8) Settings {
             settings.tutorial_language = parseTutorialLanguage(value) orelse settings.tutorial_language;
         } else if (std.mem.eql(u8, key, "bottom_panel")) {
             settings.bottom_panel = parseBottomPanel(value) orelse settings.bottom_panel;
+        } else if (std.mem.eql(u8, key, "show_file_tree")) {
+            settings.show_file_tree = parseBool(value) orelse settings.show_file_tree;
         }
     }
 
@@ -67,6 +70,7 @@ pub fn write(writer: *std.Io.Writer, settings: Settings) !void {
     try writer.print("launch_profile = {s}\n", .{@tagName(settings.launch_profile)});
     try writer.print("tutorial_language = {s}\n", .{@tagName(settings.tutorial_language)});
     try writer.print("bottom_panel = {s}\n", .{@tagName(settings.bottom_panel)});
+    try writer.print("show_file_tree = {}\n", .{settings.show_file_tree});
 }
 
 fn stripComment(line: []const u8) []const u8 {
@@ -112,6 +116,12 @@ fn parseBottomPanel(value: []const u8) ?BottomPanel {
     return null;
 }
 
+fn parseBool(value: []const u8) ?bool {
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return null;
+}
+
 test "parse workbench settings" {
     const settings = parse(
         \\# comment
@@ -119,6 +129,7 @@ test "parse workbench settings" {
         \\launch_profile = network
         \\tutorial_language = en
         \\bottom_panel = keybindings
+        \\show_file_tree = false
         \\
     );
 
@@ -126,6 +137,7 @@ test "parse workbench settings" {
     try std.testing.expectEqual(LaunchProfile.network, settings.launch_profile);
     try std.testing.expectEqual(TutorialLanguage.en, settings.tutorial_language);
     try std.testing.expectEqual(BottomPanel.keybindings, settings.bottom_panel);
+    try std.testing.expect(!settings.show_file_tree);
 }
 
 test "invalid workbench values keep safe defaults" {
@@ -134,6 +146,7 @@ test "invalid workbench values keep safe defaults" {
         \\launch_profile = trusted
         \\tutorial_language = jp
         \\bottom_panel = invisible
+        \\show_file_tree = maybe
         \\
     );
 
@@ -141,6 +154,7 @@ test "invalid workbench values keep safe defaults" {
     try std.testing.expectEqual(LaunchProfile.safe, settings.launch_profile);
     try std.testing.expectEqual(TutorialLanguage.ja, settings.tutorial_language);
     try std.testing.expectEqual(BottomPanel.output, settings.bottom_panel);
+    try std.testing.expect(settings.show_file_tree);
 }
 
 test "write workbench settings" {
@@ -151,11 +165,13 @@ test "write workbench settings" {
         .launch_profile = .publish,
         .tutorial_language = .en,
         .bottom_panel = .publish,
+        .show_file_tree = false,
     });
 
     const bytes = text.written();
     try std.testing.expect(std.mem.indexOf(u8, bytes, "launch_profile = publish") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "tutorial_language = en") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "bottom_panel = publish") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "show_file_tree = false") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "trust state is intentionally") != null);
 }

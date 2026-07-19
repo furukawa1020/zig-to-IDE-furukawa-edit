@@ -41,6 +41,7 @@ const terminal_pty = @import("../terminal/pty.zig");
 const types = @import("../core/types.zig");
 const workbench_settings = @import("workbench_settings.zig");
 const debug_session = @import("../debug/session.zig");
+const goto_line = @import("goto_line.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("linux_x11.zig is Linux-only");
@@ -53,7 +54,6 @@ const HEADER_HEIGHT = 58;
 const STATUS_HEIGHT = 28;
 const OUTPUT_HEIGHT = 210;
 const LINE_HEIGHT = 19;
-const EDITOR_LEFT = FILE_WIDTH + 24;
 const EDITOR_TOP = HEADER_HEIGHT + 58;
 const EDITOR_TEXT_TOP = EDITOR_TOP + 44;
 const X11_SHIFT_MASK: u16 = 1 << 0;
@@ -685,11 +685,6 @@ const ReplaceRequest = struct {
     replace: []const u8,
 };
 
-const GotoLineTarget = struct {
-    line: usize,
-    column: usize = 0,
-};
-
 const SelectionRange = struct {
     start: usize,
     end: usize,
@@ -873,7 +868,7 @@ const QuickPanel = struct {
             .find_document => if (self.document_matches) |items| items.len else 0,
             .replace_document => if (self.document_matches) |items| items.len else 0,
             .rename_symbol => if (renameRequest(self.query.items)) |_| 1 else 0,
-            .goto_line => if (parseGotoLine(self.query.items)) |_| 1 else 0,
+            .goto_line => if (goto_line.parse(self.query.items)) |_| 1 else 0,
             .search_workspace => if (self.search_results) |items| items.len else 0,
             .replace_workspace => if (self.replacement_preview) |preview| preview.files.len else 0,
             .new_file => if (self.query.items.len > 0) 1 else 0,
@@ -1327,6 +1322,7 @@ const LinuxGuiState = struct {
     pty_started_ms: i64 = 0,
     pty_output_bytes: usize = 0,
     bottom_panel: BottomPanel = .output,
+    show_file_tree: bool = true,
     window_width: i16 = WIDTH,
     window_height: i16 = HEIGHT,
     file_scroll_line: usize = 0,
@@ -2323,6 +2319,7 @@ const LinuxGuiState = struct {
                 .tutorial => .tutorial,
                 .publish => .publish,
             },
+            .show_file_tree = self.show_file_tree,
         };
     }
 
@@ -2350,6 +2347,7 @@ const LinuxGuiState = struct {
             .tutorial => .tutorial,
             .publish => .publish,
         };
+        self.show_file_tree = settings.show_file_tree;
     }
 
     fn allocWorkbenchSettingsDirPath(self: *const LinuxGuiState) ![]u8 {
@@ -2472,6 +2470,14 @@ const LinuxGuiState = struct {
 
     fn bottomTop(self: *const LinuxGuiState) i16 {
         return @max(HEADER_HEIGHT + 180, self.window_height - OUTPUT_HEIGHT - STATUS_HEIGHT);
+    }
+
+    fn fileWidth(self: *const LinuxGuiState) i16 {
+        return if (self.show_file_tree) FILE_WIDTH else 0;
+    }
+
+    fn editorLeft(self: *const LinuxGuiState) i16 {
+        return self.fileWidth() + 24;
     }
 
     fn visibleFileRows(self: *const LinuxGuiState) usize {
@@ -3574,6 +3580,13 @@ const LinuxGuiState = struct {
             self.openQuickPanel(.goto_line);
             return;
         }
+        if (std.mem.eql(u8, id, "view.toggle_file_tree")) {
+            self.show_file_tree = !self.show_file_tree;
+            if (!self.show_file_tree) self.app.focus = .editor;
+            self.saveWorkbenchSettings();
+            self.message("file tree: {s}", .{if (self.show_file_tree) "shown" else "hidden"});
+            return;
+        }
         if (std.mem.eql(u8, id, "file.close")) {
             self.closeActiveDocument();
             return;
@@ -3721,6 +3734,18 @@ const LinuxGuiState = struct {
             self.message("keyboard shortcuts", .{});
             return;
         }
+        if (std.mem.eql(u8, id, "view.toggle_diagnostics")) {
+            self.bottom_panel = .diagnostics;
+            self.saveWorkbenchSettings();
+            self.message("diagnostics: {d} item(s)", .{self.app.diagnostics.items.items.len});
+            return;
+        }
+        if (std.mem.eql(u8, id, "view.tutorial")) {
+            self.bottom_panel = .tutorial;
+            self.saveWorkbenchSettings();
+            self.message("tutorial", .{});
+            return;
+        }
 
         const result = dispatcher.dispatch(&self.app, .{ .id = id, .source = source }) catch |err| {
             self.message("{s} failed: {s}", .{ id, @errorName(err) });
@@ -3728,6 +3753,11 @@ const LinuxGuiState = struct {
             return;
         };
         self.handleDispatchResult(id, result);
+        if (std.mem.eql(u8, id, "demo.run")) {
+            self.bottom_panel = .output;
+            self.terminal_focused = false;
+            self.saveWorkbenchSettings();
+        }
         if (std.mem.startsWith(u8, id, "debug.")) {
             self.bottom_panel = .debug;
             self.terminal_focused = false;
@@ -5330,7 +5360,7 @@ const LinuxGuiState = struct {
 
     fn gotoLineFromQuickPanel(self: *LinuxGuiState) void {
         const doc = self.app.documents.active() orelse return self.message("no active document", .{});
-        const target = parseGotoLine(self.quick_panel.query.items) orelse return self.message("type line or line:column", .{});
+        const target = goto_line.parse(self.quick_panel.query.items) orelse return self.message("type line or line:column", .{});
         const last_line = if (doc.text.lineCount() == 0) 0 else doc.text.lineCount() - 1;
         const line = @min(target.line, last_line);
         const column = @min(target.column, doc.text.lineSlice(line).len);
@@ -5435,6 +5465,17 @@ const LinuxGuiState = struct {
         if (key.modifiers.ctrl and std.meta.activeTag(key.code) == .tab) {
             self.execute(if (key.modifiers.shift) "file.previous_editor" else "file.next_editor", .keybinding);
             return;
+        }
+        if (key.modifiers.ctrl) {
+            switch (key.code) {
+                .char => |char| {
+                    if (char == 'e' or char == 'E') {
+                        self.execute("view.toggle_file_tree", .keybinding);
+                        return;
+                    }
+                },
+                else => {},
+            }
         }
         if (key.modifiers.ctrl and std.meta.activeTag(key.code) == .enter and self.hasCachedLspWorkspaceEdit()) {
             self.applyCachedLspWorkspaceEdit();
@@ -6036,7 +6077,7 @@ const LinuxGuiState = struct {
         }
         if (button == 4 or button == 5) {
             const delta: isize = if (button == 4) -3 else 3;
-            if (x < FILE_WIDTH) {
+            if (self.show_file_tree and x < self.fileWidth()) {
                 self.scrollFileTree(delta);
             } else if (y < self.bottomTop()) {
                 self.scrollEditor(delta);
@@ -6056,7 +6097,7 @@ const LinuxGuiState = struct {
             self.pastePrimaryIntoTerminal(x11);
             return;
         }
-        if (button == 2 and x >= FILE_WIDTH and y >= HEADER_HEIGHT and y < self.bottomTop()) {
+        if (button == 2 and x >= self.fileWidth() and y >= HEADER_HEIGHT and y < self.bottomTop()) {
             self.app.focus = .editor;
             self.pasteFromPrimary(x11);
             return;
@@ -6098,7 +6139,7 @@ const LinuxGuiState = struct {
     }
 
     fn prepareContextMenuPoint(self: *LinuxGuiState, x: i16, y: i16) void {
-        if (x < FILE_WIDTH or y < HEADER_HEIGHT or y >= self.bottomTop()) return;
+        if (x < self.fileWidth() or y < HEADER_HEIGHT or y >= self.bottomTop()) return;
         const doc = self.app.documents.active() orelse return;
         const position = self.editorPositionFromPoint(x, y) orelse return;
         const clicked_offset = position.byte_offset;
@@ -6126,7 +6167,7 @@ const LinuxGuiState = struct {
             if (self.handlePaletteClick(x, y)) return;
         }
 
-        if (headerActionAt(x, y)) |action| {
+        if (headerActionAt(self, x, y)) |action| {
             self.runHeaderAction(action);
             return;
         }
@@ -6144,7 +6185,7 @@ const LinuxGuiState = struct {
         }
 
         const bottom = self.bottomTop();
-        if (y >= 78 and y < bottom and x < FILE_WIDTH) {
+        if (self.show_file_tree and y >= 78 and y < bottom and x < self.fileWidth()) {
             self.terminal_focused = false;
             const row = @divTrunc(@as(isize, y - 98), LINE_HEIGHT);
             if (row >= 0) {
@@ -6157,7 +6198,7 @@ const LinuxGuiState = struct {
             return;
         }
 
-        if (y >= HEADER_HEIGHT and y < bottom and x >= FILE_WIDTH) {
+        if (y >= HEADER_HEIGHT and y < bottom and x >= self.fileWidth()) {
             self.terminal_focused = false;
             self.app.focus = .editor;
             if (self.handleDebugGutterClick(x, y)) return;
@@ -6196,7 +6237,8 @@ const LinuxGuiState = struct {
     }
 
     fn handleBoundaryGutterClick(self: *LinuxGuiState, x: i16, y: i16) bool {
-        if (x < EDITOR_LEFT + 34 or x >= EDITOR_LEFT + 56) return false;
+        const editor_left = self.editorLeft();
+        if (x < editor_left + 34 or x >= editor_left + 56) return false;
         const doc = self.app.documents.active() orelse return false;
         const path = doc.path orelse return false;
         if (y < EDITOR_TEXT_TOP - 14) return false;
@@ -6235,7 +6277,8 @@ const LinuxGuiState = struct {
     }
 
     fn handleDebugGutterClick(self: *LinuxGuiState, x: i16, y: i16) bool {
-        if (x < EDITOR_LEFT or x >= EDITOR_LEFT + 32) return false;
+        const editor_left = self.editorLeft();
+        if (x < editor_left or x >= editor_left + 32) return false;
         const doc = self.app.documents.active() orelse return false;
         if (y < EDITOR_TEXT_TOP - 14) return false;
         const line_delta = @divTrunc(@as(isize, y - (EDITOR_TEXT_TOP - 14)), LINE_HEIGHT);
@@ -6524,7 +6567,8 @@ const LinuxGuiState = struct {
         const line_delta = @divTrunc(@as(isize, y - (EDITOR_TEXT_TOP - 14)), LINE_HEIGHT);
         if (line_delta < 0) return null;
         const line = @min(self.editor_scroll_line + @as(usize, @intCast(line_delta)), doc.text.lineCount() - 1);
-        const column_raw = if (x <= EDITOR_LEFT + 56) 0 else @divTrunc(@as(isize, x - (EDITOR_LEFT + 56)), 8);
+        const editor_left = self.editorLeft();
+        const column_raw = if (x <= editor_left + 56) 0 else @divTrunc(@as(isize, x - (editor_left + 56)), 8);
         const column = @min(@as(usize, @intCast(@max(column_raw, 0))), doc.text.lineSlice(line).len);
         const offset = doc.text.lineColumnToOffset(line, column) catch return null;
         return doc.positionFromOffset(offset) catch null;
@@ -6712,63 +6756,67 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
     try x11.fillRect(x11.gc.bg, 0, 0, width_u, height_u);
     try x11.fillRect(x11.gc.panel, 0, 0, width_u, HEADER_HEIGHT);
     try x11.fillRect(x11.gc.line, 0, HEADER_HEIGHT - 1, width_u, 1);
-    try x11.fillRect(x11.gc.panel, 0, HEADER_HEIGHT, FILE_WIDTH, toU16(state.window_height - HEADER_HEIGHT - STATUS_HEIGHT));
-    try x11.fillRect(x11.gc.line, FILE_WIDTH, HEADER_HEIGHT, 1, toU16(state.window_height - HEADER_HEIGHT - STATUS_HEIGHT));
+    if (state.show_file_tree) {
+        try x11.fillRect(x11.gc.panel, 0, HEADER_HEIGHT, FILE_WIDTH, toU16(state.window_height - HEADER_HEIGHT - STATUS_HEIGHT));
+        try x11.fillRect(x11.gc.line, FILE_WIDTH, HEADER_HEIGHT, 1, toU16(state.window_height - HEADER_HEIGHT - STATUS_HEIGHT));
+    }
     try x11.fillRect(x11.gc.panel_2, 0, bottom, width_u, toU16(state.window_height - bottom - STATUS_HEIGHT));
     try x11.fillRect(x11.gc.cyan, 16, 14, 30, 30);
 
     try x11.text(x11.gc.bg, 26, 35, "Z");
     try x11.text(x11.gc.text, 58, 34, "ZIDE");
-    try x11.text(x11.gc.muted, 152, 34, "Linux GUI / direct X11 / shared ZIDE core");
-    try drawHeaderActions(x11);
+    if (state.window_width >= 1100) try x11.text(x11.gc.muted, 152, 34, "Linux GUI / direct X11 / shared ZIDE core");
+    try drawHeaderActions(x11, state);
 
-    try x11.text(x11.gc.cyan, 18, 86, "FILES");
-    try x11.text(x11.gc.muted, 112, 86, "click opens / Enter opens / j,k move");
-    var y: i16 = 112;
-    state.ensureFileCursorVisible();
-    const visible_total = state.visibleEntryCount();
-    const max_files = @min(visible_total - @min(state.file_scroll_line, visible_total), state.visibleFileRows());
-    var visible_index: usize = 0;
-    while (visible_index < max_files) : (visible_index += 1) {
-        const index = state.entryIndexAtVisibleRank(state.file_scroll_line + visible_index) orelse break;
-        const entry = app.workspace.entries.items[index];
-        const marker = riskMarkerForEntry(state, entry.path, entry.kind == .directory);
-        const git_marker = gitMarkerForEntry(state, entry.path, entry.kind == .directory);
-        const gc = if (index == app.file_cursor)
-            x11.gc.cyan
-        else if (marker) |risk_marker|
-            riskGc(x11, risk_marker.risk)
-        else if (git_marker) |git_marker_value|
-            gitChangeGc(x11, git_marker_value.status)
-        else if (entry.kind == .directory)
-            x11.gc.green
-        else
-            x11.gc.text;
-        if (index == app.file_cursor) try x11.fillRect(x11.gc.panel_2, 8, y - 14, FILE_WIDTH - 16, LINE_HEIGHT);
-        var line_buf: [280]u8 = undefined;
-        const prefix: []const u8 = if (entry.kind == .directory)
-            if (state.directoryHasChildren(index) and !state.collapsed_dirs[index]) "- " else "+ "
-        else
-            "  ";
-        const indent = @min(entry.depth * 2, @as(usize, 12));
-        const lang = if (entry.kind == .file) modes.label(entry.language) else "";
-        const risk_label = if (marker) |risk_marker| risk_marker.label else "";
-        const risk_sep = if (marker != null) " " else "";
-        const git_label = if (git_marker) |git_marker_value| git_marker_value.label else "";
-        const git_sep = if (git_marker != null) " " else "";
-        @memset(line_buf[0..indent], ' ');
-        const suffix = std.fmt.bufPrint(line_buf[indent..], "{s}{s}  {s}{s}{s}{s}{s}", .{ prefix, entry.path, lang, risk_sep, risk_label, git_sep, git_label }) catch clipped: {
-            const available = line_buf.len - indent;
-            const clipped_path = entry.path[0..@min(entry.path.len, available)];
-            @memcpy(line_buf[indent..][0..clipped_path.len], clipped_path);
-            break :clipped line_buf[indent..][0..clipped_path.len];
-        };
-        const label = line_buf[0 .. indent + suffix.len];
-        var ascii_buf: [260]u8 = undefined;
-        try x11.text(gc, 18, y, asciiInto(ascii_buf[0..], label));
-        y += LINE_HEIGHT;
+    if (state.show_file_tree) {
+        try x11.text(x11.gc.cyan, 18, 86, "FILES");
+        try x11.text(x11.gc.muted, 112, 86, "click opens / Enter opens / j,k move");
+        var y: i16 = 112;
+        state.ensureFileCursorVisible();
+        const visible_total = state.visibleEntryCount();
+        const max_files = @min(visible_total - @min(state.file_scroll_line, visible_total), state.visibleFileRows());
+        var visible_index: usize = 0;
+        while (visible_index < max_files) : (visible_index += 1) {
+            const index = state.entryIndexAtVisibleRank(state.file_scroll_line + visible_index) orelse break;
+            const entry = app.workspace.entries.items[index];
+            const marker = riskMarkerForEntry(state, entry.path, entry.kind == .directory);
+            const git_marker = gitMarkerForEntry(state, entry.path, entry.kind == .directory);
+            const gc = if (index == app.file_cursor)
+                x11.gc.cyan
+            else if (marker) |risk_marker|
+                riskGc(x11, risk_marker.risk)
+            else if (git_marker) |git_marker_value|
+                gitChangeGc(x11, git_marker_value.status)
+            else if (entry.kind == .directory)
+                x11.gc.green
+            else
+                x11.gc.text;
+            if (index == app.file_cursor) try x11.fillRect(x11.gc.panel_2, 8, y - 14, FILE_WIDTH - 16, LINE_HEIGHT);
+            var line_buf: [280]u8 = undefined;
+            const prefix: []const u8 = if (entry.kind == .directory)
+                if (state.directoryHasChildren(index) and !state.collapsed_dirs[index]) "- " else "+ "
+            else
+                "  ";
+            const indent = @min(entry.depth * 2, @as(usize, 12));
+            const lang = if (entry.kind == .file) modes.label(entry.language) else "";
+            const risk_label = if (marker) |risk_marker| risk_marker.label else "";
+            const risk_sep = if (marker != null) " " else "";
+            const git_label = if (git_marker) |git_marker_value| git_marker_value.label else "";
+            const git_sep = if (git_marker != null) " " else "";
+            @memset(line_buf[0..indent], ' ');
+            const suffix = std.fmt.bufPrint(line_buf[indent..], "{s}{s}  {s}{s}{s}{s}{s}", .{ prefix, entry.path, lang, risk_sep, risk_label, git_sep, git_label }) catch clipped: {
+                const available = line_buf.len - indent;
+                const clipped_path = entry.path[0..@min(entry.path.len, available)];
+                @memcpy(line_buf[indent..][0..clipped_path.len], clipped_path);
+                break :clipped line_buf[indent..][0..clipped_path.len];
+            };
+            const label = line_buf[0 .. indent + suffix.len];
+            var ascii_buf: [260]u8 = undefined;
+            try x11.text(gc, 18, y, asciiInto(ascii_buf[0..], label));
+            y += LINE_HEIGHT;
+        }
+        try drawFileScrollbar(x11, state);
     }
-    try drawFileScrollbar(x11, state);
 
     try drawEditor(x11, state);
     try drawBottomPanel(x11, state);
@@ -6819,11 +6867,11 @@ fn draw(x11: *X11, state: *LinuxGuiState) !void {
     try x11.text(x11.gc.bg, 14, state.window_height - 9, status);
 }
 
-fn drawHeaderActions(x11: *X11) !void {
+fn drawHeaderActions(x11: *X11, state: *const LinuxGuiState) !void {
     inline for (header_actions) |action| {
-        const rect = headerActionRect(action);
+        const rect = headerActionRect(state, action);
         try x11.fillRect(x11.gc.panel_2, rect.left, rect.top, @intCast(rect.right - rect.left), @intCast(rect.bottom - rect.top));
-        try x11.text(x11.gc.cyan, rect.left + 10, rect.top + 20, headerActionLabel(action));
+        try x11.text(x11.gc.cyan, rect.left + 7, rect.top + 20, headerActionLabel(action, state.window_width < 1100));
     }
 }
 
@@ -6832,24 +6880,26 @@ fn drawFileScrollbar(x11: *X11, state: *LinuxGuiState) !void {
     const visible = state.visibleFileRows();
     if (total <= visible or visible == 0) return;
     const bottom = state.bottomTop();
+    const file_width = state.fileWidth();
     const track_top: i16 = 102;
     const track_h: i16 = @max(bottom - track_top - 12, 20);
-    try x11.fillRect(x11.gc.line, FILE_WIDTH - 9, track_top, 3, toU16(track_h));
+    try x11.fillRect(x11.gc.line, file_width - 9, track_top, 3, toU16(track_h));
     const thumb_h: i16 = @max(@as(i16, @intCast((@as(usize, @intCast(track_h)) * visible) / total)), 18);
     const max_scroll = total - visible;
     const travel = @max(track_h - thumb_h, 1);
     const thumb_y = track_top + @as(i16, @intCast((@as(usize, @intCast(travel)) * state.file_scroll_line) / max_scroll));
-    try x11.fillRect(x11.gc.cyan, FILE_WIDTH - 10, thumb_y, 5, toU16(thumb_h));
+    try x11.fillRect(x11.gc.cyan, file_width - 10, thumb_y, 5, toU16(thumb_h));
 }
 
 fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
     const app = &state.app;
     const bottom = state.bottomTop();
-    try x11.text(x11.gc.cyan, EDITOR_LEFT, 86, "EDITOR");
-    try x11.text(x11.gc.muted, EDITOR_LEFT + 88, 86, "shared buffer/save/security core");
+    const editor_left = state.editorLeft();
+    try x11.text(x11.gc.cyan, editor_left, 86, "EDITOR");
+    try x11.text(x11.gc.muted, editor_left + 88, 86, "shared buffer/save/security core");
 
     const tab_y: i16 = 112;
-    var tab_x: i16 = EDITOR_LEFT;
+    var tab_x: i16 = editor_left;
     for (app.documents.documents.items, 0..) |doc, index| {
         const selected = if (app.documents.activeIndex()) |active_index| active_index == index else false;
         const tab_w: u16 = 178;
@@ -6865,8 +6915,8 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
     }
 
     const doc = app.documents.active() orelse {
-        try x11.text(x11.gc.text, EDITOR_LEFT, EDITOR_TEXT_TOP, "No file open. Click a file on the left, or press Enter from FILES.");
-        try x11.text(x11.gc.muted, EDITOR_LEFT, EDITOR_TEXT_TOP + 30, "Linux zide-gui is using the same App/document/dispatcher core as the Windows workbench.");
+        try x11.text(x11.gc.text, editor_left, EDITOR_TEXT_TOP, "No file open. Open the file tree with Ctrl+E or use Ctrl+P.");
+        try x11.text(x11.gc.muted, editor_left, EDITOR_TEXT_TOP + 30, "Linux zide-gui is using the same App/document/dispatcher core as the Windows workbench.");
         return;
     };
 
@@ -6885,7 +6935,7 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
         doc.encodingLabel(),
     }) catch path;
     var header_ascii: [900]u8 = undefined;
-    try x11.text(x11.gc.green, EDITOR_LEFT, EDITOR_TOP, asciiInto(header_ascii[0..], header));
+    try x11.text(x11.gc.green, editor_left, EDITOR_TOP, asciiInto(header_ascii[0..], header));
 
     const visible_rows: usize = @intCast(@max(@divTrunc(bottom - EDITOR_TEXT_TOP - 16, LINE_HEIGHT), 1));
     const cursor_line = doc.cursor.position.line;
@@ -6902,10 +6952,10 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
         const line = doc.text.lineSlice(line_index);
         const selected = line_index == cursor_line;
         const debug_marker = debugLineMarkerX11(state, path, line_index);
-        if (selected) try x11.fillRect(x11.gc.panel_2, EDITOR_LEFT - 8, line_y - 14, toU16(state.window_width - EDITOR_LEFT - 20), LINE_HEIGHT);
+        if (selected) try x11.fillRect(x11.gc.panel_2, editor_left - 8, line_y - 14, toU16(state.window_width - editor_left - 20), LINE_HEIGHT);
         if (debug_marker.active_execution) {
-            try x11.fillRect(x11.gc.line, EDITOR_LEFT + 56, line_y - 14, toU16(state.window_width - EDITOR_LEFT - 76), LINE_HEIGHT);
-            try x11.fillRect(x11.gc.amber, EDITOR_LEFT + 39, line_y - 14, 3, LINE_HEIGHT);
+            try x11.fillRect(x11.gc.line, editor_left + 56, line_y - 14, toU16(state.window_width - editor_left - 76), LINE_HEIGHT);
+            try x11.fillRect(x11.gc.amber, editor_left + 39, line_y - 14, 3, LINE_HEIGHT);
         }
 
         if (selection) |range| {
@@ -6916,7 +6966,7 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
                 if (start < end) {
                     const start_col = @min(start - line_start, @as(usize, 140));
                     const end_col = @min(end - line_start, @as(usize, 140));
-                    const select_x = EDITOR_LEFT + 56 + @as(i16, @intCast(start_col)) * 8;
+                    const select_x = editor_left + 56 + @as(i16, @intCast(start_col)) * 8;
                     const select_w: u16 = @intCast(@max(@as(i16, @intCast(end_col - start_col)) * 8, 8));
                     try x11.fillRect(x11.gc.line, select_x, line_y - 14, select_w, LINE_HEIGHT);
                 }
@@ -6925,28 +6975,28 @@ fn drawEditor(x11: *X11, state: *LinuxGuiState) !void {
 
         var number_buf: [24]u8 = undefined;
         const number = std.fmt.bufPrint(number_buf[0..], "{d: >4}", .{line_index + 1}) catch "   ?";
-        try x11.text(x11.gc.muted, EDITOR_LEFT, line_y, number);
+        try x11.text(x11.gc.muted, editor_left, line_y, number);
         if (debug_marker.breakpoint_verified) |verified| {
-            try x11.fillRect(debugBreakpointGc(x11, debug_marker, verified), EDITOR_LEFT + 44, line_y - 9, 7, 7);
+            try x11.fillRect(debugBreakpointGc(x11, debug_marker, verified), editor_left + 44, line_y - 9, 7, 7);
         }
         if (lineBoundaryMarker(state, path, line_index)) |marker| {
             const marker_gc = riskGc(x11, marker.risk);
-            try x11.fillRect(marker_gc, EDITOR_LEFT + 52, line_y - 14, 3, LINE_HEIGHT);
+            try x11.fillRect(marker_gc, editor_left + 52, line_y - 14, 3, LINE_HEIGHT);
             var marker_buf: [8]u8 = undefined;
             const marker_text = std.fmt.bufPrint(marker_buf[0..], "{s}{s}", .{ riskInitial(marker.risk), boundaryInitial(marker.boundary) }) catch "!!";
-            try x11.text(marker_gc, EDITOR_LEFT + 36, line_y, marker_text);
+            try x11.text(marker_gc, editor_left + 36, line_y, marker_text);
         }
 
-        try drawHighlightedEditorLine(x11, state, doc.language, EDITOR_LEFT + 56, line_y, line, if (selected) x11.gc.text else x11.gc.muted);
+        try drawHighlightedEditorLine(x11, state, doc.language, editor_left + 56, line_y, line, if (selected) x11.gc.text else x11.gc.muted);
 
         if (selected and app.mode == .insert and app.focus == .editor) {
-            const cursor_x: i16 = EDITOR_LEFT + 56 + @as(i16, @intCast(@min(doc.cursor.position.column, 120))) * 8;
+            const cursor_x: i16 = editor_left + 56 + @as(i16, @intCast(@min(doc.cursor.position.column, 120))) * 8;
             try x11.fillRect(x11.gc.cyan, cursor_x, line_y - 14, 2, LINE_HEIGHT);
         }
         for (state.secondary_cursors.items) |offset| {
             const position = doc.positionFromOffset(@min(offset, doc.text.bytes.len)) catch continue;
             if (position.line != line_index) continue;
-            const cursor_x: i16 = EDITOR_LEFT + 56 + @as(i16, @intCast(@min(position.column, 120))) * 8;
+            const cursor_x: i16 = editor_left + 56 + @as(i16, @intCast(@min(position.column, 120))) * 8;
             try x11.fillRect(x11.gc.green, cursor_x, line_y - 14, 2, LINE_HEIGHT);
         }
         line_y += LINE_HEIGHT;
@@ -7000,17 +7050,9 @@ fn highlightGc(x11: *X11, role: highlight.Role, fallback_gc: u32) u32 {
 fn drawBottomPanel(x11: *X11, state: *LinuxGuiState) !void {
     const bottom = state.bottomTop();
     try x11.fillRect(x11.gc.line, 0, bottom, toU16(state.window_width), 1);
-    try drawPanelTab(x11, bottom, state.bottom_panel == .output, 18, "OUTPUT");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .debug, 122, "DEBUG");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .tasks, 226, "RUN");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .git, 330, "GIT");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .extensions, 434, "EXT");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .diagnostics, 538, "DIAG");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .security, 642, "SEC");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .settings, 746, "SET");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .keybindings, 850, "KEYS");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .tutorial, 954, "HELP");
-    try drawPanelTab(x11, bottom, state.bottom_panel == .publish, 1058, "SHIP");
+    inline for (bottom_panels) |panel| {
+        try drawPanelTab(x11, bottomPanelTabRect(state, panel), state.bottom_panel == panel, bottomPanelLabel(panel));
+    }
 
     switch (state.bottom_panel) {
         .output => try drawOutputPanel(x11, state),
@@ -7027,9 +7069,9 @@ fn drawBottomPanel(x11: *X11, state: *LinuxGuiState) !void {
     }
 }
 
-fn drawPanelTab(x11: *X11, bottom: i16, active: bool, x: i16, label: []const u8) !void {
-    if (active) try x11.fillRect(x11.gc.cyan, x - 8, bottom + 8, 104, 24);
-    try x11.text(if (active) x11.gc.bg else x11.gc.cyan, x, bottom + 27, label);
+fn drawPanelTab(x11: *X11, rect: HitRect, active: bool, label: []const u8) !void {
+    if (active) try x11.fillRect(x11.gc.cyan, rect.left, rect.top, toU16(rect.right - rect.left), toU16(rect.bottom - rect.top));
+    try x11.text(if (active) x11.gc.bg else x11.gc.cyan, rect.left + 8, rect.top + 19, label);
 }
 
 fn drawActionButton(x11: *X11, rect: HitRect, label: []const u8) !void {
@@ -7598,11 +7640,12 @@ fn drawSettingsPanel(x11: *X11, state: *LinuxGuiState) !void {
     const bottom = state.bottomTop();
     try drawSettingsPanelActions(x11, state);
 
-    var header_buf: [420]u8 = undefined;
-    const header = std.fmt.bufPrint(header_buf[0..], "SETTINGS / profile:{s} trust:{s} tutorial:{s} linux:{s}", .{
+    var header_buf: [460]u8 = undefined;
+    const header = std.fmt.bufPrint(header_buf[0..], "SETTINGS / profile:{s} trust:{s} tutorial:{s} tree:{s} linux:{s}", .{
         linuxLaunchProfileLabel(state.linux_launch_profile),
         @tagName(state.app.runtime.trust_state),
         @tagName(state.tutorial_language),
+        if (state.show_file_tree) "shown" else "hidden",
         linuxBoundaryGrade(&state.linux_security).label,
     }) catch "SETTINGS";
     try x11.text(x11.gc.green, 18, bottom + 58, header);
@@ -7986,7 +8029,7 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
             break :blk std.fmt.bufPrint(text_buf[0..], "{s} -> {s}", .{ request.find, request.replace }) catch "Rename";
         },
         .goto_line => blk: {
-            const target = parseGotoLine(state.quick_panel.query.items) orelse break :blk "Type line or line:column";
+            const target = goto_line.parse(state.quick_panel.query.items) orelse break :blk "Type line or line:column";
             break :blk std.fmt.bufPrint(text_buf[0..], "Jump to {d}:{d}", .{ target.line + 1, target.column + 1 }) catch "Jump";
         },
         .search_workspace => blk: {
@@ -9515,28 +9558,6 @@ fn confirmedDeletePath(query: []const u8) ?[]const u8 {
     return request.find;
 }
 
-fn parseGotoLine(query: []const u8) ?GotoLineTarget {
-    const trimmed = std.mem.trim(u8, query, " \t\r\n");
-    if (trimmed.len == 0) return null;
-
-    const delimiter = std.mem.indexOfAny(u8, trimmed, ":,");
-    const line_text = if (delimiter) |index| std.mem.trim(u8, trimmed[0..index], " \t\r\n") else trimmed;
-    const column_text = if (delimiter) |index| std.mem.trim(u8, trimmed[index + 1 ..], " \t\r\n") else "";
-    if (line_text.len == 0) return null;
-
-    const line_one = std.fmt.parseUnsigned(usize, line_text, 10) catch return null;
-    if (line_one == 0) return null;
-
-    var column: usize = 0;
-    if (column_text.len > 0) {
-        const column_one = std.fmt.parseUnsigned(usize, column_text, 10) catch return null;
-        if (column_one == 0) return null;
-        column = column_one - 1;
-    }
-
-    return .{ .line = line_one - 1, .column = column };
-}
-
 fn isValidIdentifierName(name: []const u8) bool {
     if (name.len == 0) return false;
     if (!(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
@@ -9756,26 +9777,48 @@ fn quickPanelApplyButtonRect() HitRect {
 
 const header_actions = [_]HeaderAction{ .open_workspace, .save, .save_all, .build, .test_run, .task, .git, .audit, .scan, .extensions, .tutorial, .publish };
 
-fn headerActionRect(action: HeaderAction) HitRect {
+fn headerActionRect(state: *const LinuxGuiState, action: HeaderAction) HitRect {
     const top: i16 = 15;
     const height: i16 = 30;
-    return switch (action) {
-        .open_workspace => .{ .left = 410, .top = top, .right = 472, .bottom = top + height },
-        .save => .{ .left = 480, .top = top, .right = 540, .bottom = top + height },
-        .save_all => .{ .left = 548, .top = top, .right = 606, .bottom = top + height },
-        .build => .{ .left = 614, .top = top, .right = 684, .bottom = top + height },
-        .test_run => .{ .left = 692, .top = top, .right = 750, .bottom = top + height },
-        .task => .{ .left = 758, .top = top, .right = 824, .bottom = top + height },
-        .git => .{ .left = 832, .top = top, .right = 888, .bottom = top + height },
-        .audit => .{ .left = 896, .top = top, .right = 970, .bottom = top + height },
-        .scan => .{ .left = 978, .top = top, .right = 1044, .bottom = top + height },
-        .extensions => .{ .left = 1052, .top = top, .right = 1110, .bottom = top + height },
-        .tutorial => .{ .left = 1118, .top = top, .right = 1184, .bottom = top + height },
-        .publish => .{ .left = 1192, .top = top, .right = 1258, .bottom = top + height },
+    const action_count: i16 = @intCast(header_actions.len);
+    const start: i16 = if (state.window_width >= 1100) 400 else 220;
+    const margin: i16 = 14;
+    const gap: i16 = if (state.window_width >= 1100) 6 else 2;
+    const available = @max(state.window_width - start - margin - gap * (action_count - 1), action_count);
+    const width = @max(@as(i16, 1), @min(@as(i16, 70), @divTrunc(available, action_count)));
+    const index: i16 = switch (action) {
+        .open_workspace => 0,
+        .save => 1,
+        .save_all => 2,
+        .build => 3,
+        .test_run => 4,
+        .task => 5,
+        .git => 6,
+        .audit => 7,
+        .scan => 8,
+        .extensions => 9,
+        .tutorial => 10,
+        .publish => 11,
     };
+    const left = start + index * (width + gap);
+    return .{ .left = left, .top = top, .right = left + width, .bottom = top + height };
 }
 
-fn headerActionLabel(action: HeaderAction) []const u8 {
+fn headerActionLabel(action: HeaderAction, compact: bool) []const u8 {
+    if (compact) return switch (action) {
+        .open_workspace => "OPEN",
+        .save => "SAVE",
+        .save_all => "ALL",
+        .build => "BLD",
+        .test_run => "TST",
+        .task => "RUN",
+        .git => "GIT",
+        .audit => "AUD",
+        .scan => "SCN",
+        .extensions => "EXT",
+        .tutorial => "?",
+        .publish => "SHIP",
+    };
     return switch (action) {
         .open_workspace => "OPEN",
         .save => "SAVE",
@@ -9792,9 +9835,9 @@ fn headerActionLabel(action: HeaderAction) []const u8 {
     };
 }
 
-fn headerActionAt(x: i16, y: i16) ?HeaderAction {
+fn headerActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?HeaderAction {
     inline for (header_actions) |action| {
-        if (pointIn(headerActionRect(action), x, y)) return action;
+        if (pointIn(headerActionRect(state, action), x, y)) return action;
     }
     return null;
 }
@@ -9802,13 +9845,52 @@ fn headerActionAt(x: i16, y: i16) ?HeaderAction {
 fn bottomPanelAt(state: *const LinuxGuiState, x: i16, y: i16) ?BottomPanel {
     const bottom = state.bottomTop();
     if (y < bottom or y >= bottom + 34) return null;
-    const panels = [_]BottomPanel{ .output, .debug, .tasks, .git, .extensions, .diagnostics, .security, .settings, .keybindings, .tutorial, .publish };
-    for (panels, 0..) |panel, index| {
-        const left: i16 = 10 + @as(i16, @intCast(index)) * 104;
-        const rect = HitRect{ .left = left, .top = bottom + 8, .right = left + 96, .bottom = bottom + 32 };
-        if (pointIn(rect, x, y)) return panel;
+    inline for (bottom_panels) |panel| {
+        if (pointIn(bottomPanelTabRect(state, panel), x, y)) return panel;
     }
     return null;
+}
+
+const bottom_panels = [_]BottomPanel{ .output, .debug, .tasks, .git, .extensions, .diagnostics, .security, .settings, .keybindings, .tutorial, .publish };
+
+fn bottomPanelTabRect(state: *const LinuxGuiState, panel: BottomPanel) HitRect {
+    const panel_count: i16 = bottom_panels.len;
+    const margin: i16 = 10;
+    const gap: i16 = if (state.window_width >= 900) 4 else 2;
+    const available = @max(state.window_width - margin * 2 - gap * (panel_count - 1), panel_count);
+    const width = @max(@as(i16, 1), @min(@as(i16, 96), @divTrunc(available, panel_count)));
+    const index: i16 = switch (panel) {
+        .output => 0,
+        .debug => 1,
+        .tasks => 2,
+        .git => 3,
+        .extensions => 4,
+        .diagnostics => 5,
+        .security => 6,
+        .settings => 7,
+        .keybindings => 8,
+        .tutorial => 9,
+        .publish => 10,
+    };
+    const left = margin + index * (width + gap);
+    const bottom = state.bottomTop();
+    return .{ .left = left, .top = bottom + 8, .right = left + width, .bottom = bottom + 32 };
+}
+
+fn bottomPanelLabel(panel: BottomPanel) []const u8 {
+    return switch (panel) {
+        .output => "OUTPUT",
+        .debug => "DEBUG",
+        .tasks => "RUN",
+        .git => "GIT",
+        .extensions => "EXT",
+        .diagnostics => "DIAG",
+        .security => "SEC",
+        .settings => "SET",
+        .keybindings => "KEYS",
+        .tutorial => "HELP",
+        .publish => "SHIP",
+    };
 }
 
 const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
@@ -10454,8 +10536,9 @@ fn taskHistoryRowAt(state: *const LinuxGuiState, y: i16) ?usize {
 }
 
 fn documentTabAt(state: *const LinuxGuiState, x: i16, y: i16) ?usize {
-    if (y < 92 or y >= 122 or x < EDITOR_LEFT) return null;
-    var tab_x: i16 = EDITOR_LEFT;
+    const editor_left = state.editorLeft();
+    if (y < 92 or y >= 122 or x < editor_left) return null;
+    var tab_x: i16 = editor_left;
     for (state.app.documents.documents.items, 0..) |_, index| {
         const rect = HitRect{ .left = tab_x - 4, .top = 96, .right = tab_x + 174, .bottom = 122 };
         if (pointIn(rect, x, y)) return index;

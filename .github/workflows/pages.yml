@@ -71,10 +71,10 @@ jobs:
 
       - name: Build release artifacts
         run: |
-          zig build install --cache-dir .zig-cache --global-cache-dir .zig-global-cache
-          zig build install-gui --cache-dir .zig-cache --global-cache-dir .zig-global-cache
-          zig build install-linux --cache-dir .zig-cache --global-cache-dir .zig-global-cache
-          zig build install-linux-gui --cache-dir .zig-cache --global-cache-dir .zig-global-cache
+          zig build install -Doptimize=ReleaseSafe --cache-dir .zig-cache --global-cache-dir .zig-global-cache
+          zig build install-gui -Doptimize=ReleaseSafe --cache-dir .zig-cache --global-cache-dir .zig-global-cache
+          zig build install-linux -Doptimize=ReleaseSafe --cache-dir .zig-cache --global-cache-dir .zig-global-cache
+          zig build install-linux-gui -Doptimize=ReleaseSafe --cache-dir .zig-cache --global-cache-dir .zig-global-cache
 
       - name: Bundle and verify release
         run: |

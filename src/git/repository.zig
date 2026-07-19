@@ -160,6 +160,80 @@ const IgnoreRules = struct {
     }
 };
 
+const TextMode = enum {
+    auto,
+    text,
+    binary,
+    unspecified,
+};
+
+const TextAttributeRule = struct {
+    pattern: []u8,
+    mode: TextMode,
+
+    fn deinit(self: *TextAttributeRule, allocator: std.mem.Allocator) void {
+        allocator.free(self.pattern);
+        self.* = undefined;
+    }
+};
+
+const TextAttributes = struct {
+    allocator: std.mem.Allocator,
+    rules: []TextAttributeRule = &.{},
+
+    fn deinit(self: *TextAttributes) void {
+        for (self.rules) |*rule| rule.deinit(self.allocator);
+        if (self.rules.len > 0) self.allocator.free(self.rules);
+        self.* = undefined;
+    }
+
+    fn modeForPath(self: *const TextAttributes, path: []const u8) TextMode {
+        var mode: TextMode = .unspecified;
+        for (self.rules) |rule| {
+            if (attributePatternMatches(rule.pattern, path)) mode = rule.mode;
+        }
+        return mode;
+    }
+
+    fn canonicalize(
+        self: *const TextAttributes,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        bytes: []const u8,
+    ) !CanonicalBytes {
+        const mode = self.modeForPath(path);
+        const normalize = switch (mode) {
+            .text => true,
+            .auto => !hasNul(bytes),
+            .binary, .unspecified => false,
+        };
+        if (!normalize or std.mem.indexOf(u8, bytes, "\r\n") == null) {
+            return .{ .bytes = bytes };
+        }
+
+        const normalized = try allocator.alloc(u8, bytes.len - countCrLf(bytes));
+        var source: usize = 0;
+        var destination: usize = 0;
+        while (source < bytes.len) : (source += 1) {
+            if (bytes[source] == '\r' and source + 1 < bytes.len and bytes[source + 1] == '\n') continue;
+            normalized[destination] = bytes[source];
+            destination += 1;
+        }
+        std.debug.assert(destination == normalized.len);
+        return .{ .bytes = normalized, .owned = normalized };
+    }
+};
+
+const CanonicalBytes = struct {
+    bytes: []const u8,
+    owned: ?[]u8 = null,
+
+    fn deinit(self: *CanonicalBytes, allocator: std.mem.Allocator) void {
+        if (self.owned) |bytes| allocator.free(bytes);
+        self.* = undefined;
+    }
+};
+
 pub fn inspect(allocator: std.mem.Allocator, workspace: *const workspace_mod.Workspace, options: InspectOptions) !Overview {
     var overview = Overview{ .allocator = allocator };
     errdefer overview.deinit();
@@ -187,7 +261,9 @@ pub fn inspect(allocator: std.mem.Allocator, workspace: *const workspace_mod.Wor
     overview.index_entries = index.entries.len;
     var ignore_rules = try loadIgnoreRules(allocator, workspace.root_path, options.max_file_bytes);
     defer ignore_rules.deinit();
-    try collectChanges(allocator, workspace, &index, &ignore_rules, options, &overview);
+    var text_attributes = try loadTextAttributes(allocator, workspace.root_path, overview.git_dir.?, options.max_file_bytes);
+    defer text_attributes.deinit();
+    try collectChanges(allocator, workspace, &index, &ignore_rules, &text_attributes, options, &overview);
 
     return overview;
 }
@@ -232,20 +308,24 @@ pub fn previewFileDiff(allocator: std.mem.Allocator, workspace: *const workspace
         else => return err,
     };
     defer if (new_bytes) |bytes| allocator.free(bytes);
+    var text_attributes = try loadTextAttributes(allocator, workspace.root_path, git_dir.?, options.max_file_bytes);
+    defer text_attributes.deinit();
 
     if (entry) |tracked| {
         var old_blob = readLooseBlob(allocator, git_dir.?, tracked.object_id, options.max_file_bytes) catch null;
         defer if (old_blob) |*blob| blob.deinit(allocator);
 
         if (new_bytes) |new_body| {
-            const object_id = gitBlobSha1(new_body);
+            var canonical = try text_attributes.canonicalize(allocator, relative, new_body);
+            defer canonical.deinit(allocator);
+            const object_id = gitBlobSha1(canonical.bytes);
             if (std.mem.eql(u8, object_id[0..], tracked.object_id[0..])) {
                 try writer.writeAll("status: clean against index\n");
                 return try out.toOwnedSlice();
             }
             try writer.writeAll("status: modified\n");
             if (old_blob) |blob| {
-                try writeChangedPreview(writer, blob.body, new_body, options.max_lines);
+                try writeChangedPreview(writer, blob.body, canonical.bytes, options.max_lines);
             } else {
                 try writer.writeAll("diff body unavailable: indexed blob is packed or too large\n");
             }
@@ -276,6 +356,7 @@ fn collectChanges(
     workspace: *const workspace_mod.Workspace,
     index: *const Index,
     ignore_rules: *const IgnoreRules,
+    text_attributes: *const TextAttributes,
     options: InspectOptions,
     overview: *Overview,
 ) !void {
@@ -309,13 +390,15 @@ fn collectChanges(
         };
         defer allocator.free(bytes);
 
-        const object_id = gitBlobSha1(bytes);
+        var canonical = try text_attributes.canonicalize(allocator, entry.path, bytes);
+        defer canonical.deinit(allocator);
+        const object_id = gitBlobSha1(canonical.bytes);
         if (std.mem.eql(u8, object_id[0..], entry.object_id[0..])) {
             overview.clean_tracked += 1;
         } else {
             var old_blob = readLooseBlob(allocator, overview.git_dir.?, entry.object_id, options.max_file_bytes) catch null;
             defer if (old_blob) |*blob| blob.deinit(allocator);
-            const stats = if (old_blob) |blob| changedStats(blob.body, bytes) else DiffStats{};
+            const stats = if (old_blob) |blob| changedStats(blob.body, canonical.bytes) else DiffStats{};
             try appendChange(&changes, allocator, entry.path, .modified, stats);
         }
     }
@@ -401,6 +484,93 @@ fn loadIgnoreRules(allocator: std.mem.Allocator, workspace_root: []const u8, max
         .allocator = allocator,
         .patterns = try patterns.toOwnedSlice(),
     };
+}
+
+fn loadTextAttributes(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    git_dir: []const u8,
+    max_bytes: usize,
+) !TextAttributes {
+    var rules = std.array_list.Managed(TextAttributeRule).init(allocator);
+    errdefer {
+        for (rules.items) |*rule| rule.deinit(allocator);
+        rules.deinit();
+    }
+
+    const workspace_attributes = try std.fs.path.join(allocator, &.{ workspace_root, ".gitattributes" });
+    defer allocator.free(workspace_attributes);
+    try appendTextAttributeFile(allocator, &rules, workspace_attributes, max_bytes);
+
+    // Repository-local info attributes have higher precedence than tracked attributes.
+    const info_attributes = try std.fs.path.join(allocator, &.{ git_dir, "info", "attributes" });
+    defer allocator.free(info_attributes);
+    try appendTextAttributeFile(allocator, &rules, info_attributes, max_bytes);
+
+    return .{
+        .allocator = allocator,
+        .rules = try rules.toOwnedSlice(),
+    };
+}
+
+fn appendTextAttributeFile(
+    allocator: std.mem.Allocator,
+    rules: *std.array_list.Managed(TextAttributeRule),
+    path: []const u8,
+    max_bytes: usize,
+) !void {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, allocator, .limited(max_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        var tokens = std.mem.tokenizeAny(u8, line, " \t");
+        var pattern = tokens.next() orelse continue;
+        if (pattern.len == 0 or pattern[0] == '!') continue;
+        if (pattern[0] == '/') pattern = pattern[1..];
+        if (pattern.len == 0 or pattern[pattern.len - 1] == '/') continue;
+
+        var mode: ?TextMode = null;
+        while (tokens.next()) |attribute| {
+            if (std.mem.eql(u8, attribute, "text")) {
+                mode = .text;
+            } else if (std.mem.eql(u8, attribute, "text=auto")) {
+                mode = .auto;
+            } else if (std.mem.eql(u8, attribute, "-text") or std.mem.eql(u8, attribute, "binary")) {
+                mode = .binary;
+            } else if (std.mem.eql(u8, attribute, "!text")) {
+                mode = .unspecified;
+            } else if (std.mem.startsWith(u8, attribute, "eol=")) {
+                mode = .text;
+            }
+        }
+        const resolved_mode = mode orelse continue;
+        try rules.append(.{
+            .pattern = try allocator.dupe(u8, pattern),
+            .mode = resolved_mode,
+        });
+    }
+}
+
+fn attributePatternMatches(pattern: []const u8, path: []const u8) bool {
+    if (containsSlash(pattern)) return wildcardMatch(pattern, path);
+    const basename_start = (std.mem.lastIndexOfAny(u8, path, "/\\") orelse return wildcardMatch(pattern, path)) + 1;
+    return wildcardMatch(pattern, path[basename_start..]);
+}
+
+fn countCrLf(bytes: []const u8) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index + 1 < bytes.len) : (index += 1) {
+        if (bytes[index] == '\r' and bytes[index + 1] == '\n') count += 1;
+    }
+    return count;
 }
 
 fn readHead(allocator: std.mem.Allocator, overview: *Overview, git_dir: []const u8) !void {
@@ -1024,4 +1194,47 @@ test "ignore patterns match directories and wildcards" {
     try std.testing.expect(ignorePatternMatches(exe_pattern, "zide.exe"));
     try std.testing.expect(ignorePatternMatches(exe_pattern, "bin/zide.exe"));
     try std.testing.expect(!ignorePatternMatches(exe_pattern, "src/main.zig"));
+}
+
+test "text attributes normalize CRLF before index hashing" {
+    var attributes = TextAttributes{
+        .allocator = std.testing.allocator,
+        .rules = try std.testing.allocator.dupe(TextAttributeRule, &.{
+            .{ .pattern = try std.testing.allocator.dupe(u8, "*"), .mode = .auto },
+            .{ .pattern = try std.testing.allocator.dupe(u8, "*.png"), .mode = .binary },
+        }),
+    };
+    defer attributes.deinit();
+
+    var source = try attributes.canonicalize(std.testing.allocator, "src/main.zig", "one\r\ntwo\r\n");
+    defer source.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("one\ntwo\n", source.bytes);
+    try std.testing.expectEqualSlices(u8, gitBlobSha1("one\ntwo\n")[0..], gitBlobSha1(source.bytes)[0..]);
+
+    var binary = try attributes.canonicalize(std.testing.allocator, "assets/image.png", "a\r\nb");
+    defer binary.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("a\r\nb", binary.bytes);
+}
+
+test "text attribute parser honors later binary overrides" {
+    var rules = std.array_list.Managed(TextAttributeRule).init(std.testing.allocator);
+    defer {
+        for (rules.items) |*rule| rule.deinit(std.testing.allocator);
+        rules.deinit();
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "attributes",
+        .data = "* text=auto\n*.zig text eol=lf\n*.png binary\n",
+    });
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(std.Options.debug_io, "attributes", &path_buffer);
+    try appendTextAttributeFile(std.testing.allocator, &rules, path_buffer[0..path_len], 4096);
+
+    const attributes = TextAttributes{ .allocator = std.testing.allocator, .rules = rules.items };
+    try std.testing.expectEqual(TextMode.text, attributes.modeForPath("src/main.zig"));
+    try std.testing.expectEqual(TextMode.binary, attributes.modeForPath("assets/logo.png"));
+    try std.testing.expectEqual(TextMode.auto, attributes.modeForPath("README.md"));
 }

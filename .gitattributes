@@ -1,0 +1,15 @@
+* text=auto
+
+*.zig text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.zon text eol=lf
+
+*.png binary
+*.bmp binary
+*.ico binary
+*.exe binary
+*.zip binary
+*.tar binary

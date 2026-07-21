@@ -3765,6 +3765,7 @@ const release_gui_asset = ReleaseAsset{ .label = "WIN GUI", .relative_path = "zi
 const release_cli_asset = ReleaseAsset{ .label = "WIN CLI", .relative_path = "zig-out/bin/zide.exe", .release_name = "zide.exe" };
 const release_linux_gui_asset = ReleaseAsset{ .label = "LINUX GUI", .relative_path = "zig-out/linux-x86_64/bin/zide-gui", .release_name = "zide-gui" };
 const release_linux_cli_asset = ReleaseAsset{ .label = "LINUX CLI", .relative_path = "zig-out/linux-x86_64/bin/zide", .release_name = "zide" };
+const release_license_asset = ReleaseAsset{ .label = "LICENSE", .relative_path = "LICENSE", .release_name = "LICENSE" };
 
 const release_assets = [_]ReleaseAsset{
     release_bundle_asset,
@@ -3853,6 +3854,26 @@ fn sha256Hex(bytes: []const u8) !Sha256Hex {
     return hex;
 }
 
+fn hasCompleteMitLicenseNotice(bytes: []const u8) bool {
+    return std.mem.indexOf(u8, bytes, "MIT License") != null and
+        std.mem.indexOf(u8, bytes, "Permission is hereby granted, free of charge") != null and
+        std.mem.indexOf(u8, bytes, "The above copyright notice and this permission notice shall be included") != null and
+        std.mem.indexOf(u8, bytes, "THE SOFTWARE IS PROVIDED \"AS IS\"") != null and
+        std.mem.indexOf(u8, bytes, "IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE") != null;
+}
+
+fn checksumContainsEntry(checksums: []const u8, digest: []const u8, path: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, checksums, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (line.len != digest.len + 2 + path.len) continue;
+        if (!std.mem.eql(u8, line[0..digest.len], digest)) continue;
+        if (!std.mem.eql(u8, line[digest.len..][0..2], "  ")) continue;
+        if (std.mem.eql(u8, line[digest.len + 2 ..], path)) return true;
+    }
+    return false;
+}
+
 const ZipInputEntry = struct {
     name: []const u8,
     bytes: []const u8,
@@ -3895,12 +3916,22 @@ fn renderReleaseBundle(app: *app_mod.App) !bool {
     defer {
         if (linux_cli_bytes_opt) |bytes| app.allocator.free(bytes);
     }
+    const license_bytes_opt = try readReleaseAssetBytes(app, release_license_asset);
+    defer {
+        if (license_bytes_opt) |bytes| app.allocator.free(bytes);
+    }
+    const license_is_mit = if (license_bytes_opt) |bytes| hasCompleteMitLicenseNotice(bytes) else false;
 
-    if (gui_bytes_opt == null or cli_bytes_opt == null or linux_gui_bytes_opt == null or linux_cli_bytes_opt == null) {
+    if (gui_bytes_opt == null or cli_bytes_opt == null or linux_gui_bytes_opt == null or linux_cli_bytes_opt == null or !license_is_mit) {
         if (gui_bytes_opt == null) try writer.print("- missing: {s}\n", .{release_gui_asset.relative_path});
         if (cli_bytes_opt == null) try writer.print("- missing: {s}\n", .{release_cli_asset.relative_path});
         if (linux_gui_bytes_opt == null) try writer.print("- missing: {s}\n", .{release_linux_gui_asset.relative_path});
         if (linux_cli_bytes_opt == null) try writer.print("- missing: {s}\n", .{release_linux_cli_asset.relative_path});
+        if (license_bytes_opt == null) {
+            try writer.print("- missing: {s}\n", .{release_license_asset.relative_path});
+        } else if (!license_is_mit) {
+            try writer.print("- invalid: {s} must contain the complete MIT grant and warranty notice\n", .{release_license_asset.relative_path});
+        }
         try writer.writeAll("\nrun zig build install, zig build install-gui, zig build install-linux, and zig build install-linux-gui before creating release bundles\n");
         try app.process_console.appendBytes(.stdout, text.written());
         return false;
@@ -3910,15 +3941,18 @@ fn renderReleaseBundle(app: *app_mod.App) !bool {
     const cli_bytes = cli_bytes_opt.?;
     const linux_gui_bytes = linux_gui_bytes_opt.?;
     const linux_cli_bytes = linux_cli_bytes_opt.?;
+    const license_bytes = license_bytes_opt.?;
     const gui_sha = try sha256Hex(gui_bytes);
     const cli_sha = try sha256Hex(cli_bytes);
     const linux_gui_sha = try sha256Hex(linux_gui_bytes);
     const linux_cli_sha = try sha256Hex(linux_cli_bytes);
+    const license_sha = try sha256Hex(license_bytes);
 
     var windows_checksums: std.Io.Writer.Allocating = .init(app.allocator);
     defer windows_checksums.deinit();
     try windows_checksums.writer.print("{s}  {s}/zide-gui.exe\n", .{ gui_sha[0..], release_bundle_root });
     try windows_checksums.writer.print("{s}  {s}/zide.exe\n", .{ cli_sha[0..], release_bundle_root });
+    try windows_checksums.writer.print("{s}  {s}/LICENSE\n", .{ license_sha[0..], release_bundle_root });
     const windows_checksum_bytes = try windows_checksums.toOwnedSlice();
     defer app.allocator.free(windows_checksum_bytes);
 
@@ -3926,6 +3960,7 @@ fn renderReleaseBundle(app: *app_mod.App) !bool {
     defer linux_checksums.deinit();
     try linux_checksums.writer.print("{s}  {s}/zide-gui\n", .{ linux_gui_sha[0..], release_linux_bundle_root });
     try linux_checksums.writer.print("{s}  {s}/zide\n", .{ linux_cli_sha[0..], release_linux_bundle_root });
+    try linux_checksums.writer.print("{s}  {s}/LICENSE\n", .{ license_sha[0..], release_linux_bundle_root });
     const linux_checksum_bytes = try linux_checksums.toOwnedSlice();
     defer app.allocator.free(linux_checksum_bytes);
 
@@ -3934,6 +3969,7 @@ fn renderReleaseBundle(app: *app_mod.App) !bool {
         "\n" ++
         "- zide-gui.exe: Windows GUI IDE/workbench\n" ++
         "- zide.exe: CLI/TUI entry point\n" ++
+        "- LICENSE: MIT License terms\n" ++
         "- CHECKSUMS.sha256: SHA-256 values for files inside this archive\n" ++
         "\n" ++
         "Built by release.bundle with pure Zig ZIP writing.\n";
@@ -3943,6 +3979,7 @@ fn renderReleaseBundle(app: *app_mod.App) !bool {
         "\n" ++
         "- zide-gui: Linux GUI IDE/workbench using Zig-only direct X11 protocol\n" ++
         "- zide: Linux CLI/TUI IDE/workbench entry point\n" ++
+        "- LICENSE: MIT License terms\n" ++
         "- CHECKSUMS.sha256: SHA-256 values for files inside this archive\n" ++
         "\n" ++
         "Built by release.bundle with pure Zig TAR writing.\n";
@@ -3950,6 +3987,7 @@ fn renderReleaseBundle(app: *app_mod.App) !bool {
     const zip_entries = [_]ZipInputEntry{
         .{ .name = release_bundle_root ++ "/zide-gui.exe", .bytes = gui_bytes },
         .{ .name = release_bundle_root ++ "/zide.exe", .bytes = cli_bytes },
+        .{ .name = release_bundle_root ++ "/LICENSE", .bytes = license_bytes },
         .{ .name = release_bundle_root ++ "/CHECKSUMS.sha256", .bytes = windows_checksum_bytes },
         .{ .name = release_bundle_root ++ "/ZIDE-RELEASE.txt", .bytes = release_note },
     };
@@ -3959,6 +3997,7 @@ fn renderReleaseBundle(app: *app_mod.App) !bool {
     const tar_entries = [_]TarInputEntry{
         .{ .name = release_linux_bundle_root ++ "/zide-gui", .bytes = linux_gui_bytes, .mode = 0o755 },
         .{ .name = release_linux_bundle_root ++ "/zide", .bytes = linux_cli_bytes, .mode = 0o755 },
+        .{ .name = release_linux_bundle_root ++ "/LICENSE", .bytes = license_bytes, .mode = 0o644 },
         .{ .name = release_linux_bundle_root ++ "/CHECKSUMS.sha256", .bytes = linux_checksum_bytes, .mode = 0o644 },
         .{ .name = release_linux_bundle_root ++ "/ZIDE-RELEASE.txt", .bytes = linux_release_note, .mode = 0o644 },
     };
@@ -4239,7 +4278,12 @@ fn renderReleasePreflight(app: *app_mod.App, argument: ?[]const u8) !bool {
     try writer.writeAll("project surface\n");
     try preflightRequired(writer, &blockers, workspaceHasPath(app, "README.md"), "README.md is present and remains human-written", .{});
     try preflightRequired(writer, &blockers, workspaceHasPath(app, "docs/security.md"), "docs/security.md explains the trust/security model", .{});
-    try preflightRequired(writer, &blockers, workspaceHasPath(app, "LICENSE") or workspaceHasPath(app, "LICENSE.md") or workspaceHasPath(app, "COPYING"), "license file is present", .{});
+    const license_bytes_opt = try readReleaseAssetBytes(app, release_license_asset);
+    defer {
+        if (license_bytes_opt) |bytes| app.allocator.free(bytes);
+    }
+    const license_is_mit = if (license_bytes_opt) |bytes| hasCompleteMitLicenseNotice(bytes) else false;
+    try preflightRequired(writer, &blockers, license_is_mit, "LICENSE contains the complete MIT grant and warranty notice", .{});
     try preflightRequired(writer, &blockers, workspaceHasPrefix(app, ".github/workflows/"), "GitHub Actions workflow is present", .{});
     try preflightWarning(writer, &warnings, workspaceHasPath(app, ".github/workflows/pages.yml"), "GitHub Pages may need one-time repository enablement or a PAGES_TOKEN secret", .{});
 
@@ -4383,6 +4427,7 @@ fn verifyStoredReleaseZip(writer: *std.Io.Writer, bytes: []const u8) !bool {
     var index: usize = 0;
     var gui_data: ?[]const u8 = null;
     var cli_data: ?[]const u8 = null;
+    var license_data: ?[]const u8 = null;
     var checksum_data: ?[]const u8 = null;
     var note_seen = false;
 
@@ -4431,6 +4476,9 @@ fn verifyStoredReleaseZip(writer: *std.Io.Writer, bytes: []const u8) !bool {
             } else if (std.mem.eql(u8, name, release_bundle_root ++ "/zide.exe")) {
                 if (cli_data != null) try reportZipIssue(writer, &ok, &issues, "duplicate CLI entry", .{});
                 cli_data = entry_bytes;
+            } else if (std.mem.eql(u8, name, release_bundle_root ++ "/LICENSE")) {
+                if (license_data != null) try reportZipIssue(writer, &ok, &issues, "duplicate LICENSE entry", .{});
+                license_data = entry_bytes;
             } else if (std.mem.eql(u8, name, release_bundle_root ++ "/CHECKSUMS.sha256")) {
                 if (checksum_data != null) try reportZipIssue(writer, &ok, &issues, "duplicate checksum entry", .{});
                 checksum_data = entry_bytes;
@@ -4450,20 +4498,32 @@ fn verifyStoredReleaseZip(writer: *std.Io.Writer, bytes: []const u8) !bool {
     }
     if (gui_data == null) try reportZipIssue(writer, &ok, &issues, "missing zide-gui.exe entry", .{});
     if (cli_data == null) try reportZipIssue(writer, &ok, &issues, "missing zide.exe entry", .{});
+    if (license_data == null) try reportZipIssue(writer, &ok, &issues, "missing LICENSE entry", .{});
     if (checksum_data == null) try reportZipIssue(writer, &ok, &issues, "missing CHECKSUMS.sha256 entry", .{});
     if (!note_seen) try reportZipIssue(writer, &ok, &issues, "missing ZIDE-RELEASE.txt entry", .{});
+    if (license_data) |license_bytes| {
+        if (!hasCompleteMitLicenseNotice(license_bytes)) {
+            try reportZipIssue(writer, &ok, &issues, "LICENSE does not contain the complete MIT grant and warranty notice", .{});
+        }
+    }
 
     if (checksum_data) |checksums| {
         if (gui_data) |gui| {
             const gui_sha = try sha256Hex(gui);
-            if (std.mem.indexOf(u8, checksums, gui_sha[0..]) == null) {
-                try reportZipIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the GUI SHA-256", .{});
+            if (!checksumContainsEntry(checksums, gui_sha[0..], release_bundle_root ++ "/zide-gui.exe")) {
+                try reportZipIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the exact GUI entry", .{});
             }
         }
         if (cli_data) |cli_bytes| {
             const cli_sha = try sha256Hex(cli_bytes);
-            if (std.mem.indexOf(u8, checksums, cli_sha[0..]) == null) {
-                try reportZipIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the CLI SHA-256", .{});
+            if (!checksumContainsEntry(checksums, cli_sha[0..], release_bundle_root ++ "/zide.exe")) {
+                try reportZipIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the exact CLI entry", .{});
+            }
+        }
+        if (license_data) |license_bytes| {
+            const license_sha = try sha256Hex(license_bytes);
+            if (!checksumContainsEntry(checksums, license_sha[0..], release_bundle_root ++ "/LICENSE")) {
+                try reportZipIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the exact LICENSE entry", .{});
             }
         }
     }
@@ -4556,10 +4616,12 @@ fn verifyStoredReleaseTar(writer: *std.Io.Writer, bytes: []const u8) !bool {
     var entry_count: usize = 0;
     var gui_data: ?[]const u8 = null;
     var cli_data: ?[]const u8 = null;
+    var license_data: ?[]const u8 = null;
     var checksum_data: ?[]const u8 = null;
     var note_seen = false;
     var gui_mode: ?u32 = null;
     var cli_mode: ?u32 = null;
+    var license_mode: ?u32 = null;
 
     while (pos + 512 <= bytes.len) {
         const header = bytes[pos..][0..512];
@@ -4615,6 +4677,10 @@ fn verifyStoredReleaseTar(writer: *std.Io.Writer, bytes: []const u8) !bool {
             if (cli_data != null) try reportTarIssue(writer, &ok, &issues, "duplicate Linux zide entry", .{});
             cli_data = data;
             cli_mode = @intCast(mode);
+        } else if (std.mem.eql(u8, name, release_linux_bundle_root ++ "/LICENSE")) {
+            if (license_data != null) try reportTarIssue(writer, &ok, &issues, "duplicate Linux LICENSE entry", .{});
+            license_data = data;
+            license_mode = @intCast(mode);
         } else if (std.mem.eql(u8, name, release_linux_bundle_root ++ "/CHECKSUMS.sha256")) {
             if (checksum_data != null) try reportTarIssue(writer, &ok, &issues, "duplicate Linux checksum entry", .{});
             checksum_data = data;
@@ -4634,6 +4700,7 @@ fn verifyStoredReleaseTar(writer: *std.Io.Writer, bytes: []const u8) !bool {
     if (entry_count == 0) try reportTarIssue(writer, &ok, &issues, "TAR has no entries", .{});
     if (gui_data == null) try reportTarIssue(writer, &ok, &issues, "missing Linux zide-gui entry", .{});
     if (cli_data == null) try reportTarIssue(writer, &ok, &issues, "missing Linux zide entry", .{});
+    if (license_data == null) try reportTarIssue(writer, &ok, &issues, "missing Linux LICENSE entry", .{});
     if (checksum_data == null) try reportTarIssue(writer, &ok, &issues, "missing Linux CHECKSUMS.sha256 entry", .{});
     if (!note_seen) try reportTarIssue(writer, &ok, &issues, "missing Linux ZIDE-RELEASE.txt entry", .{});
     if (gui_mode) |mode| {
@@ -4642,18 +4709,32 @@ fn verifyStoredReleaseTar(writer: *std.Io.Writer, bytes: []const u8) !bool {
     if (cli_mode) |mode| {
         if ((mode & 0o111) == 0) try reportTarIssue(writer, &ok, &issues, "Linux zide entry is not executable", .{});
     }
+    if (license_mode) |mode| {
+        if ((mode & 0o777) != 0o644) try reportTarIssue(writer, &ok, &issues, "Linux LICENSE mode must be 0644", .{});
+    }
+    if (license_data) |license_bytes| {
+        if (!hasCompleteMitLicenseNotice(license_bytes)) {
+            try reportTarIssue(writer, &ok, &issues, "Linux LICENSE does not contain the complete MIT grant and warranty notice", .{});
+        }
+    }
 
     if (checksum_data) |checksums| {
         if (gui_data) |gui_bytes| {
             const gui_sha = try sha256Hex(gui_bytes);
-            if (std.mem.indexOf(u8, checksums, gui_sha[0..]) == null) {
-                try reportTarIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the Linux GUI SHA-256", .{});
+            if (!checksumContainsEntry(checksums, gui_sha[0..], release_linux_bundle_root ++ "/zide-gui")) {
+                try reportTarIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the exact Linux GUI entry", .{});
             }
         }
         if (cli_data) |cli_bytes| {
             const cli_sha = try sha256Hex(cli_bytes);
-            if (std.mem.indexOf(u8, checksums, cli_sha[0..]) == null) {
-                try reportTarIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the Linux CLI SHA-256", .{});
+            if (!checksumContainsEntry(checksums, cli_sha[0..], release_linux_bundle_root ++ "/zide")) {
+                try reportTarIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the exact Linux CLI entry", .{});
+            }
+        }
+        if (license_data) |license_bytes| {
+            const license_sha = try sha256Hex(license_bytes);
+            if (!checksumContainsEntry(checksums, license_sha[0..], release_linux_bundle_root ++ "/LICENSE")) {
+                try reportTarIssue(writer, &ok, &issues, "CHECKSUMS.sha256 does not contain the exact Linux LICENSE entry", .{});
             }
         }
     }
@@ -4818,7 +4899,7 @@ fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
         \\PackageLocale: en-US
         \\Publisher: {s}
         \\PackageName: ZIDE
-        \\License: TODO
+        \\License: MIT
         \\ShortDescription: Secure Zig-native IDE/workbench with visible trust boundaries.
         \\Installers:
         \\
@@ -4841,7 +4922,7 @@ fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
         \\  "version": "{s}",
         \\  "description": "Secure Zig-native IDE/workbench with visible trust boundaries.",
         \\  "homepage": "{s}",
-        \\  "license": "TODO",
+        \\  "license": "MIT",
         \\  "architecture": {{
         \\    "64bit": {{
         \\
@@ -5907,6 +5988,18 @@ test "release assets command renders artifact hashes" {
     try std.testing.expect(saw_hash);
 }
 
+const test_mit_license =
+    "MIT License\n" ++
+    "Permission is hereby granted, free of charge, to use this Software.\n" ++
+    "The above copyright notice and this permission notice shall be included.\n" ++
+    "THE SOFTWARE IS PROVIDED \"AS IS\".\n" ++
+    "IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE.\n";
+
+test "MIT license validation requires grant inclusion and warranty notices" {
+    try std.testing.expect(hasCompleteMitLicenseNotice(test_mit_license));
+    try std.testing.expect(!hasCompleteMitLicenseNotice("MIT License\n"));
+}
+
 test "release bundle command creates Windows zip and Linux tar artifacts" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -5917,6 +6010,7 @@ test "release bundle command creates Windows zip and Linux tar artifacts" {
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide.exe", .data = "cli-bytes" });
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/linux-x86_64/bin/zide-gui", .data = "linux-gui-bytes" });
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/linux-x86_64/bin/zide", .data = "linux-cli-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "LICENSE", .data = test_mit_license });
 
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
@@ -5938,6 +6032,7 @@ test "release bundle command creates Windows zip and Linux tar artifacts" {
     try std.testing.expect(bytes.len >= 4);
     try std.testing.expectEqualSlices(u8, "PK\x03\x04", bytes[0..4]);
     try std.testing.expect(std.mem.indexOf(u8, bytes, release_bundle_root ++ "/zide.exe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, release_bundle_root ++ "/LICENSE") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, release_bundle_root ++ "/CHECKSUMS.sha256") != null);
 
     const tar_bytes = try tmp.dir.readFileAlloc(std.Options.debug_io, release_linux_bundle_asset.relative_path, std.testing.allocator, .limited(64 * 1024));
@@ -5946,6 +6041,7 @@ test "release bundle command creates Windows zip and Linux tar artifacts" {
     try std.testing.expect(std.mem.indexOf(u8, tar_bytes, "ustar") != null);
     try std.testing.expect(std.mem.indexOf(u8, tar_bytes, release_linux_bundle_root ++ "/zide-gui") != null);
     try std.testing.expect(std.mem.indexOf(u8, tar_bytes, release_linux_bundle_root ++ "/zide") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tar_bytes, release_linux_bundle_root ++ "/LICENSE") != null);
 }
 
 test "release verify validates bundled Windows zip and Linux tar artifacts" {
@@ -5958,6 +6054,7 @@ test "release verify validates bundled Windows zip and Linux tar artifacts" {
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide.exe", .data = "cli-bytes" });
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/linux-x86_64/bin/zide-gui", .data = "linux-gui-bytes" });
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/linux-x86_64/bin/zide", .data = "linux-cli-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "LICENSE", .data = test_mit_license });
 
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
@@ -6063,12 +6160,18 @@ test "release manifests command renders package drafts" {
 
     var saw_winget = false;
     var saw_scoop = false;
+    var saw_mit = false;
+    var saw_license_todo = false;
     for (app.process_console.lines.items) |line| {
         if (std.mem.indexOf(u8, line.text, "winget") != null) saw_winget = true;
         if (std.mem.indexOf(u8, line.text, "Scoop") != null) saw_scoop = true;
+        if (std.mem.indexOf(u8, line.text, "License: MIT") != null or std.mem.indexOf(u8, line.text, "\"license\": \"MIT\"") != null) saw_mit = true;
+        if (std.mem.indexOf(u8, line.text, "License: TODO") != null or std.mem.indexOf(u8, line.text, "\"license\": \"TODO\"") != null) saw_license_todo = true;
     }
     try std.testing.expect(saw_winget);
     try std.testing.expect(saw_scoop);
+    try std.testing.expect(saw_mit);
+    try std.testing.expect(!saw_license_todo);
 }
 
 test "release manifests prefer bundled zip artifact" {

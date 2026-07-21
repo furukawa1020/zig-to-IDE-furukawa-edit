@@ -3859,7 +3859,8 @@ fn hasCompleteMitLicenseNotice(bytes: []const u8) bool {
         std.mem.indexOf(u8, bytes, "Permission is hereby granted, free of charge") != null and
         std.mem.indexOf(u8, bytes, "The above copyright notice and this permission notice shall be included") != null and
         std.mem.indexOf(u8, bytes, "THE SOFTWARE IS PROVIDED \"AS IS\"") != null and
-        std.mem.indexOf(u8, bytes, "IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE") != null;
+        std.mem.indexOf(u8, bytes, "IN NO EVENT SHALL THE") != null and
+        std.mem.indexOf(u8, bytes, "AUTHORS OR COPYRIGHT HOLDERS BE LIABLE") != null;
 }
 
 fn checksumContainsEntry(checksums: []const u8, digest: []const u8, path: []const u8) bool {
@@ -5997,6 +5998,13 @@ const test_mit_license =
 
 test "MIT license validation requires grant inclusion and warranty notices" {
     try std.testing.expect(hasCompleteMitLicenseNotice(test_mit_license));
+    try std.testing.expect(hasCompleteMitLicenseNotice(
+        "MIT License\n" ++
+            "Permission is hereby granted, free of charge.\n" ++
+            "The above copyright notice and this permission notice shall be included.\n" ++
+            "THE SOFTWARE IS PROVIDED \"AS IS\". IN NO EVENT SHALL THE\n" ++
+            "AUTHORS OR COPYRIGHT HOLDERS BE LIABLE.\n",
+    ));
     try std.testing.expect(!hasCompleteMitLicenseNotice("MIT License\n"));
 }
 

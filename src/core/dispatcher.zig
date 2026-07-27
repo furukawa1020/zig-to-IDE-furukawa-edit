@@ -919,23 +919,35 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
     }
 
     if (std.mem.eql(u8, definition.id, "release.manifests")) {
-        try renderReleaseManifests(app, request.argument);
-        return .{ .completed = "release manifest drafts rendered" };
+        const rendered = try renderReleaseManifests(app, request.argument);
+        return if (rendered)
+            .{ .completed = "release manifest drafts rendered" }
+        else
+            .{ .blocked = "release manifest drafts require valid versions and complete release bundles" };
     }
 
     if (std.mem.eql(u8, definition.id, "release.bundle")) {
         const created = try renderReleaseBundle(app);
-        return .{ .completed = if (created) "release bundle created" else "release bundle waiting for build artifacts" };
+        return if (created)
+            .{ .completed = "release bundle created" }
+        else
+            .{ .blocked = "release bundle requires all platform artifacts and a valid MIT license" };
     }
 
     if (std.mem.eql(u8, definition.id, "release.verify")) {
         const verified = try renderReleaseVerification(app);
-        return .{ .completed = if (verified) "release bundle verified" else "release bundle verification found issues" };
+        return if (verified)
+            .{ .completed = "release bundle verified" }
+        else
+            .{ .blocked = "release bundle verification found issues" };
     }
 
     if (std.mem.eql(u8, definition.id, "release.preflight")) {
         const passed = try renderReleasePreflight(app, request.argument);
-        return .{ .completed = if (passed) "release preflight passed" else "release preflight found blockers" };
+        return if (passed)
+            .{ .completed = "release preflight passed" }
+        else
+            .{ .blocked = "release preflight found blockers" };
     }
 
     if (std.mem.eql(u8, definition.id, "git.status")) {
@@ -4276,6 +4288,9 @@ fn renderReleasePreflight(app: *app_mod.App, argument: ?[]const u8) !bool {
     try writer.print("version : {s}\n", .{package_version});
     try writer.print("trust   : {s}\n\n", .{@tagName(app.runtime.trust_state)});
 
+    try writer.writeAll("release identity\n");
+    try preflightRequired(writer, &blockers, isValidReleaseVersion(package_version), "version is valid semantic versioning: {s}", .{package_version});
+
     try writer.writeAll("project surface\n");
     try preflightRequired(writer, &blockers, workspaceHasPath(app, "README.md"), "README.md is present and remains human-written", .{});
     try preflightRequired(writer, &blockers, workspaceHasPath(app, "docs/security.md"), "docs/security.md explains the trust/security model", .{});
@@ -4845,7 +4860,7 @@ fn readU32Le(bytes: []const u8, offset: usize) ?u32 {
         (@as(u32, bytes[offset + 3]) << 24);
 }
 
-fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
+fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !bool {
     var text: std.Io.Writer.Allocating = .init(app.allocator);
     defer text.deinit();
     const writer = &text.writer;
@@ -4856,6 +4871,15 @@ fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
 
     const raw_version = std.mem.trim(u8, argument orelse "0.1.0", " \t\r\n");
     const package_version = packageVersionFromTag(if (raw_version.len == 0) "0.1.0" else raw_version);
+    if (!isValidReleaseVersion(package_version)) {
+        try writer.writeAll("release manifest drafts\n");
+        try writer.writeAll("mode: pure Zig; hashes come from local artifacts; verify final schema before submitting upstream\n\n");
+        try writer.print("invalid version: {s}\n", .{package_version});
+        try writer.writeAll("expected semantic version such as 0.1.0 or 1.2.3-rc.1\n");
+        try app.process_console.appendBytes(.stdout, text.written());
+        return false;
+    }
+
     var allocated_tag: ?[]u8 = null;
     const tag = if (std.mem.startsWith(u8, package_version, "v"))
         package_version
@@ -4881,17 +4905,19 @@ fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
     try writer.print("tag     : {s}\n", .{tag});
     try writer.print("version : {s}\n", .{package_version});
     if (bundle == null or linux_bundle == null) {
-        try writer.writeAll("missing : run release.bundle after zig build install, zig build install-gui, zig build install-linux, and zig build install-linux-gui for preferred archive assets\n");
+        try writer.writeAll("missing : complete Windows ZIP and Linux TAR bundles are required\n");
+        try writer.writeAll("next    : run release.bundle after building all four platform artifacts\n");
+        try app.process_console.appendBytes(.stdout, text.written());
+        return false;
     }
 
     try writer.writeAll("\nGitHub Release assets\n");
-    if (bundle) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
-    if (linux_bundle) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
+    try renderReleaseAssetUrl(writer, homepage, tag, bundle.?);
+    try renderReleaseAssetUrl(writer, homepage, tag, linux_bundle.?);
     if (gui) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
     if (cli) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
     if (linux_gui) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
     if (linux_cli) |item| try renderReleaseAssetUrl(writer, homepage, tag, item);
-    if (bundle == null and linux_bundle == null and gui == null and cli == null and linux_gui == null and linux_cli == null) try writer.writeAll("- no local artifacts found yet\n");
 
     try writer.writeAll("\nwinget portable draft\n");
     try writer.print(
@@ -4905,12 +4931,7 @@ fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
         \\Installers:
         \\
     , .{ owner, repo, package_version, owner });
-    if (bundle) |item| {
-        try renderWingetZipInstaller(writer, homepage, tag, item);
-    } else {
-        if (gui) |item| try renderWingetInstaller(writer, homepage, tag, item, "zide-gui");
-        if (cli) |item| try renderWingetInstaller(writer, homepage, tag, item, "zide");
-    }
+    try renderWingetZipInstaller(writer, homepage, tag, bundle.?);
     try writer.writeAll(
         \\ManifestType: singleton
         \\ManifestVersion: 1.9.0
@@ -4928,7 +4949,7 @@ fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
         \\    "64bit": {{
         \\
     , .{ package_version, homepage });
-    try renderScoopUrlAndHash(writer, homepage, tag, bundle, gui, cli);
+    try renderScoopUrlAndHash(writer, homepage, tag, bundle.?);
     try writer.writeAll(
         \\    }
         \\  },
@@ -4943,6 +4964,7 @@ fn renderReleaseManifests(app: *app_mod.App, argument: ?[]const u8) !void {
     try writer.print("- GitHub CLI shape: gh release create {s} zig-out/release/{s} --draft --prerelease\n", .{ tag, release_bundle_asset.release_name });
 
     try app.process_console.appendBytes(.stdout, text.written());
+    return true;
 }
 
 fn packageVersionFromTag(value: []const u8) []const u8 {
@@ -4952,21 +4974,14 @@ fn packageVersionFromTag(value: []const u8) []const u8 {
     return value;
 }
 
+fn isValidReleaseVersion(value: []const u8) bool {
+    _ = std.SemanticVersion.parse(value) catch return false;
+    return true;
+}
+
 fn renderReleaseAssetUrl(writer: *std.Io.Writer, homepage: []const u8, tag: []const u8, item: ReleaseAssetDigest) !void {
     try writer.print("- {s}: {s}/releases/download/{s}/{s}\n", .{ item.asset.label, homepage, tag, item.asset.release_name });
     try writer.print("  sha256: {s}\n", .{item.sha256[0..]});
-}
-
-fn renderWingetInstaller(writer: *std.Io.Writer, homepage: []const u8, tag: []const u8, item: ReleaseAssetDigest, command_name: []const u8) !void {
-    try writer.print(
-        \\- Architecture: x64
-        \\  InstallerType: portable
-        \\  InstallerUrl: {s}/releases/download/{s}/{s}
-        \\  InstallerSha256: {s}
-        \\  Commands:
-        \\  - {s}
-        \\
-    , .{ homepage, tag, item.asset.release_name, item.sha256[0..], command_name });
 }
 
 fn renderWingetZipInstaller(writer: *std.Io.Writer, homepage: []const u8, tag: []const u8, item: ReleaseAssetDigest) !void {
@@ -4985,60 +5000,13 @@ fn renderWingetZipInstaller(writer: *std.Io.Writer, homepage: []const u8, tag: [
     , .{ release_bundle_root, release_bundle_root, homepage, tag, item.asset.release_name, item.sha256[0..] });
 }
 
-fn renderScoopUrlAndHash(writer: *std.Io.Writer, homepage: []const u8, tag: []const u8, bundle: ?ReleaseAssetDigest, gui: ?ReleaseAssetDigest, cli: ?ReleaseAssetDigest) !void {
-    if (bundle) |item| {
-        try writer.print(
-            \\      "url": "{s}/releases/download/{s}/{s}",
-            \\      "hash": "{s}",
-            \\      "extract_dir": "{s}"
-            \\
-        , .{ homepage, tag, item.asset.release_name, item.sha256[0..], release_bundle_root });
-        return;
-    }
-    if (gui != null and cli != null) {
-        try writer.print(
-            \\      "url": [
-            \\        "{s}/releases/download/{s}/{s}",
-            \\        "{s}/releases/download/{s}/{s}"
-            \\      ],
-            \\      "hash": [
-            \\        "{s}",
-            \\        "{s}"
-            \\      ]
-            \\
-        , .{
-            homepage,
-            tag,
-            gui.?.asset.release_name,
-            homepage,
-            tag,
-            cli.?.asset.release_name,
-            gui.?.sha256[0..],
-            cli.?.sha256[0..],
-        });
-        return;
-    }
-    if (gui) |item| {
-        try writer.print(
-            \\      "url": "{s}/releases/download/{s}/{s}",
-            \\      "hash": "{s}"
-            \\
-        , .{ homepage, tag, item.asset.release_name, item.sha256[0..] });
-        return;
-    }
-    if (cli) |item| {
-        try writer.print(
-            \\      "url": "{s}/releases/download/{s}/{s}",
-            \\      "hash": "{s}"
-            \\
-        , .{ homepage, tag, item.asset.release_name, item.sha256[0..] });
-        return;
-    }
-    try writer.writeAll(
-        \\      "url": "https://github.com/OWNER/REPO/releases/download/v0.1.0/zide-windows-x86_64.zip",
-        \\      "hash": "TODO"
+fn renderScoopUrlAndHash(writer: *std.Io.Writer, homepage: []const u8, tag: []const u8, item: ReleaseAssetDigest) !void {
+    try writer.print(
+        \\      "url": "{s}/releases/download/{s}/{s}",
+        \\      "hash": "{s}",
+        \\      "extract_dir": "{s}"
         \\
-    );
+    , .{ homepage, tag, item.asset.release_name, item.sha256[0..], release_bundle_root });
 }
 
 fn checkMark(ok: bool) []const u8 {

@@ -80,6 +80,7 @@ jobs:
         run: |
           .\zig-out\bin\zide.exe command release.bundle
           .\zig-out\bin\zide.exe command release.verify
+          .\zig-out\bin\zide.exe command release.preflight v0.1.0
 
       - name: Generate site
         run: zig build site --cache-dir .zig-cache --global-cache-dir .zig-global-cache

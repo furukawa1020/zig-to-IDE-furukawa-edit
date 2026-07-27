@@ -11,9 +11,10 @@ pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     var stderr = std.Io.File.stderr().writer(init.io, &stderr_buffer);
 
-    try zide.runWithProcess(allocator, options, init.io, init.minimal.environ, &stdout.interface, &stderr.interface);
+    const exit_code = try zide.runWithProcess(allocator, options, init.io, init.minimal.environ, &stdout.interface, &stderr.interface);
     try stdout.interface.flush();
     try stderr.interface.flush();
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
 test {

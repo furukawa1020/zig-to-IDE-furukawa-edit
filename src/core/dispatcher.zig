@@ -6074,7 +6074,7 @@ test "release verify rejects unsafe zip paths" {
     defer app.deinit();
 
     const result = try dispatch(&app, .{ .id = "release.verify" });
-    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expect(std.meta.activeTag(result) == .blocked);
 
     var saw_failed = false;
     var saw_unsafe = false;
@@ -6098,7 +6098,7 @@ test "release preflight reports final gate blockers" {
     defer app.deinit();
 
     const result = try dispatch(&app, .{ .id = "release.preflight" });
-    try std.testing.expect(std.meta.activeTag(result) == .completed);
+    try std.testing.expect(std.meta.activeTag(result) == .blocked);
 
     var saw_header = false;
     var saw_blocked = false;
@@ -6121,8 +6121,11 @@ test "release manifests command renders package drafts" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/bin");
+    try tmp.dir.createDirPath(std.Options.debug_io, "zig-out/release");
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide-gui.exe", .data = "gui-bytes" });
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide.exe", .data = "cli-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = release_bundle_asset.relative_path, .data = "zip-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = release_linux_bundle_asset.relative_path, .data = "tar-bytes" });
 
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
@@ -6159,6 +6162,7 @@ test "release manifests prefer bundled zip artifact" {
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide-gui.exe", .data = "gui-bytes" });
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zig-out/bin/zide.exe", .data = "cli-bytes" });
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = release_bundle_asset.relative_path, .data = "zip-bytes" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = release_linux_bundle_asset.relative_path, .data = "tar-bytes" });
 
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
@@ -6181,6 +6185,33 @@ test "release manifests prefer bundled zip artifact" {
     try std.testing.expect(saw_bundle);
     try std.testing.expect(saw_winget_zip);
     try std.testing.expect(saw_scoop_extract);
+}
+
+test "release manifests reject invalid versions and missing bundles" {
+    try std.testing.expect(isValidReleaseVersion("0.1.0"));
+    try std.testing.expect(isValidReleaseVersion("1.2.3-rc.1"));
+    try std.testing.expect(!isValidReleaseVersion("v0.1.0"));
+    try std.testing.expect(!isValidReleaseVersion("latest"));
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.Options.debug_io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var app = try app_mod.App.init(std.testing.allocator, root_path);
+    defer app.deinit();
+
+    const invalid = try dispatch(&app, .{ .id = "release.manifests", .argument = "latest" });
+    try std.testing.expect(std.meta.activeTag(invalid) == .blocked);
+
+    app.process_console.clear();
+    const missing = try dispatch(&app, .{ .id = "release.manifests", .argument = "v0.2.0" });
+    try std.testing.expect(std.meta.activeTag(missing) == .blocked);
+    for (app.process_console.lines.items) |line| {
+        try std.testing.expect(std.mem.indexOf(u8, line.text, "TODO") == null);
+    }
 }
 
 test "file new creates a workspace file and opens it" {

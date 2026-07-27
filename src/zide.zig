@@ -190,7 +190,7 @@ pub fn run(
     stdout: anytype,
     stderr: anytype,
 ) !void {
-    try runWithProcess(allocator, options, std.Options.debug_io, std.process.Environ.empty, stdout, stderr);
+    _ = try runWithProcess(allocator, options, std.Options.debug_io, std.process.Environ.empty, stdout, stderr);
 }
 
 pub fn runWithProcess(
@@ -200,7 +200,7 @@ pub fn runWithProcess(
     environ: std.process.Environ,
     stdout: anytype,
     stderr: anytype,
-) !void {
+) !u8 {
     switch (options.action) {
         .open => |path| {
             var instance = app.App.initWithProcess(allocator, path, io, environ) catch |err| {
@@ -225,11 +225,12 @@ pub fn runWithProcess(
             }
         },
         .demo => |kind| try demo.run(allocator, kind, stdout),
-        .command => |invocation| try runCommandAction(allocator, invocation, io, environ, stdout, stderr),
+        .command => |invocation| return try runCommandAction(allocator, invocation, io, environ, stdout, stderr),
         .commands => try render.renderCommands(stdout),
         .version => try stdout.print("zide 0.1.0-dev\n", .{}),
         .help => try render.renderHelp(stdout),
     }
+    return 0;
 }
 
 fn runCommandAction(
@@ -239,7 +240,7 @@ fn runCommandAction(
     environ: std.process.Environ,
     stdout: anytype,
     stderr: anytype,
-) !void {
+) !u8 {
     var instance = app.App.initWithProcess(allocator, ".", io, environ) catch |err| {
         try stderr.print("zide: workspace open failed for '.': {s}\n", .{@errorName(err)});
         return err;
@@ -254,7 +255,10 @@ fn runCommandAction(
     try writeCommandConsole(&instance, stdout, stderr);
 
     switch (result) {
-        .completed => |message| try stdout.print("completed: {s}\n", .{message}),
+        .completed => |message| {
+            try stdout.print("completed: {s}\n", .{message});
+            return 0;
+        },
         .blocked => |message| try stderr.print("blocked: {s}\n", .{message}),
         .unknown_command => try stderr.print("unknown command: {s}\n", .{invocation.id}),
         .no_active_document => try stderr.print("no active document for command: {s}\n", .{invocation.id}),
@@ -265,6 +269,7 @@ fn runCommandAction(
             try stderr.print("external command not launched by zide command: {s}\n", .{display});
         },
     }
+    return 1;
 }
 
 fn writeCommandConsole(instance: *const app.App, stdout: anytype, stderr: anytype) !void {
@@ -284,7 +289,7 @@ test "command action dispatches an internal command" {
     var stderr_buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr_buffer.deinit();
 
-    try runWithProcess(
+    const exit_code = try runWithProcess(
         std.testing.allocator,
         .{ .action = .{ .command = .{ .id = "release.checklist" } } },
         std.Options.debug_io,
@@ -293,6 +298,27 @@ test "command action dispatches an internal command" {
         &stderr_buffer.writer,
     );
 
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_buffer.written(), "release/public launch checklist") != null);
     try std.testing.expectEqual(@as(usize, 0), stderr_buffer.written().len);
+}
+
+test "command action returns failure for an unknown command" {
+    var stdout_buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout_buffer.deinit();
+    var stderr_buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr_buffer.deinit();
+
+    const exit_code = try runWithProcess(
+        std.testing.allocator,
+        .{ .action = .{ .command = .{ .id = "missing.command" } } },
+        std.Options.debug_io,
+        std.process.Environ.empty,
+        &stdout_buffer.writer,
+        &stderr_buffer.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    try std.testing.expectEqual(@as(usize, 0), stdout_buffer.written().len);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buffer.written(), "unknown command") != null);
 }

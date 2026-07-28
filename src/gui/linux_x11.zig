@@ -1414,8 +1414,8 @@ const LinuxGuiState = struct {
     message_buf: [240]u8 = [_]u8{0} ** 240,
     message_len: usize = 0,
 
-    fn init(allocator: std.mem.Allocator, root_path: []const u8, environ: std.process.Environ) !LinuxGuiState {
-        var app = try app_mod.App.initWithProcess(allocator, root_path, std.Options.debug_io, environ);
+    fn init(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8, environ: std.process.Environ) !LinuxGuiState {
+        var app = try app_mod.App.initWithProcess(allocator, root_path, io, environ);
         errdefer app.deinit();
         const collapsed_dirs = try allocator.alloc(bool, app.workspace.entries.items.len);
         errdefer allocator.free(collapsed_dirs);
@@ -1559,7 +1559,7 @@ const LinuxGuiState = struct {
                     changed = true;
                 },
                 .modified => {
-                    const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, self.allocator, .limited(32 * 1024 * 1024)) catch |err| {
+                    const bytes = std.Io.Dir.cwd().readFileAlloc(self.app.io, path, self.allocator, .limited(32 * 1024 * 1024)) catch |err| {
                         self.appendOutput(.stderr, "external reload failed: {s}: {s}\n", .{ path, @errorName(err) });
                         continue;
                     };
@@ -2327,7 +2327,7 @@ const LinuxGuiState = struct {
         };
         defer self.allocator.free(path);
 
-        const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, self.allocator, .limited(64 * 1024)) catch |err| switch (err) {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(self.app.io, path, self.allocator, .limited(64 * 1024)) catch |err| switch (err) {
             error.FileNotFound => return,
             else => {
                 self.appendOutput(.stderr, "workbench settings load failed: {s}\n", .{@errorName(err)});
@@ -2352,18 +2352,18 @@ const LinuxGuiState = struct {
 
         const dir_path = try self.allocWorkbenchSettingsDirPath();
         defer self.allocator.free(dir_path);
-        try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir_path);
+        try std.Io.Dir.cwd().createDirPath(self.app.io, dir_path);
 
         const path = try self.allocWorkbenchSettingsPath();
         defer self.allocator.free(path);
-        var file = try createWorkbenchSettingsFile(path);
-        defer file.close(std.Options.debug_io);
+        var file = try createWorkbenchSettingsFile(self.app.io, path);
+        defer file.close(self.app.io);
 
         var buffer: [4096]u8 = undefined;
-        var writer = file.writer(std.Options.debug_io, &buffer);
+        var writer = file.writer(self.app.io, &buffer);
         try writer.interface.writeAll(text.written());
         try writer.interface.flush();
-        try file.sync(std.Options.debug_io);
+        try file.sync(self.app.io);
     }
 
     fn currentWorkbenchSettings(self: *const LinuxGuiState) workbench_settings.Settings {
@@ -4505,6 +4505,7 @@ const LinuxGuiState = struct {
             .argument = argument,
             .source = .command_palette,
         }) catch |err| {
+            std.log.err("source control {s} failed: {s}", .{ id, @errorName(err) });
             self.message("{s} failed: {s}", .{ id, @errorName(err) });
             self.appendOutput(.stderr, "{s} failed: {s}\n", .{ id, @errorName(err) });
             return;
@@ -5710,7 +5711,7 @@ const LinuxGuiState = struct {
     }
 
     fn openWorkspace(self: *LinuxGuiState, root_path: []const u8) void {
-        var next = app_mod.App.initWithProcess(self.allocator, root_path, std.Options.debug_io, self.app.environ) catch |err| {
+        var next = app_mod.App.initWithProcess(self.allocator, root_path, self.app.io, self.app.environ) catch |err| {
             self.message("workspace open failed: {s}", .{@errorName(err)});
             self.appendOutput(.stderr, "workspace open failed: {s}\n", .{@errorName(err)});
             return;
@@ -7021,20 +7022,21 @@ test "Linux browser environment excludes executable injection and GitHub secrets
     try std.testing.expect(!desktopEnvironmentKeyAllowed("BROWSER"));
 }
 
-fn createWorkbenchSettingsFile(path: []const u8) !std.Io.File {
+fn createWorkbenchSettingsFile(io: std.Io, path: []const u8) !std.Io.File {
     if (std.fs.path.isAbsolute(path)) {
-        return std.Io.Dir.createFileAbsolute(std.Options.debug_io, path, .{ .truncate = true });
+        return std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
     }
-    return std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{ .truncate = true });
+    return std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
 }
 
 pub fn run(
     allocator: std.mem.Allocator,
+    io: std.Io,
     root_path: []const u8,
     environ: std.process.Environ,
     environ_map: *const std.process.Environ.Map,
 ) !void {
-    var state = try LinuxGuiState.init(allocator, root_path, environ);
+    var state = try LinuxGuiState.init(allocator, io, root_path, environ);
     defer state.deinit();
     defer state.saveWorkbenchSettings();
 

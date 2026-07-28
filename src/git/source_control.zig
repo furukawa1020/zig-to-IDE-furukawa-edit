@@ -115,6 +115,11 @@ pub const Snapshot = struct {
     }
 };
 
+pub const Upstream = struct {
+    remote: []const u8,
+    branch: []const u8,
+};
+
 pub const Operation = enum {
     status,
     list_branches,
@@ -225,6 +230,7 @@ pub const Plan = struct {
         errdefer self.deinit();
 
         try self.appendBaseArguments();
+        try self.appendWorkspaceOwnershipBoundary();
         switch (operation) {
             .status => try self.appendMany(&.{ "status", "--porcelain=v1", "-z", "--branch", "--untracked-files=all" }),
             .list_branches => try self.appendMany(&.{ "for-each-ref", "--format=%(refname:short)", "refs/heads/" }),
@@ -310,8 +316,6 @@ pub const Plan = struct {
     }
 
     fn appendBaseArguments(self: *Plan) !void {
-        const safe_directory = try std.fmt.allocPrint(self.allocator, "safe.directory={s}", .{self.root_path});
-        defer self.allocator.free(safe_directory);
         try self.appendMany(&.{
             "--no-pager",
             "--no-optional-locks",
@@ -348,8 +352,6 @@ pub const Plan = struct {
             "submodule.recurse=false",
             "-c",
             "fetch.recurseSubmodules=false",
-            "-c",
-            safe_directory,
         });
     }
 
@@ -366,6 +368,18 @@ pub const Plan = struct {
             "-c",
             "protocol.ext.allow=never",
         });
+    }
+
+    fn appendWorkspaceOwnershipBoundary(self: *Plan) !void {
+        if (!std.fs.path.isAbsolute(self.root_path)) return error.WorkspaceRootMustBeAbsolute;
+        if (std.mem.indexOfScalar(u8, self.root_path, 0) != null or
+            std.mem.indexOfAny(u8, self.root_path, "\r\n") != null)
+        {
+            return error.InvalidWorkspaceRoot;
+        }
+        const setting = try std.fmt.allocPrint(self.allocator, "safe.directory={s}", .{self.root_path});
+        defer self.allocator.free(setting);
+        try self.appendMany(&.{ "-c", setting });
     }
 
     fn appendMany(self: *Plan, values: []const []const u8) !void {
@@ -650,6 +664,14 @@ pub fn validateRemoteName(name: []const u8) bool {
     return true;
 }
 
+pub fn parseUpstream(value: []const u8) ?Upstream {
+    const separator = std.mem.indexOfScalar(u8, value, '/') orelse return null;
+    const remote = value[0..separator];
+    const branch = value[separator + 1 ..];
+    if (!validateRemoteName(remote) or !validateBranchName(branch)) return null;
+    return .{ .remote = remote, .branch = branch };
+}
+
 fn parseBranchHeader(allocator: std.mem.Allocator, snapshot: *Snapshot, value: []const u8) !void {
     var detail = value;
     if (std.mem.startsWith(u8, detail, "No commits yet on ")) {
@@ -838,12 +860,29 @@ test "git plans use fixed argv boundaries" {
     try std.testing.expectEqualStrings("add", plan.args.items[plan.args.items.len - 3]);
     try std.testing.expectEqualStrings("--", plan.args.items[plan.args.items.len - 2]);
     try std.testing.expectEqualStrings("src/main.zig", plan.args.items[plan.args.items.len - 1]);
-    var workspace_scoped_safe_directory = false;
+    var credential_helpers_disabled = false;
+    var exact_ownership_boundary = false;
+    var wildcard_ownership_boundary = false;
     for (plan.args.items) |arg| {
-        workspace_scoped_safe_directory =
-            workspace_scoped_safe_directory or std.mem.eql(u8, arg, "safe.directory=C:\\workspace");
+        credential_helpers_disabled =
+            credential_helpers_disabled or std.mem.eql(u8, arg, "credential.helper=");
+        exact_ownership_boundary =
+            exact_ownership_boundary or std.mem.eql(u8, arg, "safe.directory=C:\\workspace");
+        wildcard_ownership_boundary =
+            wildcard_ownership_boundary or std.mem.eql(u8, arg, "safe.directory=*");
     }
-    try std.testing.expect(workspace_scoped_safe_directory);
+    try std.testing.expect(credential_helpers_disabled);
+    try std.testing.expect(exact_ownership_boundary);
+    try std.testing.expect(!wildcard_ownership_boundary);
+}
+
+test "upstream parser preserves remote and differently named tracking branch" {
+    const upstream = parseUpstream("origin/main").?;
+    try std.testing.expectEqualStrings("origin", upstream.remote);
+    try std.testing.expectEqualStrings("main", upstream.branch);
+    try std.testing.expect(parseUpstream("origin") == null);
+    try std.testing.expect(parseUpstream("origin/../main") == null);
+    try std.testing.expect(parseUpstream("-origin/main") == null);
 }
 
 test "network plans permit HTTPS and deny alternate Git transports" {

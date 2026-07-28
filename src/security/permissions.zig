@@ -82,6 +82,8 @@ fn isAllowedEnvKey(key: []const u8) bool {
         "USERPROFILE",
         "TMP",
         "TEMP",
+        "SYSTEMROOT",
+        "SSH_AUTH_SOCK",
         "ZIG_GLOBAL_CACHE_DIR",
         "ZIG_LOCAL_CACHE_DIR",
     };

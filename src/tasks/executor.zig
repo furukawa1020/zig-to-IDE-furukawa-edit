@@ -22,6 +22,13 @@ pub const RunOptions = struct {
     stdout_limit: usize = 512 * 1024,
     stderr_limit: usize = 512 * 1024,
     audit_log: bool = true,
+    clear_console: bool = true,
+    environment_overrides: []const EnvironmentOverride = &.{},
+};
+
+pub const EnvironmentOverride = struct {
+    key: []const u8,
+    value: []const u8,
 };
 
 pub const RunResult = union(enum) {
@@ -115,7 +122,12 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
     var ticket = queue.takeNextQueued() orelse return .empty_queue;
     defer ticket.deinit();
 
-    process_console.begin();
+    if (options.clear_console) {
+        process_console.begin();
+    } else {
+        process_console.running = true;
+        process_console.exit_code = null;
+    }
     if (!permissions.allowsWorkspacePath(ticket.fs_policy, options.workspace_root, ticket.cwd)) {
         const message = "approved command cwd is outside the permitted workspace boundary";
         try appendFormatted(process_console, .stderr, "blocked: {s}\n", .{message});
@@ -148,6 +160,12 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
 
     var env_map = try environmentMapForPolicy(process_console.allocator, options.environ, ticket.env_policy);
     defer if (env_map) |*map| map.deinit();
+    if (options.environment_overrides.len > 0 and env_map == null) {
+        env_map = try std.process.Environ.createMap(options.environ, process_console.allocator);
+    }
+    if (env_map) |*map| {
+        for (options.environment_overrides) |entry| try map.put(entry.key, entry.value);
+    }
     const env_ptr: ?*const std.process.Environ.Map = if (env_map) |*map| map else null;
 
     try appendFormatted(process_console, .stdout, "$ {s}\n", .{ticket.display_command});

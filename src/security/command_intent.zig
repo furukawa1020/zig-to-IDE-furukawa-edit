@@ -49,11 +49,11 @@ pub fn classify(executable: []const u8, args: []const []const u8) Intent {
             intent.reason = "Zig subcommand writes build artifacts or source";
         }
     } else if (isOneOf(basename, &.{ "git", "git.exe" })) {
-        if (firstArgIn(args, &.{ "add", "am", "apply", "bisect", "checkout", "clean", "clone", "commit", "fetch", "init", "merge", "mv", "pull", "push", "rebase", "reset", "restore", "rm", "stash", "submodule", "switch" })) {
+        if (gitSubcommandIn(args, &.{ "add", "am", "apply", "bisect", "checkout", "clean", "clone", "commit", "fetch", "init", "merge", "mv", "pull", "push", "rebase", "reset", "restore", "rm", "stash", "submodule", "switch" })) {
             intent.mutating = true;
             intent.reason = "Git subcommand mutates repository or network state";
         }
-        if (firstArgIn(args, &.{ "clone", "fetch", "ls-remote", "pull", "push", "remote", "submodule" })) {
+        if (gitSubcommandIn(args, &.{ "clone", "fetch", "ls-remote", "pull", "push", "remote", "submodule" })) {
             intent.network = true;
             intent.reason = "Git subcommand may access remotes";
         }
@@ -150,6 +150,46 @@ fn firstArgIn(args: []const []const u8, comptime names: []const []const u8) bool
     return false;
 }
 
+fn gitSubcommandIn(args: []const []const u8, comptime names: []const []const u8) bool {
+    const subcommand = gitSubcommand(args) orelse return false;
+    for (names) |name| {
+        if (std.ascii.eqlIgnoreCase(subcommand, name)) return true;
+    }
+    return false;
+}
+
+fn gitSubcommand(args: []const []const u8) ?[]const u8 {
+    var index: usize = 0;
+    while (index < args.len) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--")) {
+            index += 1;
+            return if (index < args.len) args[index] else null;
+        }
+        if (gitGlobalOptionConsumesValue(arg)) {
+            index += 2;
+            continue;
+        }
+        if (arg.len > 0 and arg[0] == '-') {
+            index += 1;
+            continue;
+        }
+        return arg;
+    }
+    return null;
+}
+
+fn gitGlobalOptionConsumesValue(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-c") or
+        std.mem.eql(u8, arg, "-C") or
+        std.mem.eql(u8, arg, "--config-env") or
+        std.mem.eql(u8, arg, "--exec-path") or
+        std.mem.eql(u8, arg, "--git-dir") or
+        std.mem.eql(u8, arg, "--namespace") or
+        std.mem.eql(u8, arg, "--super-prefix") or
+        std.mem.eql(u8, arg, "--work-tree");
+}
+
 fn isOneOf(value: []const u8, comptime names: []const []const u8) bool {
     for (names) |name| {
         if (std.ascii.eqlIgnoreCase(value, name)) return true;
@@ -180,6 +220,30 @@ test "command intent distinguishes local git from remote and package manager com
     try std.testing.expect(intent.network);
     try std.testing.expect(intent.mutating);
     try std.testing.expect(intent.package_manager);
+}
+
+test "command intent finds git subcommand after hardened global options" {
+    var intent = classify("git", &.{
+        "--no-optional-locks",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "add",
+        "--",
+        "src/main.zig",
+    });
+    try std.testing.expect(intent.mutating);
+    try std.testing.expect(!intent.network);
+
+    intent = classify("git", &.{
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--no-verify",
+    });
+    try std.testing.expect(intent.mutating);
+    try std.testing.expect(intent.network);
 }
 
 test "command intent handles shell and path basenames" {

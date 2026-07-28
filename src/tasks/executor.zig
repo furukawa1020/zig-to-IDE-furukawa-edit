@@ -3,6 +3,7 @@ const console = @import("console.zig");
 const execution_queue = @import("execution_queue.zig");
 const audit_chain = @import("../security/audit_chain.zig");
 const command_intent = @import("../security/command_intent.zig");
+const secure_environment = @import("../security/environment.zig");
 const permissions = @import("../security/permissions.zig");
 
 pub const PreviewResult = enum {
@@ -29,6 +30,7 @@ pub const RunOptions = struct {
 pub const EnvironmentOverride = struct {
     key: []const u8,
     value: []const u8,
+    sensitive: bool = false,
 };
 
 pub const RunResult = union(enum) {
@@ -159,7 +161,11 @@ pub fn runNext(queue: *execution_queue.Queue, process_console: *console.ProcessC
     defer argv.deinit();
 
     var env_map = try environmentMapForPolicy(process_console.allocator, options.environ, ticket.env_policy);
-    defer if (env_map) |*map| map.deinit();
+    defer if (env_map) |*map| {
+        wipeSensitiveOverrides(map, options.environment_overrides);
+        secure_environment.wipeMapValues(map);
+        map.deinit();
+    };
     if (options.environment_overrides.len > 0 and env_map == null) {
         env_map = try std.process.Environ.createMap(options.environ, process_console.allocator);
     }
@@ -360,7 +366,10 @@ fn environmentMapForPolicy(
         .empty => return std.process.Environ.Map.init(allocator),
         .allowlist => {
             var source = try std.process.Environ.createMap(environ, allocator);
-            defer source.deinit();
+            defer {
+                secure_environment.wipeMapValues(&source);
+                source.deinit();
+            }
 
             var filtered = std.process.Environ.Map.init(allocator);
             errdefer filtered.deinit();
@@ -373,6 +382,27 @@ fn environmentMapForPolicy(
             return filtered;
         },
     }
+}
+
+fn wipeSensitiveOverrides(map: *std.process.Environ.Map, overrides: []const EnvironmentOverride) void {
+    for (overrides) |entry| {
+        if (!entry.sensitive) continue;
+        const value = map.getPtr(entry.key) orelse continue;
+        @memset(@constCast(value.*), 0);
+    }
+}
+
+test "sensitive environment overrides are zeroed before map release" {
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("ZIDE_TEST_SECRET", "temporary-secret");
+
+    const overrides = [_]EnvironmentOverride{
+        .{ .key = "ZIDE_TEST_SECRET", .value = "temporary-secret", .sensitive = true },
+    };
+    wipeSensitiveOverrides(&map, &overrides);
+    const value = map.get("ZIDE_TEST_SECRET").?;
+    for (value) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
 fn termExitCode(term: std.process.Child.Term) i32 {

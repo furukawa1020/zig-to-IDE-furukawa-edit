@@ -8,6 +8,8 @@ const render_view = @import("../ui/render.zig");
 const runtime = @import("runtime.zig");
 const console = @import("../tasks/console.zig");
 const execution_queue = @import("../tasks/execution_queue.zig");
+const git_source_control = @import("../git/source_control.zig");
+const github_state = @import("../github/state.zig");
 const modes = @import("../language/modes.zig");
 const lsp_manager = @import("../lsp/manager.zig");
 const lsp_session = @import("../lsp/session.zig");
@@ -51,6 +53,8 @@ pub const App = struct {
     pending_build_source_id: ?[]u8,
     pending_build_argument: ?[]u8,
     execution_queue: execution_queue.Queue,
+    source_control_snapshot: ?git_source_control.Snapshot,
+    github_state: github_state.State,
 
     pub fn init(allocator: std.mem.Allocator, root_path: []const u8) !App {
         return initWithProcess(allocator, root_path, std.Options.debug_io, std.process.Environ.empty);
@@ -99,6 +103,8 @@ pub const App = struct {
                 .pending_build_source_id = null,
                 .pending_build_argument = null,
                 .execution_queue = execution_queue.Queue.init(allocator),
+                .source_control_snapshot = null,
+                .github_state = github_state.State.init(allocator),
             };
         };
         errdefer self.deinit();
@@ -116,6 +122,8 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.clearPendingBuildConsent();
+        self.clearSourceControlSnapshot();
+        self.github_state.deinit();
         self.recovery_manager.deinit();
         self.debug_manager.deinit();
         self.lsp_manager.deinit();
@@ -126,6 +134,16 @@ pub const App = struct {
         self.palette.deinit();
         self.documents.deinit();
         self.workspace.deinit();
+    }
+
+    pub fn replaceSourceControlSnapshot(self: *App, snapshot: git_source_control.Snapshot) void {
+        self.clearSourceControlSnapshot();
+        self.source_control_snapshot = snapshot;
+    }
+
+    pub fn clearSourceControlSnapshot(self: *App) void {
+        if (self.source_control_snapshot) |*snapshot| snapshot.deinit();
+        self.source_control_snapshot = null;
     }
 
     pub fn checkpointRecovery(self: *App) !recovery_mod.CheckpointReport {

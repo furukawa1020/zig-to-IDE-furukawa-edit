@@ -885,7 +885,7 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         }
 
         var git_environment: ?GitEnvironment = if (queued_git_operation) |operation|
-            GitEnvironment.init(app.allocator, app.environ, operation.usesNetwork()) catch |err| {
+            GitEnvironment.init(app.allocator, app.environ, operation) catch |err| {
                 try appendConsole(app, .stderr, "Git authentication setup blocked: {s}\n", .{@errorName(err)});
                 return .{ .blocked = "GitHub token is invalid or too large for the secure HTTPS bridge" };
             }
@@ -1092,6 +1092,9 @@ fn executeGitOperation(
     clear_console: bool,
 ) !Result {
     if (operation == .status) {
+        if (try gitMetadataBlocksOperation(app, operation)) {
+            return .{ .blocked = "Git status may execute a configured filter or helper; review Git Security Status first" };
+        }
         try refreshSourceControlSnapshot(app, true);
         return .{ .completed = gitOperationSuccessMessage(operation) };
     }
@@ -1111,7 +1114,7 @@ fn executeGitOperation(
     var preview = try build_consent.makePreview(app.allocator, spec, app.runtime.trust_state);
     defer preview.deinit();
     configureGitConsent(&preview, operation);
-    var git_environment = GitEnvironment.init(app.allocator, app.environ, operation.usesNetwork()) catch |err| {
+    var git_environment = GitEnvironment.init(app.allocator, app.environ, operation) catch |err| {
         try appendConsole(app, .stderr, "Git authentication setup blocked: {s}\n", .{@errorName(err)});
         return .{ .blocked = "GitHub token is invalid or too large for the secure HTTPS bridge" };
     };
@@ -1223,20 +1226,27 @@ const GitEnvironment = struct {
     fn init(
         allocator: std.mem.Allocator,
         environ: std.process.Environ,
-        include_github_authentication: bool,
+        operation: git_source_control.Operation,
     ) !GitEnvironment {
         var self = GitEnvironment{ .allocator = allocator };
         errdefer self.deinit();
-        for (git_environment_overrides) |entry| self.append(entry);
+        for (git_environment_overrides) |entry| {
+            if (!includeGitEnvironmentOverride(operation, entry.key)) continue;
+            self.append(entry);
+        }
 
-        if (!include_github_authentication) return self;
+        if (!operation.usesNetwork()) return self;
         self.token = try github_client.tokenFromEnv(allocator, environ);
         if (self.token) |token| {
             if (token.value.len > max_token_bytes) return error.GitHubTokenTooLong;
             self.authorization_header = try makeGitHubAuthorizationHeader(allocator, token.value);
             self.append(.{ .key = "GIT_CONFIG_COUNT", .value = "1" });
             self.append(.{ .key = "GIT_CONFIG_KEY_0", .value = github_header_key });
-            self.append(.{ .key = "GIT_CONFIG_VALUE_0", .value = self.authorization_header.? });
+            self.append(.{
+                .key = "GIT_CONFIG_VALUE_0",
+                .value = self.authorization_header.?,
+                .sensitive = true,
+            });
         }
         return self;
     }
@@ -1259,6 +1269,18 @@ const GitEnvironment = struct {
         self.len += 1;
     }
 };
+
+fn includeGitEnvironmentOverride(operation: git_source_control.Operation, key: []const u8) bool {
+    if (operation == .commit and std.mem.eql(u8, key, "GIT_CONFIG_GLOBAL")) return false;
+    return true;
+}
+
+test "Git commit keeps user identity config while other operations isolate global config" {
+    try std.testing.expect(!includeGitEnvironmentOverride(.commit, "GIT_CONFIG_GLOBAL"));
+    try std.testing.expect(includeGitEnvironmentOverride(.commit, "GIT_CONFIG_NOSYSTEM"));
+    try std.testing.expect(includeGitEnvironmentOverride(.stage_path, "GIT_CONFIG_GLOBAL"));
+    try std.testing.expect(includeGitEnvironmentOverride(.push, "GIT_CONFIG_GLOBAL"));
+}
 
 fn makeGitHubAuthorizationHeader(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
     const credential_prefix = "x-access-token:";
@@ -1323,6 +1345,7 @@ test "Git remote transport findings block network operations but not local stagi
     try std.testing.expect(!gitFindingBlocksOperation(remote, .stage_path));
     try std.testing.expect(gitFindingBlocksOperation(remote, .push));
     try std.testing.expect(gitFindingBlocksOperation("Git filter can execute commands", .stage_path));
+    try std.testing.expect(gitFindingBlocksOperation("Git filter can execute commands", .status));
 }
 
 fn preferredGitHubRemote(overview: git_repository.Overview) ?[]const u8 {

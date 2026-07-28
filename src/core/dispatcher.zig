@@ -10,6 +10,7 @@ const process = @import("../platform/process.zig");
 const executor = @import("../tasks/executor.zig");
 const task_registry = @import("../tasks/registry.zig");
 const git_repository = @import("../git/repository.zig");
+const git_source_control = @import("../git/source_control.zig");
 const git_status = @import("../git/status.zig");
 const github_client = @import("../github/client.zig");
 const diagnostic_model = @import("../diagnostics/model.zig");
@@ -806,6 +807,34 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
             return result;
         }
 
+        if (gitOperationForCommand(source_id)) |first_operation| {
+            if (try gitMetadataBlocksOperation(app, first_operation)) {
+                return .{ .blocked = "Git metadata has high-risk executable boundaries; review Git Security Status first" };
+            }
+            if (first_operation.changesWorktree() and app.documents.dirtyCount() > 0) {
+                return .{ .blocked = "save or close dirty editor buffers before approving a Git worktree change" };
+            }
+            var first_plan = initGitPlan(app, first_operation, app.pending_build_argument) catch |err| {
+                return .{ .blocked = gitOperationValidationMessage(err) };
+            };
+            defer first_plan.deinit();
+            const current_command = try process.appendDisplay(app.allocator, first_plan.spawnSpec().command);
+            defer app.allocator.free(current_command);
+            if (!std.mem.eql(u8, current_command, preview.command)) {
+                return .{ .blocked = "Git launch plan changed after consent; review the action again" };
+            }
+            const cwd = first_plan.spawnSpec().command.cwd orelse app.workspace.root_path;
+            if (!permissions.allowsWorkspacePath(preview.consent.fs_policy, app.workspace.root_path, cwd)) {
+                return .{ .blocked = "approved Git action cwd is outside the workspace boundary" };
+            }
+            if (first_operation.usesNetwork() and !permissions.allowsNetwork(preview.consent.network_policy)) {
+                return .{ .blocked = "approved Git network action still has network denied" };
+            }
+            try app.execution_queue.enqueueSpec(source_id, first_plan.spawnSpec(), preview.consent);
+            app.clearPendingBuildConsent();
+            return .{ .completed = "approved Git action queued" };
+        }
+
         const spec = externalCommandPreviewById(app, source_id) orelse return .{ .blocked = "pending consent is not an executable command" };
         const cwd = spec.command.cwd orelse app.workspace.root_path;
         if (!permissions.allowsWorkspacePath(preview.consent.fs_policy, app.workspace.root_path, cwd)) {
@@ -836,12 +865,52 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
     }
 
     if (std.mem.eql(u8, definition.id, "task.run_next")) {
+        const queued_source_id = if (app.execution_queue.latestQueued()) |ticket|
+            try app.allocator.dupe(u8, ticket.source_command_id)
+        else
+            null;
+        defer if (queued_source_id) |source_id| app.allocator.free(source_id);
+        const queued_git_operation = if (queued_source_id) |source_id|
+            gitOperationForCommand(source_id)
+        else
+            null;
+
+        if (queued_git_operation) |operation| {
+            if (try gitMetadataBlocksOperation(app, operation)) {
+                return .{ .blocked = "queued Git action is no longer safe; review Git Security Status again" };
+            }
+            if (operation.changesWorktree() and app.documents.dirtyCount() > 0) {
+                return .{ .blocked = "save or close dirty editor buffers before running the approved Git action" };
+            }
+        }
+
+        var git_environment: ?GitEnvironment = if (queued_git_operation) |operation|
+            GitEnvironment.init(app.allocator, app.environ, operation.usesNetwork()) catch |err| {
+                try appendConsole(app, .stderr, "Git authentication setup blocked: {s}\n", .{@errorName(err)});
+                return .{ .blocked = "GitHub token is invalid or too large for the secure HTTPS bridge" };
+            }
+        else
+            null;
+        defer if (git_environment) |*environment| environment.deinit();
+
         const run_result = try executor.runNext(&app.execution_queue, &app.process_console, .{
             .workspace_root = app.workspace.root_path,
             .io = app.io,
             .environ = app.environ,
+            .environment_overrides = if (git_environment) |*environment| environment.slice() else &.{},
         });
         try syncDiagnosticsFromConsole(app);
+        const git_succeeded = switch (run_result) {
+            .ran => |exit_code| exit_code == 0 and queued_git_operation != null,
+            else => false,
+        };
+        if (git_succeeded) {
+            const operation = queued_git_operation.?;
+            if (operation.changesWorktree()) try app.workspace.refresh();
+            refreshSourceControlSnapshot(app, false) catch |err| {
+                try appendConsole(app, .stderr, "approved Git action completed, but status refresh failed: {s}\n", .{@errorName(err)});
+            };
+        }
         return switch (run_result) {
             .ran => |exit_code| if (exit_code == 0) .{ .completed = "approved command finished" } else .{ .completed = "approved command finished with non-zero exit" },
             .empty_queue => .{ .blocked = "no approved command in execution queue" },
@@ -883,6 +952,16 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
         defer app.allocator.free(preview);
         try app.process_console.appendBytes(.stdout, preview);
         return .{ .completed = "git diff preview rendered" };
+    }
+
+    if (gitOperationForCommand(definition.id)) |operation| {
+        return try executeGitOperation(app, definition.id, operation, request.argument, true);
+    }
+
+    if (std.mem.eql(u8, definition.id, "git.sync")) {
+        const pulled = try executeGitOperation(app, "git.pull", .pull, null, true);
+        if (std.meta.activeTag(pulled) != .completed) return pulled;
+        return try executeGitOperation(app, "git.push", .push, null, false);
     }
 
     if (std.mem.eql(u8, definition.id, "github.fetch")) {
@@ -1005,6 +1084,309 @@ fn zigCommand(app: *app_mod.App, invocation: build_commands.BuildInvocation) pro
     return spec;
 }
 
+fn executeGitOperation(
+    app: *app_mod.App,
+    source_id: []const u8,
+    operation: git_source_control.Operation,
+    argument: ?[]const u8,
+    clear_console: bool,
+) !Result {
+    if (operation == .status) {
+        try refreshSourceControlSnapshot(app, true);
+        return .{ .completed = gitOperationSuccessMessage(operation) };
+    }
+    if (try gitMetadataBlocksOperation(app, operation)) {
+        return .{ .blocked = "Git metadata has high-risk executable boundaries for this action; run Git Security Status and review them first" };
+    }
+    if (operation.changesWorktree() and app.documents.dirtyCount() > 0) {
+        return .{ .blocked = "save or close dirty editor buffers before Git changes the working tree" };
+    }
+
+    var plan = initGitPlan(app, operation, argument) catch |err| {
+        try appendConsole(app, .stderr, "git action blocked: {s}\n", .{@errorName(err)});
+        return .{ .blocked = gitOperationValidationMessage(err) };
+    };
+    defer plan.deinit();
+    const spec = plan.spawnSpec();
+    var preview = try build_consent.makePreview(app.allocator, spec, app.runtime.trust_state);
+    defer preview.deinit();
+    configureGitConsent(&preview, operation);
+    var git_environment = GitEnvironment.init(app.allocator, app.environ, operation.usesNetwork()) catch |err| {
+        try appendConsole(app, .stderr, "Git authentication setup blocked: {s}\n", .{@errorName(err)});
+        return .{ .blocked = "GitHub token is invalid or too large for the secure HTTPS bridge" };
+    };
+    defer git_environment.deinit();
+    try app.execution_queue.enqueueSpec(source_id, spec, preview.consent);
+
+    const run_result = try executor.runNext(&app.execution_queue, &app.process_console, .{
+        .workspace_root = app.workspace.root_path,
+        .io = app.io,
+        .environ = app.environ,
+        .clear_console = clear_console,
+        .environment_overrides = git_environment.slice(),
+    });
+    try syncDiagnosticsFromConsole(app);
+    const result: Result = switch (run_result) {
+        .ran => |exit_code| if (exit_code == 0)
+            .{ .completed = gitOperationSuccessMessage(operation) }
+        else
+            .{ .blocked = "Git exited with a non-zero status" },
+        .empty_queue => .{ .blocked = "Git action was not queued" },
+        .blocked => |message| .{ .blocked = message },
+        .failed => |message| .{ .blocked = message },
+        .timed_out => .{ .blocked = "Git action timed out" },
+        .output_limited => .{ .blocked = "Git action exceeded the output limit" },
+    };
+    if (std.meta.activeTag(result) == .completed and operation.changesWorktree()) {
+        try app.workspace.refresh();
+    }
+    if (std.meta.activeTag(result) == .completed) {
+        refreshSourceControlSnapshot(app, false) catch |err| {
+            try appendConsole(app, .stderr, "Git action completed, but status refresh failed: {s}\n", .{@errorName(err)});
+        };
+    }
+    return result;
+}
+
+fn refreshSourceControlSnapshot(app: *app_mod.App, render: bool) !void {
+    var snapshot = try git_source_control.inspect(app.allocator, app.io, app.environ, app.workspace.root_path);
+    errdefer snapshot.deinit();
+    if (render) {
+        try appendConsole(app, .stdout, "source control (argv-only Git bridge; hooks/fsmonitor/pager disabled)\n", .{});
+        try appendConsole(app, .stdout, "  branch  : {s}\n", .{snapshot.branch orelse if (snapshot.detached) "(detached)" else "(unknown)"});
+        try appendConsole(app, .stdout, "  upstream: {s}  ahead:{d} behind:{d}\n", .{
+            snapshot.upstream orelse "(not published)",
+            snapshot.ahead,
+            snapshot.behind,
+        });
+        try appendConsole(app, .stdout, "  staged:{d} changes:{d}\n", .{
+            snapshot.stagedCount(),
+            snapshot.unstagedCount(),
+        });
+    }
+    app.replaceSourceControlSnapshot(snapshot);
+}
+
+fn initGitPlan(
+    app: *app_mod.App,
+    operation: git_source_control.Operation,
+    argument: ?[]const u8,
+) !git_source_control.Plan {
+    const executable = try git_source_control.resolveGitExecutable(
+        app.allocator,
+        app.io,
+        app.environ,
+        app.workspace.root_path,
+    );
+    defer app.allocator.free(executable);
+    var overview = try git_repository.inspect(app.allocator, &app.workspace, .{});
+    defer overview.deinit();
+    if (!overview.present) return error.GitRepositoryRequired;
+
+    return git_source_control.Plan.init(app.allocator, app.workspace.root_path, operation, .{
+        .argument = argument,
+        .remote = if (operation.usesNetwork()) preferredGitHubRemote(overview) else null,
+        .branch = overview.branch,
+        .has_head = overview.commit != null,
+        .executable = executable,
+    });
+}
+
+fn configureGitConsent(preview: *build_consent.Preview, operation: git_source_control.Operation) void {
+    preview.consent.env_policy = .allowlist;
+    preview.consent.fs_policy = .workspace_only;
+    preview.consent.network_policy = if (operation.usesNetwork()) .unrestricted else .deny;
+    preview.consent.timeout_ms = if (operation.usesNetwork()) 120_000 else 30_000;
+    preview.consent.output_limit_bytes = 2 * 1024 * 1024;
+}
+
+const git_environment_overrides = [_]executor.EnvironmentOverride{
+    .{ .key = "GIT_CONFIG_NOSYSTEM", .value = "1" },
+    .{ .key = "GIT_CONFIG_GLOBAL", .value = if (@import("builtin").os.tag == .windows) "NUL" else "/dev/null" },
+    .{ .key = "GIT_ATTR_NOSYSTEM", .value = "1" },
+    .{ .key = "GIT_TERMINAL_PROMPT", .value = "0" },
+    .{ .key = "GCM_INTERACTIVE", .value = "Never" },
+    .{ .key = "GIT_OPTIONAL_LOCKS", .value = "0" },
+    .{ .key = "GIT_PAGER", .value = "" },
+};
+
+const GitEnvironment = struct {
+    const max_token_bytes = 4096;
+    const github_header_key = "http.https://github.com/.extraHeader";
+
+    allocator: std.mem.Allocator,
+    token: ?github_client.Token = null,
+    authorization_header: ?[]u8 = null,
+    overrides: [git_environment_overrides.len + 3]executor.EnvironmentOverride = undefined,
+    len: usize = 0,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        environ: std.process.Environ,
+        include_github_authentication: bool,
+    ) !GitEnvironment {
+        var self = GitEnvironment{ .allocator = allocator };
+        errdefer self.deinit();
+        for (git_environment_overrides) |entry| self.append(entry);
+
+        if (!include_github_authentication) return self;
+        self.token = try github_client.tokenFromEnv(allocator, environ);
+        if (self.token) |token| {
+            if (token.value.len > max_token_bytes) return error.GitHubTokenTooLong;
+            self.authorization_header = try makeGitHubAuthorizationHeader(allocator, token.value);
+            self.append(.{ .key = "GIT_CONFIG_COUNT", .value = "1" });
+            self.append(.{ .key = "GIT_CONFIG_KEY_0", .value = github_header_key });
+            self.append(.{ .key = "GIT_CONFIG_VALUE_0", .value = self.authorization_header.? });
+        }
+        return self;
+    }
+
+    fn deinit(self: *GitEnvironment) void {
+        if (self.authorization_header) |header| {
+            @memset(header, 0);
+            self.allocator.free(header);
+        }
+        if (self.token) |*token| token.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn slice(self: *const GitEnvironment) []const executor.EnvironmentOverride {
+        return self.overrides[0..self.len];
+    }
+
+    fn append(self: *GitEnvironment, entry: executor.EnvironmentOverride) void {
+        self.overrides[self.len] = entry;
+        self.len += 1;
+    }
+};
+
+fn makeGitHubAuthorizationHeader(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+    const credential_prefix = "x-access-token:";
+    const credential = try allocator.alloc(u8, credential_prefix.len + token.len);
+    defer {
+        @memset(credential, 0);
+        allocator.free(credential);
+    }
+    @memcpy(credential[0..credential_prefix.len], credential_prefix);
+    @memcpy(credential[credential_prefix.len..], token);
+
+    const header_prefix = "Authorization: Basic ";
+    const encoded_len = std.base64.standard.Encoder.calcSize(credential.len);
+    const header = try allocator.alloc(u8, header_prefix.len + encoded_len);
+    @memcpy(header[0..header_prefix.len], header_prefix);
+    _ = std.base64.standard.Encoder.encode(header[header_prefix.len..], credential);
+    return header;
+}
+
+test "GitHub Git authorization header uses scoped Basic credentials" {
+    const header = try makeGitHubAuthorizationHeader(std.testing.allocator, "test-token");
+    defer {
+        @memset(header, 0);
+        std.testing.allocator.free(header);
+    }
+    try std.testing.expectEqualStrings(
+        "Authorization: Basic eC1hY2Nlc3MtdG9rZW46dGVzdC10b2tlbg==",
+        header,
+    );
+}
+
+fn gitMetadataBlocksOperation(app: *app_mod.App, operation: git_source_control.Operation) !bool {
+    var audit = try git_status.auditRepository(app.allocator, app.workspace.root_path, .{});
+    defer audit.deinit();
+    var count: usize = 0;
+    for (audit.items.items) |finding| {
+        if (!riskAtLeast(finding.risk, .high)) continue;
+        if (!gitFindingBlocksOperation(finding.message, operation)) continue;
+        count += 1;
+    }
+    if (count > 0) {
+        try appendConsole(app, .stderr, "Git {s} boundary blocked: {d} high/critical metadata finding(s)\n", .{
+            if (operation.usesNetwork()) "network" else if (operation == .status) "read" else "write",
+            count,
+        });
+    }
+    return count > 0;
+}
+
+fn gitFindingBlocksOperation(message: []const u8, operation: git_source_control.Operation) bool {
+    if (operation.usesNetwork()) return true;
+    return !std.mem.startsWith(u8, message, "Git remote URL") and
+        !std.mem.startsWith(u8, message, "submodule URL");
+}
+
+fn riskAtLeast(actual: security_findings.Risk, minimum: security_findings.Risk) bool {
+    return @intFromEnum(actual) >= @intFromEnum(minimum);
+}
+
+test "Git remote transport findings block network operations but not local staging" {
+    const remote = "Git remote URL uses an SSH transport outside ZIDE's HTTPS-only SCM bridge";
+    try std.testing.expect(!gitFindingBlocksOperation(remote, .stage_path));
+    try std.testing.expect(gitFindingBlocksOperation(remote, .push));
+    try std.testing.expect(gitFindingBlocksOperation("Git filter can execute commands", .stage_path));
+}
+
+fn preferredGitHubRemote(overview: git_repository.Overview) ?[]const u8 {
+    for (overview.remotes) |remote| {
+        if (remote.github != null and std.mem.eql(u8, remote.name, "origin")) return remote.name;
+    }
+    for (overview.remotes) |remote| {
+        if (remote.github != null) return remote.name;
+    }
+    return null;
+}
+
+fn gitOperationForCommand(id: []const u8) ?git_source_control.Operation {
+    if (std.mem.eql(u8, id, "git.refresh_source_control")) return .status;
+    if (std.mem.eql(u8, id, "git.stage")) return .stage_path;
+    if (std.mem.eql(u8, id, "git.unstage")) return .unstage_path;
+    if (std.mem.eql(u8, id, "git.stage_all")) return .stage_all;
+    if (std.mem.eql(u8, id, "git.unstage_all")) return .unstage_all;
+    if (std.mem.eql(u8, id, "git.commit")) return .commit;
+    if (std.mem.eql(u8, id, "git.fetch")) return .fetch;
+    if (std.mem.eql(u8, id, "git.pull")) return .pull;
+    if (std.mem.eql(u8, id, "git.push")) return .push;
+    if (std.mem.eql(u8, id, "git.publish_branch")) return .publish_branch;
+    if (std.mem.eql(u8, id, "git.branch.create")) return .create_branch;
+    if (std.mem.eql(u8, id, "git.branch.switch")) return .switch_branch;
+    return null;
+}
+
+fn gitOperationSuccessMessage(operation: git_source_control.Operation) []const u8 {
+    return switch (operation) {
+        .status => "source control refreshed",
+        .list_branches => "local branches refreshed",
+        .stage_path => "change staged",
+        .unstage_path => "change unstaged",
+        .stage_all => "all changes staged",
+        .unstage_all => "all changes unstaged",
+        .commit => "commit created",
+        .fetch => "fetch completed",
+        .pull => "pull completed",
+        .push => "push completed",
+        .publish_branch => "branch published",
+        .create_branch => "branch created",
+        .switch_branch => "branch switched",
+        .diff_worktree, .diff_index => "diff rendered",
+    };
+}
+
+fn gitOperationValidationMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.GitPathRequired => "select a change first",
+        error.InvalidWorkspacePath => "Git path is outside the workspace boundary",
+        error.GitMetadataPathDenied => "Git metadata paths cannot be staged directly",
+        error.GitRepositoryRequired => "workspace is not a Git repository",
+        error.CommitMessageRequired, error.GitCommitMessageRequired => "commit message is required",
+        error.GitCommitMessageTooLong => "commit message exceeds 4096 bytes",
+        error.InvalidCommitMessage, error.InvalidGitCommitMessage => "commit message must be one valid UTF-8 line",
+        error.GitHubRemoteRequired => "no Git remote is configured",
+        error.GitBranchRequired => "current Git branch is unknown",
+        error.InvalidGitRemoteName => "Git remote name is invalid",
+        error.InvalidGitBranchName => "Git branch name is invalid",
+        else => "invalid Git action",
+    };
+}
+
 fn rememberConsentPreview(app: *app_mod.App, request: command.Request) !void {
     if (std.mem.eql(u8, request.id, "debug.start")) {
         const doc = app.documents.active() orelse return;
@@ -1012,6 +1394,19 @@ fn rememberConsentPreview(app: *app_mod.App, request: command.Request) !void {
         defer plan.deinit();
         var preview = try build_consent.makePreview(app.allocator, plan.spawnSpec(), app.runtime.trust_state);
         errdefer preview.deinit();
+        try app.setPendingBuildConsent(request.id, request.argument, preview);
+        return;
+    }
+    if (std.mem.eql(u8, request.id, "git.sync")) {
+        try appendConsole(app, .stderr, "Git sync requires trusted manual execution; in consent-gated modes review Pull and Push separately\n", .{});
+        return;
+    }
+    if (gitOperationForCommand(request.id)) |operation| {
+        var plan = initGitPlan(app, operation, request.argument) catch return;
+        defer plan.deinit();
+        var preview = try build_consent.makePreview(app.allocator, plan.spawnSpec(), app.runtime.trust_state);
+        errdefer preview.deinit();
+        configureGitConsent(&preview, operation);
         try app.setPendingBuildConsent(request.id, request.argument, preview);
         return;
     }
@@ -5102,6 +5497,23 @@ fn renderGitOverview(app: *app_mod.App, overview: *const git_repository.Overview
 
     try writer.print("ignored   : {d} untracked file(s) hidden by .gitignore\n", .{overview.ignored_untracked});
 
+    if (overview.staged_scan_available) {
+        try writer.print("staged    : {d}\n", .{overview.staged_changes.len});
+        const staged_limit = @min(overview.staged_changes.len, 80);
+        for (overview.staged_changes[0..staged_limit]) |change| {
+            if (change.diff_available) {
+                try writer.print("{s} +{d} -{d} {s}\n", .{ gitChangeLabel(change.status), change.additions, change.deletions, change.path });
+            } else {
+                try writer.print("{s} diff:n/a {s}\n", .{ gitChangeLabel(change.status), change.path });
+            }
+        }
+        if (overview.staged_changes.len > staged_limit) {
+            try writer.print("... {d} more staged changes\n", .{overview.staged_changes.len - staged_limit});
+        }
+    } else {
+        try writer.writeAll("staged    : unavailable (HEAD tree is packed or unreadable)\n");
+    }
+
     try writer.print("changes   : {d}", .{overview.changes.len});
     if (overview.change_limit_hit) try writer.writeAll(" (truncated)");
     try writer.writeByte('\n');
@@ -5168,9 +5580,10 @@ fn fetchGitHubLive(app: *app_mod.App) !Result {
         try appendConsole(app, .stderr, "github live fetch failed for {s}/{s}: {s}\n", .{ remote.owner, remote.repo, @errorName(err) });
         return .{ .blocked = "github live fetch failed" };
     };
-    defer live.deinit();
+    errdefer live.deinit();
 
     try renderGitHubLive(app, &live);
+    app.github_state.replaceLive(live);
     return .{ .completed = "github live overview fetched" };
 }
 
@@ -5190,12 +5603,13 @@ fn fetchGitHubIssues(app: *app_mod.App) !Result {
         try appendConsole(app, .stderr, "github issues fetch failed for {s}/{s}: {s}\n", .{ remote.owner, remote.repo, @errorName(err) });
         return .{ .blocked = "github issues fetch failed" };
     };
-    defer {
+    errdefer {
         for (issues) |*issue| issue.deinit(app.allocator);
         if (issues.len > 0) app.allocator.free(issues);
     }
 
     try renderGitHubIssues(app, remote.owner, remote.repo, issues, auth.options().token_source);
+    app.github_state.replaceIssues(issues);
     return .{ .completed = "github issues fetched" };
 }
 
@@ -5215,9 +5629,10 @@ fn fetchGitHubActionsFailureLog(app: *app_mod.App) !Result {
         try appendConsole(app, .stderr, "github actions failure log fetch failed for {s}/{s}: {s}\n", .{ remote.owner, remote.repo, @errorName(err) });
         return .{ .blocked = "github actions failure log fetch failed" };
     };
-    defer failure.deinit(app.allocator);
+    errdefer failure.deinit(app.allocator);
 
     try renderGitHubFailureLog(app, remote.owner, remote.repo, &failure, auth.options().token_source);
+    app.github_state.replaceLatestFailure(failure);
     return .{ .completed = "github actions failure log fetched" };
 }
 
@@ -5242,6 +5657,12 @@ fn createDraftGitHubPullRequest(app: *app_mod.App, argument: ?[]const u8) !Resul
         return .{ .blocked = "GITHUB_TOKEN or GH_TOKEN required" };
     }
 
+    const trimmed_title = if (argument) |value| std.mem.trim(u8, value, " \t\r\n") else "";
+    if (trimmed_title.len > 0 and !validPullRequestTitle(trimmed_title)) {
+        try appendConsole(app, .stderr, "github pr create blocked: title must be one valid UTF-8 line up to 256 bytes\n", .{});
+        return .{ .blocked = "pull request title must be one valid UTF-8 line up to 256 bytes" };
+    }
+
     var repository = github_client.fetchRepository(app.allocator, app.io, remote.owner, remote.repo, auth.options()) catch |err| {
         try appendConsole(app, .stderr, "github repository fetch failed for {s}/{s}: {s}\n", .{ remote.owner, remote.repo, @errorName(err) });
         return .{ .blocked = "github repository fetch failed" };
@@ -5254,7 +5675,6 @@ fn createDraftGitHubPullRequest(app: *app_mod.App, argument: ?[]const u8) !Resul
         return .{ .blocked = "current branch is the base branch" };
     }
 
-    const trimmed_title = if (argument) |value| std.mem.trim(u8, value, " \t\r\n") else "";
     const title = if (trimmed_title.len > 0)
         try app.allocator.dupe(u8, trimmed_title)
     else
@@ -5283,10 +5703,20 @@ fn createDraftGitHubPullRequest(app: *app_mod.App, argument: ?[]const u8) !Resul
         try appendConsole(app, .stderr, "github draft PR create failed for {s}/{s}: {s}\n", .{ remote.owner, remote.repo, @errorName(err) });
         return .{ .blocked = "github draft PR create failed" };
     };
-    defer pull.deinit(app.allocator);
+    errdefer pull.deinit(app.allocator);
 
     try renderCreatedPullRequest(app, remote.owner, remote.repo, base, branch, &pull, auth.options().token_source);
+    app.github_state.replaceLastCreatedPull(pull);
     return .{ .completed = "github draft pull request created" };
+}
+
+fn validPullRequestTitle(title: []const u8) bool {
+    if (title.len == 0 or title.len > 256 or !std.unicode.utf8ValidateSlice(title)) return false;
+    for (title) |byte| {
+        if (byte == 0 or byte == '\r' or byte == '\n') return false;
+        if (byte < 0x20 and byte != '\t') return false;
+    }
+    return true;
 }
 
 fn firstGitHubRemote(overview: *const git_repository.Overview) ?git_repository.GitHubRemote {
@@ -5434,6 +5864,7 @@ fn tokenSourceLabel(source: github_client.TokenSource) []const u8 {
 
 fn gitChangeLabel(status: git_repository.ChangeStatus) []const u8 {
     return switch (status) {
+        .added => "A ",
         .modified => "M ",
         .deleted => "D ",
         .untracked => "??",
@@ -6580,4 +7011,15 @@ test "critical security scan locks workspace down" {
     const result = try dispatch(&app, .{ .id = "security.scan_current" });
     try std.testing.expect(std.meta.activeTag(result) == .completed);
     try std.testing.expectEqual(@import("../security/trust.zig").TrustState.locked_down, app.runtime.trust_state);
+}
+
+test "draft pull request titles stay inside the explicit text boundary" {
+    try std.testing.expect(validPullRequestTitle("Ship the secure Source Control panel"));
+    try std.testing.expect(validPullRequestTitle("\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e"));
+    try std.testing.expect(!validPullRequestTitle("line one\nline two"));
+    try std.testing.expect(!validPullRequestTitle("control\x01byte"));
+
+    var oversized: [257]u8 = undefined;
+    @memset(&oversized, 'a');
+    try std.testing.expect(!validPullRequestTitle(&oversized));
 }

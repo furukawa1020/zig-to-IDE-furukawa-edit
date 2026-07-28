@@ -55,6 +55,7 @@ const FILE_WIDTH = 330;
 const HEADER_HEIGHT = 58;
 const STATUS_HEIGHT = 28;
 const OUTPUT_HEIGHT = 210;
+const GIT_PANEL_HEIGHT = 340;
 const LINE_HEIGHT = 19;
 const EDITOR_TOP = HEADER_HEIGHT + 58;
 const EDITOR_TEXT_TOP = EDITOR_TOP + 44;
@@ -2540,7 +2541,8 @@ const LinuxGuiState = struct {
     }
 
     fn bottomTop(self: *const LinuxGuiState) i16 {
-        return @max(HEADER_HEIGHT + 180, self.window_height - OUTPUT_HEIGHT - STATUS_HEIGHT);
+        const panel_height: i16 = if (self.bottom_panel == .git) GIT_PANEL_HEIGHT else OUTPUT_HEIGHT;
+        return @max(HEADER_HEIGHT + 180, self.window_height - panel_height - STATUS_HEIGHT);
     }
 
     fn fileWidth(self: *const LinuxGuiState) i16 {
@@ -6677,6 +6679,14 @@ const LinuxGuiState = struct {
                     }
                     return true;
                 }
+                if (gitHubDetailRowAt(self, y)) |detail| {
+                    if (self.app.github_state.scmDetailUrl(detail)) |url| {
+                        self.openExternalGitHubUrl(url);
+                    } else {
+                        self.executeGitPanelAction(if (detail == .issue) .issues else .live);
+                    }
+                    return true;
+                }
                 if (gitChangeRowAt(self, y)) |row| {
                     const overview = if (self.git_overview) |*value| value else return true;
                     const target = gitPanelChangeTargetAtDataRow(overview, row) orelse return true;
@@ -7961,6 +7971,9 @@ fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
     const lane_gc = if (!has_github_remote) x11.gc.amber else if (std.mem.eql(u8, token_label, "none")) x11.gc.muted else x11.gc.cyan;
     try x11.text(lane_gc, 18, bottom + 130, asciiInto(lane_ascii[0..], lane));
     try drawGitHubScmSummary(x11, state, bottom + 154);
+    for (git_hub_scm_details, 0..) |detail, index| {
+        try drawGitHubScmDetail(x11, state, bottom + 178 + @as(i16, @intCast(index)) * LINE_HEIGHT, detail);
+    }
 
     const top = gitChangesTop(state);
     const total_rows = gitScmRowCount(overview);
@@ -8037,6 +8050,26 @@ fn drawGitHubScmSummary(x11: *X11, state: *const LinuxGuiState, y: i16) !void {
     if (state.app.github_state.primaryUrl() != null) {
         try x11.text(gc, @max(@as(i16, 18), state.window_width - 74), y, "OPEN");
     }
+}
+
+fn drawGitHubScmDetail(
+    x11: *X11,
+    state: *const LinuxGuiState,
+    y: i16,
+    detail: github_state_mod.ScmDetail,
+) !void {
+    var detail_buf: [720]u8 = undefined;
+    const text = state.app.github_state.formatScmDetail(detail, detail_buf[0..]);
+    const has_url = state.app.github_state.scmDetailUrl(detail) != null;
+    const gc = if (state.app.github_state.scmDetailFailed(detail))
+        x11.gc.red
+    else if (has_url)
+        x11.gc.cyan
+    else
+        x11.gc.muted;
+    var ascii_buf: [720]u8 = undefined;
+    try x11.text(gc, 34, y, asciiInto(ascii_buf[0..], text));
+    if (has_url) try x11.text(gc, @max(@as(i16, 18), state.window_width - 74), y, "OPEN");
 }
 
 fn drawSettingsPanel(x11: *X11, state: *LinuxGuiState) !void {
@@ -9737,6 +9770,8 @@ fn commandCapabilityGc(x11: *const X11, capability: command_mod.Capability) u32 
         .network_read => x11.gc.cyan,
         .network_write => x11.gc.amber,
         .workspace_write => x11.gc.amber,
+        .source_control_local => x11.gc.green,
+        .source_control_network => x11.gc.amber,
         .external_command => x11.gc.red,
     };
 }
@@ -10944,12 +10979,29 @@ fn outputLineRowAt(state: *const LinuxGuiState, y: i16) ?usize {
 }
 
 fn gitChangesTop(state: *const LinuxGuiState) i16 {
-    return state.bottomTop() + 178;
+    return state.bottomTop() + 250;
 }
 
 fn gitHubSummaryRowAt(state: *const LinuxGuiState, y: i16) bool {
     const baseline = state.bottomTop() + 154;
     return y >= baseline - 17 and y < baseline + 7;
+}
+
+const git_hub_scm_details = [_]github_state_mod.ScmDetail{
+    .pull_request,
+    .workflow_run,
+    .issue,
+};
+
+fn gitHubDetailRowAt(state: *const LinuxGuiState, y: i16) ?github_state_mod.ScmDetail {
+    const first_baseline = state.bottomTop() + 178;
+    if (y < first_baseline - 17) return null;
+    const offset = @as(isize, y - (first_baseline - 17));
+    const index = @divTrunc(offset, LINE_HEIGHT);
+    if (index < 0 or index >= git_hub_scm_details.len) return null;
+    const baseline = first_baseline + @as(i16, @intCast(index)) * LINE_HEIGHT;
+    if (y >= baseline + 7) return null;
+    return git_hub_scm_details[@intCast(index)];
 }
 
 fn gitScmRowCount(overview: git_repository.Overview) usize {

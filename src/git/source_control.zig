@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const process = @import("../platform/process.zig");
+const secure_environment = @import("../security/environment.zig");
 const workspace_io = @import("../security/workspace_io.zig");
 
 pub const FileStatus = enum {
@@ -309,6 +310,8 @@ pub const Plan = struct {
     }
 
     fn appendBaseArguments(self: *Plan) !void {
+        const safe_directory = try std.fmt.allocPrint(self.allocator, "safe.directory={s}", .{self.root_path});
+        defer self.allocator.free(safe_directory);
         try self.appendMany(&.{
             "--no-pager",
             "--no-optional-locks",
@@ -336,6 +339,8 @@ pub const Plan = struct {
             "-c",
             "core.askPass=",
             "-c",
+            "credential.helper=",
+            "-c",
             "credential.interactive=never",
             "-c",
             "diff.external=",
@@ -343,6 +348,8 @@ pub const Plan = struct {
             "submodule.recurse=false",
             "-c",
             "fetch.recurseSubmodules=false",
+            "-c",
+            safe_directory,
         });
     }
 
@@ -753,7 +760,10 @@ fn secureGitEnvironment(
     environ: std.process.Environ,
 ) !std.process.Environ.Map {
     var source = try std.process.Environ.createMap(environ, allocator);
-    defer source.deinit();
+    defer {
+        secure_environment.wipeMapValues(&source);
+        source.deinit();
+    }
 
     var filtered = std.process.Environ.Map.init(allocator);
     errdefer filtered.deinit();
@@ -828,6 +838,12 @@ test "git plans use fixed argv boundaries" {
     try std.testing.expectEqualStrings("add", plan.args.items[plan.args.items.len - 3]);
     try std.testing.expectEqualStrings("--", plan.args.items[plan.args.items.len - 2]);
     try std.testing.expectEqualStrings("src/main.zig", plan.args.items[plan.args.items.len - 1]);
+    var workspace_scoped_safe_directory = false;
+    for (plan.args.items) |arg| {
+        workspace_scoped_safe_directory =
+            workspace_scoped_safe_directory or std.mem.eql(u8, arg, "safe.directory=C:\\workspace");
+    }
+    try std.testing.expect(workspace_scoped_safe_directory);
 }
 
 test "network plans permit HTTPS and deny alternate Git transports" {

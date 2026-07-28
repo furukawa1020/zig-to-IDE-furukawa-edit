@@ -13,6 +13,7 @@ const extension_registry = @import("../extensions/registry.zig");
 const navigation = @import("../editor/navigation.zig");
 const git_repository = @import("../git/repository.zig");
 const git_source_control = @import("../git/source_control.zig");
+const github_state_mod = @import("../github/state.zig");
 const highlight = @import("../language/highlight.zig");
 const lsp_responses = @import("../lsp/responses.zig");
 const lsp_session = @import("../lsp/session.zig");
@@ -3590,7 +3591,7 @@ const LinuxGuiState = struct {
             return;
         }
         if (std.mem.eql(u8, id, "github.pr.create_draft")) {
-            self.openQuickPanel(.github_pr);
+            self.executeGitPanelAction(.draft_pr);
             return;
         }
         if (std.mem.startsWith(u8, id, "recovery.")) {
@@ -4473,7 +4474,13 @@ const LinuxGuiState = struct {
                 null,
             ),
             .publish => self.executeGitMutation("git.publish_branch", null),
-            .draft_pr => self.openQuickPanel(.github_pr),
+            .draft_pr => {
+                if (self.gitBranchNeedsPublish()) {
+                    self.message("publish this branch before creating a pull request", .{});
+                    return;
+                }
+                self.openQuickPanel(.github_pr);
+            },
             .live, .issues => {
                 self.execute(gitPanelActionCommand(action), .command_palette);
                 self.bottom_panel = .git;
@@ -4540,6 +4547,55 @@ const LinuxGuiState = struct {
         } else {
             self.message("Git diff preview", .{});
         }
+    }
+
+    fn openExternalGitHubUrl(self: *LinuxGuiState, url: []const u8) void {
+        if (!github_state_mod.isSafeGitHubWebUrl(url)) {
+            self.message("blocked non-GitHub or malformed URL", .{});
+            self.appendOutput(.stderr, "blocked external URL outside https://github.com/\n", .{});
+            return;
+        }
+
+        const openers = [_]struct {
+            executable: []const u8,
+            verb: ?[]const u8 = null,
+        }{
+            .{ .executable = "/usr/bin/gio", .verb = "open" },
+            .{ .executable = "/usr/bin/xdg-open" },
+        };
+        var environment = desktopOpenEnvironment(self.allocator, self.app.environ) catch |err| {
+            self.message("browser environment blocked: {s}", .{@errorName(err)});
+            return;
+        };
+        defer environment.deinit();
+        for (openers) |opener| {
+            const with_verb = [_][]const u8{ opener.executable, opener.verb orelse "", url };
+            const without_verb = [_][]const u8{ opener.executable, url };
+            const argv: []const []const u8 = if (opener.verb != null) with_verb[0..] else without_verb[0..];
+            const result = std.process.run(self.allocator, self.app.io, .{
+                .argv = argv,
+                .cwd = .{ .path = "/" },
+                .environ_map = &environment,
+                .stdout_limit = .limited(16 * 1024),
+                .stderr_limit = .limited(16 * 1024),
+                .timeout = .{ .duration = .{
+                    .clock = .boot,
+                    .raw = .fromMilliseconds(2_000),
+                } },
+            }) catch continue;
+            const opened = switch (result.term) {
+                .exited => |code| code == 0,
+                else => false,
+            };
+            self.allocator.free(result.stdout);
+            self.allocator.free(result.stderr);
+            if (opened) {
+                self.message("opened GitHub URL", .{});
+                return;
+            }
+        }
+        self.message("could not open GitHub URL", .{});
+        self.appendOutput(.stderr, "GitHub URL opener unavailable (tried gio and xdg-open)\n", .{});
     }
 
     fn executeTaskPanelAction(self: *LinuxGuiState, action: TaskPanelAction) void {
@@ -6613,6 +6669,14 @@ const LinuxGuiState = struct {
                     self.executeGitPanelAction(action);
                     return true;
                 }
+                if (gitHubSummaryRowAt(self, y)) {
+                    if (self.app.github_state.primaryUrl()) |url| {
+                        self.openExternalGitHubUrl(url);
+                    } else {
+                        self.executeGitPanelAction(.live);
+                    }
+                    return true;
+                }
                 if (gitChangeRowAt(self, y)) |row| {
                     const overview = if (self.git_overview) |*value| value else return true;
                     const target = gitPanelChangeTargetAtDataRow(overview, row) orelse return true;
@@ -6898,6 +6962,54 @@ const LinuxGuiState = struct {
         }
     }
 };
+
+const desktop_environment_keys = [_][]const u8{
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+    "XDG_CURRENT_DESKTOP",
+    "DESKTOP_SESSION",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+};
+
+fn desktopOpenEnvironment(
+    allocator: std.mem.Allocator,
+    environ: std.process.Environ,
+) !std.process.Environ.Map {
+    var filtered = std.process.Environ.Map.init(allocator);
+    errdefer filtered.deinit();
+
+    if (builtin.os.tag != .windows) {
+        for (desktop_environment_keys) |key| {
+            if (std.process.Environ.getPosix(environ, key)) |value| {
+                try filtered.put(key, value);
+            }
+        }
+    }
+    try filtered.put("PATH", "/usr/local/bin:/usr/bin:/bin");
+    return filtered;
+}
+
+fn desktopEnvironmentKeyAllowed(key: []const u8) bool {
+    for (desktop_environment_keys) |allowed| {
+        if (std.mem.eql(u8, key, allowed)) return true;
+    }
+    return std.mem.eql(u8, key, "PATH");
+}
+
+test "Linux browser environment excludes executable injection and GitHub secrets" {
+    try std.testing.expect(desktopEnvironmentKeyAllowed("DISPLAY"));
+    try std.testing.expect(desktopEnvironmentKeyAllowed("DBUS_SESSION_BUS_ADDRESS"));
+    try std.testing.expect(!desktopEnvironmentKeyAllowed("GITHUB_TOKEN"));
+    try std.testing.expect(!desktopEnvironmentKeyAllowed("LD_PRELOAD"));
+    try std.testing.expect(!desktopEnvironmentKeyAllowed("BROWSER"));
+}
 
 fn createWorkbenchSettingsFile(path: []const u8) !std.Io.File {
     if (std.fs.path.isAbsolute(path)) {
@@ -7912,56 +8024,19 @@ fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
 }
 
 fn drawGitHubScmSummary(x11: *X11, state: *const LinuxGuiState, y: i16) !void {
-    var issues_buf: [48]u8 = undefined;
-    const issues = if (state.app.github_state.issues_loaded)
-        std.fmt.bufPrint(issues_buf[0..], "{d}", .{state.app.github_state.issueCount()}) catch "?"
-    else
-        "-";
-
-    var draft_buf: [48]u8 = undefined;
-    const draft = if (state.app.github_state.last_created_pull) |pull|
-        std.fmt.bufPrint(draft_buf[0..], "#{d}", .{pull.number}) catch "yes"
-    else
-        "-";
-
-    var run_buf: [160]u8 = undefined;
-    const run = if (state.app.github_state.live) |live|
-        if (live.runs.len > 0)
-            std.fmt.bufPrint(run_buf[0..], "{s}/{s}", .{
-                live.runs[0].status,
-                if (live.runs[0].conclusion.len > 0) live.runs[0].conclusion else "pending",
-            }) catch "loaded"
-        else
-            "none"
-    else
-        "not-loaded";
-
     var summary_buf: [720]u8 = undefined;
-    const summary = if (state.app.github_state.live) |live|
-        std.fmt.bufPrint(summary_buf[0..], "GITHUB {s} PR:{d} issues:{s} actions:{s} draft:{s} auth:{s}", .{
-            live.repository.full_name,
-            live.pulls.len,
-            issues,
-            run,
-            draft,
-            @tagName(live.token_source),
-        }) catch "GITHUB LIVE"
+    const summary = state.app.github_state.formatScmSummary(summary_buf[0..]);
+    const gc = if (state.app.github_state.hasFailure())
+        x11.gc.red
+    else if (state.app.github_state.live != null)
+        x11.gc.cyan
     else
-        std.fmt.bufPrint(summary_buf[0..], "GITHUB live:not-loaded issues:{s} actions:{s} draft:{s} press LIVE", .{
-            issues,
-            run,
-            draft,
-        }) catch "GITHUB LIVE not loaded";
-
-    const failed = if (state.app.github_state.latest_failure != null)
-        true
-    else if (state.app.github_state.live) |live|
-        live.runs.len > 0 and std.mem.eql(u8, live.runs[0].conclusion, "failure")
-    else
-        false;
-    const gc = if (failed) x11.gc.red else if (state.app.github_state.live != null) x11.gc.cyan else x11.gc.muted;
+        x11.gc.muted;
     var summary_ascii: [720]u8 = undefined;
     try x11.text(gc, 18, y, asciiInto(summary_ascii[0..], summary));
+    if (state.app.github_state.primaryUrl() != null) {
+        try x11.text(gc, @max(@as(i16, 18), state.window_width - 74), y, "OPEN");
+    }
 }
 
 fn drawSettingsPanel(x11: *X11, state: *LinuxGuiState) !void {
@@ -10870,6 +10945,11 @@ fn outputLineRowAt(state: *const LinuxGuiState, y: i16) ?usize {
 
 fn gitChangesTop(state: *const LinuxGuiState) i16 {
     return state.bottomTop() + 178;
+}
+
+fn gitHubSummaryRowAt(state: *const LinuxGuiState, y: i16) bool {
+    const baseline = state.bottomTop() + 154;
+    return y >= baseline - 17 and y < baseline + 7;
 }
 
 fn gitScmRowCount(overview: git_repository.Overview) usize {

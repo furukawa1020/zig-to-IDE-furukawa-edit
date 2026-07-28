@@ -457,48 +457,60 @@ pub fn inspect(
     environ: std.process.Environ,
     root_path: []const u8,
 ) !Snapshot {
-    const executable = try resolveGitExecutable(allocator, io, environ, root_path);
+    const executable = resolveGitExecutable(allocator, io, environ, root_path) catch |err|
+        return remapOutOfMemory(err, error.GitExecutableResolutionOutOfMemory);
     defer allocator.free(executable);
-    var plan = try Plan.init(allocator, root_path, .status, .{ .executable = executable });
+    var plan = Plan.init(allocator, root_path, .status, .{ .executable = executable }) catch |err|
+        return remapOutOfMemory(err, error.GitStatusPlanOutOfMemory);
     defer plan.deinit();
     const spec = plan.spawnSpec();
-    const argv = try argvForSpec(allocator, spec);
+    const argv = argvForSpec(allocator, spec) catch |err|
+        return remapOutOfMemory(err, error.GitStatusArgvOutOfMemory);
     defer allocator.free(argv);
-    var env_map = try secureGitEnvironment(allocator, environ);
+    var env_map = secureGitEnvironment(allocator, environ) catch |err|
+        return remapOutOfMemory(err, error.GitEnvironmentOutOfMemory);
     defer env_map.deinit();
-    const result = try std.process.run(allocator, io, .{
+    const result = std.process.run(allocator, io, .{
         .argv = argv,
         .cwd = .{ .path = root_path },
         .environ_map = &env_map,
         .stdout_limit = .limited(4 * 1024 * 1024),
         .stderr_limit = .limited(256 * 1024),
         .timeout = timeoutFromMs(10_000),
-    });
+    }) catch |err| return remapOutOfMemory(err, error.GitStatusProcessOutOfMemory);
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (termExitCode(result.term) != 0) return error.GitStatusFailed;
 
-    var snapshot = try parseStatus(allocator, result.stdout);
+    var snapshot = parseStatus(allocator, result.stdout) catch |err|
+        return remapOutOfMemory(err, error.GitStatusParseOutOfMemory);
     errdefer snapshot.deinit();
 
-    var branch_plan = try Plan.init(allocator, root_path, .list_branches, .{ .executable = executable });
+    var branch_plan = Plan.init(allocator, root_path, .list_branches, .{ .executable = executable }) catch |err|
+        return remapOutOfMemory(err, error.GitBranchPlanOutOfMemory);
     defer branch_plan.deinit();
     const branch_spec = branch_plan.spawnSpec();
-    const branch_argv = try argvForSpec(allocator, branch_spec);
+    const branch_argv = argvForSpec(allocator, branch_spec) catch |err|
+        return remapOutOfMemory(err, error.GitBranchArgvOutOfMemory);
     defer allocator.free(branch_argv);
-    const branch_result = try std.process.run(allocator, io, .{
+    const branch_result = std.process.run(allocator, io, .{
         .argv = branch_argv,
         .cwd = .{ .path = root_path },
         .environ_map = &env_map,
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(256 * 1024),
         .timeout = timeoutFromMs(10_000),
-    });
+    }) catch |err| return remapOutOfMemory(err, error.GitBranchProcessOutOfMemory);
     defer allocator.free(branch_result.stdout);
     defer allocator.free(branch_result.stderr);
     if (termExitCode(branch_result.term) != 0) return error.GitBranchListFailed;
-    snapshot.branches = try parseBranches(allocator, branch_result.stdout);
+    snapshot.branches = parseBranches(allocator, branch_result.stdout) catch |err|
+        return remapOutOfMemory(err, error.GitBranchParseOutOfMemory);
     return snapshot;
+}
+
+fn remapOutOfMemory(err: anyerror, replacement: anyerror) anyerror {
+    return if (err == error.OutOfMemory) replacement else err;
 }
 
 pub fn previewDiff(

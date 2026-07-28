@@ -381,6 +381,15 @@ pub fn resolveGitExecutable(
     var env_map = try std.process.Environ.createMap(environ, allocator);
     defer env_map.deinit();
     const path_value = env_map.get("PATH") orelse return error.GitExecutableNotFound;
+    return resolveGitExecutableFromPath(allocator, io, path_value, workspace_root);
+}
+
+fn resolveGitExecutableFromPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path_value: []const u8,
+    workspace_root: []const u8,
+) ![:0]u8 {
     const executable_names = if (builtin.os.tag == .windows)
         [_][]const u8{"git.exe"}
     else
@@ -867,4 +876,48 @@ test "local branch parser validates deduplicates and sorts refs" {
     try std.testing.expectEqualStrings("feature/gui", branches[0]);
     try std.testing.expectEqualStrings("main", branches[1]);
     try std.testing.expectEqualStrings("topic/zeta", branches[2]);
+}
+
+test "Git executable resolution rejects a workspace shadow executable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Options.debug_io;
+    try tmp.dir.createDir(io, "workspace", .default_dir);
+    try tmp.dir.createDir(io, "tools", .default_dir);
+
+    const executable_name = if (builtin.os.tag == .windows) "git.exe" else "git";
+    {
+        const tools = try tmp.dir.openDir(io, "tools", .{});
+        defer tools.close(io);
+        const file = try tools.createFile(io, executable_name, .{});
+        file.close(io);
+    }
+    {
+        const workspace = try tmp.dir.openDir(io, "workspace", .{});
+        defer workspace.close(io);
+        const file = try workspace.createFile(io, executable_name, .{});
+        file.close(io);
+    }
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const workspace_path = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace" });
+    defer std.testing.allocator.free(workspace_path);
+    const tools_path = try std.fs.path.join(std.testing.allocator, &.{ root, "tools" });
+    defer std.testing.allocator.free(tools_path);
+
+    const resolved = try resolveGitExecutableFromPath(
+        std.testing.allocator,
+        io,
+        tools_path,
+        workspace_path,
+    );
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expect(!pathIsWithin(workspace_path, resolved));
+
+    try std.testing.expectError(
+        error.GitExecutableNotFound,
+        resolveGitExecutableFromPath(std.testing.allocator, io, workspace_path, workspace_path),
+    );
 }

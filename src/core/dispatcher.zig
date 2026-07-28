@@ -959,6 +959,16 @@ fn dispatchAllowed(app: *app_mod.App, definition: command.Definition, request: c
     }
 
     if (std.mem.eql(u8, definition.id, "git.sync")) {
+        const refreshed = try executeGitOperation(app, "git.refresh_source_control", .status, null, true);
+        if (std.meta.activeTag(refreshed) != .completed) return refreshed;
+        const snapshot = app.source_control_snapshot orelse
+            return .{ .blocked = "Source Control status is unavailable" };
+        if (snapshot.detached or snapshot.branch == null) {
+            return .{ .blocked = "create or switch to a branch before syncing" };
+        }
+        if (snapshot.upstream == null) {
+            return try executeGitOperation(app, "git.publish_branch", .publish_branch, null, true);
+        }
         const pulled = try executeGitOperation(app, "git.pull", .pull, null, true);
         if (std.meta.activeTag(pulled) != .completed) return pulled;
         return try executeGitOperation(app, "git.push", .push, null, false);
@@ -1185,14 +1195,56 @@ fn initGitPlan(
     var overview = try git_repository.inspect(app.allocator, &app.workspace, .{});
     defer overview.deinit();
     if (!overview.present) return error.GitRepositoryRequired;
+    const target = try gitNetworkTarget(operation, overview, if (app.source_control_snapshot) |*snapshot| snapshot else null);
 
     return git_source_control.Plan.init(app.allocator, app.workspace.root_path, operation, .{
         .argument = argument,
-        .remote = if (operation.usesNetwork()) preferredGitHubRemote(overview) else null,
-        .branch = overview.branch,
+        .remote = target.remote,
+        .branch = target.branch orelse overview.branch,
         .has_head = overview.commit != null,
         .executable = executable,
     });
+}
+
+const GitNetworkTarget = struct {
+    remote: ?[]const u8 = null,
+    branch: ?[]const u8 = null,
+};
+
+fn gitNetworkTarget(
+    operation: git_source_control.Operation,
+    overview: git_repository.Overview,
+    snapshot: ?*const git_source_control.Snapshot,
+) !GitNetworkTarget {
+    if (!operation.usesNetwork()) return .{ .branch = overview.branch };
+
+    if (operation == .fetch) {
+        return .{ .remote = preferredGitHubRemote(overview) orelse return error.GitHubHttpsRemoteRequired };
+    }
+
+    const branch = overview.branch orelse return error.DetachedGitHead;
+    if (operation == .publish_branch) {
+        return .{
+            .remote = preferredGitHubRemote(overview) orelse return error.GitHubHttpsRemoteRequired,
+            .branch = branch,
+        };
+    }
+
+    const current = snapshot orelse return error.SourceControlRefreshRequired;
+    if (current.detached or current.branch == null) return error.DetachedGitHead;
+    if (!std.mem.eql(u8, current.branch.?, branch)) return error.SourceControlSnapshotStale;
+    const parsed = git_source_control.parseUpstream(current.upstream orelse return error.GitUpstreamRequired) orelse
+        return error.InvalidGitUpstream;
+    if (!isHttpsGitHubRemote(overview, parsed.remote)) return error.GitHubUpstreamRequired;
+    return .{ .remote = parsed.remote, .branch = parsed.branch };
+}
+
+fn isHttpsGitHubRemote(overview: git_repository.Overview, name: []const u8) bool {
+    for (overview.remotes) |remote| {
+        if (!std.mem.eql(u8, remote.name, name)) continue;
+        return remote.github != null and std.ascii.startsWithIgnoreCase(remote.url, "https://github.com/");
+    }
+    return false;
 }
 
 fn configureGitConsent(preview: *build_consent.Preview, operation: git_source_control.Operation) void {
@@ -1350,12 +1402,69 @@ test "Git remote transport findings block network operations but not local stagi
 
 fn preferredGitHubRemote(overview: git_repository.Overview) ?[]const u8 {
     for (overview.remotes) |remote| {
-        if (remote.github != null and std.mem.eql(u8, remote.name, "origin")) return remote.name;
+        if (std.mem.eql(u8, remote.name, "origin") and isHttpsGitHubRemote(overview, remote.name)) return remote.name;
     }
     for (overview.remotes) |remote| {
-        if (remote.github != null) return remote.name;
+        if (isHttpsGitHubRemote(overview, remote.name)) return remote.name;
     }
     return null;
+}
+
+test "Git network target follows the configured upstream branch" {
+    var remotes = [_]git_repository.Remote{.{
+        .name = @constCast("origin"),
+        .url = @constCast("https://github.com/owner/repo.git"),
+        .github = .{
+            .owner = @constCast("owner"),
+            .repo = @constCast("repo"),
+            .web_url = @constCast("https://github.com/owner/repo"),
+            .actions_url = @constCast("https://github.com/owner/repo/actions"),
+        },
+    }};
+    const overview = git_repository.Overview{
+        .allocator = std.testing.allocator,
+        .present = true,
+        .branch = @constCast("feature/local-name"),
+        .remotes = remotes[0..],
+    };
+    var snapshot = git_source_control.Snapshot{
+        .allocator = std.testing.allocator,
+        .branch = @constCast("feature/local-name"),
+        .upstream = @constCast("origin/main"),
+    };
+
+    const target = try gitNetworkTarget(.pull, overview, &snapshot);
+    try std.testing.expectEqualStrings("origin", target.remote.?);
+    try std.testing.expectEqualStrings("main", target.branch.?);
+}
+
+test "Git network target rejects stale status and non-HTTPS upstreams" {
+    var remotes = [_]git_repository.Remote{.{
+        .name = @constCast("origin"),
+        .url = @constCast("git@github.com:owner/repo.git"),
+        .github = .{
+            .owner = @constCast("owner"),
+            .repo = @constCast("repo"),
+            .web_url = @constCast("https://github.com/owner/repo"),
+            .actions_url = @constCast("https://github.com/owner/repo/actions"),
+        },
+    }};
+    const overview = git_repository.Overview{
+        .allocator = std.testing.allocator,
+        .present = true,
+        .branch = @constCast("main"),
+        .remotes = remotes[0..],
+    };
+    var stale = git_source_control.Snapshot{
+        .allocator = std.testing.allocator,
+        .branch = @constCast("other"),
+        .upstream = @constCast("origin/main"),
+    };
+    try std.testing.expectError(error.SourceControlSnapshotStale, gitNetworkTarget(.pull, overview, &stale));
+
+    stale.branch = @constCast("main");
+    try std.testing.expectError(error.GitHubUpstreamRequired, gitNetworkTarget(.push, overview, &stale));
+    try std.testing.expectError(error.GitHubHttpsRemoteRequired, gitNetworkTarget(.publish_branch, overview, &stale));
 }
 
 fn gitOperationForCommand(id: []const u8) ?git_source_control.Operation {
@@ -1403,6 +1512,13 @@ fn gitOperationValidationMessage(err: anyerror) []const u8 {
         error.GitCommitMessageTooLong => "commit message exceeds 4096 bytes",
         error.InvalidCommitMessage, error.InvalidGitCommitMessage => "commit message must be one valid UTF-8 line",
         error.GitHubRemoteRequired => "no Git remote is configured",
+        error.GitHubHttpsRemoteRequired => "an HTTPS github.com remote is required",
+        error.GitHubUpstreamRequired => "the tracked upstream must be an HTTPS github.com remote",
+        error.GitUpstreamRequired => "publish the current branch before pulling or pushing",
+        error.InvalidGitUpstream => "the configured Git upstream is invalid",
+        error.SourceControlRefreshRequired => "refresh Source Control before pulling or pushing",
+        error.SourceControlSnapshotStale => "the branch changed; refresh Source Control and try again",
+        error.DetachedGitHead => "create or switch to a branch before this Git action",
         error.GitBranchRequired => "current Git branch is unknown",
         error.InvalidGitRemoteName => "Git remote name is invalid",
         error.InvalidGitBranchName => "Git branch name is invalid",

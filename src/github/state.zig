@@ -1,6 +1,12 @@
 const std = @import("std");
 const client = @import("client.zig");
 
+pub const ScmDetail = enum {
+    pull_request,
+    workflow_run,
+    issue,
+};
+
 pub const State = struct {
     allocator: std.mem.Allocator,
     live: ?client.LiveOverview = null,
@@ -118,6 +124,75 @@ pub const State = struct {
         return null;
     }
 
+    pub fn formatScmDetail(self: *const State, detail: ScmDetail, buffer: []u8) []const u8 {
+        return switch (detail) {
+            .pull_request => if (self.featuredPull()) |pull|
+                std.fmt.bufPrint(buffer, "PR  #{d}{s}  {s}  @{s}", .{
+                    pull.number,
+                    if (pull.draft) " draft" else "",
+                    pull.title,
+                    pull.user,
+                }) catch "PR  loaded"
+            else if (self.live != null)
+                "PR  no open pull requests"
+            else
+                "PR  not loaded - use LIVE",
+            .workflow_run => if (self.featuredRun()) |run|
+                std.fmt.bufPrint(buffer, "ACTION  {s}/{s}  {s}", .{
+                    run.status,
+                    if (run.conclusion.len > 0) run.conclusion else "pending",
+                    run.name,
+                }) catch "ACTION  loaded"
+            else if (self.live != null)
+                "ACTION  no recent workflow runs"
+            else
+                "ACTION  not loaded - use LIVE",
+            .issue => if (self.featuredIssue()) |issue|
+                std.fmt.bufPrint(buffer, "ISSUE  #{d}  {s}  @{s}", .{
+                    issue.number,
+                    issue.title,
+                    issue.user,
+                }) catch "ISSUE  loaded"
+            else if (self.issues_loaded)
+                "ISSUE  no open issues"
+            else
+                "ISSUE  not loaded - use ISS",
+        };
+    }
+
+    pub fn scmDetailUrl(self: *const State, detail: ScmDetail) ?[]const u8 {
+        const url = switch (detail) {
+            .pull_request => if (self.featuredPull()) |pull| pull.html_url else return null,
+            .workflow_run => if (self.featuredRun()) |run| run.html_url else return null,
+            .issue => if (self.featuredIssue()) |issue| issue.html_url else return null,
+        };
+        return if (isSafeGitHubWebUrl(url)) url else null;
+    }
+
+    pub fn scmDetailFailed(self: *const State, detail: ScmDetail) bool {
+        if (detail != .workflow_run) return false;
+        const run = self.featuredRun() orelse return false;
+        return isFailureConclusion(run.conclusion);
+    }
+
+    fn featuredPull(self: *const State) ?*const client.PullRequest {
+        if (self.last_created_pull) |*pull| return pull;
+        const live = if (self.live) |*value| value else return null;
+        return if (live.pulls.len > 0) &live.pulls[0] else null;
+    }
+
+    fn featuredRun(self: *const State) ?*const client.WorkflowRun {
+        const live = if (self.live) |*value| value else return null;
+        return if (live.runs.len > 0) &live.runs[0] else null;
+    }
+
+    fn featuredIssue(self: *const State) ?*const client.Issue {
+        for (self.issues) |*issue| {
+            if (!issue.pull_request) return issue;
+        }
+        return null;
+    }
+
     fn clearLive(self: *State) void {
         if (self.live) |*live| live.deinit();
         self.live = null;
@@ -187,6 +262,14 @@ test "GitHub GUI state distinguishes issues from pull requests" {
     const summary = state.formatScmSummary(summary_buffer[0..]);
     try std.testing.expect(std.mem.indexOf(u8, summary, "PR:1") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "issues:1") != null);
+
+    var detail_buffer: [256]u8 = undefined;
+    const detail = state.formatScmDetail(.issue, detail_buffer[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "ISSUE  #1") != null);
+    try std.testing.expectEqualStrings(
+        "https://github.com/o/r/issues/1",
+        state.scmDetailUrl(.issue).?,
+    );
 }
 
 test "GitHub GUI state only exposes exact HTTPS github.com URLs" {

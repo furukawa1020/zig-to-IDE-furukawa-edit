@@ -61,6 +61,27 @@ pub const Policy = struct {
             };
         }
 
+        if (capability == .source_control_local) {
+            return if (reason == .automatic)
+                .{ .confirm = "automatic local source-control action requires consent" }
+            else
+                .allow;
+        }
+
+        if (capability == .source_control_network) {
+            return switch (self.state) {
+                .untrusted => .{ .block = "untrusted workspace: Git network operations are blocked" },
+                .reviewed => .{ .block = "reviewed workspace is not trusted for Git network operations yet" },
+                .locked_down => .{ .block = "workspace is locked down by security policy" },
+                .trusted => if (reason == .automatic)
+                    .{ .confirm = "automatic Git network operation requires consent" }
+                else
+                    .allow,
+                .hardened => .{ .confirm = "hardened mode requires per-Git-network-operation consent" },
+                .paranoid => .{ .confirm = "paranoid mode requires explicit Git remote review" },
+            };
+        }
+
         if (capability != .external_command) return .allow;
 
         return switch (self.state) {
@@ -101,4 +122,19 @@ test "network writes require trusted manual intent" {
     const trusted = Policy{ .state = .trusted };
     try @import("std").testing.expect(trusted.canRun(.network_write, .manual));
     try @import("std").testing.expect(!trusted.canRun(.network_write, .automatic));
+}
+
+test "manual local source control remains available under workspace lockdown" {
+    const locked = Policy{ .state = .locked_down };
+    try std.testing.expect(locked.canRun(.source_control_local, .manual));
+    try std.testing.expect(!locked.canRun(.source_control_local, .automatic));
+}
+
+test "source control network operations retain the network trust boundary" {
+    const untrusted = Policy{ .state = .untrusted };
+    try std.testing.expect(!untrusted.canRun(.source_control_network, .manual));
+
+    const trusted = Policy{ .state = .trusted };
+    try std.testing.expect(trusted.canRun(.source_control_network, .manual));
+    try std.testing.expect(!trusted.canRun(.source_control_network, .automatic));
 }

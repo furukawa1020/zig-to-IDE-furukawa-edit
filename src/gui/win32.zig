@@ -11,6 +11,7 @@ const navigation = @import("../editor/navigation.zig");
 const extension_registry = @import("../extensions/registry.zig");
 const git_repository = @import("../git/repository.zig");
 const git_source_control = @import("../git/source_control.zig");
+const github_state_mod = @import("../github/state.zig");
 const zig_output = @import("../diagnostics/zig_output.zig");
 const highlight = @import("../language/highlight.zig");
 const lsp_responses = @import("../lsp/responses.zig");
@@ -1277,7 +1278,7 @@ const GuiState = struct {
             return;
         }
         if (std.mem.eql(u8, id, "github.pr.create_draft")) {
-            self.openQuickPanel(.github_pr);
+            self.executeGitPanelAction(.draft_pr);
             return;
         }
         if (std.mem.startsWith(u8, id, "recovery.")) {
@@ -2011,7 +2012,13 @@ const GuiState = struct {
                 null,
             ),
             .publish => self.executeGitMutation("git.publish_branch", null),
-            .draft_pr => self.openQuickPanel(.github_pr),
+            .draft_pr => {
+                if (self.gitBranchNeedsPublish()) {
+                    self.setMessage("Publish this branch before creating a pull request") catch {};
+                    return;
+                }
+                self.openQuickPanel(.github_pr);
+            },
             .live, .issues => {
                 self.executeCommand(gitPanelActionCommand(action));
                 self.show_output = true;
@@ -3576,6 +3583,11 @@ const GuiState = struct {
     }
 
     fn openExternalUrl(self: *GuiState, url: []const u8) void {
+        if (!github_state_mod.isSafeGitHubWebUrl(url)) {
+            self.setMessage("Blocked non-GitHub or malformed URL") catch {};
+            self.appendOutput(.stderr, "blocked external URL outside https://github.com/\n", .{});
+            return;
+        }
         const wide = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, url) catch |err| {
             self.setError(err) catch {};
             return;
@@ -6542,56 +6554,16 @@ fn drawGitPanelRow(hdc: windows.HDC, state: *GuiState, rect: RECT, overview: git
 }
 
 fn drawGitHubScmSummary(hdc: windows.HDC, state: *const GuiState, rect: RECT, y: c_int) void {
-    var issues_buf: [48]u8 = undefined;
-    const issues = if (state.app.github_state.issues_loaded)
-        std.fmt.bufPrint(&issues_buf, "{d}", .{state.app.github_state.issueCount()}) catch "?"
-    else
-        "-";
-
-    var draft_buf: [48]u8 = undefined;
-    const draft = if (state.app.github_state.last_created_pull) |pull|
-        std.fmt.bufPrint(&draft_buf, "#{d}", .{pull.number}) catch "yes"
-    else
-        "-";
-
-    var run_buf: [160]u8 = undefined;
-    const actions_status = if (state.app.github_state.live) |live|
-        if (live.runs.len > 0)
-            std.fmt.bufPrint(&run_buf, "{s}/{s}", .{
-                live.runs[0].status,
-                if (live.runs[0].conclusion.len > 0) live.runs[0].conclusion else "pending",
-            }) catch "loaded"
-        else
-            "none"
-    else
-        "not loaded";
-
     var summary_buf: [720]u8 = undefined;
-    const summary = if (state.app.github_state.live) |live|
-        std.fmt.bufPrint(&summary_buf, "GITHUB  {s}  PR:{d}  issues:{s}  actions:{s}  draft:{s}  auth:{s}", .{
-            live.repository.full_name,
-            live.pulls.len,
-            issues,
-            actions_status,
-            draft,
-            @tagName(live.token_source),
-        }) catch "GITHUB LIVE"
+    const summary = state.app.github_state.formatScmSummary(summary_buf[0..]);
+    const color = if (state.app.github_state.hasFailure())
+        rgb(255, 115, 124)
+    else if (state.app.github_state.live != null)
+        rgb(127, 211, 255)
     else
-        std.fmt.bufPrint(&summary_buf, "GITHUB  live:not loaded  issues:{s}  actions:{s}  draft:{s}  click LIVE to refresh", .{
-            issues,
-            actions_status,
-            draft,
-        }) catch "GITHUB LIVE not loaded";
-
-    const failed = if (state.app.github_state.latest_failure != null)
-        true
-    else if (state.app.github_state.live) |live|
-        live.runs.len > 0 and std.mem.eql(u8, live.runs[0].conclusion, "failure")
-    else
-        false;
-    const color = if (failed) rgb(255, 115, 124) else if (state.app.github_state.live != null) rgb(127, 211, 255) else rgb(116, 128, 140);
+        rgb(116, 128, 140);
     drawTextClipped(hdc, rect.left + 16, y, rect.right - 72, color, summary);
-    if (state.app.github_state.last_created_pull != null or state.app.github_state.live != null) {
+    if (state.app.github_state.primaryUrl() != null) {
         drawTextRight(hdc, rect.right - 64, y, rect.right - 16, color, "OPEN");
     }
 }
@@ -6688,10 +6660,7 @@ fn gitPanelChangeTargetAtRow(overview: *const git_repository.Overview, row: usiz
 }
 
 fn gitPanelUrlAtRow(state: *const GuiState, overview: git_repository.Overview, row: usize) ?[]const u8 {
-    if (row == 1) {
-        if (state.app.github_state.last_created_pull) |pull| return pull.html_url;
-        if (state.app.github_state.live) |live| return live.repository.html_url;
-    }
+    if (row == 1) return state.app.github_state.primaryUrl();
 
     var current: usize = 2;
     for (overview.remotes) |remote| {

@@ -58,6 +58,66 @@ pub const State = struct {
         return count;
     }
 
+    pub fn formatScmSummary(self: *const State, buffer: []u8) []const u8 {
+        const issue_count = if (self.issues_loaded) self.issueCount() else null;
+        const pull_count = if (self.live) |live|
+            live.pulls.len
+        else if (self.issues_loaded)
+            self.pullRequestCount()
+        else
+            null;
+        const repository = if (self.live) |live| live.repository.full_name else "not loaded";
+        const authentication = if (self.live) |live| @tagName(live.token_source) else "-";
+        const action = if (self.live) |live|
+            if (live.runs.len > 0)
+                if (live.runs[0].conclusion.len > 0)
+                    live.runs[0].conclusion
+                else
+                    live.runs[0].status
+            else
+                "none"
+        else
+            "not loaded";
+
+        var issues_buf: [32]u8 = undefined;
+        const issues = if (issue_count) |count|
+            std.fmt.bufPrint(issues_buf[0..], "{d}", .{count}) catch "?"
+        else
+            "-";
+        var pulls_buf: [32]u8 = undefined;
+        const pulls = if (pull_count) |count|
+            std.fmt.bufPrint(pulls_buf[0..], "{d}", .{count}) catch "?"
+        else
+            "-";
+        var draft_buf: [32]u8 = undefined;
+        const draft = if (self.last_created_pull) |pull|
+            std.fmt.bufPrint(draft_buf[0..], "#{d}", .{pull.number}) catch "yes"
+        else
+            "-";
+
+        return std.fmt.bufPrint(
+            buffer,
+            "GITHUB  {s}  PR:{s}  issues:{s}  actions:{s}  draft:{s}  auth:{s}",
+            .{ repository, pulls, issues, action, draft, authentication },
+        ) catch "GITHUB  live status unavailable";
+    }
+
+    pub fn hasFailure(self: *const State) bool {
+        if (self.latest_failure != null) return true;
+        const live = self.live orelse return false;
+        return live.runs.len > 0 and isFailureConclusion(live.runs[0].conclusion);
+    }
+
+    pub fn primaryUrl(self: *const State) ?[]const u8 {
+        if (self.last_created_pull) |pull| {
+            if (isSafeGitHubWebUrl(pull.html_url)) return pull.html_url;
+        }
+        if (self.live) |live| {
+            if (isSafeGitHubWebUrl(live.repository.html_url)) return live.repository.html_url;
+        }
+        return null;
+    }
+
     fn clearLive(self: *State) void {
         if (self.live) |*live| live.deinit();
         self.live = null;
@@ -80,6 +140,24 @@ pub const State = struct {
         self.last_created_pull = null;
     }
 };
+
+pub fn isSafeGitHubWebUrl(url: []const u8) bool {
+    const prefix = "https://github.com/";
+    if (url.len > 4096 or !std.unicode.utf8ValidateSlice(url)) return false;
+    if (!std.mem.startsWith(u8, url, prefix) or url.len == prefix.len) return false;
+    for (url[prefix.len..]) |byte| {
+        if (byte <= 0x20 or byte == 0x7f or byte == '\\') return false;
+    }
+    return true;
+}
+
+fn isFailureConclusion(value: []const u8) bool {
+    return std.mem.eql(u8, value, "failure") or
+        std.mem.eql(u8, value, "timed_out") or
+        std.mem.eql(u8, value, "cancelled") or
+        std.mem.eql(u8, value, "action_required") or
+        std.mem.eql(u8, value, "startup_failure");
+}
 
 test "GitHub GUI state distinguishes issues from pull requests" {
     var state = State.init(std.testing.allocator);
@@ -104,4 +182,19 @@ test "GitHub GUI state distinguishes issues from pull requests" {
     try std.testing.expect(state.issues_loaded);
     try std.testing.expectEqual(@as(usize, 1), state.issueCount());
     try std.testing.expectEqual(@as(usize, 1), state.pullRequestCount());
+
+    var summary_buffer: [256]u8 = undefined;
+    const summary = state.formatScmSummary(summary_buffer[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "PR:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "issues:1") != null);
+}
+
+test "GitHub GUI state only exposes exact HTTPS github.com URLs" {
+    try std.testing.expect(isSafeGitHubWebUrl("https://github.com/owner/repo"));
+    try std.testing.expect(isSafeGitHubWebUrl("https://github.com/owner/repo/pull/7"));
+    try std.testing.expect(!isSafeGitHubWebUrl("http://github.com/owner/repo"));
+    try std.testing.expect(!isSafeGitHubWebUrl("https://github.com.evil.example/owner/repo"));
+    try std.testing.expect(!isSafeGitHubWebUrl("https://github.com/owner/repo\n--inject"));
+    try std.testing.expect(!isSafeGitHubWebUrl("https://github.com/owner\\repo"));
+    try std.testing.expect(!isSafeGitHubWebUrl("https://github.com/\xff"));
 }

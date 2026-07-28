@@ -157,7 +157,7 @@ fn scanGitConfig(collection: *findings.Collection, path: []const u8, bytes: []co
         try detectConfig(collection, path, line, line_number, "hooksPath", .high, "custom hooksPath can redirect future Git hook execution");
         try detectConfig(collection, path, line, line_number, "fsmonitor", .high, "Git fsmonitor can execute an external helper during status-like operations");
         try detectConfig(collection, path, line, line_number, "sshCommand", .high, "core.sshCommand changes the executable used for Git network operations");
-        try detectConfig(collection, path, line, line_number, "insteadOf", .medium, "url.insteadOf rewrites remotes and can hide the real fetch destination");
+        try detectConfig(collection, path, line, line_number, "insteadOf", .high, "url.insteadOf rewrites remotes and can hide the real fetch destination");
         try detectConfig(collection, path, line, line_number, "credential.helper", .medium, "credential helper can execute external credential code");
         try detectConfig(collection, path, line, line_number, "include.path", .high, "Git config includes another config file; review inherited trust");
         try detectConfig(collection, path, line, line_number, "includeIf", .high, "conditional Git config include changes trust based on repository path");

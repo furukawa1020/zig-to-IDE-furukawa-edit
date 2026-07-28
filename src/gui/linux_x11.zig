@@ -12,6 +12,7 @@ const multi_cursor_mod = @import("../editor/multi_cursor.zig");
 const extension_registry = @import("../extensions/registry.zig");
 const navigation = @import("../editor/navigation.zig");
 const git_repository = @import("../git/repository.zig");
+const git_source_control = @import("../git/source_control.zig");
 const highlight = @import("../language/highlight.zig");
 const lsp_responses = @import("../lsp/responses.zig");
 const lsp_session = @import("../lsp/session.zig");
@@ -564,10 +565,36 @@ const GitPanelAction = enum {
     refresh,
     status,
     diff,
+    stage_all,
+    unstage_all,
+    commit,
+    branch_switch,
+    branch_create,
+    fetch,
+    pull,
+    push,
+    publish,
+    sync,
     live,
     issues,
     failures,
     draft_pr,
+};
+
+const GitChangeLane = enum {
+    staged,
+    unstaged,
+};
+
+const GitPanelChangeTarget = struct {
+    lane: GitChangeLane,
+    index: usize,
+    change: git_repository.Change,
+};
+
+const GitSelection = struct {
+    lane: GitChangeLane,
+    index: usize,
 };
 
 const SecurityPanelAction = enum {
@@ -658,6 +685,10 @@ const QuickPanelMode = enum {
     new_folder,
     rename_path,
     delete_path,
+    git_commit,
+    git_branch_switch,
+    git_branch_create,
+    github_pr,
     run_task,
     document_symbols,
     workspace_symbols,
@@ -737,6 +768,19 @@ const TaskMatch = struct {
         self.* = undefined;
     }
 };
+
+fn appendTaskMatch(
+    allocator: std.mem.Allocator,
+    matches: *std.array_list.Managed(TaskMatch),
+    name: []const u8,
+    label: []const u8,
+) !void {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const owned_label = try allocator.dupe(u8, label);
+    errdefer allocator.free(owned_label);
+    try matches.append(.{ .name = owned_name, .executable = owned_label });
+}
 
 const LspPanelAction = struct {
     id: []const u8,
@@ -875,6 +919,9 @@ const QuickPanel = struct {
             .new_folder => if (self.query.items.len > 0) 1 else 0,
             .rename_path => if (pathMutationRequest(self.query.items)) |_| 1 else 0,
             .delete_path => if (confirmedDeletePath(self.query.items)) |_| 1 else 0,
+            .git_commit, .github_pr => if (std.mem.trim(u8, self.query.items, " \t\r\n").len > 0) 1 else 0,
+            .git_branch_switch => if (self.task_matches) |items| items.len else 0,
+            .git_branch_create => @intFromBool(git_source_control.validateBranchName(std.mem.trim(u8, self.query.items, " \t\r\n"))),
             .run_task => if (self.task_matches) |items| items.len else 0,
             .document_symbols => if (self.symbol_matches) |items| items.len else 0,
             .workspace_symbols => if (self.workspace_symbol_matches) |items| items.len else 0,
@@ -1004,7 +1051,29 @@ const QuickPanel = struct {
                 request.literal_options = self.search_options;
                 self.replacement_preview = try workspace_replace.preview(self.allocator, &app.workspace, request, .{});
             },
-            .new_file, .new_folder, .rename_path, .delete_path => {},
+            .new_file, .new_folder, .rename_path, .delete_path, .git_commit, .git_branch_create, .github_pr => {},
+            .git_branch_switch => {
+                const snapshot = app.source_control_snapshot orelse return;
+                var matches = std.array_list.Managed(TaskMatch).init(self.allocator);
+                errdefer {
+                    for (matches.items) |*item| item.deinit(self.allocator);
+                    matches.deinit();
+                }
+                const query = std.mem.trim(u8, self.query.items, " \t\r\n");
+                if (snapshot.branch) |current| {
+                    if (query.len == 0 or command_mod.fuzzyScore(query, current) != null) {
+                        try appendTaskMatch(self.allocator, &matches, current, "current branch");
+                    }
+                }
+                for (snapshot.branches) |branch| {
+                    if (snapshot.branch) |current| {
+                        if (std.mem.eql(u8, current, branch)) continue;
+                    }
+                    if (query.len > 0 and command_mod.fuzzyScore(query, branch) == null) continue;
+                    try appendTaskMatch(self.allocator, &matches, branch, "local branch");
+                }
+                self.task_matches = try matches.toOwnedSlice();
+            },
             .debug_watch => self.debug_watch_count = app.debug_manager.session.watches.items.len,
             .debug_functions => self.debug_function_count = app.debug_manager.session.function_breakpoints.items.len,
             .debug_data => {
@@ -1286,6 +1355,7 @@ const LinuxGuiState = struct {
     app: app_mod.App,
     quick_panel: QuickPanel,
     git_overview: ?git_repository.Overview = null,
+    git_selection: ?GitSelection = null,
     extensions_registry: ?extension_registry.Registry = null,
     tutorial_language: TutorialLanguage = .ja,
     linux_launch_profile: LinuxLaunchProfile = .safe,
@@ -3506,6 +3576,23 @@ const LinuxGuiState = struct {
     }
 
     fn execute(self: *LinuxGuiState, id: []const u8, source: command_mod.Source) void {
+        if (std.mem.eql(u8, id, "git.commit")) {
+            if (self.git_overview == null) self.openGitPanel();
+            self.executeGitPanelAction(.commit);
+            return;
+        }
+        if (std.mem.eql(u8, id, "git.branch.switch")) {
+            self.openQuickPanel(.git_branch_switch);
+            return;
+        }
+        if (std.mem.eql(u8, id, "git.branch.create")) {
+            self.openQuickPanel(.git_branch_create);
+            return;
+        }
+        if (std.mem.eql(u8, id, "github.pr.create_draft")) {
+            self.openQuickPanel(.github_pr);
+            return;
+        }
         if (std.mem.startsWith(u8, id, "recovery.")) {
             self.openQuickPanel(.recovery);
             return;
@@ -3913,6 +4000,7 @@ const LinuxGuiState = struct {
         self.bottom_panel = .git;
         self.saveWorkbenchSettings();
         self.refreshGitOverview();
+        self.executeGitMutation("git.refresh_source_control", null);
     }
 
     fn openTasksPanel(self: *LinuxGuiState) void {
@@ -3924,11 +4012,19 @@ const LinuxGuiState = struct {
 
     fn refreshGitOverview(self: *LinuxGuiState) void {
         self.clearGitOverview();
-        const overview = git_repository.inspect(self.allocator, &self.app.workspace, .{}) catch |err| {
+        self.git_selection = null;
+        var overview = git_repository.inspect(self.allocator, &self.app.workspace, .{}) catch |err| {
             self.message("git overview failed: {s}", .{@errorName(err)});
             self.appendOutput(.stderr, "git overview failed: {s}\n", .{@errorName(err)});
             return;
         };
+        if (self.app.source_control_snapshot) |*snapshot| {
+            git_repository.applySourceControlSnapshot(&overview, snapshot, 512) catch |err| {
+                self.message("source control merge failed: {s}", .{@errorName(err)});
+                overview.deinit();
+                return;
+            };
+        }
         const present = overview.present;
         const changes = overview.changes.len;
         self.git_overview = overview;
@@ -4332,7 +4428,10 @@ const LinuxGuiState = struct {
     fn executeGitPanelAction(self: *LinuxGuiState, action: GitPanelAction) void {
         self.bottom_panel = .git;
         switch (action) {
-            .refresh => self.refreshGitOverview(),
+            .refresh => {
+                self.refreshGitOverview();
+                self.executeGitMutation("git.refresh_source_control", null);
+            },
             .status => {
                 self.execute("git.status", .command_palette);
                 self.bottom_panel = .output;
@@ -4341,10 +4440,105 @@ const LinuxGuiState = struct {
                 self.execute("git.diff_current", .command_palette);
                 self.bottom_panel = .output;
             },
-            .live, .issues, .failures, .draft_pr => {
+            .stage_all => self.executeGitMutation("git.stage_all", null),
+            .unstage_all => self.executeGitMutation("git.unstage_all", null),
+            .commit => {
+                const overview = self.git_overview orelse return self.message("no Git repository", .{});
+                const staged_count = if (self.app.source_control_snapshot) |snapshot|
+                    snapshot.stagedCount()
+                else
+                    overview.staged_changes.len;
+                if ((overview.staged_scan_available or self.app.source_control_snapshot != null) and staged_count == 0) {
+                    return self.message("stage at least one change before committing", .{});
+                }
+                self.openQuickPanel(.git_commit);
+                self.bottom_panel = .git;
+            },
+            .branch_switch => self.openQuickPanel(.git_branch_switch),
+            .branch_create => self.openQuickPanel(.git_branch_create),
+            .fetch => self.executeGitMutation("git.fetch", null),
+            .pull => {
+                if (self.gitBranchNeedsPublish()) {
+                    self.message("publish this branch before pulling", .{});
+                    return;
+                }
+                self.executeGitMutation("git.pull", null);
+            },
+            .push => self.executeGitMutation(
+                if (self.gitBranchNeedsPublish()) "git.publish_branch" else "git.push",
+                null,
+            ),
+            .sync => self.executeGitMutation(
+                if (self.gitBranchNeedsPublish()) "git.publish_branch" else "git.sync",
+                null,
+            ),
+            .publish => self.executeGitMutation("git.publish_branch", null),
+            .draft_pr => self.openQuickPanel(.github_pr),
+            .live, .issues => {
+                self.execute(gitPanelActionCommand(action), .command_palette);
+                self.bottom_panel = .git;
+            },
+            .failures => {
                 self.execute(gitPanelActionCommand(action), .command_palette);
                 self.bottom_panel = .output;
             },
+        }
+    }
+
+    fn gitBranchNeedsPublish(self: *const LinuxGuiState) bool {
+        const snapshot = self.app.source_control_snapshot orelse return false;
+        return !snapshot.detached and snapshot.branch != null and snapshot.upstream == null;
+    }
+
+    fn executeGitMutation(self: *LinuxGuiState, id: []const u8, argument: ?[]const u8) void {
+        const result = dispatcher.dispatch(&self.app, .{
+            .id = id,
+            .argument = argument,
+            .source = .command_palette,
+        }) catch |err| {
+            self.message("{s} failed: {s}", .{ id, @errorName(err) });
+            self.appendOutput(.stderr, "{s} failed: {s}\n", .{ id, @errorName(err) });
+            return;
+        };
+        self.handleDispatchResult(id, result);
+        self.bottom_panel = .git;
+        self.terminal_focused = false;
+        if (std.meta.activeTag(result) == .completed) {
+            const completed = result.completed;
+            self.refreshGitOverview();
+            self.refreshLinuxSelfProtection();
+            self.message("{s}", .{completed});
+        }
+    }
+
+    fn previewGitDiffForPath(self: *LinuxGuiState, path: []const u8, staged: bool) void {
+        const preview = (if (staged)
+            git_repository.previewStagedFileDiff(self.allocator, &self.app.workspace, path, .{})
+        else
+            git_repository.previewFileDiff(self.allocator, &self.app.workspace, path, .{})) catch blk: {
+            break :blk git_source_control.previewDiff(
+                self.allocator,
+                self.app.io,
+                self.app.environ,
+                self.app.workspace.root_path,
+                path,
+                staged,
+            ) catch |err| {
+                self.message("git diff preview failed: {s}", .{@errorName(err)});
+                self.appendOutput(.stderr, "git diff preview failed: {s}\n", .{@errorName(err)});
+                return;
+            };
+        };
+        defer self.allocator.free(preview);
+        self.app.process_console.appendBytes(.stdout, preview) catch |err| {
+            self.message("git diff output failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.bottom_panel = .output;
+        if (staged) {
+            self.message("staged Git diff preview", .{});
+        } else {
+            self.message("Git diff preview", .{});
         }
     }
 
@@ -4746,6 +4940,56 @@ const LinuxGuiState = struct {
             .new_folder => self.dispatchQuickPanelFileMutation("file.new_folder", "new folder"),
             .rename_path => self.dispatchQuickPanelFileMutation("file.rename", "rename"),
             .delete_path => self.dispatchQuickPanelFileMutation("file.delete", "delete"),
+            .git_commit => {
+                const commit_message = std.mem.trim(u8, self.quick_panel.query.items, " \t\r\n");
+                if (commit_message.len == 0) return self.message("type a commit message", .{});
+                const owned = self.allocator.dupe(u8, commit_message) catch |err| {
+                    return self.message("commit failed: {s}", .{@errorName(err)});
+                };
+                defer self.allocator.free(owned);
+                self.quick_panel.close();
+                self.executeGitMutation("git.commit", owned);
+            },
+            .git_branch_switch => {
+                const item = self.quick_panel.selectedTask() orelse return self.message("no local branch selected", .{});
+                const owned = self.allocator.dupe(u8, item.name) catch |err| {
+                    return self.message("branch switch failed: {s}", .{@errorName(err)});
+                };
+                defer self.allocator.free(owned);
+                self.quick_panel.close();
+                self.executeGitMutation("git.branch.switch", owned);
+            },
+            .git_branch_create => {
+                const branch = std.mem.trim(u8, self.quick_panel.query.items, " \t\r\n");
+                if (!git_source_control.validateBranchName(branch)) return self.message("type a valid new branch name", .{});
+                const owned = self.allocator.dupe(u8, branch) catch |err| {
+                    return self.message("branch failed: {s}", .{@errorName(err)});
+                };
+                defer self.allocator.free(owned);
+                self.quick_panel.close();
+                self.executeGitMutation("git.branch.create", owned);
+            },
+            .github_pr => {
+                const title = std.mem.trim(u8, self.quick_panel.query.items, " \t\r\n");
+                if (title.len == 0) return self.message("type a pull request title", .{});
+                const owned = self.allocator.dupe(u8, title) catch |err| {
+                    return self.message("draft PR failed: {s}", .{@errorName(err)});
+                };
+                defer self.allocator.free(owned);
+                self.quick_panel.close();
+                const result = dispatcher.dispatch(&self.app, .{
+                    .id = "github.pr.create_draft",
+                    .argument = owned,
+                    .source = .command_palette,
+                }) catch |err| {
+                    self.message("draft PR failed: {s}", .{@errorName(err)});
+                    self.appendOutput(.stderr, "draft PR failed: {s}\n", .{@errorName(err)});
+                    return;
+                };
+                self.handleDispatchResult("github.pr.create_draft", result);
+                self.bottom_panel = if (std.meta.activeTag(result) == .completed) .git else .output;
+                self.terminal_focused = false;
+            },
             .run_task => {
                 const item = self.quick_panel.selectedTask() orelse return self.message("no task", .{});
                 const name = self.allocator.dupe(u8, item.name) catch |err| return self.message("task failed: {s}", .{@errorName(err)});
@@ -5442,6 +5686,7 @@ const LinuxGuiState = struct {
         self.task_scroll_line = 0;
         self.task_history_selected = null;
         self.git_scroll_line = 0;
+        self.git_selection = null;
         self.extensions_scroll_line = 0;
         self.diagnostics_scroll_line = 0;
         self.security_scroll_line = 0;
@@ -6368,14 +6613,21 @@ const LinuxGuiState = struct {
                     self.executeGitPanelAction(action);
                     return true;
                 }
-                if (gitChangeRowAt(self, y)) |index| {
-                    if (self.git_overview) |overview| {
-                        if (index < overview.changes.len) {
-                            self.openRelativeLocation(overview.changes[index].path, 0, 0);
-                        }
+                if (gitChangeRowAt(self, y)) |row| {
+                    const overview = if (self.git_overview) |*value| value else return true;
+                    const target = gitPanelChangeTargetAtDataRow(overview, row) orelse return true;
+                    self.git_selection = .{ .lane = target.lane, .index = target.index };
+                    if (x >= self.window_width - 58) {
+                        self.executeGitMutation(
+                            if (target.lane == .staged) "git.unstage" else "git.stage",
+                            target.change.path,
+                        );
+                        return true;
                     }
-                } else {
-                    self.executeGitPanelAction(.diff);
+                    if (target.change.status != .deleted) {
+                        self.openRelativeLocation(target.change.path, 0, 0);
+                    }
+                    self.previewGitDiffForPath(target.change.path, target.lane == .staged);
                 }
                 return true;
             },
@@ -6590,7 +6842,7 @@ const LinuxGuiState = struct {
                 self.output_scroll_line = if (start == max_start) 0 else start + 1;
             },
             .git => {
-                const total = if (self.git_overview) |overview| overview.changes.len else 0;
+                const total = if (self.git_overview) |overview| gitScmRowCount(overview) else 0;
                 const visible = self.bottomRowsFrom(gitChangesTop(self));
                 const max_start = if (total > visible) total - visible else 0;
                 self.git_scroll_line = scrollValue(self.git_scroll_line, max_start, delta);
@@ -7548,71 +7800,92 @@ fn drawSecurityPanel(x11: *X11, state: *LinuxGuiState) !void {
 fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
     const bottom = state.bottomTop();
     try drawGitPanelActions(x11, state);
-    try x11.text(x11.gc.green, 18, bottom + 58, "GIT / hook-free repository view / GitHub live actions");
+    try x11.text(x11.gc.green, 18, bottom + 82, "SOURCE CONTROL / hook-free plans / staged + working tree / GitHub");
 
     const overview = state.git_overview orelse {
-        try x11.text(x11.gc.muted, 18, bottom + 86, "Press REFRESH. ZIDE reads .git directly without running hooks, filters, fsmonitor, or git status.");
+        try x11.text(x11.gc.muted, 18, bottom + 106, "Press REF. ZIDE reads .git directly without running hooks, filters, fsmonitor, or git status.");
         return;
     };
 
     if (!overview.present) {
-        try x11.text(x11.gc.muted, 18, bottom + 86, "No Git repository detected in this workspace.");
+        try x11.text(x11.gc.muted, 18, bottom + 106, "No Git repository detected in this workspace.");
         return;
     }
 
     const workflow_risk = workflowRiskCounts(state, overview);
+    const snapshot = state.app.source_control_snapshot;
+    const branch = if (snapshot) |value| value.branch orelse overview.branch orelse "(detached)" else overview.branch orelse "(detached)";
+    const upstream = if (snapshot) |value| value.upstream orelse "unpublished" else "not refreshed";
+    const ahead = if (snapshot) |value| value.ahead else 0;
+    const behind = if (snapshot) |value| value.behind else 0;
     var meta_buf: [720]u8 = undefined;
-    const meta = std.fmt.bufPrint(meta_buf[0..], "branch:{s} commit:{s} index:v{d} entries:{d} tracked-clean:{d} changes:{d} ignored:{d} workflows:{d} wf-risk:{d}/{d}/{d}", .{
-        overview.branch orelse "(detached)",
+    const meta = std.fmt.bufPrint(meta_buf[0..], "branch:{s} -> {s} up:{d} down:{d} commit:{s} staged:{d} changes:{d} workflows:{d} risk:{d}/{d}/{d}", .{
+        branch,
+        upstream,
+        ahead,
+        behind,
         if (overview.commit) |commit| commit[0..@min(commit.len, 12)] else "unknown",
-        overview.index_version orelse 0,
-        overview.index_entries,
-        overview.clean_tracked,
+        overview.staged_changes.len,
         overview.changes.len,
-        overview.ignored_untracked,
         overview.workflow_files,
         workflow_risk.critical,
         workflow_risk.high,
         workflow_risk.medium,
     }) catch "git overview";
     var meta_ascii: [720]u8 = undefined;
-    try x11.text(x11.gc.muted, 18, bottom + 82, asciiInto(meta_ascii[0..], meta));
+    try x11.text(x11.gc.muted, 18, bottom + 106, asciiInto(meta_ascii[0..], meta));
 
     const has_github_remote = overviewHasGitHubRemote(overview);
     const token_label = githubTokenPresenceLabel(state.app.environ);
-    var lane_buf: [420]u8 = undefined;
-    const lane = std.fmt.bufPrint(lane_buf[0..], "GITHUB lanes remote:{s} token:{s} read:LIVE/ISS/FAIL write:PR(draft)", .{
-        if (has_github_remote) "yes" else "no",
-        token_label,
-    }) catch "GITHUB lanes";
-    var lane_ascii: [420]u8 = undefined;
+    var lane_buf: [720]u8 = undefined;
+    const lane = if (overview.remotes.len > 0)
+        if (overview.remotes[0].github) |github|
+            std.fmt.bufPrint(lane_buf[0..], "remote:{s} github:{s}/{s} token:{s}", .{ overview.remotes[0].name, github.owner, github.repo, token_label }) catch overview.remotes[0].name
+        else
+            std.fmt.bufPrint(lane_buf[0..], "remote:{s} {s}", .{ overview.remotes[0].name, overview.remotes[0].url }) catch overview.remotes[0].name
+    else
+        "remote:none";
+    var lane_ascii: [720]u8 = undefined;
     const lane_gc = if (!has_github_remote) x11.gc.amber else if (std.mem.eql(u8, token_label, "none")) x11.gc.muted else x11.gc.cyan;
-    try x11.text(lane_gc, 18, bottom + 106, asciiInto(lane_ascii[0..], lane));
+    try x11.text(lane_gc, 18, bottom + 130, asciiInto(lane_ascii[0..], lane));
 
-    var y: i16 = bottom + 130;
-    if (overview.remotes.len > 0) {
-        for (overview.remotes[0..@min(overview.remotes.len, @as(usize, 2))]) |remote| {
-            var remote_buf: [720]u8 = undefined;
-            const remote_line = if (remote.github) |github|
-                std.fmt.bufPrint(remote_buf[0..], "remote:{s} github:{s}/{s} actions:{s}", .{ remote.name, github.owner, github.repo, github.actions_url }) catch remote.name
+    const top = gitChangesTop(state);
+    const total_rows = gitScmRowCount(overview);
+    const visible_rows = state.bottomRowsFrom(top);
+    const start = @min(state.git_scroll_line, total_rows);
+    const limit = @min(total_rows, start + visible_rows);
+    try drawScrollHint(x11, state, total_rows, visible_rows, start, top);
+    var y = top;
+    var display_row = start;
+    while (display_row < limit) : (display_row += 1) {
+        if (display_row == 0) {
+            var staged_buf: [160]u8 = undefined;
+            const staged = if (overview.staged_scan_available)
+                std.fmt.bufPrint(staged_buf[0..], "STAGED CHANGES  {d}", .{overview.staged_changes.len}) catch "STAGED CHANGES"
             else
-                std.fmt.bufPrint(remote_buf[0..], "remote:{s} {s}", .{ remote.name, remote.url }) catch remote.name;
-            var remote_ascii: [720]u8 = undefined;
-            try x11.text(x11.gc.cyan, 18, y, asciiInto(remote_ascii[0..], remote_line));
+                "STAGED CHANGES  unavailable (packed HEAD)";
+            try x11.text(if (overview.staged_changes.len > 0) x11.gc.green else x11.gc.muted, 18, y, staged);
             y += LINE_HEIGHT;
+            continue;
         }
-    } else {
-        try x11.text(x11.gc.muted, 18, y, "No remotes configured.");
-        y += LINE_HEIGHT;
-    }
+        const changes_header = 1 + overview.staged_changes.len;
+        if (display_row == changes_header) {
+            var changes_buf: [120]u8 = undefined;
+            const changes = std.fmt.bufPrint(changes_buf[0..], "CHANGES  {d}", .{overview.changes.len}) catch "CHANGES";
+            try x11.text(if (overview.changes.len > 0) x11.gc.amber else x11.gc.muted, 18, y, changes);
+            y += LINE_HEIGHT;
+            continue;
+        }
 
-    const max_rows = state.bottomRowsFrom(y);
-    const start = @min(state.git_scroll_line, overview.changes.len);
-    const limit = @min(overview.changes.len, start + max_rows);
-    try drawScrollHint(x11, state, overview.changes.len, max_rows, start, y);
-    var row: usize = 0;
-    while (start + row < limit) : (row += 1) {
-        const change = overview.changes[start + row];
+        const target = gitPanelChangeTargetAtDisplayRow(&overview, display_row) orelse {
+            y += LINE_HEIGHT;
+            continue;
+        };
+        const change = target.change;
+        const selected = if (state.git_selection) |selection| selection.lane == target.lane and selection.index == target.index else false;
+        if (selected) {
+            try x11.fillRect(x11.gc.panel_2, 10, y - 14, toU16(state.window_width - 20), LINE_HEIGHT);
+        }
         const counts = pathRiskCounts(state, change.path);
         const worst = highestRisk(counts);
         var row_buf: [720]u8 = undefined;
@@ -7629,10 +7902,11 @@ fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
         var row_ascii: [720]u8 = undefined;
         const row_gc = if (worst) |risk| riskGc(x11, risk) else gitChangeGc(x11, change.status);
         try x11.text(row_gc, 18, y, asciiInto(row_ascii[0..], line));
+        try drawActionButton(x11, gitChangeActionRect(state, y), if (target.lane == .staged) "-" else "+");
         y += LINE_HEIGHT;
     }
-    if (overview.changes.len == 0) {
-        try x11.text(x11.gc.muted, 18, y, "No tracked or untracked changes found by the safe .git reader.");
+    if (overview.changes.len == 0 and overview.staged_changes.len == 0) {
+        try x11.text(x11.gc.muted, 160, top, "Working tree clean");
     }
 }
 
@@ -7983,8 +8257,9 @@ fn drawQuickPanel(x11: *X11, state: *LinuxGuiState) !void {
     }
 
     var y: i16 = top + 104;
-    const limit = @min(state.quick_panel.itemCount(), @as(usize, 12));
+    const total = state.quick_panel.itemCount();
     const start = quickPanelVisibleStart(&state.quick_panel, 12);
+    const limit = @min(total - start, @as(usize, 12));
     var row: usize = 0;
     while (row < limit) : (row += 1) {
         const item_index = start + row;
@@ -8060,6 +8335,17 @@ fn drawQuickPanelRow(x11: *X11, state: *LinuxGuiState, x: i16, y: i16, row: usiz
             const path = confirmedDeletePath(state.quick_panel.query.items) orelse break :blk "Type path=>DELETE";
             break :blk std.fmt.bufPrint(text_buf[0..], "Delete {s}", .{path}) catch "Delete path";
         },
+        .git_commit => "Commit staged changes",
+        .git_branch_switch => blk: {
+            const items = state.quick_panel.task_matches orelse break :blk "";
+            if (row >= items.len) break :blk "";
+            break :blk std.fmt.bufPrint(text_buf[0..], "{s}  {s}", .{
+                items[row].name,
+                items[row].executable,
+            }) catch items[row].name;
+        },
+        .git_branch_create => "Create and switch to branch",
+        .github_pr => "Create draft PR with this title",
         .run_task => blk: {
             const items = state.quick_panel.task_matches orelse break :blk "";
             if (row >= items.len) break :blk "";
@@ -8653,6 +8939,7 @@ fn riskMarkerLabel(risk: findings_mod.Risk) []const u8 {
 
 fn gitChangeLabel(status: git_repository.ChangeStatus) []const u8 {
     return switch (status) {
+        .added => "A",
         .modified => "M",
         .deleted => "D",
         .untracked => "??",
@@ -8661,6 +8948,7 @@ fn gitChangeLabel(status: git_repository.ChangeStatus) []const u8 {
 
 fn gitChangeGc(x11: *X11, status: git_repository.ChangeStatus) u32 {
     return switch (status) {
+        .added => x11.gc.green,
         .modified => x11.gc.amber,
         .deleted => x11.gc.red,
         .untracked => x11.gc.cyan,
@@ -9434,7 +9722,7 @@ fn isReadOnlyQuickPanelMode(mode: QuickPanelMode) bool {
 }
 
 fn quickPanelVisibleStart(panel: *const QuickPanel, max_visible: usize) usize {
-    if ((panel.mode != .debug_exceptions and panel.mode != .debug_functions and panel.mode != .debug_data and panel.mode != .debug_low_level) or max_visible == 0) return 0;
+    if ((panel.mode != .git_branch_switch and panel.mode != .debug_exceptions and panel.mode != .debug_functions and panel.mode != .debug_data and panel.mode != .debug_low_level) or max_visible == 0) return 0;
     const count = panel.itemCount();
     if (count <= max_visible or panel.selected_index < max_visible) return 0;
     return @min(panel.selected_index + 1 - max_visible, count - max_visible);
@@ -9616,6 +9904,10 @@ fn quickPanelTitle(mode: QuickPanelMode) []const u8 {
         .new_folder => "NEW FOLDER",
         .rename_path => "RENAME PATH  old=>new",
         .delete_path => "DELETE PATH  path=>DELETE",
+        .git_commit => "SOURCE CONTROL  COMMIT MESSAGE",
+        .git_branch_switch => "SOURCE CONTROL  SWITCH BRANCH",
+        .git_branch_create => "SOURCE CONTROL  CREATE BRANCH",
+        .github_pr => "GITHUB  CREATE DRAFT PULL REQUEST",
         .run_task => "RUN TASK",
         .document_symbols => "SYMBOLS",
         .workspace_symbols => "WORKSPACE SYMBOLS",
@@ -9893,7 +10185,33 @@ fn bottomPanelLabel(panel: BottomPanel) []const u8 {
     };
 }
 
-const git_panel_actions = [_]GitPanelAction{ .refresh, .status, .diff, .live, .issues, .failures, .draft_pr };
+const git_panel_compact_actions = [_]GitPanelAction{
+    .refresh,
+    .branch_switch,
+    .stage_all,
+    .unstage_all,
+    .commit,
+    .pull,
+    .push,
+    .sync,
+    .draft_pr,
+};
+const git_panel_full_actions = [_]GitPanelAction{
+    .refresh,
+    .branch_switch,
+    .branch_create,
+    .stage_all,
+    .unstage_all,
+    .commit,
+    .fetch,
+    .pull,
+    .push,
+    .sync,
+    .live,
+    .issues,
+    .failures,
+    .draft_pr,
+};
 const debug_panel_actions = [_]DebugPanelAction{ .configure, .start, .continue_execution, .pause, .step_over, .step_into, .step_out, .watch, .low_level, .advanced_breakpoint, .breakpoint, .stop, .status };
 const task_panel_actions = [_]TaskPanelAction{ .profile_read_only, .profile_safe, .profile_network, .profile_publish, .terminal, .queue_terminal, .run_pty, .stop_pty, .tasks, .preview, .seal, .run_next, .history };
 const security_panel_actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean, .seal, .linux };
@@ -9903,9 +10221,17 @@ const tutorial_panel_actions = [_]TutorialPanelAction{ .ja, .en };
 const publish_panel_actions = [_]PublishPanelAction{ .checklist, .assets, .manifests, .bundle, .verify, .preflight };
 const context_actions = [_]ContextAction{ .copy, .cut, .paste, .select_all, .find, .goto_line, .scan, .scan_selection, .boundary_lens, .comment, .references, .rename, .close_editor, .task_queue, .palette };
 
+fn gitPanelActions(state: *const LinuxGuiState) []const GitPanelAction {
+    return if (state.window_width >= 1060)
+        git_panel_full_actions[0..]
+    else
+        git_panel_compact_actions[0..];
+}
+
 fn drawGitPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
-    inline for (git_panel_actions) |action| {
-        try drawActionButton(x11, gitPanelActionRect(state, action), gitPanelActionLabel(action));
+    for (gitPanelActions(state)) |action| {
+        const label = if (action == .push and state.gitBranchNeedsPublish()) "PUB" else gitPanelActionLabel(action);
+        try drawActionButton(x11, gitPanelActionRect(state, action), label);
     }
 }
 
@@ -9958,7 +10284,7 @@ fn drawPublishPanelActions(x11: *X11, state: *const LinuxGuiState) !void {
 }
 
 fn gitPanelActionAt(state: *const LinuxGuiState, x: i16, y: i16) ?GitPanelAction {
-    inline for (git_panel_actions) |action| {
+    for (gitPanelActions(state)) |action| {
         if (pointIn(gitPanelActionRect(state, action), x, y)) return action;
     }
     return null;
@@ -10070,18 +10396,18 @@ fn debugPanelActionRect(state: *const LinuxGuiState, action: DebugPanelAction) H
 }
 
 fn gitPanelActionRect(state: *const LinuxGuiState, action: GitPanelAction) HitRect {
-    const index: i16 = switch (action) {
-        .refresh => 0,
-        .status => 1,
-        .diff => 2,
-        .live => 3,
-        .issues => 4,
-        .failures => 5,
-        .draft_pr => 6,
-    };
-    const width: i16 = 62;
-    const gap: i16 = 8;
-    const right = state.window_width - 18 - (6 - index) * (width + gap);
+    const actions = gitPanelActions(state);
+    var index: usize = 0;
+    for (actions, 0..) |candidate, candidate_index| {
+        if (candidate == action) {
+            index = candidate_index;
+            break;
+        }
+    }
+    const width: i16 = 43;
+    const gap: i16 = 4;
+    const slot: i16 = @intCast(actions.len - 1 - index);
+    const right = state.window_width - 18 - slot * (width + gap);
     const bottom = state.bottomTop();
     return .{ .left = right - width, .top = bottom + 42, .right = right, .bottom = bottom + 66 };
 }
@@ -10186,6 +10512,16 @@ fn gitPanelActionLabel(action: GitPanelAction) []const u8 {
         .refresh => "REF",
         .status => "STAT",
         .diff => "DIFF",
+        .stage_all => "+ALL",
+        .unstage_all => "-ALL",
+        .commit => "COMMIT",
+        .branch_switch => "BR",
+        .branch_create => "NEW",
+        .fetch => "FETCH",
+        .pull => "PULL",
+        .push => "PUSH",
+        .publish => "PUB",
+        .sync => "SYNC",
         .live => "LIVE",
         .issues => "ISS",
         .failures => "FAIL",
@@ -10216,6 +10552,16 @@ fn gitPanelActionCommand(action: GitPanelAction) []const u8 {
         .refresh => "git.overview",
         .status => "git.status",
         .diff => "git.diff_current",
+        .stage_all => "git.stage_all",
+        .unstage_all => "git.unstage_all",
+        .commit => "git.commit",
+        .branch_switch => "git.branch.switch",
+        .branch_create => "git.branch.create",
+        .fetch => "git.fetch",
+        .pull => "git.pull",
+        .push => "git.push",
+        .publish => "git.publish_branch",
+        .sync => "git.sync",
         .live => "github.fetch",
         .issues => "github.issues",
         .failures => "github.actions.failures",
@@ -10469,9 +10815,47 @@ fn outputLineRowAt(state: *const LinuxGuiState, y: i16) ?usize {
 }
 
 fn gitChangesTop(state: *const LinuxGuiState) i16 {
-    const bottom = state.bottomTop();
-    const remote_rows: usize = if (state.git_overview) |overview| @max(@min(overview.remotes.len, @as(usize, 2)), 1) else 1;
-    return bottom + 132 + @as(i16, @intCast(remote_rows)) * LINE_HEIGHT;
+    return state.bottomTop() + 154;
+}
+
+fn gitScmRowCount(overview: git_repository.Overview) usize {
+    return 2 + overview.staged_changes.len + overview.changes.len;
+}
+
+fn gitPanelDataRowCount(overview: git_repository.Overview) usize {
+    return gitScmRowCount(overview);
+}
+
+fn gitPanelChangeTargetAtDisplayRow(
+    overview: *const git_repository.Overview,
+    row: usize,
+) ?GitPanelChangeTarget {
+    if (row > 0 and row <= overview.staged_changes.len) {
+        const index = row - 1;
+        return .{
+            .lane = .staged,
+            .index = index,
+            .change = overview.staged_changes[index],
+        };
+    }
+
+    const changes_start = overview.staged_changes.len + 2;
+    if (row < changes_start or row >= changes_start + overview.changes.len) return null;
+    const index = row - changes_start;
+    return .{
+        .lane = .unstaged,
+        .index = index,
+        .change = overview.changes[index],
+    };
+}
+
+fn gitChangeActionRect(state: *const LinuxGuiState, row_baseline: i16) HitRect {
+    return .{
+        .left = state.window_width - 54,
+        .top = row_baseline - 15,
+        .right = state.window_width - 18,
+        .bottom = row_baseline + 5,
+    };
 }
 
 fn gitChangeRowAt(state: *const LinuxGuiState, y: i16) ?usize {
@@ -10480,6 +10864,13 @@ fn gitChangeRowAt(state: *const LinuxGuiState, y: i16) ?usize {
     const row = @divTrunc(@as(isize, y - top), LINE_HEIGHT);
     if (row < 0) return null;
     return state.git_scroll_line + @as(usize, @intCast(row));
+}
+
+fn gitPanelChangeTargetAtDataRow(
+    overview: *const git_repository.Overview,
+    row: usize,
+) ?GitPanelChangeTarget {
+    return gitPanelChangeTargetAtDisplayRow(overview, row);
 }
 
 fn extensionRowAt(state: *const LinuxGuiState, y: i16) ?usize {

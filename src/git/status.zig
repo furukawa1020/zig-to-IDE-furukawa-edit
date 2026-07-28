@@ -191,11 +191,11 @@ fn scanGitConfig(collection: *findings.Collection, path: []const u8, bytes: []co
         }
 
         if (lower_section_is_diff and containsAssignment(line, "textconv")) {
-            try collection.append(.git_trust, .medium, path, line_number, 0, "Git diff textconv can execute external conversion commands", line);
+            try collection.append(.git_trust, .high, path, line_number, 0, "Git diff textconv can execute external conversion commands", line);
         }
 
         if (lower_section_is_merge and containsAssignment(line, "driver")) {
-            try collection.append(.git_trust, .medium, path, line_number, 0, "Git merge driver can execute external commands", line);
+            try collection.append(.git_trust, .high, path, line_number, 0, "Git merge driver can execute external commands", line);
         }
 
         if ((lower_section_is_difftool or lower_section_is_mergetool) and containsAssignment(line, "cmd")) {
@@ -348,6 +348,10 @@ fn detectRemoteUrl(collection: *findings.Collection, path: []const u8, line: []c
     }
     if (startsWithIgnoreCase(value, "git://")) {
         try collection.append(.git_trust, .high, path, line_number, 0, "Git remote URL uses unauthenticated git:// transport", line);
+        return;
+    }
+    if (startsWithIgnoreCase(value, "ssh://") or startsWithIgnoreCase(value, "git@")) {
+        try collection.append(.git_trust, .high, path, line_number, 0, "Git remote URL uses an SSH transport outside ZIDE's HTTPS-only SCM bridge", line);
         return;
     }
     if (startsWithIgnoreCase(value, "file://") or startsWithIgnoreCase(value, "../") or startsWithIgnoreCase(value, "..\\")) {

@@ -187,6 +187,8 @@ const ExtensionPanelAction = enum {
 
 const SecurityPanelAction = enum {
     audit,
+    review,
+    trust,
     lock,
     scan,
     lf,
@@ -855,6 +857,7 @@ pub fn run(
     environ: std.process.Environ,
 ) !void {
     if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+    _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     var state = try GuiState.init(allocator, root_path, environ);
     defer state.deinit();
@@ -2073,6 +2076,8 @@ const GuiState = struct {
         self.bottom_panel = .security;
         switch (action) {
             .audit => self.runWorkspaceSecurityAudit("Security audit"),
+            .review => self.executeCommand("security.mark_reviewed"),
+            .trust => self.executeCommand("security.trust_workspace"),
             .lock => self.lockWorkspaceFromGui(),
             .scan => self.refreshActiveSecurityFindings("Current file security scan"),
             .lf => self.normalizeActiveDocumentNewlines(.lf),
@@ -3495,6 +3500,22 @@ const GuiState = struct {
 
     fn openGitPanelRow(self: *GuiState, rect: RECT, row: usize, x: c_int) void {
         const overview = if (self.git_overview) |*value| value else return;
+        if (row == 1) {
+            if (self.app.github_state.primaryUrl()) |url| {
+                self.openExternalUrl(url);
+            } else {
+                self.executeGitPanelAction(.live);
+            }
+            return;
+        }
+        if (gitHubScmDetailAtRow(row)) |detail| {
+            if (self.app.github_state.scmDetailUrl(detail)) |url| {
+                self.openExternalUrl(url);
+            } else {
+                self.executeGitPanelAction(if (detail == .issue) .issues else .live);
+            }
+            return;
+        }
         if (gitPanelUrlAtRow(self, overview.*, row)) |url| {
             self.openExternalUrl(url);
             return;
@@ -6471,7 +6492,12 @@ fn drawGitPanelRow(hdc: windows.HDC, state: *GuiState, rect: RECT, overview: git
         return;
     }
 
-    var current: usize = 2;
+    if (gitHubScmDetailAtRow(row)) |detail| {
+        drawGitHubScmDetail(hdc, state, rect, y, detail);
+        return;
+    }
+
+    var current: usize = 5;
     for (overview.remotes) |remote| {
         if (row == current) {
             var remote_buf: [520]u8 = undefined;
@@ -6568,6 +6594,26 @@ fn drawGitHubScmSummary(hdc: windows.HDC, state: *const GuiState, rect: RECT, y:
     }
 }
 
+fn drawGitHubScmDetail(
+    hdc: windows.HDC,
+    state: *const GuiState,
+    rect: RECT,
+    y: c_int,
+    detail: github_state_mod.ScmDetail,
+) void {
+    var detail_buf: [720]u8 = undefined;
+    const text = state.app.github_state.formatScmDetail(detail, detail_buf[0..]);
+    const has_url = state.app.github_state.scmDetailUrl(detail) != null;
+    const color = if (state.app.github_state.scmDetailFailed(detail))
+        rgb(255, 115, 124)
+    else if (has_url)
+        rgb(127, 211, 255)
+    else
+        rgb(116, 128, 140);
+    drawTextClipped(hdc, rect.left + 34, y, rect.right - 72, color, text);
+    if (has_url) drawTextRight(hdc, rect.right - 64, y, rect.right - 16, color, "OPEN");
+}
+
 fn drawGitScmChangeRow(
     hdc: windows.HDC,
     state: *GuiState,
@@ -6608,7 +6654,7 @@ fn drawGitScmChangeRow(
 }
 
 fn gitPanelRowCount(overview: git_repository.Overview) usize {
-    var count: usize = 2;
+    var count: usize = 5;
     for (overview.remotes) |remote| {
         count += 1;
         if (remote.github != null) count += 2;
@@ -6620,7 +6666,7 @@ fn gitPanelRowCount(overview: git_repository.Overview) usize {
 }
 
 fn gitPanelWorkflowStartRow(overview: git_repository.Overview) usize {
-    var row: usize = 3;
+    var row: usize = 6;
     for (overview.remotes) |remote| {
         row += 1;
         if (remote.github != null) row += 2;
@@ -6661,8 +6707,9 @@ fn gitPanelChangeTargetAtRow(overview: *const git_repository.Overview, row: usiz
 
 fn gitPanelUrlAtRow(state: *const GuiState, overview: git_repository.Overview, row: usize) ?[]const u8 {
     if (row == 1) return state.app.github_state.primaryUrl();
+    if (gitHubScmDetailAtRow(row)) |detail| return state.app.github_state.scmDetailUrl(detail);
 
-    var current: usize = 2;
+    var current: usize = 5;
     for (overview.remotes) |remote| {
         current += 1;
         if (remote.github) |github| {
@@ -6673,6 +6720,17 @@ fn gitPanelUrlAtRow(state: *const GuiState, overview: git_repository.Overview, r
         }
     }
     return null;
+}
+
+const git_hub_scm_details = [_]github_state_mod.ScmDetail{
+    .pull_request,
+    .workflow_run,
+    .issue,
+};
+
+fn gitHubScmDetailAtRow(row: usize) ?github_state_mod.ScmDetail {
+    if (row < 2 or row >= 2 + git_hub_scm_details.len) return null;
+    return git_hub_scm_details[row - 2];
 }
 
 const git_panel_compact_actions = [_]GitPanelAction{
@@ -7313,7 +7371,7 @@ fn tutorialLineColor(line: []const u8) windows.COLORREF {
 
 fn drawSecurityPanelActions(hdc: windows.HDC, rect: RECT) void {
     if (!securityPanelHasActionButtons(rect)) return;
-    const actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean };
+    const actions = [_]SecurityPanelAction{ .audit, .review, .trust, .lock, .scan, .lf, .crlf, .clean };
     for (actions) |action| {
         drawButton(hdc, securityPanelActionButtonRect(rect, action), securityPanelActionLabel(action));
     }
@@ -7322,7 +7380,7 @@ fn drawSecurityPanelActions(hdc: windows.HDC, rect: RECT) void {
 fn securityPanelActionAt(rect: RECT, x: c_int, y: c_int) ?SecurityPanelAction {
     if (!securityPanelHasActionButtons(rect)) return null;
     if (y < rect.top or y >= rect.top + HEADER_HEIGHT) return null;
-    const actions = [_]SecurityPanelAction{ .audit, .lock, .scan, .lf, .crlf, .clean };
+    const actions = [_]SecurityPanelAction{ .audit, .review, .trust, .lock, .scan, .lf, .crlf, .clean };
     for (actions) |action| {
         if (pointIn(securityPanelActionButtonRect(rect, action), x, y)) return action;
     }
@@ -7330,7 +7388,7 @@ fn securityPanelActionAt(rect: RECT, x: c_int, y: c_int) ?SecurityPanelAction {
 }
 
 fn securityPanelHasActionButtons(rect: RECT) bool {
-    return rect.right - rect.left >= 720;
+    return rect.right - rect.left >= 860;
 }
 
 fn securityPanelActionButtonRect(rect: RECT, action: SecurityPanelAction) RECT {
@@ -7342,7 +7400,9 @@ fn securityPanelActionButtonRect(rect: RECT, action: SecurityPanelAction) RECT {
         .lf => 2,
         .scan => 3,
         .lock => 4,
-        .audit => 5,
+        .trust => 5,
+        .review => 6,
+        .audit => 7,
     };
     const right = rect.right - 12 - slot * (width + gap);
     return .{
@@ -7356,6 +7416,8 @@ fn securityPanelActionButtonRect(rect: RECT, action: SecurityPanelAction) RECT {
 fn securityPanelActionLabel(action: SecurityPanelAction) []const u8 {
     return switch (action) {
         .audit => "AUDIT",
+        .review => "REVIEW",
+        .trust => "TRUST",
         .lock => "LOCK",
         .scan => "SCAN",
         .lf => "LF",
@@ -7470,6 +7532,8 @@ fn commandCapabilityLabel(capability: command_mod.Capability) []const u8 {
         .workspace_write => "write",
         .network_read => "net-read",
         .network_write => "net-write",
+        .source_control_local => "git-local",
+        .source_control_network => "git-net",
         .external_command => "exec",
     };
 }
@@ -7480,6 +7544,8 @@ fn commandCapabilityColor(capability: command_mod.Capability) windows.COLORREF {
         .workspace_write => rgb(255, 207, 92),
         .network_read => rgb(127, 211, 255),
         .network_write => rgb(255, 148, 82),
+        .source_control_local => rgb(107, 224, 187),
+        .source_control_network => rgb(255, 166, 92),
         .external_command => rgb(255, 118, 118),
     };
 }
@@ -7490,6 +7556,8 @@ fn commandCapabilityBackground(capability: command_mod.Capability) windows.COLOR
         .workspace_write => rgb(52, 43, 22),
         .network_read => rgb(20, 42, 52),
         .network_write => rgb(58, 34, 24),
+        .source_control_local => rgb(20, 48, 40),
+        .source_control_network => rgb(58, 37, 24),
         .external_command => rgb(58, 26, 31),
     };
 }
@@ -9045,7 +9113,7 @@ fn tutorialLines(language: TutorialLanguage) []const []const u8 {
             "Zigの境界性をSECへ落とし込み、memory/execution/filesystem/networkの交差点としてfindingを読めます。",
             "",
             "セキュリティ差分: trust before execution",
-            "commandはsafe/workspace_write/network_read/network_write/external_commandへ分類されます。",
+            "commandはsafe/write/network/Git local/Git network/execの境界へ分類されます。",
             "untrusted workspaceは読めて編集できますが、外部実行とnetwork writeは止めます。",
             "critical findingはlocked_downへ、high findingはtrusted workspaceをparanoid寄りへ押し戻します。",
             "",
@@ -9091,7 +9159,7 @@ fn tutorialLines(language: TutorialLanguage) []const []const u8 {
             "Zig boundary thinking is surfaced as memory/execution/filesystem/network crossing points in SEC.",
             "",
             "SECURITY DIFFERENCE: trust before execution",
-            "Commands are classified as safe, workspace_write, network_read, network_write, or external_command.",
+            "Commands are separated into safe, write, network, Git local, Git network, and exec boundaries.",
             "Untrusted workspaces can be read and edited, but external execution and network writes are blocked.",
             "Critical findings force locked_down posture; high findings can push trusted workspaces into paranoid mode.",
             "",
@@ -9330,6 +9398,7 @@ const BROWSEINFOW = extern struct {
 const HGDIOBJ = *opaque {};
 const HFONT = *opaque {};
 const HGLOBAL = *anyopaque;
+const DPI_AWARENESS_CONTEXT = *opaque {};
 const WPARAM = windows.ULONG_PTR;
 const LRESULT = windows.LONG_PTR;
 const HRESULT = c_long;
@@ -9355,6 +9424,8 @@ const CW_USEDEFAULT: c_int = -2147483648;
 const IDC_ARROW: windows.LPCWSTR = @ptrFromInt(32512);
 const SW_SHOW: c_int = 5;
 const SW_SHOWNORMAL: c_int = 1;
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT =
+    @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
 const TRANSPARENT: c_int = 1;
 const WS_OVERLAPPEDWINDOW: windows.DWORD = 0x00CF0000;
 const FW_NORMAL: c_int = 400;
@@ -9426,6 +9497,7 @@ extern "shell32" fn ShellExecuteW(
 ) callconv(.winapi) windows.HINSTANCE;
 
 extern "user32" fn RegisterClassExW(lpWndClass: *const WNDCLASSEXW) callconv(.winapi) windows.ATOM;
+extern "user32" fn SetProcessDpiAwarenessContext(value: DPI_AWARENESS_CONTEXT) callconv(.winapi) windows.BOOL;
 extern "user32" fn CreateWindowExW(
     dwExStyle: windows.DWORD,
     lpClassName: windows.LPCWSTR,

@@ -61,6 +61,7 @@ test {
     _ = @import("editor/store.zig");
     _ = @import("editor/undo.zig");
     _ = @import("git/repository.zig");
+    _ = @import("git/source_control.zig");
     _ = @import("git/status.zig");
     _ = @import("github/client.zig");
     _ = @import("gui/goto_line.zig");

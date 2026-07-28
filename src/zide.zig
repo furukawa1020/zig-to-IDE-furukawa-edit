@@ -153,11 +153,13 @@ pub const debug_layer = struct {
 
 pub const git = struct {
     pub const repository = @import("git/repository.zig");
+    pub const source_control = @import("git/source_control.zig");
     pub const status = @import("git/status.zig");
 };
 
 pub const github = struct {
     pub const client = @import("github/client.zig");
+    pub const state = @import("github/state.zig");
 };
 
 pub const security = struct {

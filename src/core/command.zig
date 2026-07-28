@@ -18,6 +18,8 @@ pub const Capability = enum {
     network_read,
     network_write,
     workspace_write,
+    source_control_local,
+    source_control_network,
     external_command,
 };
 
@@ -205,19 +207,19 @@ const definitions = [_]Definition{
     .{ .id = "git.overview", .title = "Git and GitHub Overview", .description = "Read branch, remotes, GitHub links, and file changes without executing Git.", .default_key = "ctrl-shift-g", .scope = .workspace, .capability = .safe },
     .{ .id = "git.status", .title = "Git Security Status", .description = "Read Git metadata without executing Git hooks, filters, or fsmonitor.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "git.diff_current", .title = "Preview Current Git Diff", .description = "Render a compact diff for the active file without running git diff.", .default_key = "", .scope = .workspace, .capability = .safe },
-    .{ .id = "git.refresh_source_control", .title = "Refresh Source Control", .description = "Refresh staged and unstaged Git state with hooks, fsmonitor, and optional locks disabled.", .default_key = "", .scope = .workspace, .capability = .external_command },
-    .{ .id = "git.stage", .title = "Stage Change", .description = "Stage one validated workspace-relative path through an explicit Git argv.", .default_key = "", .scope = .workspace, .capability = .external_command },
-    .{ .id = "git.unstage", .title = "Unstage Change", .description = "Unstage one validated workspace-relative path through an explicit Git argv.", .default_key = "", .scope = .workspace, .capability = .external_command },
-    .{ .id = "git.stage_all", .title = "Stage All Changes", .description = "Stage all workspace changes through an explicit Git argv.", .default_key = "", .scope = .workspace, .capability = .external_command },
-    .{ .id = "git.unstage_all", .title = "Unstage All Changes", .description = "Unstage all changes through an explicit Git argv.", .default_key = "", .scope = .workspace, .capability = .external_command },
-    .{ .id = "git.commit", .title = "Commit Staged Changes", .description = "Commit staged changes with an explicit message while hooks and signing programs are disabled.", .default_key = "", .scope = .workspace, .capability = .external_command },
-    .{ .id = "git.fetch", .title = "Fetch GitHub Remote", .description = "Fetch the selected GitHub remote without tags or recursive submodules.", .default_key = "", .scope = .workspace, .capability = .external_command },
-    .{ .id = "git.pull", .title = "Pull Current Branch", .description = "Fast-forward the current branch from its upstream with hooks disabled.", .default_key = "", .scope = .workspace, .capability = .external_command },
-    .{ .id = "git.push", .title = "Push Current Branch", .description = "Push the current branch through the audited external-command boundary.", .default_key = "", .scope = .workspace, .capability = .external_command },
-    .{ .id = "git.publish_branch", .title = "Publish Current Branch", .description = "Push HEAD to the GitHub remote and establish its upstream.", .default_key = "", .scope = .workspace, .capability = .external_command },
-    .{ .id = "git.sync", .title = "Sync Current Branch", .description = "Fast-forward pull and then push the current branch without invoking a shell.", .default_key = "", .scope = .workspace, .capability = .external_command },
-    .{ .id = "git.branch.create", .title = "Create Git Branch", .description = "Create and switch to a validated local branch name.", .default_key = "", .scope = .workspace, .capability = .external_command },
-    .{ .id = "git.branch.switch", .title = "Switch Git Branch", .description = "Switch to a validated local branch while dirty editor buffers are blocked.", .default_key = "", .scope = .workspace, .capability = .external_command },
+    .{ .id = "git.refresh_source_control", .title = "Refresh Source Control", .description = "Refresh staged and unstaged Git state with hooks, fsmonitor, and optional locks disabled.", .default_key = "", .scope = .workspace, .capability = .source_control_local },
+    .{ .id = "git.stage", .title = "Stage Change", .description = "Stage one validated workspace-relative path through an explicit Git argv.", .default_key = "", .scope = .workspace, .capability = .source_control_local },
+    .{ .id = "git.unstage", .title = "Unstage Change", .description = "Unstage one validated workspace-relative path through an explicit Git argv.", .default_key = "", .scope = .workspace, .capability = .source_control_local },
+    .{ .id = "git.stage_all", .title = "Stage All Changes", .description = "Stage all workspace changes through an explicit Git argv.", .default_key = "", .scope = .workspace, .capability = .source_control_local },
+    .{ .id = "git.unstage_all", .title = "Unstage All Changes", .description = "Unstage all changes through an explicit Git argv.", .default_key = "", .scope = .workspace, .capability = .source_control_local },
+    .{ .id = "git.commit", .title = "Commit Staged Changes", .description = "Commit staged changes with an explicit message while hooks and signing programs are disabled.", .default_key = "", .scope = .workspace, .capability = .source_control_local },
+    .{ .id = "git.fetch", .title = "Fetch GitHub Remote", .description = "Fetch the selected GitHub remote without tags or recursive submodules.", .default_key = "", .scope = .workspace, .capability = .source_control_network },
+    .{ .id = "git.pull", .title = "Pull Current Branch", .description = "Fast-forward the current branch from its upstream with hooks disabled.", .default_key = "", .scope = .workspace, .capability = .source_control_network },
+    .{ .id = "git.push", .title = "Push Current Branch", .description = "Push the current branch through the audited Git network boundary.", .default_key = "", .scope = .workspace, .capability = .source_control_network },
+    .{ .id = "git.publish_branch", .title = "Publish Current Branch", .description = "Push HEAD to the GitHub remote and establish its upstream.", .default_key = "", .scope = .workspace, .capability = .source_control_network },
+    .{ .id = "git.sync", .title = "Sync Current Branch", .description = "Fast-forward pull and then push the current branch without invoking a shell.", .default_key = "", .scope = .workspace, .capability = .source_control_network },
+    .{ .id = "git.branch.create", .title = "Create Git Branch", .description = "Create and switch to a validated local branch name.", .default_key = "", .scope = .workspace, .capability = .source_control_local },
+    .{ .id = "git.branch.switch", .title = "Switch Git Branch", .description = "Switch to a validated local branch while dirty editor buffers are blocked.", .default_key = "", .scope = .workspace, .capability = .source_control_local },
     .{ .id = "github.overview", .title = "GitHub Overview", .description = "Show GitHub repository and Actions links inferred from local Git remotes.", .default_key = "", .scope = .workspace, .capability = .safe },
     .{ .id = "github.fetch", .title = "Fetch GitHub Live Overview", .description = "Fetch read-only GitHub repo, PR, and Actions data with optional GITHUB_TOKEN.", .default_key = "", .scope = .workspace, .capability = .network_read },
     .{ .id = "github.issues", .title = "Fetch GitHub Issues", .description = "Fetch open GitHub issues and pull requests for the current repository.", .default_key = "", .scope = .workspace, .capability = .network_read },
@@ -298,4 +300,16 @@ test "goto line and Git overview use distinct shortcuts" {
     try std.testing.expectEqualStrings("ctrl-g", goto.default_key);
     try std.testing.expectEqualStrings("ctrl-shift-g", git.default_key);
     try std.testing.expect(!std.mem.eql(u8, goto.default_key, git.default_key));
+}
+
+test "source control commands keep local and network boundaries distinct" {
+    const refresh = findById("git.refresh_source_control") orelse return error.ExpectedCommand;
+    const commit = findById("git.commit") orelse return error.ExpectedCommand;
+    const fetch = findById("git.fetch") orelse return error.ExpectedCommand;
+    const push = findById("git.push") orelse return error.ExpectedCommand;
+
+    try std.testing.expectEqual(Capability.source_control_local, refresh.capability);
+    try std.testing.expectEqual(Capability.source_control_local, commit.capability);
+    try std.testing.expectEqual(Capability.source_control_network, fetch.capability);
+    try std.testing.expectEqual(Capability.source_control_network, push.capability);
 }

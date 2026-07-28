@@ -1,4 +1,5 @@
 const std = @import("std");
+const secure_environment = @import("../security/environment.zig");
 
 pub const TokenSource = enum {
     none,
@@ -160,7 +161,10 @@ const LogExcerpt = struct {
 
 pub fn tokenFromEnv(allocator: std.mem.Allocator, environ: std.process.Environ) !?Token {
     var map = try std.process.Environ.createMap(environ, allocator);
-    defer map.deinit();
+    defer {
+        secure_environment.wipeMapValues(&map);
+        map.deinit();
+    }
 
     if (try tokenFromMap(allocator, &map, "GITHUB_TOKEN", .github_token)) |token| return token;
     if (try tokenFromMap(allocator, &map, "GH_TOKEN", .gh_token)) |token| return token;

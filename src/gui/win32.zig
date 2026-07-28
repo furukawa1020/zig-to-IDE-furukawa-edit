@@ -853,13 +853,14 @@ const SearchPanel = struct {
 
 pub fn run(
     allocator: std.mem.Allocator,
+    io: std.Io,
     root_path: []const u8,
     environ: std.process.Environ,
 ) !void {
     if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
     _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    var state = try GuiState.init(allocator, root_path, environ);
+    var state = try GuiState.init(allocator, io, root_path, environ);
     defer state.deinit();
     global_state = &state;
     defer global_state = null;
@@ -961,10 +962,11 @@ const GuiState = struct {
 
     fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         root_path: []const u8,
         environ: std.process.Environ,
     ) !GuiState {
-        var app = try app_mod.App.initWithProcess(allocator, root_path, std.Options.debug_io, environ);
+        var app = try app_mod.App.initWithProcess(allocator, root_path, io, environ);
         errdefer app.deinit();
 
         const collapsed_dirs = try allocator.alloc(bool, app.workspace.entries.items.len);
@@ -987,7 +989,7 @@ const GuiState = struct {
         var next_app = app_mod.App.initWithProcess(
             self.allocator,
             root_path,
-            std.Options.debug_io,
+            self.app.io,
             self.app.environ,
         ) catch |err| {
             self.setError(err) catch {};
@@ -2046,6 +2048,7 @@ const GuiState = struct {
             .argument = argument,
             .source = .command_palette,
         }) catch |err| {
+            std.log.err("source control {s} failed: {s}", .{ id, @errorName(err) });
             self.setError(err) catch {};
             self.appendOutput(.stderr, "{s} failed: {s}\n", .{ id, @errorName(err) });
             return;
@@ -3766,7 +3769,7 @@ const GuiState = struct {
                     changed = true;
                 },
                 .modified => {
-                    const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, self.allocator, .limited(32 * 1024 * 1024)) catch |err| {
+                    const bytes = std.Io.Dir.cwd().readFileAlloc(self.app.io, path, self.allocator, .limited(32 * 1024 * 1024)) catch |err| {
                         self.appendOutput(.stderr, "external reload failed: {s}: {s}\n", .{ path, @errorName(err) });
                         continue;
                     };

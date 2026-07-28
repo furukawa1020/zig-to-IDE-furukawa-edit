@@ -12,8 +12,8 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const root_path = if (args.len > 1) args[1] else ".";
     switch (builtin.os.tag) {
-        .windows => try gui.run(allocator, root_path, init.minimal.environ),
-        .linux => try gui.run(allocator, root_path, init.minimal.environ, init.environ_map),
+        .windows => try gui.run(allocator, init.io, root_path, init.minimal.environ),
+        .linux => try gui.run(allocator, init.io, root_path, init.minimal.environ, init.environ_map),
         else => unreachable,
     }
 }

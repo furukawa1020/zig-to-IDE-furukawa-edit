@@ -7848,6 +7848,7 @@ fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
     var lane_ascii: [720]u8 = undefined;
     const lane_gc = if (!has_github_remote) x11.gc.amber else if (std.mem.eql(u8, token_label, "none")) x11.gc.muted else x11.gc.cyan;
     try x11.text(lane_gc, 18, bottom + 130, asciiInto(lane_ascii[0..], lane));
+    try drawGitHubScmSummary(x11, state, bottom + 154);
 
     const top = gitChangesTop(state);
     const total_rows = gitScmRowCount(overview);
@@ -7908,6 +7909,59 @@ fn drawGitPanel(x11: *X11, state: *LinuxGuiState) !void {
     if (overview.changes.len == 0 and overview.staged_changes.len == 0) {
         try x11.text(x11.gc.muted, 160, top, "Working tree clean");
     }
+}
+
+fn drawGitHubScmSummary(x11: *X11, state: *const LinuxGuiState, y: i16) !void {
+    var issues_buf: [48]u8 = undefined;
+    const issues = if (state.app.github_state.issues_loaded)
+        std.fmt.bufPrint(issues_buf[0..], "{d}", .{state.app.github_state.issueCount()}) catch "?"
+    else
+        "-";
+
+    var draft_buf: [48]u8 = undefined;
+    const draft = if (state.app.github_state.last_created_pull) |pull|
+        std.fmt.bufPrint(draft_buf[0..], "#{d}", .{pull.number}) catch "yes"
+    else
+        "-";
+
+    var run_buf: [160]u8 = undefined;
+    const run = if (state.app.github_state.live) |live|
+        if (live.runs.len > 0)
+            std.fmt.bufPrint(run_buf[0..], "{s}/{s}", .{
+                live.runs[0].status,
+                if (live.runs[0].conclusion.len > 0) live.runs[0].conclusion else "pending",
+            }) catch "loaded"
+        else
+            "none"
+    else
+        "not-loaded";
+
+    var summary_buf: [720]u8 = undefined;
+    const summary = if (state.app.github_state.live) |live|
+        std.fmt.bufPrint(summary_buf[0..], "GITHUB {s} PR:{d} issues:{s} actions:{s} draft:{s} auth:{s}", .{
+            live.repository.full_name,
+            live.pulls.len,
+            issues,
+            run,
+            draft,
+            @tagName(live.token_source),
+        }) catch "GITHUB LIVE"
+    else
+        std.fmt.bufPrint(summary_buf[0..], "GITHUB live:not-loaded issues:{s} actions:{s} draft:{s} press LIVE", .{
+            issues,
+            run,
+            draft,
+        }) catch "GITHUB LIVE not loaded";
+
+    const failed = if (state.app.github_state.latest_failure != null)
+        true
+    else if (state.app.github_state.live) |live|
+        live.runs.len > 0 and std.mem.eql(u8, live.runs[0].conclusion, "failure")
+    else
+        false;
+    const gc = if (failed) x11.gc.red else if (state.app.github_state.live != null) x11.gc.cyan else x11.gc.muted;
+    var summary_ascii: [720]u8 = undefined;
+    try x11.text(gc, 18, y, asciiInto(summary_ascii[0..], summary));
 }
 
 fn drawSettingsPanel(x11: *X11, state: *LinuxGuiState) !void {
@@ -10815,7 +10869,7 @@ fn outputLineRowAt(state: *const LinuxGuiState, y: i16) ?usize {
 }
 
 fn gitChangesTop(state: *const LinuxGuiState) i16 {
-    return state.bottomTop() + 154;
+    return state.bottomTop() + 178;
 }
 
 fn gitScmRowCount(overview: git_repository.Overview) usize {

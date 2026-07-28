@@ -1,8 +1,10 @@
 const std = @import("std");
 const workspace_mod = @import("../workspace/workspace.zig");
+const source_control = @import("source_control.zig");
 const flate = std.compress.flate;
 
 pub const ChangeStatus = enum {
+    added,
     modified,
     deleted,
     untracked,
@@ -70,6 +72,7 @@ pub const Overview = struct {
     commit: ?[]u8 = null,
     remotes: []Remote = &.{},
     changes: []Change = &.{},
+    staged_changes: []Change = &.{},
     workflow_paths: [][]u8 = &.{},
     index_version: ?u32 = null,
     index_entries: usize = 0,
@@ -78,6 +81,7 @@ pub const Overview = struct {
     ignored_untracked: usize = 0,
     change_limit_hit: bool = false,
     unsupported_index: bool = false,
+    staged_scan_available: bool = false,
 
     pub fn deinit(self: *Overview) void {
         if (self.git_dir) |value| self.allocator.free(value);
@@ -87,6 +91,8 @@ pub const Overview = struct {
         if (self.remotes.len > 0) self.allocator.free(self.remotes);
         for (self.changes) |*change| change.deinit(self.allocator);
         if (self.changes.len > 0) self.allocator.free(self.changes);
+        for (self.staged_changes) |*change| change.deinit(self.allocator);
+        if (self.staged_changes.len > 0) self.allocator.free(self.staged_changes);
         for (self.workflow_paths) |path| self.allocator.free(path);
         if (self.workflow_paths.len > 0) self.allocator.free(self.workflow_paths);
         self.* = undefined;
@@ -127,6 +133,44 @@ const LooseBlob = struct {
 
     fn deinit(self: *LooseBlob, allocator: std.mem.Allocator) void {
         allocator.free(self.allocation);
+        self.* = undefined;
+    }
+};
+
+const ObjectKind = enum {
+    blob,
+    tree,
+    commit,
+};
+
+const LooseObject = struct {
+    allocation: []u8,
+    body: []const u8,
+    kind: ObjectKind,
+
+    fn deinit(self: *LooseObject, allocator: std.mem.Allocator) void {
+        allocator.free(self.allocation);
+        self.* = undefined;
+    }
+};
+
+const HeadEntry = struct {
+    path: []u8,
+    object_id: [20]u8,
+
+    fn deinit(self: *HeadEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+const HeadTree = struct {
+    allocator: std.mem.Allocator,
+    entries: []HeadEntry = &.{},
+
+    fn deinit(self: *HeadTree) void {
+        for (self.entries) |*entry| entry.deinit(self.allocator);
+        if (self.entries.len > 0) self.allocator.free(self.entries);
         self.* = undefined;
     }
 };
@@ -259,6 +303,16 @@ pub fn inspect(allocator: std.mem.Allocator, workspace: *const workspace_mod.Wor
 
     overview.index_version = index.version;
     overview.index_entries = index.entries.len;
+    overview.staged_changes = collectStagedChanges(
+        allocator,
+        overview.git_dir.?,
+        overview.commit,
+        index.entries,
+        options.max_file_bytes,
+        options.max_changes,
+    ) catch &.{};
+    overview.staged_scan_available = overview.commit == null or overview.staged_changes.len > 0 or
+        headTreeReadable(allocator, overview.git_dir.?, overview.commit, options.max_file_bytes);
     var ignore_rules = try loadIgnoreRules(allocator, workspace.root_path, options.max_file_bytes);
     defer ignore_rules.deinit();
     var text_attributes = try loadTextAttributes(allocator, workspace.root_path, overview.git_dir.?, options.max_file_bytes);
@@ -266,6 +320,147 @@ pub fn inspect(allocator: std.mem.Allocator, workspace: *const workspace_mod.Wor
     try collectChanges(allocator, workspace, &index, &ignore_rules, &text_attributes, options, &overview);
 
     return overview;
+}
+
+pub fn applySourceControlSnapshot(
+    overview: *Overview,
+    snapshot: *const source_control.Snapshot,
+    max_changes: usize,
+) !void {
+    var staged = std.array_list.Managed(Change).init(overview.allocator);
+    errdefer {
+        for (staged.items) |*change| change.deinit(overview.allocator);
+        staged.deinit();
+    }
+    var unstaged = std.array_list.Managed(Change).init(overview.allocator);
+    errdefer {
+        for (unstaged.items) |*change| change.deinit(overview.allocator);
+        unstaged.deinit();
+    }
+
+    for (snapshot.entries) |entry| {
+        if (entry.isStaged() and staged.items.len < max_changes) {
+            try appendChange(
+                &staged,
+                overview.allocator,
+                entry.path,
+                sourceControlStatus(entry.index_status),
+                .{},
+            );
+        }
+        if (entry.isUnstaged() and unstaged.items.len < max_changes) {
+            const status = if (entry.index_status == .untracked)
+                ChangeStatus.untracked
+            else
+                sourceControlStatus(entry.worktree_status);
+            try appendChange(&unstaged, overview.allocator, entry.path, status, .{});
+        }
+    }
+
+    const staged_owned = try staged.toOwnedSlice();
+    errdefer {
+        for (staged_owned) |*change| change.deinit(overview.allocator);
+        if (staged_owned.len > 0) overview.allocator.free(staged_owned);
+    }
+    const unstaged_owned = try unstaged.toOwnedSlice();
+
+    for (overview.staged_changes) |*change| change.deinit(overview.allocator);
+    if (overview.staged_changes.len > 0) overview.allocator.free(overview.staged_changes);
+    for (overview.changes) |*change| change.deinit(overview.allocator);
+    if (overview.changes.len > 0) overview.allocator.free(overview.changes);
+    overview.staged_changes = staged_owned;
+    overview.changes = unstaged_owned;
+    overview.staged_scan_available = true;
+    overview.change_limit_hit = snapshot.entries.len > max_changes;
+}
+
+fn sourceControlStatus(status: source_control.FileStatus) ChangeStatus {
+    return switch (status) {
+        .added => .added,
+        .deleted => .deleted,
+        .untracked => .untracked,
+        .clean, .modified, .type_changed, .renamed, .copied, .unmerged, .ignored, .unknown => .modified,
+    };
+}
+
+pub fn previewStagedFileDiff(allocator: std.mem.Allocator, workspace: *const workspace_mod.Workspace, path: []const u8, options: DiffPreviewOptions) ![]u8 {
+    const relative = try normalizeWorkspacePath(allocator, workspace.root_path, path);
+    defer allocator.free(relative);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("git staged diff preview (pure Zig, no git executable)\n");
+    try writer.print("path: {s}\n", .{relative});
+
+    const git_dir = try resolveGitDir(allocator, workspace.root_path);
+    defer if (git_dir) |value| allocator.free(value);
+    if (git_dir == null) {
+        try writer.writeAll("status: no .git metadata found\n");
+        return try out.toOwnedSlice();
+    }
+
+    var index = readIndex(allocator, git_dir.?, options.max_index_bytes) catch |err| switch (err) {
+        error.UnsupportedGitIndexVersion => {
+            try writer.writeAll("status: unsupported Git index version\n");
+            return try out.toOwnedSlice();
+        },
+        error.FileNotFound => {
+            try writer.writeAll("status: Git index not found\n");
+            return try out.toOwnedSlice();
+        },
+        else => return err,
+    };
+    defer index.deinit();
+
+    var head_commit: ?[]u8 = null;
+    defer if (head_commit) |value| allocator.free(value);
+    var head_overview = Overview{ .allocator = allocator };
+    defer head_overview.deinit();
+    try readHead(allocator, &head_overview, git_dir.?);
+    if (head_overview.commit) |commit| {
+        head_commit = try allocator.dupe(u8, commit);
+    }
+
+    var head_tree = loadHeadTree(allocator, git_dir.?, head_commit, options.max_file_bytes, 65_536) catch {
+        try writer.writeAll("status: staged preview unavailable because HEAD objects are packed or unreadable\n");
+        return try out.toOwnedSlice();
+    };
+    defer head_tree.deinit();
+
+    const old_entry = findHeadEntry(head_tree.entries, relative);
+    const new_entry = findTrackedEntry(index.entries, relative);
+    if (old_entry == null and new_entry == null) {
+        try writer.writeAll("status: file not found in HEAD or Git index\n");
+        return try out.toOwnedSlice();
+    }
+    if (old_entry != null and new_entry != null and std.mem.eql(u8, old_entry.?.object_id[0..], new_entry.?.object_id[0..])) {
+        try writer.writeAll("status: no staged change\n");
+        return try out.toOwnedSlice();
+    }
+
+    var old_blob = if (old_entry) |entry| readLooseBlob(allocator, git_dir.?, entry.object_id, options.max_file_bytes) catch null else null;
+    defer if (old_blob) |*blob| blob.deinit(allocator);
+    var new_blob = if (new_entry) |entry| readLooseBlob(allocator, git_dir.?, entry.object_id, options.max_file_bytes) catch null else null;
+    defer if (new_blob) |*blob| blob.deinit(allocator);
+
+    if (old_entry == null) {
+        try writer.writeAll("status: staged added\n");
+        if (new_blob) |blob| try writePrefixedLines(writer, '+', blob.body, options.max_lines) else try writer.writeAll("diff body unavailable: indexed blob is packed or too large\n");
+    } else if (new_entry == null) {
+        try writer.writeAll("status: staged deleted\n");
+        if (old_blob) |blob| try writePrefixedLines(writer, '-', blob.body, options.max_lines) else try writer.writeAll("diff body unavailable: HEAD blob is packed or too large\n");
+    } else {
+        try writer.writeAll("status: staged modified\n");
+        if (old_blob != null and new_blob != null) {
+            try writeChangedPreview(writer, old_blob.?.body, new_blob.?.body, options.max_lines);
+        } else {
+            try writer.writeAll("diff body unavailable: HEAD or indexed blob is packed or too large\n");
+        }
+    }
+
+    return try out.toOwnedSlice();
 }
 
 pub fn previewFileDiff(allocator: std.mem.Allocator, workspace: *const workspace_mod.Workspace, path: []const u8, options: DiffPreviewOptions) ![]u8 {
@@ -436,6 +631,180 @@ fn appendChange(changes: *std.array_list.Managed(Change), allocator: std.mem.All
     };
     errdefer change.deinit(allocator);
     try changes.append(change);
+}
+
+fn collectStagedChanges(
+    allocator: std.mem.Allocator,
+    git_dir: []const u8,
+    head_commit: ?[]const u8,
+    index_entries: []const IndexEntry,
+    max_blob_bytes: usize,
+    max_changes: usize,
+) ![]Change {
+    var head_tree = try loadHeadTree(allocator, git_dir, head_commit, max_blob_bytes, 65_536);
+    defer head_tree.deinit();
+
+    var changes = std.array_list.Managed(Change).init(allocator);
+    errdefer {
+        for (changes.items) |*change| change.deinit(allocator);
+        changes.deinit();
+    }
+
+    for (index_entries) |entry| {
+        if (changes.items.len >= max_changes) break;
+        const head_entry = findHeadEntry(head_tree.entries, entry.path);
+        if (head_entry) |previous| {
+            if (std.mem.eql(u8, previous.object_id[0..], entry.object_id[0..])) continue;
+            const stats = stagedDiffStats(allocator, git_dir, previous.object_id, entry.object_id, max_blob_bytes);
+            try appendChange(&changes, allocator, entry.path, .modified, stats);
+        } else {
+            const stats = stagedAddedStats(allocator, git_dir, entry.object_id, max_blob_bytes);
+            try appendChange(&changes, allocator, entry.path, .added, stats);
+        }
+    }
+
+    for (head_tree.entries) |entry| {
+        if (changes.items.len >= max_changes) break;
+        if (findTrackedEntry(index_entries, entry.path) != null) continue;
+        const stats = stagedRemovedStats(allocator, git_dir, entry.object_id, max_blob_bytes);
+        try appendChange(&changes, allocator, entry.path, .deleted, stats);
+    }
+
+    return try changes.toOwnedSlice();
+}
+
+fn stagedDiffStats(
+    allocator: std.mem.Allocator,
+    git_dir: []const u8,
+    old_id: [20]u8,
+    new_id: [20]u8,
+    max_blob_bytes: usize,
+) DiffStats {
+    var old_blob = readLooseBlob(allocator, git_dir, old_id, max_blob_bytes) catch return .{};
+    defer old_blob.deinit(allocator);
+    var new_blob = readLooseBlob(allocator, git_dir, new_id, max_blob_bytes) catch return .{};
+    defer new_blob.deinit(allocator);
+    return changedStats(old_blob.body, new_blob.body);
+}
+
+fn stagedAddedStats(allocator: std.mem.Allocator, git_dir: []const u8, object_id: [20]u8, max_blob_bytes: usize) DiffStats {
+    var blob = readLooseBlob(allocator, git_dir, object_id, max_blob_bytes) catch return .{};
+    defer blob.deinit(allocator);
+    return addedStats(blob.body);
+}
+
+fn stagedRemovedStats(allocator: std.mem.Allocator, git_dir: []const u8, object_id: [20]u8, max_blob_bytes: usize) DiffStats {
+    var blob = readLooseBlob(allocator, git_dir, object_id, max_blob_bytes) catch return .{};
+    defer blob.deinit(allocator);
+    return removedStats(blob.body);
+}
+
+fn headTreeReadable(
+    allocator: std.mem.Allocator,
+    git_dir: []const u8,
+    head_commit: ?[]const u8,
+    max_object_bytes: usize,
+) bool {
+    var tree = loadHeadTree(allocator, git_dir, head_commit, max_object_bytes, 65_536) catch return false;
+    tree.deinit();
+    return true;
+}
+
+fn loadHeadTree(
+    allocator: std.mem.Allocator,
+    git_dir: []const u8,
+    head_commit: ?[]const u8,
+    max_object_bytes: usize,
+    max_entries: usize,
+) !HeadTree {
+    const commit_hex = head_commit orelse return .{ .allocator = allocator };
+    const commit_id = parseHexObjectId(commit_hex) orelse return error.InvalidGitObject;
+    var commit = try readLooseObject(allocator, git_dir, commit_id, max_object_bytes);
+    defer commit.deinit(allocator);
+    if (commit.kind != .commit) return error.UnsupportedGitObject;
+
+    const tree_id = commitTreeId(commit.body) orelse return error.InvalidGitObject;
+    var entries = std.array_list.Managed(HeadEntry).init(allocator);
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(allocator);
+        entries.deinit();
+    }
+    try appendHeadTreeEntries(allocator, git_dir, tree_id, "", max_object_bytes, max_entries, 0, &entries);
+    return .{
+        .allocator = allocator,
+        .entries = try entries.toOwnedSlice(),
+    };
+}
+
+fn appendHeadTreeEntries(
+    allocator: std.mem.Allocator,
+    git_dir: []const u8,
+    tree_id: [20]u8,
+    prefix: []const u8,
+    max_object_bytes: usize,
+    max_entries: usize,
+    depth: usize,
+    entries: *std.array_list.Managed(HeadEntry),
+) !void {
+    if (depth > 128) return error.GitTreeTooDeep;
+    var tree = try readLooseObject(allocator, git_dir, tree_id, max_object_bytes);
+    defer tree.deinit(allocator);
+    if (tree.kind != .tree) return error.UnsupportedGitObject;
+
+    var offset: usize = 0;
+    while (offset < tree.body.len) {
+        const mode_end_relative = std.mem.indexOfScalar(u8, tree.body[offset..], ' ') orelse return error.InvalidGitObject;
+        const mode_end = offset + mode_end_relative;
+        const mode = tree.body[offset..mode_end];
+        const name_start = mode_end + 1;
+        const name_end_relative = std.mem.indexOfScalar(u8, tree.body[name_start..], 0) orelse return error.InvalidGitObject;
+        const name_end = name_start + name_end_relative;
+        const name = tree.body[name_start..name_end];
+        if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or std.mem.indexOfScalar(u8, name, '/') != null) {
+            return error.InvalidGitObject;
+        }
+        const object_start = name_end + 1;
+        if (object_start + 20 > tree.body.len) return error.InvalidGitObject;
+        var object_id: [20]u8 = undefined;
+        @memcpy(object_id[0..], tree.body[object_start .. object_start + 20]);
+        offset = object_start + 20;
+
+        const path = if (prefix.len == 0)
+            try allocator.dupe(u8, name)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, name });
+        if (isTreeMode(mode)) {
+            defer allocator.free(path);
+            try appendHeadTreeEntries(allocator, git_dir, object_id, path, max_object_bytes, max_entries, depth + 1, entries);
+            continue;
+        }
+
+        if (entries.items.len >= max_entries) {
+            allocator.free(path);
+            return error.GitTreeEntryLimitExceeded;
+        }
+        try entries.append(.{ .path = path, .object_id = object_id });
+    }
+}
+
+fn isTreeMode(mode: []const u8) bool {
+    return std.mem.eql(u8, mode, "40000") or std.mem.eql(u8, mode, "040000");
+}
+
+fn commitTreeId(body: []const u8) ?[20]u8 {
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "tree ")) continue;
+        return parseHexObjectId(std.mem.trim(u8, line["tree ".len..], " \t\r"));
+    }
+    return null;
+}
+
+fn findHeadEntry(entries: []const HeadEntry, path: []const u8) ?*const HeadEntry {
+    for (entries) |*entry| {
+        if (std.mem.eql(u8, entry.path, path)) return entry;
+    }
+    return null;
 }
 
 fn loadIgnoreRules(allocator: std.mem.Allocator, workspace_root: []const u8, max_bytes: usize) !IgnoreRules {
@@ -672,17 +1041,26 @@ fn parseRemoteSection(line: []const u8) ?[]const u8 {
 }
 
 fn parseGitHubRemote(allocator: std.mem.Allocator, url: []const u8) !?GitHubRemote {
-    const marker = "github.com";
-    const at = std.mem.indexOf(u8, url, marker) orelse return null;
-    var rest = url[at + marker.len ..];
-    if (rest.len > 0 and (rest[0] == ':' or rest[0] == '/')) rest = rest[1..];
-    if (startsWith(rest, "git/")) rest = rest["git/".len..];
+    const prefixes = [_][]const u8{
+        "https://github.com/",
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "ssh://github.com/",
+    };
+    var rest: ?[]const u8 = null;
+    for (prefixes) |prefix| {
+        if (startsWithIgnoreCase(url, prefix)) {
+            rest = url[prefix.len..];
+            break;
+        }
+    }
+    var path = rest orelse return null;
 
-    const owner_end = std.mem.indexOfAny(u8, rest, "/:") orelse return null;
-    const owner = rest[0..owner_end];
-    rest = rest[owner_end + 1 ..];
-    const repo_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
-    var repo = rest[0..repo_end];
+    const owner_end = std.mem.indexOfScalar(u8, path, '/') orelse return null;
+    const owner = path[0..owner_end];
+    path = path[owner_end + 1 ..];
+    const repo_end = std.mem.indexOfAny(u8, path, "/?#") orelse path.len;
+    var repo = path[0..repo_end];
     if (std.mem.endsWith(u8, repo, ".git")) repo = repo[0 .. repo.len - ".git".len];
     if (owner.len == 0 or repo.len == 0) return null;
 
@@ -898,6 +1276,16 @@ fn addedFileStats(allocator: std.mem.Allocator, workspace_root: []const u8, path
 }
 
 fn readLooseBlob(allocator: std.mem.Allocator, git_dir: []const u8, object_id: [20]u8, max_body_bytes: usize) !LooseBlob {
+    var object = try readLooseObject(allocator, git_dir, object_id, max_body_bytes);
+    errdefer object.deinit(allocator);
+    if (object.kind != .blob) return error.UnsupportedGitObject;
+    return .{
+        .allocation = object.allocation,
+        .body = object.body,
+    };
+}
+
+fn readLooseObject(allocator: std.mem.Allocator, git_dir: []const u8, object_id: [20]u8, max_body_bytes: usize) !LooseObject {
     var hex: [40]u8 = undefined;
     hexObjectId(&hex, object_id);
 
@@ -917,14 +1305,25 @@ fn readLooseBlob(allocator: std.mem.Allocator, git_dir: []const u8, object_id: [
 
     const nul = std.mem.indexOfScalar(u8, decompressed, 0) orelse return error.InvalidGitObject;
     const header = decompressed[0..nul];
-    if (!startsWith(header, "blob ")) return error.UnsupportedGitObject;
+    const separator = std.mem.indexOfScalar(u8, header, ' ') orelse return error.InvalidGitObject;
+    const kind = objectKind(header[0..separator]) orelse return error.UnsupportedGitObject;
+    const declared_size = std.fmt.parseUnsigned(usize, header[separator + 1 ..], 10) catch return error.InvalidGitObject;
     const body = decompressed[nul + 1 ..];
+    if (body.len != declared_size) return error.InvalidGitObject;
     if (body.len > max_body_bytes) return error.FileTooBig;
 
     return .{
         .allocation = decompressed,
         .body = body,
+        .kind = kind,
     };
+}
+
+fn objectKind(value: []const u8) ?ObjectKind {
+    if (std.mem.eql(u8, value, "blob")) return .blob;
+    if (std.mem.eql(u8, value, "tree")) return .tree;
+    if (std.mem.eql(u8, value, "commit")) return .commit;
+    return null;
 }
 
 fn changedStats(old: []const u8, new: []const u8) DiffStats {
@@ -1066,6 +1465,26 @@ fn hexObjectId(out: *[40]u8, object_id: [20]u8) void {
     }
 }
 
+fn parseHexObjectId(value: []const u8) ?[20]u8 {
+    if (value.len != 40) return null;
+    var object_id: [20]u8 = undefined;
+    for (0..20) |index| {
+        const high = hexNibble(value[index * 2]) orelse return null;
+        const low = hexNibble(value[index * 2 + 1]) orelse return null;
+        object_id[index] = (high << 4) | low;
+    }
+    return object_id;
+}
+
+fn hexNibble(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => null,
+    };
+}
+
 fn isTracked(entries: []const IndexEntry, path: []const u8) bool {
     for (entries) |entry| {
         if (std.mem.eql(u8, entry.path, path)) return true;
@@ -1161,6 +1580,17 @@ test "parse github remote urls" {
     try std.testing.expectEqualStrings("repo", remote.repo);
     try std.testing.expectEqualStrings("https://github.com/owner/repo", remote.web_url);
     try std.testing.expectEqualStrings("https://github.com/owner/repo/actions", remote.actions_url);
+}
+
+test "github remote parser requires the exact github host" {
+    try std.testing.expect((try parseGitHubRemote(std.testing.allocator, "https://evil.example/github.com/owner/repo.git")) == null);
+    try std.testing.expect((try parseGitHubRemote(std.testing.allocator, "https://github.com.evil.example/owner/repo.git")) == null);
+    try std.testing.expect((try parseGitHubRemote(std.testing.allocator, "https://github.com@evil.example/owner/repo.git")) == null);
+
+    var remote = (try parseGitHubRemote(std.testing.allocator, "https://github.com/owner/repo.git")) orelse return error.ExpectedRemote;
+    defer remote.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("owner", remote.owner);
+    try std.testing.expectEqualStrings("repo", remote.repo);
 }
 
 test "git blob sha1 matches known empty blob id" {

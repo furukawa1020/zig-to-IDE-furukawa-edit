@@ -3503,7 +3503,8 @@ const GuiState = struct {
 
     fn openGitPanelRow(self: *GuiState, rect: RECT, row: usize, x: c_int) void {
         const overview = if (self.git_overview) |*value| value else return;
-        if (row == 1) {
+        const rows = gitPanelRows(overview.*);
+        if (row == rows.github_summary) {
             if (self.app.github_state.primaryUrl()) |url| {
                 self.openExternalUrl(url);
             } else {
@@ -3511,7 +3512,7 @@ const GuiState = struct {
             }
             return;
         }
-        if (gitHubScmDetailAtRow(row)) |detail| {
+        if (gitHubScmDetailAtRow(overview.*, row)) |detail| {
             if (self.app.github_state.scmDetailUrl(detail)) |url| {
                 self.openExternalUrl(url);
             } else {
@@ -6481,7 +6482,51 @@ fn drawGitPanel(hdc: windows.HDC, state: *GuiState, rect: RECT) void {
 }
 
 fn drawGitPanelRow(hdc: windows.HDC, state: *GuiState, rect: RECT, overview: git_repository.Overview, row: usize, y: c_int) void {
-    if (row == 0) {
+    const rows = gitPanelRows(overview);
+    if (row == rows.staged_header) {
+        var staged_buf: [96]u8 = undefined;
+        const text = if (overview.staged_scan_available)
+            std.fmt.bufPrint(&staged_buf, "STAGED CHANGES  {d}", .{overview.staged_changes.len}) catch "STAGED CHANGES"
+        else
+            "STAGED CHANGES  unavailable (packed HEAD)";
+        drawText(hdc, rect.left + 16, y, if (overview.staged_changes.len > 0) rgb(102, 220, 150) else rgb(116, 128, 140), text);
+        return;
+    }
+
+    if (row >= rows.staged_start and row < rows.changes_header) {
+        const index = row - rows.staged_start;
+        drawGitScmChangeRow(hdc, state, rect, overview.staged_changes[index], .staged, index, y);
+        return;
+    }
+
+    if (row == rows.changes_header) {
+        if (overview.changes.len == 0 and overview.staged_changes.len == 0) {
+            drawText(hdc, rect.left + 16, y, rgb(116, 128, 140), "No changes");
+        } else {
+            var changes_buf: [96]u8 = undefined;
+            const text = std.fmt.bufPrint(&changes_buf, "CHANGES  {d}", .{overview.changes.len}) catch "CHANGES";
+            drawText(hdc, rect.left + 16, y, if (overview.changes.len > 0) rgb(255, 207, 92) else rgb(116, 128, 140), text);
+        }
+        return;
+    }
+
+    if (row >= rows.changes_start and row < rows.github_summary) {
+        const index = row - rows.changes_start;
+        drawGitScmChangeRow(hdc, state, rect, overview.changes[index], .unstaged, index, y);
+        return;
+    }
+
+    if (row == rows.github_summary) {
+        drawGitHubScmSummary(hdc, state, rect, y);
+        return;
+    }
+
+    if (gitHubScmDetailAtRow(overview, row)) |detail| {
+        drawGitHubScmDetail(hdc, state, rect, y, detail);
+        return;
+    }
+
+    if (row == rows.commit) {
         if (overview.commit) |commit| {
             drawTextClipped(hdc, rect.left + 16, y, rect.right - 16, rgb(180, 190, 200), commit);
         } else {
@@ -6490,17 +6535,7 @@ fn drawGitPanelRow(hdc: windows.HDC, state: *GuiState, rect: RECT, overview: git
         return;
     }
 
-    if (row == 1) {
-        drawGitHubScmSummary(hdc, state, rect, y);
-        return;
-    }
-
-    if (gitHubScmDetailAtRow(row)) |detail| {
-        drawGitHubScmDetail(hdc, state, rect, y, detail);
-        return;
-    }
-
-    var current: usize = 5;
+    var current = rows.remotes_start;
     for (overview.remotes) |remote| {
         if (row == current) {
             var remote_buf: [520]u8 = undefined;
@@ -6523,63 +6558,26 @@ fn drawGitPanelRow(hdc: windows.HDC, state: *GuiState, rect: RECT, overview: git
         }
     }
 
-    if (row == current) {
+    if (row == rows.workflows_header) {
         var workflow_buf: [160]u8 = undefined;
         const text = std.fmt.bufPrint(&workflow_buf, "GitHub Actions workflows: {d}", .{overview.workflow_paths.len}) catch "GitHub Actions workflows";
         drawText(hdc, rect.left + 16, y, rgb(255, 207, 92), text);
         return;
     }
-    current += 1;
 
-    for (overview.workflow_paths) |path| {
-        if (row == current) {
-            const counts = pathRiskCounts(state, path);
-            const worst = highestRisk(counts);
-            const color = if (worst) |risk| riskColor(risk) else rgb(127, 211, 255);
-            var risk_buf: [64]u8 = undefined;
-            const risk_label = if (worst != null)
-                std.fmt.bufPrint(&risk_buf, "risk {d}/{d}/{d}", .{ counts.critical, counts.high, counts.medium }) catch "risk"
-            else
-                "clear";
-            drawTextClipped(hdc, rect.left + 34, y, rect.right - 132, color, path);
-            drawTextRight(hdc, rect.right - 124, y, rect.right - 16, color, risk_label);
-            return;
-        }
-        current += 1;
-    }
-
-    if (row == current) {
-        var staged_buf: [96]u8 = undefined;
-        const text = if (overview.staged_scan_available)
-            std.fmt.bufPrint(&staged_buf, "STAGED CHANGES  {d}", .{overview.staged_changes.len}) catch "STAGED CHANGES"
+    if (row >= rows.workflows_start and row < rows.total) {
+        const path = overview.workflow_paths[row - rows.workflows_start];
+        const counts = pathRiskCounts(state, path);
+        const worst = highestRisk(counts);
+        const color = if (worst) |risk| riskColor(risk) else rgb(127, 211, 255);
+        var risk_buf: [64]u8 = undefined;
+        const risk_label = if (worst != null)
+            std.fmt.bufPrint(&risk_buf, "risk {d}/{d}/{d}", .{ counts.critical, counts.high, counts.medium }) catch "risk"
         else
-            "STAGED CHANGES  unavailable (packed HEAD)";
-        drawText(hdc, rect.left + 16, y, if (overview.staged_changes.len > 0) rgb(102, 220, 150) else rgb(116, 128, 140), text);
-        return;
+            "clear";
+        drawTextClipped(hdc, rect.left + 34, y, rect.right - 132, color, path);
+        drawTextRight(hdc, rect.right - 124, y, rect.right - 16, color, risk_label);
     }
-    current += 1;
-
-    if (row < current + overview.staged_changes.len) {
-        drawGitScmChangeRow(hdc, state, rect, overview.staged_changes[row - current], .staged, row - current, y);
-        return;
-    }
-    current += overview.staged_changes.len;
-
-    if (row == current) {
-        if (overview.changes.len == 0 and overview.staged_changes.len == 0) {
-            drawText(hdc, rect.left + 16, y, rgb(116, 128, 140), "No changes");
-        } else {
-            var changes_buf: [96]u8 = undefined;
-            const text = std.fmt.bufPrint(&changes_buf, "CHANGES  {d}", .{overview.changes.len}) catch "CHANGES";
-            drawText(hdc, rect.left + 16, y, if (overview.changes.len > 0) rgb(255, 207, 92) else rgb(116, 128, 140), text);
-        }
-        return;
-    }
-    current += 1;
-
-    const change_index = row - current;
-    if (change_index >= overview.changes.len) return;
-    drawGitScmChangeRow(hdc, state, rect, overview.changes[change_index], .unstaged, change_index, y);
 }
 
 fn drawGitHubScmSummary(hdc: windows.HDC, state: *const GuiState, rect: RECT, y: c_int) void {
@@ -6656,39 +6654,62 @@ fn drawGitScmChangeRow(
     }, if (lane == .staged) "-" else "+");
 }
 
-fn gitPanelRowCount(overview: git_repository.Overview) usize {
-    var count: usize = 5;
+const GitPanelRows = struct {
+    staged_header: usize,
+    staged_start: usize,
+    changes_header: usize,
+    changes_start: usize,
+    github_summary: usize,
+    github_details_start: usize,
+    commit: usize,
+    remotes_start: usize,
+    workflows_header: usize,
+    workflows_start: usize,
+    total: usize,
+};
+
+fn gitPanelRows(overview: git_repository.Overview) GitPanelRows {
+    const staged_header: usize = 0;
+    const staged_start: usize = 1;
+    const changes_header = staged_start + overview.staged_changes.len;
+    const changes_start = changes_header + 1;
+    const github_summary = changes_start + overview.changes.len;
+    const github_details_start = github_summary + 1;
+    const commit = github_details_start + git_hub_scm_details.len;
+    const remotes_start = commit + 1;
+    var workflows_header = remotes_start;
     for (overview.remotes) |remote| {
-        count += 1;
-        if (remote.github != null) count += 2;
+        workflows_header += 1;
+        if (remote.github != null) workflows_header += 2;
     }
-    count += 1 + overview.workflow_paths.len;
-    count += 1 + overview.staged_changes.len;
-    count += 1 + overview.changes.len;
-    return count;
+    const workflows_start = workflows_header + 1;
+    return .{
+        .staged_header = staged_header,
+        .staged_start = staged_start,
+        .changes_header = changes_header,
+        .changes_start = changes_start,
+        .github_summary = github_summary,
+        .github_details_start = github_details_start,
+        .commit = commit,
+        .remotes_start = remotes_start,
+        .workflows_header = workflows_header,
+        .workflows_start = workflows_start,
+        .total = workflows_start + overview.workflow_paths.len,
+    };
+}
+
+fn gitPanelRowCount(overview: git_repository.Overview) usize {
+    return gitPanelRows(overview).total;
 }
 
 fn gitPanelWorkflowStartRow(overview: git_repository.Overview) usize {
-    var row: usize = 6;
-    for (overview.remotes) |remote| {
-        row += 1;
-        if (remote.github != null) row += 2;
-    }
-    return row;
-}
-
-fn gitPanelStagedStartRow(overview: git_repository.Overview) usize {
-    return gitPanelWorkflowStartRow(overview) + overview.workflow_paths.len + 1;
-}
-
-fn gitPanelChangeStartRow(overview: git_repository.Overview) usize {
-    return gitPanelStagedStartRow(overview) + overview.staged_changes.len + 1;
+    return gitPanelRows(overview).workflows_start;
 }
 
 fn gitPanelChangeTargetAtRow(overview: *const git_repository.Overview, row: usize) ?GitPanelChangeTarget {
-    const staged_start = gitPanelStagedStartRow(overview.*);
-    if (row >= staged_start and row < staged_start + overview.staged_changes.len) {
-        const index = row - staged_start;
+    const rows = gitPanelRows(overview.*);
+    if (row >= rows.staged_start and row < rows.changes_header) {
+        const index = row - rows.staged_start;
         return .{
             .lane = .staged,
             .index = index,
@@ -6696,9 +6717,8 @@ fn gitPanelChangeTargetAtRow(overview: *const git_repository.Overview, row: usiz
         };
     }
 
-    const change_start = gitPanelChangeStartRow(overview.*);
-    if (row >= change_start and row < change_start + overview.changes.len) {
-        const index = row - change_start;
+    if (row >= rows.changes_start and row < rows.github_summary) {
+        const index = row - rows.changes_start;
         return .{
             .lane = .unstaged,
             .index = index,
@@ -6709,10 +6729,11 @@ fn gitPanelChangeTargetAtRow(overview: *const git_repository.Overview, row: usiz
 }
 
 fn gitPanelUrlAtRow(state: *const GuiState, overview: git_repository.Overview, row: usize) ?[]const u8 {
-    if (row == 1) return state.app.github_state.primaryUrl();
-    if (gitHubScmDetailAtRow(row)) |detail| return state.app.github_state.scmDetailUrl(detail);
+    const rows = gitPanelRows(overview);
+    if (row == rows.github_summary) return state.app.github_state.primaryUrl();
+    if (gitHubScmDetailAtRow(overview, row)) |detail| return state.app.github_state.scmDetailUrl(detail);
 
-    var current: usize = 5;
+    var current = rows.remotes_start;
     for (overview.remotes) |remote| {
         current += 1;
         if (remote.github) |github| {
@@ -6731,9 +6752,10 @@ const git_hub_scm_details = [_]github_state_mod.ScmDetail{
     .issue,
 };
 
-fn gitHubScmDetailAtRow(row: usize) ?github_state_mod.ScmDetail {
-    if (row < 2 or row >= 2 + git_hub_scm_details.len) return null;
-    return git_hub_scm_details[row - 2];
+fn gitHubScmDetailAtRow(overview: git_repository.Overview, row: usize) ?github_state_mod.ScmDetail {
+    const start = gitPanelRows(overview).github_details_start;
+    if (row < start or row >= start + git_hub_scm_details.len) return null;
+    return git_hub_scm_details[row - start];
 }
 
 const git_panel_compact_actions = [_]GitPanelAction{
